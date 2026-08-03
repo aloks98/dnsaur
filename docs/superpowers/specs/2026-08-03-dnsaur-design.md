@@ -215,6 +215,44 @@ use Postgres locally).
 - Phase 1 is built sync-aware (config versioning + hot-reload), so 1.5 is
   additive.
 
+## RFC Compliance
+
+Compliance is an explicit, tested commitment. `miekg/dns` covers the wire
+format layer (RFC 1035 encoding, name compression, RFC 3597 unknown
+types, EDNS0 encoding); dnsaur owns behavioral compliance:
+
+- **Phase 1:** RFC 1034/1035 (core resolution behavior), RFC 6891 (EDNS0
+  + UDP payload size negotiation), RFC 7766 (TCP transport; retry over
+  TCP on truncation), RFC 2308 (negative caching), RFC 8767
+  (serve-stale), RFC 9520 (resolution-failure caching). Hardening:
+  source-port randomization and 0x20 case randomization.
+- **Phase 2:** RFC 2131/2132 (DHCPv4 + options), RFC 4702 (client FQDN
+  option for DNS registration).
+- **Phase 3:** RFC 7858 (DoT), RFC 8484 (DoH); RFC 9250 (DoQ) roadmap.
+- **Phase 4:** RFC 4033–4035, RFC 5155 (DNSSEC validation incl. NSEC3).
+  Hardest item; `miekg/dns` supplies crypto primitives. For *signing*,
+  PowerDNS remains the documented fallback if hand-rolling proves too
+  risky (see Fallback Options).
+
+Verification: integration tests assert RFC behaviors (truncation→TCP,
+negative-TTL honoring, EDNS edge cases); external conformance tooling
+(ISC EDNS compliance checks; dnsviz once DNSSEC lands) runs against a
+live instance in CI where feasible.
+
+## Fallback Options
+
+Evaluated and rejected as the primary architecture: building dnsaur as a
+control plane over PowerDNS + Kea. Reasons: multi-process deployment
+breaks the single-binary/5-minute-setup story; per-client filtering and
+query-log attribution would live in Lua/RPZ glue we don't control; both
+servers target ISP scale, not homelab scale. Retained as explicit
+fallbacks:
+
+- **Phase 2:** if our DHCP implementation hits protocol walls, Kea behind
+  our API is the fallback.
+- **Phase 4:** if DNSSEC signing proves too risky to hand-roll, PowerDNS
+  (auth) behind our API is the fallback for hosted zones.
+
 ## Error Handling
 
 Guiding rule: **DNS must not die.**
