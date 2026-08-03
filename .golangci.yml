@@ -1,4 +1,5 @@
+version: "2"
 linters:
-  enable: [govet, staticcheck, errcheck, ineffassign, unused, misspell]
+  enable: [staticcheck, errcheck, ineffassign, unused, misspell]
 run:
   timeout: 5m
