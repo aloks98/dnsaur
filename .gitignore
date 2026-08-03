@@ -1,1 +1,4 @@
 .superpowers/
+/dnsaur
+/data/
+*.db
