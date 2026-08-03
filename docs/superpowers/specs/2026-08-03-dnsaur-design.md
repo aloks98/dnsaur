@@ -184,11 +184,15 @@ unit-testable in isolation, new stages additive.
 
 ## High Availability — Config Sync (Phase 1.5)
 
-Primary/replica; every instance fully self-contained on its own SQLite.
+Primary/replica; every instance fully self-contained on its own local
+store (SQLite by default — sync is storage-agnostic, so an instance may
+use Postgres locally).
 
 - One **primary** = source of truth for configuration. **Replicas** join
   via one-time join token (generated in primary UI, pasted into replica
-  setup wizard). Token exchange over HTTPS.
+  setup wizard). Sync traffic runs over HTTPS: the primary auto-generates
+  a self-signed cert whose fingerprint is embedded in the join token and
+  pinned by the replica (user-provided certs also supported).
 - **Syncs:** settings, upstreams, blocklist subscriptions, rules, groups,
   clients, local DNS records. **Does not sync:** query logs,
   instance-local identity (listen addresses, hostname).
