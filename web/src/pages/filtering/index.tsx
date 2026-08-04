@@ -1,26 +1,7 @@
 import { Separator, Tabs, TabsContent, TabsList, TabsTrigger } from "@e412/rnui-react";
+import { GroupsClientsTab } from "./groups-clients";
 import { ListsTab } from "./lists";
-
-// Placeholder — Task 10 replaces these two panels with real per-domain/regex
-// rule management and group/client assignment, reusing this same tab shell.
-// Copy matches the app's other not-yet-built pages (pages/dns.tsx,
-// pages/settings.tsx, pages/account.tsx): a plain, present-tense "X land
-// here", no "coming soon" filler.
-function RulesPlaceholder() {
-  return (
-    <p className="text-sm text-muted-foreground">
-      Per-domain and regex allow/block rules land here.
-    </p>
-  );
-}
-
-function GroupsPlaceholder() {
-  return (
-    <p className="text-sm text-muted-foreground">
-      Groups, clients, and per-group blocking controls land here.
-    </p>
-  );
-}
+import { RulesTab } from "./rules";
 
 export function Filtering() {
   return (
@@ -53,10 +34,10 @@ export function Filtering() {
           <ListsTab />
         </TabsContent>
         <TabsContent value="rules" className="pt-4">
-          <RulesPlaceholder />
+          <RulesTab />
         </TabsContent>
         <TabsContent value="groups" className="pt-4">
-          <GroupsPlaceholder />
+          <GroupsClientsTab />
         </TabsContent>
       </Tabs>
     </div>
