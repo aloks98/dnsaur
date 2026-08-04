@@ -1,4 +1,5 @@
 import { LogOut, Pause, Search } from "lucide-react";
+import { toast } from "sonner";
 import {
   Avatar,
   AvatarFallback,
@@ -77,7 +78,14 @@ export function Header({ onOpenCommandPalette }: HeaderProps) {
           <DropdownMenuContent align="end">
             <DropdownMenuLabel>{me.data?.username ?? "Account"}</DropdownMenuLabel>
             <DropdownMenuSeparator />
-            <DropdownMenuItem variant="destructive" onClick={() => logout.mutate()}>
+            <DropdownMenuItem
+              variant="destructive"
+              onClick={() =>
+                logout.mutate(undefined, {
+                  onError: () => toast.error("Couldn't sign out — try again"),
+                })
+              }
+            >
               <LogOut />
               Log out
             </DropdownMenuItem>

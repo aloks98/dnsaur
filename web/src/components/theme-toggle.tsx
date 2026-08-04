@@ -6,6 +6,8 @@ export function ThemeToggle() {
   const { theme, toggleTheme } = useTheme();
   const isDark = theme === "dark";
 
+  // Icon button (not rnui's Switch) is deliberate: it matches the other
+  // icon-only controls in the header's utility cluster (pause, account).
   return (
     <Button
       type="button"

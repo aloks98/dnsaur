@@ -27,3 +27,14 @@ test("unauthenticated + setup-done shows login", async () => {
   renderWithProviders(<App />);
   await waitFor(() => expect(screen.getByLabelText(/password/i)).toBeInTheDocument());
 });
+
+test("api unreachable (both auth/me and setup fail) shows the unreachable banner, not the shell or login", async () => {
+  server.use(
+    http.get("/api/v1/auth/me", () => HttpResponse.json({ error: "unreachable" }, { status: 500 })),
+    http.get("/api/v1/setup", () => HttpResponse.json({ error: "unreachable" }, { status: 500 })),
+  );
+  renderWithProviders(<App />);
+  await waitFor(() => expect(screen.getByText(/can't reach/i)).toBeInTheDocument());
+  expect(screen.queryByRole("link", { name: /query log/i })).not.toBeInTheDocument();
+  expect(screen.queryByLabelText(/password/i)).not.toBeInTheDocument();
+});
