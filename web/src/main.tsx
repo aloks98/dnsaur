@@ -1,18 +1,20 @@
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { QueryClientProvider } from "@tanstack/react-query";
+import { BrowserRouter } from "react-router";
 
 import { App } from "./app";
+import { makeQueryClient } from "./lib/query-client";
 import "./styles/app.css";
 
-// Task 1 uses a bare QueryClient; Task 3 replaces this with a configured
-// client from './lib/query-client'.
-const queryClient = new QueryClient();
+const queryClient = makeQueryClient();
 
 createRoot(document.getElementById("root")!).render(
   <StrictMode>
     <QueryClientProvider client={queryClient}>
-      <App />
+      <BrowserRouter>
+        <App />
+      </BrowserRouter>
     </QueryClientProvider>
   </StrictMode>,
 );
