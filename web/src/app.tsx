@@ -1,8 +1,9 @@
 import { Navigate, Route, Routes } from "react-router";
-import { Spinner } from "@e412/rnui-react";
+import { Spinner, Toaster } from "@e412/rnui-react";
 import { AppShell } from "./components/app-shell";
 import { ApiUnreachableBanner } from "./components/api-unreachable-banner";
 import { useMe, useSetupState } from "./hooks/use-auth";
+import { useTheme } from "./lib/theme";
 import { Account } from "./pages/account";
 import { Dashboard } from "./pages/dashboard";
 import { LocalDns } from "./pages/dns";
@@ -48,26 +49,30 @@ function UnauthenticatedGate() {
 
 export function App() {
   const me = useMe();
-
-  if (me.isPending) {
-    return <FullPageSpinner />;
-  }
-
-  if (me.isError) {
-    return <UnauthenticatedGate />;
-  }
+  const { theme } = useTheme();
 
   return (
-    <Routes>
-      <Route element={<AppShell />}>
-        <Route index element={<Dashboard />} />
-        <Route path="queries" element={<QueryLog />} />
-        <Route path="filtering" element={<Filtering />} />
-        <Route path="dns" element={<LocalDns />} />
-        <Route path="settings" element={<SettingsPage />} />
-        <Route path="account" element={<Account />} />
-        <Route path="*" element={<Navigate to="/" replace />} />
-      </Route>
-    </Routes>
+    <>
+      {me.isPending ? (
+        <FullPageSpinner />
+      ) : me.isError ? (
+        <UnauthenticatedGate />
+      ) : (
+        <Routes>
+          <Route element={<AppShell />}>
+            <Route index element={<Dashboard />} />
+            <Route path="queries" element={<QueryLog />} />
+            <Route path="filtering" element={<Filtering />} />
+            <Route path="dns" element={<LocalDns />} />
+            <Route path="settings" element={<SettingsPage />} />
+            <Route path="account" element={<Account />} />
+            <Route path="*" element={<Navigate to="/" replace />} />
+          </Route>
+        </Routes>
+      )}
+      {/* One Toaster for the whole app — mounted here (not per-shell) so
+          unauthenticated screens (Setup, Login) can toast too. */}
+      <Toaster theme={theme} />
+    </>
   );
 }
