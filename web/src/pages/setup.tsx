@@ -36,7 +36,7 @@ import {
 import { ApiError } from "../api/client";
 import { AuthLayout } from "../components/auth-layout";
 import { authKeys, useSetup, useSetupSignIn } from "../hooks/use-auth";
-import { useAssignGroupLists, useCreateList } from "../hooks/use-filters";
+import { useAddList, useAssignGroupLists } from "../hooks/use-filters";
 import { useUpdateSetting } from "../hooks/use-settings";
 
 const DEFAULT_UPSTREAMS = "1.1.1.1:53,1.0.0.1:53,9.9.9.9:53";
@@ -92,7 +92,7 @@ export function Setup() {
 
   const setup = useSetup();
   const signIn = useSetupSignIn();
-  const createList = useCreateList();
+  const addList = useAddList();
   const assignGroupLists = useAssignGroupLists();
   const updateSetting = useUpdateSetting();
 
@@ -109,7 +109,7 @@ export function Setup() {
 
   const creatingAccount = setup.isPending || signIn.isPending;
   const applyingStarters =
-    createList.isPending || assignGroupLists.isPending || updateSetting.isPending;
+    addList.isPending || assignGroupLists.isPending || updateSetting.isPending;
 
   function onCreateAccount(values: AccountFormValues) {
     setFormError(null);
@@ -163,7 +163,7 @@ export function Setup() {
       const chosen = STARTER_LISTS.filter((l) => selectedLists[l.key]);
       const ids: number[] = [];
       for (const list of chosen) {
-        const created = await createList.mutateAsync({ url: list.url, kind: "block" });
+        const created = await addList.mutateAsync({ url: list.url, kind: "block" });
         ids.push(created.id);
       }
       if (ids.length > 0) {

@@ -11,6 +11,7 @@ import type {
   TimelineBucket,
   TopEntry,
 } from "../api/types";
+import type { BlockingStatus } from "../hooks/use-blocking";
 
 // Default "happy path" fixture for /stats/timeline — a handful of hourly
 // buckets ending now, each with a plausible decision mix. Real enough that
@@ -105,5 +106,14 @@ export const handlers = [
   http.get("/api/v1/queries", () => {
     const entries: QueryEntry[] = [];
     return HttpResponse.json(entries);
+  }),
+
+  // Global blocking-pause status (group 0) — the shell Header's pause
+  // control (Task 9) polls this on every authenticated page, so it needs a
+  // default "active" fixture even for tests that have nothing to do with
+  // pausing (onUnhandledRequest is "error", see test/setup.ts).
+  http.get("/api/v1/blocking", () => {
+    const status: BlockingStatus = { paused_until: 0 };
+    return HttpResponse.json(status);
   }),
 ];

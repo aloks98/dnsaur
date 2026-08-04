@@ -1,4 +1,4 @@
-import { useMutation, useQuery } from "@tanstack/react-query";
+import { useQuery } from "@tanstack/react-query";
 import { api } from "../api/client";
 import type { HealthStatus, StatsOverview, TimelineBucket, TopEntry } from "../api/types";
 
@@ -48,26 +48,5 @@ export function useHealth() {
     queryFn: () => api.get<HealthStatus>("/health"),
     refetchInterval: LIVE_REFETCH_MS,
     retry: false,
-  });
-}
-
-const QUICK_RULE_GROUP_ID = 1;
-
-/**
- * Local stand-in for the dashboard's per-domain quick block/allow action.
- * Task 9 owns the real shared rule hooks (in use-filters.ts, with proper
- * rule-list query invalidation for the Filtering page) — this only calls
- * the same POST /groups/:id/rules endpoint so the dashboard has something
- * to wire its action to in the meantime. Supersede this with Task 9's hook
- * once it lands; nothing on this page reads the rules list itself, so
- * there's no cache to invalidate here.
- */
-export function useAddRule() {
-  return useMutation({
-    mutationFn: (v: { action: "allow" | "block"; pattern: string }) =>
-      api.post<{ id: number }>(`/groups/${QUICK_RULE_GROUP_ID}/rules`, {
-        action: v.action,
-        pattern: v.pattern,
-      }),
   });
 }

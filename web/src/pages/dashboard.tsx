@@ -35,14 +35,15 @@ import {
   type BadgeProps,
 } from "@e412/rnui-react";
 import type { StatsOverview, TimelineBucket, TopEntry } from "../api/types";
-import { useLists } from "../hooks/use-filters";
-import {
-  useAddRule,
-  useHealth,
-  useStatsOverview,
-  useStatsTimeline,
-  useStatsTop,
-} from "../hooks/use-stats";
+import { useAddRule, useLists } from "../hooks/use-filters";
+import { useHealth, useStatsOverview, useStatsTimeline, useStatsTop } from "../hooks/use-stats";
+import { relativeTime } from "../lib/format";
+
+// The one group the setup wizard ever creates today (see the query log's
+// own STARTER_GROUP_ID convention in pages/queries.tsx) — the dashboard's
+// per-domain quick block/allow action targets it until group selection
+// exists in the UI (Task 10).
+const QUICK_RULE_GROUP_ID = 1;
 
 // --- window selector -------------------------------------------------------
 
@@ -94,18 +95,6 @@ function WindowSelect({
 function pct(numerator: number, denominator: number): string {
   if (denominator <= 0) return "—";
   return `${Math.round((numerator / denominator) * 100)}%`;
-}
-
-function relativeTime(epochMs: number): string {
-  if (!epochMs) return "never";
-  const diffSec = Math.max(0, Math.floor((Date.now() - epochMs) / 1000));
-  if (diffSec < 60) return "just now";
-  const diffMin = Math.floor(diffSec / 60);
-  if (diffMin < 60) return `${diffMin}m ago`;
-  const diffHour = Math.floor(diffMin / 60);
-  if (diffHour < 24) return `${diffHour}h ago`;
-  const diffDay = Math.floor(diffHour / 24);
-  return `${diffDay}d ago`;
 }
 
 // --- health strip ------------------------------------------------------------
@@ -446,7 +435,7 @@ export function Dashboard() {
   function quickRule(action: "allow" | "block", pattern: string) {
     setRuleStatus((s) => ({ ...s, [pattern]: "pending" }));
     addRule.mutate(
-      { action, pattern },
+      { groupId: QUICK_RULE_GROUP_ID, action, pattern },
       {
         onSuccess: () => {
           setRuleStatus((s) => ({ ...s, [pattern]: "done" }));

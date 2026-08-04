@@ -48,16 +48,8 @@ import {
 } from "@e412/rnui-react";
 import type { List, QueryEntry, Rule } from "../api/types";
 import type { SseState } from "../api/sse";
-import { useRules, useLists } from "../hooks/use-filters";
+import { useAddRule, useRules, useLists } from "../hooks/use-filters";
 import { useLiveTail, useQuerySearch, type QuerySearchFilter } from "../hooks/use-queries";
-// Reused from the dashboard's own quick block/allow action (Task 7) — the
-// same POST /groups/1/rules {action, pattern} mutation, no invalidation
-// since nothing here reads the rules list back (the "why?" drawer's rules
-// query re-fetches independently on its own schedule). Task 9's Filtering
-// page owns the real shared rule hooks (create/delete + proper
-// invalidation) — this is intentionally reused rather than duplicated
-// until then.
-import { useAddRule } from "../hooks/use-stats";
 
 // The one group the setup wizard ever creates today (see use-stats.ts's
 // own STARTER_GROUP_ID convention) — rules/lists resolution for the "why?"
@@ -547,7 +539,7 @@ export function QueryLog() {
   function quickRule(action: "allow" | "block", entry: QueryEntry) {
     setRowStatus((s) => ({ ...s, [entry.id]: "pending" }));
     addRule.mutate(
-      { action, pattern: entry.q_name },
+      { groupId: STARTER_GROUP_ID, action, pattern: entry.q_name },
       {
         onSuccess: () => {
           setRowStatus((s) => ({ ...s, [entry.id]: action === "block" ? "blocked" : "allowed" }));

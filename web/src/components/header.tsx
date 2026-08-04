@@ -1,4 +1,4 @@
-import { LogOut, Pause, Search } from "lucide-react";
+import { LogOut, Search } from "lucide-react";
 import { toast } from "sonner";
 import {
   Avatar,
@@ -6,6 +6,7 @@ import {
   Button,
   DropdownMenu,
   DropdownMenuContent,
+  DropdownMenuGroup,
   DropdownMenuItem,
   DropdownMenuLabel,
   DropdownMenuSeparator,
@@ -16,6 +17,7 @@ import {
   SidebarTrigger,
 } from "@e412/rnui-react";
 import { useLogout, useMe } from "../hooks/use-auth";
+import { PauseControl } from "./pause-control";
 import { ThemeToggle } from "./theme-toggle";
 
 interface HeaderProps {
@@ -49,16 +51,10 @@ export function Header({ onOpenCommandPalette }: HeaderProps) {
       </Button>
 
       <div className="ml-auto flex items-center gap-1.5">
-        <Button
-          type="button"
-          variant="outline"
-          size="sm"
-          disabled
-          title="Pause DNS resolution — coming soon"
-        >
-          <Pause />
-          Pause
-        </Button>
+        {/* Global pause (group 0) — see components/pause-control.tsx. The
+            same component is reused per-group on the Filtering page's
+            Groups & Clients tab (Task 10). */}
+        <PauseControl />
 
         <ThemeToggle />
 
@@ -76,7 +72,12 @@ export function Header({ onOpenCommandPalette }: HeaderProps) {
             </Avatar>
           </DropdownMenuTrigger>
           <DropdownMenuContent align="end">
-            <DropdownMenuLabel>{me.data?.username ?? "Account"}</DropdownMenuLabel>
+            {/* Menu.GroupLabel (rnui's DropdownMenuLabel) throws unless it's
+                inside a Menu.Group — base-ui requires that context even for
+                a single ungrouped label. */}
+            <DropdownMenuGroup>
+              <DropdownMenuLabel>{me.data?.username ?? "Account"}</DropdownMenuLabel>
+            </DropdownMenuGroup>
             <DropdownMenuSeparator />
             <DropdownMenuItem
               variant="destructive"
