@@ -41,3 +41,45 @@ if (typeof window.ResizeObserver !== "function") {
 if (typeof document.elementFromPoint !== "function") {
   document.elementFromPoint = () => null;
 }
+
+// jsdom does not implement 2D canvas rendering (getContext('2d') returns
+// null — the real implementation needs the native `canvas` npm package,
+// which this project deliberately doesn't install just for tests). rnui's
+// chart components (ECharts, via zrender's canvas renderer) grab a 2D
+// context on mount and call a broad set of drawing methods on it; without
+// this, any page that renders a chart (e.g. the dashboard's timeline)
+// throws inside a layout effect and gets swallowed by the nearest
+// ErrorBoundary instead of actually rendering. Stub getContext('2d') with
+// a permissive no-op proxy — nothing under test asserts on actual pixels
+// (chart data is asserted on props/text, not canvas output; see
+// pages/dashboard.test.tsx), so a no-op context is sufficient to let
+// mount/update/dispose run without throwing.
+if (typeof HTMLCanvasElement !== "undefined") {
+  const noopCanvasContext = (): CanvasRenderingContext2D => {
+    const state: Record<string | symbol, unknown> = {};
+    return new Proxy(state, {
+      get(target, prop) {
+        if (prop in target) return target[prop];
+        if (prop === "measureText") return () => ({ width: 0 });
+        if (
+          prop === "createLinearGradient" ||
+          prop === "createRadialGradient" ||
+          prop === "createPattern"
+        ) {
+          return () => ({ addColorStop: () => {} });
+        }
+        if (prop === "getImageData") return () => ({ data: new Uint8ClampedArray(4) });
+        return () => undefined;
+      },
+      set(target, prop, value) {
+        target[prop] = value;
+        return true;
+      },
+    }) as unknown as CanvasRenderingContext2D;
+  };
+
+  HTMLCanvasElement.prototype.getContext = ((contextId: string) =>
+    contextId === "2d"
+      ? noopCanvasContext()
+      : null) as typeof HTMLCanvasElement.prototype.getContext;
+}

@@ -1,5 +1,28 @@
 import { http, HttpResponse } from "msw";
-import type { MeResponse, SetupState, Settings } from "../api/types";
+import type {
+  HealthStatus,
+  List,
+  MeResponse,
+  SetupState,
+  Settings,
+  StatsOverview,
+  TimelineBucket,
+  TopEntry,
+} from "../api/types";
+
+// Default "happy path" fixture for /stats/timeline — a handful of hourly
+// buckets ending now, each with a plausible decision mix. Real enough that
+// the dashboard's chart/percentage math has something non-trivial to chew
+// on by default; tests that care about specific numbers override via
+// server.use().
+function defaultTimeline(): TimelineBucket[] {
+  const nowSec = Math.floor(Date.now() / 1000);
+  const hourSec = 3600;
+  return [4, 3, 2, 1, 0].map((hoursAgo) => ({
+    bucket: nowSec - hoursAgo * hourSec,
+    decisions: { allowed: 120, blocked: 30, cached: 90, forwarded: 40, stale: 5 },
+  }));
+}
 
 export const handlers = [
   http.get("/api/v1/auth/me", () => {
@@ -15,5 +38,57 @@ export const handlers = [
   http.get("/api/v1/settings", () => {
     const settings: Settings = {};
     return HttpResponse.json(settings);
+  }),
+
+  http.get("/api/v1/health", () => {
+    const health: HealthStatus = { status: "ok", version: "dev" };
+    return HttpResponse.json(health);
+  }),
+
+  http.get("/api/v1/stats/overview", () => {
+    const overview: StatsOverview = {
+      total: 1000,
+      blocked: 250,
+      cached: 400,
+      forwarded: 350,
+      clients: 12,
+    };
+    return HttpResponse.json(overview);
+  }),
+
+  http.get("/api/v1/stats/timeline", () => HttpResponse.json(defaultTimeline())),
+
+  http.get("/api/v1/stats/top", ({ request }) => {
+    const metric = new URL(request.url).searchParams.get("metric");
+    const byMetric: Record<string, TopEntry[]> = {
+      domain: [
+        { key: "example.com", count: 320 },
+        { key: "api.github.com", count: 210 },
+        { key: "cdn.example.net", count: 150 },
+      ],
+      blocked_domain: [
+        { key: "ads.tracker.example", count: 140 },
+        { key: "telemetry.example.io", count: 88 },
+      ],
+      client: [
+        { key: "192.168.1.10", count: 480 },
+        { key: "192.168.1.24", count: 310 },
+      ],
+    };
+    return HttpResponse.json(byMetric[metric ?? ""] ?? []);
+  }),
+
+  http.get("/api/v1/filters/lists", () => {
+    const lists: List[] = [
+      {
+        id: 1,
+        url: "https://example.com/hosts",
+        kind: "block",
+        enabled: true,
+        last_refreshed: Date.now() - 15 * 60 * 1000,
+        entry_count: 85000,
+      },
+    ];
+    return HttpResponse.json(lists);
   }),
 ];

@@ -8,6 +8,11 @@ export interface SetupState {
   setup_required: boolean;
 }
 
+export interface HealthStatus {
+  status: string;
+  version: string;
+}
+
 export interface Group {
   id: number;
   name: string;

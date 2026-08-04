@@ -20,7 +20,9 @@ import {
   SidebarMenuItem,
   SidebarSeparator,
   StatusIndicator,
+  type StatusIndicatorProps,
 } from "@e412/rnui-react";
+import { useHealth } from "../hooks/use-stats";
 
 export interface NavItem {
   to: string;
@@ -44,8 +46,22 @@ function isNavItemActive(pathname: string, item: NavItem): boolean {
   return pathname === item.to || pathname.startsWith(`${item.to}/`);
 }
 
+// Derived from GET /health (see hooks/use-stats.ts's useHealth) — a real
+// liveness signal, not decoration. "fixing" reads as an in-flight amber
+// pulse rather than a hard down/up jump while the first check is pending.
+function resolverStatus(health: ReturnType<typeof useHealth>): {
+  state: NonNullable<StatusIndicatorProps["state"]>;
+  label: string;
+} {
+  if (health.isPending) return { state: "fixing", label: "Checking…" };
+  if (health.isError) return { state: "down", label: "Unreachable" };
+  return { state: "active", label: "Resolving" };
+}
+
 export function SidebarNav() {
   const location = useLocation();
+  const health = useHealth();
+  const status = resolverStatus(health);
 
   return (
     <Sidebar collapsible="icon">
@@ -87,8 +103,8 @@ export function SidebarNav() {
       <SidebarSeparator />
       <SidebarFooter>
         <StatusIndicator
-          state="active"
-          label="Resolving"
+          state={status.state}
+          label={status.label}
           size="sm"
           className="px-2 py-1.5 group-data-[collapsible=icon]:justify-center"
           labelClassName="group-data-[collapsible=icon]:hidden"
