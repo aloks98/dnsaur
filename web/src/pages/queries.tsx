@@ -23,7 +23,7 @@ import {
   DataGrid,
   DataGridContainer,
   DataGridScrollArea,
-  DataGridTable,
+  DataGridTableVirtual,
   Drawer,
   DrawerContent,
   DrawerDescription,
@@ -35,6 +35,7 @@ import {
   InputGroupAddon,
   InputGroupInput,
   Separator,
+  Skeleton,
   StatusIndicator,
   Switch,
   Tooltip,
@@ -330,6 +331,21 @@ function buildColumns(opts: {
 }
 
 // --- shared grid -----------------------------------------------------------
+// Virtualized per the brief: every SSE message can replace the whole
+// 500-row live-tail array, and a plain (non-virtualized) table would
+// re-render every richly-celled row on every single message on a busy
+// resolver. DataGridTableVirtual only mounts the rows within (or near) the
+// visible scroll window, so a full-buffer replacement stays cheap
+// regardless of how many rows are logically in the array.
+//
+// DataGridTableVirtual has no built-in skeleton/isLoading handling (unlike
+// the plain DataGridTable) — its virtual body only branches on
+// isFetchingMore/hasMore for infinite-scroll status rows, not an initial
+// loading state. So the loading skeleton is rendered here explicitly,
+// swapped in for the grid entirely while paged search is still in flight,
+// rather than relying on DataGrid's (virtual-body-unaware) isLoading prop.
+
+const ROW_HEIGHT_ESTIMATE = 34; // dense row: ~12px vertical padding + text-xs line height + 1px border
 
 function QueryDataGridPanel({
   entries,
@@ -354,14 +370,21 @@ function QueryDataGridPanel({
       table={table}
       recordCount={entries.length}
       isLoading={isLoading}
-      loadingMode="skeleton"
       emptyMessage={emptyState}
       tableLayout={{ dense: true, width: "auto" }}
     >
       <DataGridContainer>
-        <DataGridScrollArea className="max-h-[34rem]">
-          <DataGridTable />
-        </DataGridScrollArea>
+        {isLoading ? (
+          <div className="flex flex-col gap-2 p-3" aria-hidden="true">
+            {Array.from({ length: 8 }).map((_, i) => (
+              <Skeleton key={i} className="h-8 w-full" />
+            ))}
+          </div>
+        ) : (
+          <DataGridScrollArea className="h-[34rem]">
+            <DataGridTableVirtual estimateSize={ROW_HEIGHT_ESTIMATE} overscan={12} />
+          </DataGridScrollArea>
+        )}
       </DataGridContainer>
     </DataGrid>
   );
