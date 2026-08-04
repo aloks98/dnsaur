@@ -83,3 +83,14 @@ if (typeof HTMLCanvasElement !== "undefined") {
       ? noopCanvasContext()
       : null) as typeof HTMLCanvasElement.prototype.getContext;
 }
+
+// jsdom does not implement Element.getAnimations() (used by base-ui's
+// ScrollArea — which rnui's dropdown menus, Filters, and DataGrid all use
+// internally — to detect thumb-visibility fade animations via a delayed
+// timeout callback). Without this, the callback throws asynchronously
+// after the triggering test has already finished, surfacing as an
+// "unhandled error" that pollutes unrelated test output. A no-op empty
+// list is sufficient — no test asserts on actual scrollbar animations.
+if (typeof Element !== "undefined" && typeof Element.prototype.getAnimations !== "function") {
+  Element.prototype.getAnimations = () => [];
+}

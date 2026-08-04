@@ -54,6 +54,7 @@ export interface LocalRecord {
 export interface QueryEntry {
   id: number;
   at: number;
+  instance_id: string;
   client_ip: string;
   client_id: number;
   q_name: string;

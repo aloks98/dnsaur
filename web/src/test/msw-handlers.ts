@@ -3,6 +3,8 @@ import type {
   HealthStatus,
   List,
   MeResponse,
+  QueryEntry,
+  Rule,
   SetupState,
   Settings,
   StatsOverview,
@@ -90,5 +92,18 @@ export const handlers = [
       },
     ];
     return HttpResponse.json(lists);
+  }),
+
+  // Query log page (Task 8) — the "why?" drawer's rules lookup and the
+  // paged search's default (empty, since most tests drive the page via
+  // the live SSE tail instead and only need this endpoint to not 404).
+  http.get("/api/v1/groups/:id/rules", () => {
+    const rules: Rule[] = [];
+    return HttpResponse.json(rules);
+  }),
+
+  http.get("/api/v1/queries", () => {
+    const entries: QueryEntry[] = [];
+    return HttpResponse.json(entries);
   }),
 ];
