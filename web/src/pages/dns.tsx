@@ -101,14 +101,26 @@ function isValidIPv4(value: string): boolean {
 /** The server parses AAAA values with Go's net.ParseIP (not netip.ParseAddr
  * — unlike the client-matcher validator in groups-clients.tsx), which has
  * no concept of an RFC 4007 zone id, so a "%eth0" suffix isn't accepted
- * here either. A literal "." is also rejected: net.ParseIP would still
- * parse an IPv4-mapped/compatible literal (e.g. "::ffff:192.168.1.1") as a
- * valid IP, but the server's `ip.To4() == nil` check then rejects it as an
- * AAAA value — real IPv6 literals never contain a dot, so excluding it
- * here keeps this validator from being *less* strict than the server on
- * that edge case. */
+ * here either.
+ *
+ * A literal "." is NOT rejected: RFC 4291 §2.2 defines a dotted-quad tail
+ * form, and real, useful addresses use it — e.g. the NAT64 well-known
+ * prefix "64:ff9b::192.0.2.1" or "2001:db8::192.168.1.1" both parse fine
+ * on the server (net.ParseIP succeeds, To4() == nil, so the AAAA check
+ * accepts them). An earlier version of this validator excluded any "."
+ * outright on the theory that "real IPv6 literals never contain a dot" —
+ * that premise was wrong and blocked exactly these valid addresses from
+ * ever reaching the server (caught in review). The one case a dot *should*
+ * disqualify — an IPv4-mapped address like "::ffff:192.168.1.1", where
+ * Go's To4() returns non-nil and the server 400s it as AAAA — isn't worth
+ * special-casing here: reliably distinguishing "mapped" from "embedded"
+ * dotted-quad forms needs a real IPv6 parser (bit-level, not textual), and
+ * getting that narrowing wrong in either direction repeats the same
+ * mistake. Left to the server: a false accept here just surfaces as a 400
+ * toast, which is strictly better than a false reject that silently blocks
+ * a legitimate record. */
 function isValidIPv6(value: string): boolean {
-  if (!value.includes(":") || value.includes(".")) return false;
+  if (!value.includes(":")) return false;
   try {
     // The URL host parser validates bracketed IPv6 syntax for us — a
     // pragmatic stand-in for a real IPv6 parser that's good enough to

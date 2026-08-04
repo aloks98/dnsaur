@@ -1,5 +1,6 @@
 import { http, HttpResponse } from "msw";
-import { expect, test } from "vitest";
+import { toast } from "sonner";
+import { expect, test, vi } from "vitest";
 import { screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { server } from "../test/msw-server";
@@ -148,6 +149,84 @@ test("switching the type select updates the value field's label and placeholder"
 
   expect(within(dialog).getByLabelText(/^ipv6 address$/i)).toBeInTheDocument();
   expect(within(dialog).getByPlaceholderText(/2001:db8::1/i)).toBeInTheDocument();
+});
+
+// Regression: RFC 4291 §2.2 defines a dotted-quad *tail* form for IPv6 —
+// e.g. the NAT64 well-known prefix — and Go's net.ParseIP/To4() (the
+// server's actual validator) accepts it as a genuine AAAA value (To4() is
+// nil for it, so the AAAA check passes). An earlier version of
+// isValidIPv6 excluded any literal "." outright, which wrongly blocked
+// this from ever reaching the server.
+test("an embedded-IPv4 (NAT64) AAAA value is accepted and posts /records", async () => {
+  const user = userEvent.setup();
+  let requestBody: unknown;
+  mockRecords([record()]);
+  server.use(
+    http.post("/api/v1/records", async ({ request }) => {
+      requestBody = await request.json();
+      return HttpResponse.json({ id: 99 }, { status: 201 });
+    }),
+  );
+
+  renderWithProviders(<LocalDns />);
+  await screen.findByText("nas.home.lan");
+
+  await user.click(screen.getByRole("button", { name: /^add record$/i }));
+  const dialog = await screen.findByRole("dialog");
+
+  await user.type(within(dialog).getByLabelText(/^name$/i), "nat64.home.lan");
+  await user.click(within(dialog).getByRole("combobox", { name: /record type/i }));
+  await user.click(await screen.findByRole("option", { name: /^aaaa$/i }));
+  await user.type(within(dialog).getByLabelText(/^ipv6 address$/i), "64:ff9b::192.0.2.1");
+  await user.click(within(dialog).getByRole("button", { name: /^add record$/i }));
+
+  await waitFor(() =>
+    expect(requestBody).toEqual({
+      name: "nat64.home.lan",
+      type: "AAAA",
+      value: "64:ff9b::192.0.2.1",
+      ttl: 300,
+    }),
+  );
+});
+
+// isValidIPv6 deliberately doesn't special-case the narrower IPv4-mapped
+// form (::ffff:a.b.c.d) — which the server's `ip.To4() == nil` check does
+// reject as AAAA — since reliably distinguishing "mapped" from "embedded"
+// dotted-quad text needs real IPv6 parsing, not a string check. A false
+// accept here is expected to surface as the server's own 400 via toast,
+// not silently succeed.
+test("an IPv4-mapped AAAA value posts, and the server's rejection surfaces as a toast", async () => {
+  const user = userEvent.setup();
+  let posted = false;
+  mockRecords([record()]);
+  server.use(
+    http.post("/api/v1/records", () => {
+      posted = true;
+      return HttpResponse.json({ error: "value must be an IPv6 address" }, { status: 400 });
+    }),
+  );
+  const errorSpy = vi.spyOn(toast, "error");
+
+  renderWithProviders(<LocalDns />);
+  await screen.findByText("nas.home.lan");
+
+  await user.click(screen.getByRole("button", { name: /^add record$/i }));
+  const dialog = await screen.findByRole("dialog");
+
+  await user.type(within(dialog).getByLabelText(/^name$/i), "mapped.home.lan");
+  await user.click(within(dialog).getByRole("combobox", { name: /record type/i }));
+  await user.click(await screen.findByRole("option", { name: /^aaaa$/i }));
+  await user.type(within(dialog).getByLabelText(/^ipv6 address$/i), "::ffff:192.168.1.1");
+  await user.click(within(dialog).getByRole("button", { name: /^add record$/i }));
+
+  await waitFor(() => expect(posted).toBe(true));
+  await waitFor(() =>
+    expect(errorSpy).toHaveBeenCalledWith(expect.stringMatching(/ipv6 address/i)),
+  );
+  // The sheet stays open on a failed submission (no onSuccess close), so
+  // the admin can see the error and correct the value in place.
+  expect(screen.getByRole("dialog")).toBeInTheDocument();
 });
 
 test("editing a record PUTs /records/{id} with the updated fields", async () => {
