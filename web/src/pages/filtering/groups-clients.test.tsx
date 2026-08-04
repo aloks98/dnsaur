@@ -354,6 +354,71 @@ test("an out-of-range CIDR prefix shows inline error and never posts", async () 
   expect(posted).toBe(false);
 });
 
+test("a plain IPv6 matcher is accepted and posts /clients", async () => {
+  const user = userEvent.setup();
+  let requestBody: unknown;
+  mockGroups([group({ id: 1, name: "Default" })]);
+  mockClients([client()]);
+  mockNoLists();
+  server.use(
+    http.post("/api/v1/clients", async ({ request }) => {
+      requestBody = await request.json();
+      return HttpResponse.json({ id: 99 }, { status: 201 });
+    }),
+  );
+
+  renderWithProviders(<GroupsClientsTab />);
+  await screen.findByText("Kid's laptop");
+
+  await user.click(screen.getByRole("button", { name: /^add client$/i }));
+  const dialog = await screen.findByRole("dialog");
+  await user.type(within(dialog).getByLabelText(/^name$/i), "IPv6 device");
+  await user.type(within(dialog).getByLabelText(/^matcher$/i), "2001:db8::1");
+  await user.click(within(dialog).getByRole("button", { name: /^add client$/i }));
+
+  await waitFor(() =>
+    expect(requestBody).toEqual({ name: "IPv6 device", matcher: "2001:db8::1", group_id: 1 }),
+  );
+});
+
+// Regression: net/netip.ParseAddr (the server's validator, see
+// internal/api/clients_handlers.go's validMatcher) accepts a link-local
+// IPv6 address with an RFC 4007 zone id — e.g. "fe80::1%eth0" scopes the
+// address to a specific interface. The client-side validator previously
+// rejected this outright (it built `new URL("http://[fe80::1%eth0]")`,
+// which throws on the literal `%`), blocking a legitimate matcher before
+// it ever reached the network.
+test("an IPv6 matcher with a zone id is accepted and posts /clients", async () => {
+  const user = userEvent.setup();
+  let requestBody: unknown;
+  mockGroups([group({ id: 1, name: "Default" })]);
+  mockClients([client()]);
+  mockNoLists();
+  server.use(
+    http.post("/api/v1/clients", async ({ request }) => {
+      requestBody = await request.json();
+      return HttpResponse.json({ id: 99 }, { status: 201 });
+    }),
+  );
+
+  renderWithProviders(<GroupsClientsTab />);
+  await screen.findByText("Kid's laptop");
+
+  await user.click(screen.getByRole("button", { name: /^add client$/i }));
+  const dialog = await screen.findByRole("dialog");
+  await user.type(within(dialog).getByLabelText(/^name$/i), "Link-local device");
+  await user.type(within(dialog).getByLabelText(/^matcher$/i), "fe80::1%eth0");
+  await user.click(within(dialog).getByRole("button", { name: /^add client$/i }));
+
+  await waitFor(() =>
+    expect(requestBody).toEqual({
+      name: "Link-local device",
+      matcher: "fe80::1%eth0",
+      group_id: 1,
+    }),
+  );
+});
+
 test("editing a client PUTs /clients/{id} with the updated fields", async () => {
   const user = userEvent.setup();
   let requestBody: unknown;

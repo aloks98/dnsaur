@@ -476,13 +476,24 @@ function isValidIPv4(value: string): boolean {
 }
 
 function isValidIPv6(value: string): boolean {
-  if (!value.includes(":")) return false;
+  // A zone id (RFC 4007 — e.g. "fe80::1%eth0" scopes a link-local address
+  // to a specific interface) isn't part of the address itself. Go's
+  // net/netip.ParseAddr accepts any non-empty zone suffix after `%` (and
+  // the server does too, see internal/api/clients_handlers.go's
+  // validMatcher) — but the WHATWG URL host parser rejects a literal,
+  // non-percent-encoded `%` inside IPv6 brackets. Strip the zone off and
+  // validate it separately so a legitimate zone-scoped matcher isn't
+  // rejected client-side while the server would accept it.
+  const zoneIndex = value.indexOf("%");
+  const address = zoneIndex === -1 ? value : value.slice(0, zoneIndex);
+  const zone = zoneIndex === -1 ? null : value.slice(zoneIndex + 1);
+  if (zone !== null && zone === "") return false;
+  if (!address.includes(":")) return false;
   try {
     // The URL parser validates bracketed IPv6 host syntax for us — a
     // pragmatic stand-in for a real IPv6 parser (Go's net/netip on the
-    // server, see internal/api/clients_handlers.go's validMatcher) that's
-    // good enough to catch typos before the round trip.
-    new URL(`http://[${value}]`);
+    // server) that's good enough to catch typos before the round trip.
+    new URL(`http://[${address}]`);
     return true;
   } catch {
     return false;
