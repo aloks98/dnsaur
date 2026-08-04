@@ -24,6 +24,7 @@ most; proven libraries over from-scratch protocol work).
 | Web UI | React + Vite SPA, Tailwind/shadcn, embedded in the binary via `go:embed` |
 | Storage | SQLite default (`modernc.org/sqlite`, no CGO), Postgres optional (`pgx`), behind a storage interface with per-dialect migrations |
 | Deployment | Docker-first (distroless, multi-arch amd64+arm64, GHCR) + single static binary (GoReleaser: deb/rpm/tarball, systemd unit, setcap) |
+| Config loading | koanf (file + env) for the bootstrap config — chosen over Viper (dependency weight, implicit merge magic) as the env surface grows. Migrations via goose (pressly/goose v3) as an embedded library: per-dialect `embed.FS` SQL files, applied at startup; standardized over hand-rolled per user decision. |
 | HA | Instance-to-instance config sync, primary/replica, each instance self-contained on its own SQLite. Shared-Postgres and multi-master CRDT models rejected (DB host becomes a SPOF; conflict-resolution complexity not worth it). |
 
 ## Phasing
@@ -180,7 +181,11 @@ unit-testable in isolation, new stages additive.
   blocklists) → point router DNS at it. Under 5 minutes, no file editing.
 - **Lifecycle:** config changes hot-reload (no restarts); SIGTERM drains
   in-flight queries; DNS keeps serving even if API/UI errors — resolution
-  degrades last.
+  degrades last. Phase 1 restart-required exceptions (documented, revisit
+  in Phase 2): cache sizing/TTL clamps (`cache.*`) and the blocklist
+  refresh interval (`lists.refresh_hours`); everything else — blocking
+  mode/TTL, upstreams, strategy, clients, groups, lists, rules, local
+  records, query-log privacy — applies live.
 
 ## High Availability — Config Sync (Phase 1.5)
 

@@ -1,0 +1,29 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  checks:
+    runs-on: tiny-no-docker
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version: "1.26" }
+      - name: Lint
+        uses: https://github.com/golangci/golangci-lint-action@v8
+        with: { version: v2.12 }
+      - name: Vet
+        run: go vet ./...
+      - name: Build
+        run: CGO_ENABLED=0 go build -ldflags "-X main.Version=${GITHUB_SHA::7}" ./cmd/dnsaur
+
+  test:
+    runs-on: medium
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version: "1.26" }
+      - name: Race tests
+        run: go test -race ./...

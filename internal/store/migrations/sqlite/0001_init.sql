@@ -1,0 +1,66 @@
+-- +goose Up
+CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE config_version (id INTEGER PRIMARY KEY CHECK (id = 1), version INTEGER NOT NULL);
+INSERT INTO config_version (id, version) VALUES (1, 1);
+CREATE TABLE groups (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL UNIQUE,
+  enabled INTEGER NOT NULL DEFAULT 1
+);
+CREATE TABLE clients (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL DEFAULT '',
+  matcher TEXT NOT NULL UNIQUE,
+  group_id INTEGER NOT NULL REFERENCES groups(id)
+);
+CREATE TABLE lists (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  url TEXT NOT NULL UNIQUE,
+  kind TEXT NOT NULL DEFAULT 'block',
+  enabled INTEGER NOT NULL DEFAULT 1,
+  last_refreshed INTEGER NOT NULL DEFAULT 0,
+  entry_count INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE group_lists (
+  group_id INTEGER NOT NULL REFERENCES groups(id),
+  list_id INTEGER NOT NULL REFERENCES lists(id),
+  PRIMARY KEY (group_id, list_id)
+);
+CREATE TABLE rules (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  group_id INTEGER NOT NULL REFERENCES groups(id),
+  action TEXT NOT NULL,
+  pattern TEXT NOT NULL,
+  is_regex INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE local_records (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  type TEXT NOT NULL,
+  value TEXT NOT NULL,
+  ttl INTEGER NOT NULL DEFAULT 300
+);
+CREATE TABLE query_log (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  at INTEGER NOT NULL,
+  instance_id TEXT NOT NULL,
+  client_ip TEXT NOT NULL,
+  client_id INTEGER NOT NULL DEFAULT 0,
+  qname TEXT NOT NULL,
+  qtype TEXT NOT NULL,
+  decision TEXT NOT NULL,
+  rule_id INTEGER NOT NULL DEFAULT 0,
+  list_id INTEGER NOT NULL DEFAULT 0,
+  upstream TEXT NOT NULL DEFAULT '',
+  rcode TEXT NOT NULL,
+  duration_ms INTEGER NOT NULL
+);
+CREATE INDEX idx_qlog_at ON query_log(at);
+CREATE INDEX idx_qlog_qname ON query_log(qname);
+CREATE TABLE stats_hourly (
+  bucket INTEGER NOT NULL,
+  metric TEXT NOT NULL,
+  key TEXT NOT NULL,
+  value INTEGER NOT NULL,
+  PRIMARY KEY (bucket, metric, key)
+);

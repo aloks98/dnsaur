@@ -1,5 +1,11 @@
 version: "2"
 linters:
   enable: [staticcheck, errcheck, ineffassign, unused, misspell]
+  settings:
+    errcheck:
+      exclude-functions:
+        - (*database/sql.Rows).Close
+        - (*database/sql.DB).Close
+        - (*database/sql.Tx).Rollback
 run:
   timeout: 5m

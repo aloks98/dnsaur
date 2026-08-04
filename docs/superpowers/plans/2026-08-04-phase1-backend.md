@@ -6,14 +6,14 @@
 
 **Architecture:** Single Go binary. `miekg/dns` handles wire format; we own a middleware pipeline where each stage answers or passes on. All state flows through `internal/store` interfaces (SQLite default, Postgres optional, one `database/sql` implementation with dialect-aware migrations). Filtering uses an in-memory reversed-label trie rebuilt by a background refresher.
 
-**Tech Stack:** Go ≥1.24, `github.com/miekg/dns`, `modernc.org/sqlite` (no CGO), `github.com/jackc/pgx/v5/stdlib`, `gopkg.in/yaml.v3`, `golang.org/x/sync/singleflight`, `github.com/google/uuid`, `github.com/testcontainers/testcontainers-go` (tests only).
+**Tech Stack:** Go 1.26, `github.com/miekg/dns`, `modernc.org/sqlite` (no CGO), `github.com/jackc/pgx/v5/stdlib`, `gopkg.in/yaml.v3`, `golang.org/x/sync/singleflight`, `github.com/google/uuid`, `github.com/testcontainers/testcontainers-go` (tests only).
 
 ## Global Constraints
 
 - Module path: `github.com/aloks98/dnsaur` (adjust in Task 1 only if the GitHub username differs; nothing else hardcodes it).
-- Go ≥1.24; CGO disabled (`CGO_ENABLED=0`); binary must stay static.
+- Go 1.26 (project baseline — go.mod and CI both pin 1.26); CGO disabled (`CGO_ENABLED=0`); binary must stay static.
 - Logging via stdlib `log/slog` only.
-- All timestamps stored as Unix milliseconds (`INTEGER`/`BIGINT`), never TEXT.
+- All timestamps stored as Unix milliseconds (`INTEGER`/`BIGINT`), never TEXT. Sanctioned exception: `stats_hourly.bucket` is hour-start Unix **seconds** (Phase 2 API code must not assume ms there).
 - DNS names normalized lowercase without trailing dot internally; `dns.Fqdn()` only at wire boundaries.
 - Guiding rule from spec: **DNS must not die** — storage/blocklist/upstream failures degrade features, never resolution.
 - Conventional commit messages (`feat:`, `test:`, `chore:`).
@@ -121,7 +121,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
-        with: { go-version: "1.24" }
+        with: { go-version: "1.26" }
       - uses: golangci/golangci-lint-action@v6
       - run: go test -race ./...
       - run: CGO_ENABLED=0 go build -ldflags "-X main.Version=${GITHUB_SHA::7}" ./cmd/dnsaur
