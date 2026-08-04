@@ -64,6 +64,28 @@ test("changing the window select refetches with the new hours", async () => {
   await waitFor(() => expect(overviewUrls.at(-1)).toContain("hours=1"));
 });
 
+test("the timeline chart excludes error decisions from the not-blocked series", async () => {
+  server.use(
+    http.get("/api/v1/stats/timeline", () =>
+      HttpResponse.json([
+        {
+          bucket: Math.floor(Date.now() / 1000),
+          // total=20, but 3 of those are `error` (a failed resolve, not a
+          // query dnsaur let through) — must not be counted as "not blocked".
+          decisions: { allowed: 10, blocked: 5, error: 3, cached: 2 },
+        },
+      ]),
+    ),
+  );
+
+  renderWithProviders(<Dashboard />);
+
+  // Not blocked = (10 allowed + 2 cached), excluding both the 5 blocked and
+  // the 3 error — i.e. 12, not 15 (the old, buggy total-minus-blocked math).
+  expect(await screen.findByText("Not blocked: 12")).toBeInTheDocument();
+  expect(screen.getByText("Blocked: 5")).toBeInTheDocument();
+});
+
 test("empty stats show EmptyState everywhere and never render NaN", async () => {
   server.use(
     http.get("/api/v1/stats/overview", () =>

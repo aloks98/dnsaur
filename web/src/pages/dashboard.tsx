@@ -221,9 +221,10 @@ function StatTiles({
 }
 
 // --- timeline chart ------------------------------------------------------------
-// Stacked allowed (bottom, indigo) + blocked (top, destructive) area, so the
-// total-height reads as query volume and the red cap reads as block share —
-// one glance answers both "how busy" and "how much is being filtered".
+// Stacked not-blocked (bottom, indigo) + blocked (top, destructive) area, so
+// the total-height reads as query volume and the red cap reads as block
+// share — one glance answers both "how busy" and "how much is being
+// filtered".
 
 function bucketLabel(bucketSec: number, hours: number): string {
   const date = new Date(bucketSec * 1000);
@@ -237,11 +238,17 @@ function timelineSeries(buckets: TimelineBucket[], hours: number) {
   const sorted = [...buckets].sort((a, b) => a.bucket - b.bucket);
   const categories = sorted.map((b) => bucketLabel(b.bucket, hours));
   const blockedSeries = sorted.map((b) => b.decisions.blocked ?? 0);
-  const allowedSeries = sorted.map((b, i) => {
-    const total = Object.values(b.decisions).reduce((sum, n) => sum + n, 0);
+  // "Not blocked" = every decision except blocked *and* error — a failed
+  // upstream/resolve attempt isn't a query dnsaur let through, so counting
+  // it as "allowed" would be misleading. (Decision kinds: allowed, blocked,
+  // local, cached, stale, forwarded, error — see internal/dnssrv/pipeline.go.)
+  const notBlockedSeries = sorted.map((b, i) => {
+    const total = Object.entries(b.decisions)
+      .filter(([decision]) => decision !== "error")
+      .reduce((sum, [, n]) => sum + n, 0);
     return total - (blockedSeries[i] ?? 0);
   });
-  return { categories, allowedSeries, blockedSeries };
+  return { categories, notBlockedSeries, blockedSeries };
 }
 
 function TimelineCard({
@@ -266,16 +273,16 @@ function TimelineCard({
       <EmptyState
         icon={<Activity />}
         title="No query activity yet"
-        description="Once dnsaur resolves queries in this window, allowed vs. blocked volume shows up here."
+        description="Once dnsaur resolves queries in this window, blocked vs. not-blocked volume shows up here."
       />
     );
   } else {
-    const { categories, allowedSeries, blockedSeries } = timelineSeries(timeline.data, hours);
-    const totalAllowed = allowedSeries.reduce((s, n) => s + n, 0);
+    const { categories, notBlockedSeries, blockedSeries } = timelineSeries(timeline.data, hours);
+    const totalNotBlocked = notBlockedSeries.reduce((s, n) => s + n, 0);
     const totalBlocked = blockedSeries.reduce((s, n) => s + n, 0);
     body = (
       <figure
-        aria-label={`Query volume over time: ${totalAllowed.toLocaleString()} allowed, ${totalBlocked.toLocaleString()} blocked`}
+        aria-label={`Query volume over time: ${totalNotBlocked.toLocaleString()} not blocked, ${totalBlocked.toLocaleString()} blocked`}
       >
         <AreaChart
           categories={categories}
@@ -285,7 +292,7 @@ function TimelineCard({
             // color blindness, the most common form. Red vs. indigo stays
             // distinguishable, and the legend + tooltip below back it with
             // text either way.
-            { name: "Allowed", data: allowedSeries, color: "var(--chart-1)" },
+            { name: "Not blocked", data: notBlockedSeries, color: "var(--chart-1)" },
             { name: "Blocked", data: blockedSeries, color: "var(--destructive)" },
           ]}
           stacked
@@ -300,7 +307,7 @@ function TimelineCard({
     <Card>
       <CardHeader>
         <CardTitle>Query volume</CardTitle>
-        <CardDescription>Allowed vs. blocked queries over time.</CardDescription>
+        <CardDescription>Blocked vs. not-blocked queries over time.</CardDescription>
       </CardHeader>
       <CardContent>{body}</CardContent>
     </Card>
