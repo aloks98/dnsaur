@@ -22,3 +22,22 @@ if (typeof window.matchMedia !== "function") {
       dispatchEvent: () => false,
     }) as MediaQueryList;
 }
+
+// jsdom does not implement ResizeObserver. rnui's InputOTP (via the
+// input-otp library) observes its container to size itself, so stub it out
+// under test.
+if (typeof window.ResizeObserver !== "function") {
+  window.ResizeObserver = class ResizeObserver {
+    observe() {}
+    unobserve() {}
+    disconnect() {}
+  };
+}
+
+// jsdom does not implement elementFromPoint. input-otp polls it (to detect
+// password-manager badges overlapping the input) on a timer while focused,
+// which otherwise throws an unhandled "not a function" error after the
+// test that focused an InputOTP has already finished.
+if (typeof document.elementFromPoint !== "function") {
+  document.elementFromPoint = () => null;
+}
