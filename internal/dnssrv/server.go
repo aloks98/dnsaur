@@ -97,10 +97,24 @@ func (s *Server) serve(w dns.ResponseWriter, m *dns.Msg) {
 	if err != nil || resp == nil || resp.Msg == nil {
 		resp = Servfail(req)
 	}
+
+	// RFC 6891: echo EDNS on any OPT-less response to an EDNS query.
+	// Covers locally synthesized responses (SetReply/SetRcode) and upstream responses
+	// that dropped OPT. Spec-correct behavior per RFC 6891.
+	if m.IsEdns0() != nil && resp.Msg.IsEdns0() == nil {
+		resp.Msg.SetEdns0(1232, false)
+	}
+
 	if _, isUDP := w.RemoteAddr().(*net.UDPAddr); isUDP {
 		size := 512
 		if opt := m.IsEdns0(); opt != nil {
 			size = int(opt.UDPSize())
+		}
+		// RFC 6891 §6.2.5: clamp UDP size to minimum 512.
+		// miekg's Truncate also floors at MinMsgSize (512); kept as defense-in-depth
+		// against dependency behavior changes.
+		if size < 512 {
+			size = 512
 		}
 		resp.Msg.Truncate(size)
 	}
