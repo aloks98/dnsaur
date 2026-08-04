@@ -5,12 +5,48 @@ on:
   pull_request:
 
 jobs:
+  web:
+    runs-on: tiny-no-docker
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: "20" }
+      - name: Enable corepack
+        run: corepack enable
+      - name: Install
+        working-directory: web
+        run: pnpm install --frozen-lockfile
+      - name: Lint
+        working-directory: web
+        run: pnpm oxlint src/
+      - name: Format check
+        working-directory: web
+        run: pnpm format:check
+      - name: Typecheck
+        working-directory: web
+        run: pnpm typecheck
+      - name: Test
+        working-directory: web
+        run: pnpm test
+      - name: Build
+        working-directory: web
+        run: pnpm build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: web-dist
+          path: web/dist
+
   checks:
     runs-on: tiny-no-docker
+    needs: web
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with: { go-version: "1.26" }
+      - uses: actions/download-artifact@v4
+        with:
+          name: web-dist
+          path: web/dist
       - name: Lint
         uses: https://github.com/golangci/golangci-lint-action@v8
         with: { version: v2.12 }
@@ -21,9 +57,14 @@ jobs:
 
   test:
     runs-on: medium
+    needs: web
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with: { go-version: "1.26" }
+      - uses: actions/download-artifact@v4
+        with:
+          name: web-dist
+          path: web/dist
       - name: Race tests
         run: go test -race ./...
