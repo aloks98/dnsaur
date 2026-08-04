@@ -54,14 +54,16 @@ func TestMigrateIdempotent(t *testing.T) {
 func TestClientAndFilterCRUD(t *testing.T) {
 	forEachDriver(t, func(t *testing.T, s Store) {
 		ctx := context.Background()
-		gid, err := s.Clients().AddGroup(ctx, "kids")
+		groupName := testGroupName("kids")
+		listURL := testGroupName("https://example.com/hosts")
+		gid, err := s.Clients().AddGroup(ctx, groupName)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := s.Clients().AddClient(ctx, Client{Name: "tablet", Matcher: "10.0.0.5", GroupID: gid}); err != nil {
+		if _, err := s.Clients().AddClient(ctx, Client{Name: "tablet", Matcher: groupName, GroupID: gid}); err != nil {
 			t.Fatal(err)
 		}
-		lid, err := s.Filters().AddList(ctx, List{URL: "https://example.com/hosts", Kind: "block", Enabled: true})
+		lid, err := s.Filters().AddList(ctx, List{URL: listURL, Kind: "block", Enabled: true})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -72,7 +74,7 @@ func TestClientAndFilterCRUD(t *testing.T) {
 			t.Fatal(err)
 		}
 		ls, err := s.Filters().ListsForGroup(ctx, gid)
-		if err != nil || len(ls) != 1 || ls[0].URL != "https://example.com/hosts" {
+		if err != nil || len(ls) != 1 || ls[0].URL != listURL {
 			t.Fatalf("lists: %v %v", ls, err)
 		}
 		rs, err := s.Filters().Rules(ctx, gid)
@@ -85,6 +87,10 @@ func TestClientAndFilterCRUD(t *testing.T) {
 func TestLocalRecords(t *testing.T) {
 	forEachDriver(t, func(t *testing.T, s Store) {
 		ctx := context.Background()
+		// Clean up local_records to handle shared postgres DB
+		ss := s.(*sqlStore)
+		_, _ = ss.db.ExecContext(ctx, ss.q(`DELETE FROM local_records`))
+
 		if _, err := s.Records().Add(ctx, LocalRecord{Name: "nas.home.lan", Type: "A", Value: "10.0.0.9", TTL: 300}); err != nil {
 			t.Fatal(err)
 		}

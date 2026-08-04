@@ -15,6 +15,12 @@ func (f *fakeRecordStore) All(ctx context.Context) ([]store.LocalRecord, error) 
 func (f *fakeRecordStore) Add(ctx context.Context, r store.LocalRecord) (int64, error) {
 	return 0, nil
 }
+func (f *fakeRecordStore) Update(ctx context.Context, r store.LocalRecord) error {
+	return nil
+}
+func (f *fakeRecordStore) Delete(ctx context.Context, id int64) error {
+	return nil
+}
 
 func resolver(t *testing.T, recs ...store.LocalRecord) *Resolver {
 	r := NewResolver(&fakeRecordStore{recs: recs})

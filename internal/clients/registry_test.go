@@ -21,6 +21,21 @@ func (f *fakeClientStore) AddGroup(ctx context.Context, name string) (int64, err
 func (f *fakeClientStore) AddClient(ctx context.Context, c store.Client) (int64, error) {
 	return 0, nil
 }
+func (f *fakeClientStore) UpdateClient(ctx context.Context, c store.Client) error {
+	return nil
+}
+func (f *fakeClientStore) DeleteClient(ctx context.Context, id int64) error {
+	return nil
+}
+func (f *fakeClientStore) RenameGroup(ctx context.Context, id int64, name string) error {
+	return nil
+}
+func (f *fakeClientStore) SetGroupEnabled(ctx context.Context, id int64, enabled bool) error {
+	return nil
+}
+func (f *fakeClientStore) DeleteGroup(ctx context.Context, id int64) error {
+	return nil
+}
 
 func TestLookupPrecedence(t *testing.T) {
 	fs := &fakeClientStore{

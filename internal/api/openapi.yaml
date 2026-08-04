@@ -1,0 +1,1476 @@
+openapi: 3.1.0
+info:
+  title: dnsaur API
+  version: "1.0"
+  description: >
+    REST API for the dnsaur DNS/DHCP server. All paths are prefixed
+    /api/v1. Authenticate with either the dnsaur_session cookie (set by
+    POST /auth/login) or an Authorization: Bearer <token> API token
+    (see /tokens). API tokens may have scope "read" (GET/HEAD only) or
+    "write" (all methods); the session cookie always has full access.
+    A read-scoped token used for a POST/PUT/PATCH/DELETE request is
+    rejected with 403 {"error": "read-only token"} — see the 403
+    response documented on each mutating operation below.
+    There is no separate "upstreams" resource: upstream DNS servers are
+    configured via the "upstreams" key in /settings (a comma-separated
+    list), alongside "upstream.strategy".
+servers:
+  - url: /api/v1
+security:
+  - cookieAuth: []
+  - bearerAuth: []
+tags:
+  - name: Meta
+  - name: Setup
+  - name: Auth
+  - name: Settings
+  - name: Blocking
+  - name: Groups
+  - name: Clients
+  - name: Filters
+  - name: Records
+  - name: Queries
+  - name: Stats
+  - name: Tokens
+components:
+  securitySchemes:
+    cookieAuth:
+      type: apiKey
+      in: cookie
+      name: dnsaur_session
+      description: Session cookie set by POST /auth/login. HttpOnly, SameSite=Strict.
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: API token minted via POST /tokens, sent as "Authorization Bearer <token>".
+  schemas:
+    Error:
+      type: object
+      properties:
+        error: { type: string }
+  responses:
+    ReadOnlyToken:
+      description: read-only token used for a write operation
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+paths:
+  /health:
+    get:
+      tags: [Meta]
+      security: []
+      summary: Liveness and version
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: ok }
+                  version: { type: string }
+
+  /openapi.yaml:
+    get:
+      tags: [Meta]
+      security: []
+      summary: This OpenAPI 3.1 document
+      responses:
+        "200":
+          description: OK
+          content:
+            application/yaml:
+              schema: { type: string }
+
+  /setup:
+    get:
+      tags: [Setup]
+      security: []
+      summary: Whether first-run setup is required
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  setup_required: { type: boolean }
+        "503":
+          description: storage unavailable
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+    post:
+      tags: [Setup]
+      security: []
+      summary: Create the admin account (first run only)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username, password]
+              properties:
+                username: { type: string }
+                password: { type: string, minLength: 8 }
+                totp_code: { type: string, description: unused on setup }
+      responses:
+        "201":
+          description: created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: created }
+        "400":
+          description: "invalid input: username required, or password must be at least 8 characters"
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "409":
+          description: setup already completed
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /auth/login:
+    post:
+      tags: [Auth]
+      security: []
+      summary: Log in and receive a session cookie
+      description: >
+        On success, sets the dnsaur_session cookie (HttpOnly, SameSite=Strict,
+        30-day TTL). If the account has TOTP enabled, totp_code must be
+        supplied or the request fails with 428. If first-run setup hasn't
+        completed yet, the request fails with 409 instead of being
+        evaluated against the (empty) users table.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username, password]
+              properties:
+                username: { type: string }
+                password: { type: string }
+                totp_code: { type: string }
+      responses:
+        "200":
+          description: OK
+          headers:
+            Set-Cookie:
+              schema: { type: string }
+              description: dnsaur_session=<token>; HttpOnly; SameSite=Strict
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: ok }
+        "400":
+          description: invalid json
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401":
+          description: bad credentials
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "428":
+          description: totp code required
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "409":
+          description: setup required
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503":
+          description: storage unavailable
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /auth/logout:
+    post:
+      tags: [Auth]
+      summary: Log out and clear the session cookie
+      responses:
+        "204":
+          description: No Content
+          headers:
+            Set-Cookie:
+              schema: { type: string }
+              description: dnsaur_session cleared (Max-Age -1)
+        "401":
+          description: authentication required
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "403":
+          $ref: "#/components/responses/ReadOnlyToken"
+
+  /auth/me:
+    get:
+      tags: [Auth]
+      summary: Current authenticated user
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: { type: integer, format: int64 }
+                  username: { type: string }
+                  totp_enabled: { type: boolean }
+        "401":
+          description: authentication required
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /auth/totp/start:
+    post:
+      tags: [Auth]
+      summary: Begin enrolling TOTP for the current user
+      description: Generates a new secret; must be confirmed via /auth/totp/confirm to take effect.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  secret: { type: string, description: base32 TOTP secret }
+                  otpauth_url: { type: string, description: otpauth:// URL for QR-code enrollment }
+        "401":
+          description: authentication required
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "403":
+          $ref: "#/components/responses/ReadOnlyToken"
+        "500":
+          description: totp generation failed
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /auth/totp/confirm:
+    post:
+      tags: [Auth]
+      summary: Confirm and enable TOTP with a code from the secret
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [secret, code]
+              properties:
+                secret: { type: string }
+                code: { type: string }
+      responses:
+        "204":
+          description: No Content, TOTP now enabled
+        "400":
+          description: invalid json or wrong code
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401":
+          description: authentication required
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "403":
+          $ref: "#/components/responses/ReadOnlyToken"
+
+  /auth/totp/disable:
+    post:
+      tags: [Auth]
+      summary: Disable TOTP for the current user
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [code]
+              properties:
+                code: { type: string }
+      responses:
+        "204":
+          description: No Content, TOTP now disabled
+        "400":
+          description: invalid json or wrong code
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401":
+          description: authentication required
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "403":
+          $ref: "#/components/responses/ReadOnlyToken"
+
+  /settings:
+    get:
+      tags: [Settings]
+      summary: All editable settings as a flat key-value map
+      description: >
+        Keys with the "instance." and "stats." prefixes are internal and
+        omitted. The "upstreams" key holds a comma-separated list of
+        upstream DNS servers; there is no separate /upstreams resource.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                description: setting key -> string value
+                additionalProperties: { type: string }
+                example:
+                  upstreams: "1.1.1.1:53,9.9.9.9:53"
+                  upstream.strategy: failover
+                  blocking.mode: null-ip
+                  blocking.ttl: "300"
+        "401":
+          description: authentication required
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503":
+          description: storage unavailable
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+    put:
+      tags: [Settings]
+      summary: Set a single setting
+      description: >
+        Editable keys: upstreams, upstream.strategy (failover|fastest|race),
+        blocking.mode (null-ip|nxdomain), blocking.ttl (non-negative int),
+        cache.min_ttl, cache.max_ttl, cache.max_entries,
+        cache.serve_stale_for (non-negative ints), lists.refresh_hours
+        (non-negative int), qlog.retention_days (non-negative int),
+        qlog.privacy (full|anon|none). All other keys are rejected.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [key, value]
+              properties:
+                key:
+                  type: string
+                  enum:
+                    - upstreams
+                    - upstream.strategy
+                    - blocking.mode
+                    - blocking.ttl
+                    - cache.min_ttl
+                    - cache.max_ttl
+                    - cache.max_entries
+                    - cache.serve_stale_for
+                    - lists.refresh_hours
+                    - qlog.retention_days
+                    - qlog.privacy
+                value: { type: string }
+      responses:
+        "204":
+          description: No Content
+        "400":
+          description: setting not editable, or invalid value for the key
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401":
+          description: authentication required
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "403":
+          $ref: "#/components/responses/ReadOnlyToken"
+        "503":
+          description: storage unavailable
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /blocking:
+    get:
+      tags: [Blocking]
+      summary: Whether blocking is currently paused for a group
+      parameters:
+        - name: group_id
+          in: query
+          required: false
+          schema: { type: integer, format: int64, description: defaults to 0 when omitted }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  paused_until:
+                    type: integer
+                    format: int64
+                    description: unix ms when the pause ends, or 0 if not paused
+        "401":
+          description: authentication required
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /blocking/pause:
+    post:
+      tags: [Blocking]
+      summary: Pause blocking for a group for N minutes
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [group_id, minutes]
+              properties:
+                group_id: { type: integer, format: int64 }
+                minutes: { type: integer, minimum: 1, maximum: 1440 }
+      responses:
+        "204":
+          description: No Content
+        "400":
+          description: minutes must be 1-1440
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401":
+          description: authentication required
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "403":
+          $ref: "#/components/responses/ReadOnlyToken"
+    delete:
+      tags: [Blocking]
+      summary: Resume blocking for a group (cancel a pause)
+      parameters:
+        - name: group_id
+          in: query
+          required: true
+          schema: { type: integer, format: int64 }
+      responses:
+        "204":
+          description: No Content
+        "401":
+          description: authentication required
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "403":
+          $ref: "#/components/responses/ReadOnlyToken"
+
+  /groups:
+    get:
+      tags: [Groups]
+      summary: List client groups
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    id: { type: integer, format: int64 }
+                    name: { type: string }
+                    enabled: { type: boolean }
+        "401":
+          description: authentication required
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+    post:
+      tags: [Groups]
+      summary: Create a client group
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string }
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: { type: integer, format: int64 }
+        "400":
+          description: name required
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401":
+          description: authentication required
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "403":
+          $ref: "#/components/responses/ReadOnlyToken"
+
+  /groups/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: integer, format: int64 }
+    patch:
+      tags: [Groups]
+      summary: Rename and/or enable/disable a group
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string, description: if present, must be non-empty }
+                enabled: { type: boolean }
+      responses:
+        "204":
+          description: No Content
+        "400":
+          description: bad id, name cannot be empty, or invalid json
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401":
+          description: authentication required
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "403":
+          $ref: "#/components/responses/ReadOnlyToken"
+        "404":
+          description: not found
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+    delete:
+      tags: [Groups]
+      summary: Delete a group
+      responses:
+        "204":
+          description: No Content
+        "400":
+          description: bad id
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401":
+          description: authentication required
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "403":
+          $ref: "#/components/responses/ReadOnlyToken"
+        "404":
+          description: not found
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "409":
+          description: resource in use
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /groups/{id}/lists:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: integer, format: int64 }
+    get:
+      tags: [Groups, Filters]
+      summary: Filter lists assigned to a group
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    id: { type: integer, format: int64 }
+                    url: { type: string }
+                    kind: { type: string, enum: [block, allow] }
+                    enabled: { type: boolean }
+                    last_refreshed: { type: integer, format: int64 }
+                    entry_count: { type: integer, format: int64 }
+        "400":
+          description: bad id
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401":
+          description: authentication required
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+    put:
+      tags: [Groups, Filters]
+      summary: Replace the set of filter lists assigned to a group
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [list_ids]
+              properties:
+                list_ids:
+                  type: array
+                  items: { type: integer, format: int64 }
+      responses:
+        "204":
+          description: No Content
+        "400":
+          description: bad id or invalid json
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401":
+          description: authentication required
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "403":
+          $ref: "#/components/responses/ReadOnlyToken"
+
+  /groups/{id}/rules:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: integer, format: int64 }
+    get:
+      tags: [Groups, Filters]
+      summary: Per-group allow/block rules
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    id: { type: integer, format: int64 }
+                    group_id: { type: integer, format: int64 }
+                    action: { type: string, enum: [allow, block] }
+                    pattern: { type: string }
+                    is_regex: { type: boolean }
+        "400":
+          description: bad id
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401":
+          description: authentication required
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+    post:
+      tags: [Groups, Filters]
+      summary: Add a rule to a group
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [action, pattern]
+              properties:
+                action: { type: string, enum: [allow, block] }
+                pattern:
+                  type: string
+                  description: literal domain, or a regex when is_regex is true (max 512 chars)
+                is_regex: { type: boolean, default: false }
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: { type: integer, format: int64 }
+        "400":
+          description: >
+            bad id; action allow|block and pattern required; regex pattern
+            too long (max 512); or invalid regex
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401":
+          description: authentication required
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "403":
+          $ref: "#/components/responses/ReadOnlyToken"
+
+  /clients:
+    get:
+      tags: [Clients]
+      summary: List clients
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    id: { type: integer, format: int64 }
+                    name: { type: string }
+                    matcher: { type: string, description: IP address or CIDR }
+                    group_id: { type: integer, format: int64 }
+        "401":
+          description: authentication required
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+    post:
+      tags: [Clients]
+      summary: Create a client
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [matcher, group_id]
+              properties:
+                name: { type: string }
+                matcher: { type: string, description: IP address or CIDR }
+                group_id: { type: integer, format: int64 }
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: { type: integer, format: int64 }
+        "400":
+          description: matcher must be an IP or CIDR and group_id set
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401":
+          description: authentication required
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "403":
+          $ref: "#/components/responses/ReadOnlyToken"
+
+  /clients/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: integer, format: int64 }
+    put:
+      tags: [Clients]
+      summary: Replace a client
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [matcher, group_id]
+              properties:
+                name: { type: string }
+                matcher: { type: string, description: IP address or CIDR }
+                group_id: { type: integer, format: int64 }
+      responses:
+        "204":
+          description: No Content
+        "400":
+          description: bad id, or matcher must be an IP or CIDR and group_id set
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401":
+          description: authentication required
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "403":
+          $ref: "#/components/responses/ReadOnlyToken"
+        "404":
+          description: not found
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+    delete:
+      tags: [Clients]
+      summary: Delete a client
+      responses:
+        "204":
+          description: No Content
+        "400":
+          description: bad id
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401":
+          description: authentication required
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "403":
+          $ref: "#/components/responses/ReadOnlyToken"
+        "404":
+          description: not found
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /filters/lists:
+    get:
+      tags: [Filters]
+      summary: List all filter lists (block and allow)
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    id: { type: integer, format: int64 }
+                    url: { type: string }
+                    kind: { type: string, enum: [block, allow] }
+                    enabled: { type: boolean }
+                    last_refreshed: { type: integer, format: int64 }
+                    entry_count: { type: integer, format: int64 }
+        "401":
+          description: authentication required
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+    post:
+      tags: [Filters]
+      summary: Add a filter list
+      description: >
+        Adding a list refreshes filters asynchronously after the response
+        (the same as POST /filters/refresh): the list row is created and
+        its id returned immediately, and the potentially slow full-network
+        refresh runs in the background.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [url, kind]
+              properties:
+                url: { type: string, description: http(s) URL of the list }
+                kind: { type: string, enum: [block, allow] }
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: { type: integer, format: int64 }
+        "400":
+          description: url must be http(s), or kind must be block or allow
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401":
+          description: authentication required
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "403":
+          $ref: "#/components/responses/ReadOnlyToken"
+
+  /filters/lists/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: integer, format: int64 }
+    patch:
+      tags: [Filters]
+      summary: Enable or disable a filter list
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [enabled]
+              properties:
+                enabled: { type: boolean }
+      responses:
+        "204":
+          description: No Content
+        "400":
+          description: enabled required
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401":
+          description: authentication required
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "403":
+          $ref: "#/components/responses/ReadOnlyToken"
+        "404":
+          description: not found
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+    delete:
+      tags: [Filters]
+      summary: Delete a filter list
+      responses:
+        "204":
+          description: No Content
+        "400":
+          description: bad id
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401":
+          description: authentication required
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "403":
+          $ref: "#/components/responses/ReadOnlyToken"
+        "404":
+          description: not found
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /filters/rules/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: integer, format: int64 }
+    delete:
+      tags: [Filters]
+      summary: Delete a per-group rule
+      responses:
+        "204":
+          description: No Content
+        "400":
+          description: bad id
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401":
+          description: authentication required
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "403":
+          $ref: "#/components/responses/ReadOnlyToken"
+        "404":
+          description: not found
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /filters/refresh:
+    post:
+      tags: [Filters]
+      summary: Trigger an immediate, asynchronous refresh of all filter lists
+      responses:
+        "202":
+          description: Accepted, refresh started in background
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: refreshing }
+        "401":
+          description: authentication required
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "403":
+          $ref: "#/components/responses/ReadOnlyToken"
+
+  /records:
+    get:
+      tags: [Records]
+      summary: List local DNS records
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    id: { type: integer, format: int64 }
+                    name: { type: string, description: domain name; wildcard *.parent allowed }
+                    type: { type: string, enum: [A, AAAA, CNAME, TXT] }
+                    value: { type: string }
+                    ttl: { type: integer, minimum: 1, maximum: 86400 }
+        "401":
+          description: authentication required
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+    post:
+      tags: [Records]
+      summary: Create a local DNS record
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, type, value, ttl]
+              properties:
+                name: { type: string, description: domain name; wildcard *.parent allowed }
+                type: { type: string, enum: [A, AAAA, CNAME, TXT] }
+                value:
+                  type: string
+                  description: IPv4 for A, IPv6 for AAAA, domain for CNAME, text for TXT
+                ttl: { type: integer, minimum: 1, maximum: 86400 }
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: { type: integer, format: int64 }
+        "400":
+          description: invalid name, type, value or ttl (see message)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401":
+          description: authentication required
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "403":
+          $ref: "#/components/responses/ReadOnlyToken"
+
+  /records/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: integer, format: int64 }
+    put:
+      tags: [Records]
+      summary: Replace a local DNS record
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, type, value, ttl]
+              properties:
+                name: { type: string }
+                type: { type: string, enum: [A, AAAA, CNAME, TXT] }
+                value: { type: string }
+                ttl: { type: integer, minimum: 1, maximum: 86400 }
+      responses:
+        "204":
+          description: No Content
+        "400":
+          description: bad id, or invalid name, type, value or ttl
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401":
+          description: authentication required
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "403":
+          $ref: "#/components/responses/ReadOnlyToken"
+        "404":
+          description: not found
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+    delete:
+      tags: [Records]
+      summary: Delete a local DNS record
+      responses:
+        "204":
+          description: No Content
+        "400":
+          description: bad id
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401":
+          description: authentication required
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "403":
+          $ref: "#/components/responses/ReadOnlyToken"
+        "404":
+          description: not found
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /queries:
+    get:
+      tags: [Queries]
+      summary: Search the query log
+      parameters:
+        - name: from
+          in: query
+          schema: { type: integer, format: int64, description: unix ms, inclusive lower bound }
+        - name: to
+          in: query
+          schema: { type: integer, format: int64, description: unix ms, inclusive upper bound }
+        - name: client
+          in: query
+          schema: { type: string, description: exact client IP }
+        - name: q
+          in: query
+          schema: { type: string, description: substring match on query name }
+        - name: decision
+          in: query
+          schema: { type: string, description: e.g. blocked, forwarded, cached, stale }
+        - name: type
+          in: query
+          schema: { type: string, description: DNS query type, e.g. A, AAAA }
+        - name: limit
+          in: query
+          schema: { type: integer, description: 0 defaults to 100, capped at 1000 }
+        - name: offset
+          in: query
+          schema: { type: integer }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    id: { type: integer, format: int64 }
+                    at: { type: integer, format: int64, description: unix ms }
+                    instance_id: { type: string }
+                    client_ip: { type: string }
+                    client_id: { type: integer, format: int64 }
+                    q_name: { type: string }
+                    q_type: { type: string }
+                    decision: { type: string }
+                    rule_id: { type: integer, format: int64 }
+                    list_id: { type: integer, format: int64 }
+                    upstream: { type: string }
+                    r_code: { type: string }
+                    duration_ms: { type: integer, format: int64 }
+        "401":
+          description: authentication required
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503":
+          description: storage unavailable
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /queries/tail:
+    get:
+      tags: [Queries]
+      summary: Live-tail the query log as server-sent events
+      description: >
+        Streams newly-logged query entries as they occur. Each SSE
+        "data:" line is a JSON-encoded query log entry (same shape as
+        GET /queries items). The connection stays open until the client
+        disconnects.
+      responses:
+        "200":
+          description: text/event-stream of query log entries
+          content:
+            text/event-stream:
+              schema: { type: string }
+        "401":
+          description: authentication required
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "500":
+          description: streaming unsupported
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503":
+          description: query log disabled
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /stats/overview:
+    get:
+      tags: [Stats]
+      summary: Aggregate query counts over a recent window
+      parameters:
+        - name: hours
+          in: query
+          schema: { type: integer, description: lookback window; <=0 defaults to 24 }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  total: { type: integer, format: int64 }
+                  blocked: { type: integer, format: int64 }
+                  cached: { type: integer, format: int64, description: cached + stale }
+                  forwarded: { type: integer, format: int64 }
+                  clients: { type: integer, format: int64, description: distinct client count }
+        "401":
+          description: authentication required
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503":
+          description: storage unavailable
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /stats/timeline:
+    get:
+      tags: [Stats]
+      summary: Query decision counts bucketed over time
+      parameters:
+        - name: hours
+          in: query
+          schema: { type: integer, description: lookback window; <=0 defaults to 24 }
+      responses:
+        "200":
+          description: OK, sorted ascending by bucket
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    bucket: { type: integer, format: int64, description: unix seconds bucket start }
+                    decisions:
+                      type: object
+                      description: decision -> count
+                      additionalProperties: { type: integer, format: int64 }
+        "401":
+          description: authentication required
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503":
+          description: storage unavailable
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /stats/top:
+    get:
+      tags: [Stats]
+      summary: Top-N values for a metric over a recent window
+      parameters:
+        - name: metric
+          in: query
+          required: true
+          schema: { type: string, enum: [domain, blocked_domain, client] }
+        - name: n
+          in: query
+          schema: { type: integer, description: "<=0 defaults to 10, capped at 100" }
+        - name: hours
+          in: query
+          schema: { type: integer, description: lookback window; <=0 defaults to 24 }
+      responses:
+        "200":
+          description: OK, sorted descending by count
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    key: { type: string }
+                    count: { type: integer, format: int64 }
+        "400":
+          description: metric must be domain, blocked_domain or client
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401":
+          description: authentication required
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503":
+          description: storage unavailable
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /tokens:
+    get:
+      tags: [Tokens]
+      summary: List API tokens owned by the current user
+      description: Session tokens are excluded; only kind=api tokens are returned. The token hash is never returned.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    id: { type: integer, format: int64 }
+                    user_id: { type: integer, format: int64 }
+                    kind: { type: string, enum: [session, api] }
+                    name: { type: string }
+                    scope: { type: string, enum: [read, write] }
+                    created_at: { type: integer, format: int64 }
+                    expires_at: { type: integer, format: int64 }
+                    last_used: { type: integer, format: int64 }
+        "401":
+          description: authentication required
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+    post:
+      tags: [Tokens]
+      summary: Create an API token
+      description: The plaintext token is returned only in this response and cannot be retrieved again.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string }
+                scope: { type: string, enum: [read, write], description: defaults to write when omitted }
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: { type: integer, format: int64 }
+                  token: { type: string, description: plaintext token; shown once }
+        "400":
+          description: name required, or invalid scope
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401":
+          description: authentication required
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "403":
+          $ref: "#/components/responses/ReadOnlyToken"
+
+  /tokens/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: integer, format: int64 }
+    delete:
+      tags: [Tokens]
+      summary: Revoke an API token
+      responses:
+        "204":
+          description: No Content
+        "400":
+          description: bad id
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401":
+          description: authentication required
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "403":
+          $ref: "#/components/responses/ReadOnlyToken"
+        "404":
+          description: not found
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }

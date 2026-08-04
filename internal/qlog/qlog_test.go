@@ -33,6 +33,10 @@ func (f *fakeQLStore) DeleteBefore(ctx context.Context, cutoffMs int64) (int64, 
 	return 0, nil
 }
 
+func (f *fakeQLStore) Search(ctx context.Context, filter store.QueryLogFilter) ([]store.QueryLogEntry, error) {
+	return nil, nil
+}
+
 func (f *fakeQLStore) entries() []store.QueryLogEntry {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -177,6 +181,27 @@ func waitForCount(t *testing.T, fs *fakeQLStore, n int) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	t.Fatalf("timed out waiting for %d entries, have %d", n, len(fs.entries()))
+}
+
+func TestSubscribeReceivesEntries(t *testing.T) {
+	fs := &fakeQLStore{}
+	l := New(fs, Options{InstanceID: "i1", FlushEvery: time.Hour, BatchSize: 100})
+	ch, cancel := l.Subscribe()
+	defer cancel()
+	h := l.Middleware()(blockedHandler())
+	m := new(dns.Msg)
+	m.SetQuestion("live.example.", dns.TypeA)
+	_, _ = h.ServeDNS(context.Background(), &dnssrv.Request{Msg: m})
+	select {
+	case e := <-ch:
+		if e.QName != "live.example" {
+			t.Fatalf("entry: %+v", e)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("no live entry received")
+	}
+	cancel()
+	_, _ = h.ServeDNS(context.Background(), &dnssrv.Request{Msg: m}) // must not panic after unsubscribe
 }
 
 func TestPrivacyNone(t *testing.T) {

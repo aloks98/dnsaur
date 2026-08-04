@@ -31,6 +31,18 @@ func (f *fakeFilterStore) TouchList(ctx context.Context, id, at, n int64) error 
 	f.touched.Add(1)
 	return nil
 }
+func (f *fakeFilterStore) SetListEnabled(ctx context.Context, id int64, enabled bool) error {
+	return nil
+}
+func (f *fakeFilterStore) DeleteList(ctx context.Context, id int64) error {
+	return nil
+}
+func (f *fakeFilterStore) UnassignList(ctx context.Context, groupID, listID int64) error {
+	return nil
+}
+func (f *fakeFilterStore) DeleteRule(ctx context.Context, id int64) error {
+	return nil
+}
 
 type fakeClientStore struct {
 	groups []store.Group
@@ -41,6 +53,21 @@ func (f *fakeClientStore) Groups(ctx context.Context) ([]store.Group, error) { r
 func (f *fakeClientStore) Clients(ctx context.Context) ([]store.Client, error) { return f.clients, nil }
 func (f *fakeClientStore) AddGroup(ctx context.Context, name string) (int64, error) { return 0, nil }
 func (f *fakeClientStore) AddClient(ctx context.Context, c store.Client) (int64, error) { return 0, nil }
+func (f *fakeClientStore) UpdateClient(ctx context.Context, c store.Client) error {
+	return nil
+}
+func (f *fakeClientStore) DeleteClient(ctx context.Context, id int64) error {
+	return nil
+}
+func (f *fakeClientStore) RenameGroup(ctx context.Context, id int64, name string) error {
+	return nil
+}
+func (f *fakeClientStore) SetGroupEnabled(ctx context.Context, id int64, enabled bool) error {
+	return nil
+}
+func (f *fakeClientStore) DeleteGroup(ctx context.Context, id int64) error {
+	return nil
+}
 
 func TestRefreshDownloadsCompilesAndKeepsOldOnFailure(t *testing.T) {
 	var failing atomic.Bool

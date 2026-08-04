@@ -49,6 +49,22 @@ func (e *Engine) isPaused(groupID int64) bool {
 	return e.paused[0].After(now) || e.paused[groupID].After(now)
 }
 
+// PausedUntil reports when blocking resumes for the group (zero time when
+// not paused). The global pause (id 0) and the group's own pause are both
+// considered; the later wins.
+func (e *Engine) PausedUntil(groupID int64) time.Time {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	t := e.paused[0]
+	if g := e.paused[groupID]; g.After(t) {
+		t = g
+	}
+	if !t.After(e.now()) {
+		return time.Time{}
+	}
+	return t
+}
+
 func (e *Engine) Middleware() dnssrv.Middleware {
 	return func(next dnssrv.Handler) dnssrv.Handler {
 		return dnssrv.HandlerFunc(func(ctx context.Context, req *dnssrv.Request) (*dnssrv.Response, error) {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"net/netip"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -27,6 +28,7 @@ type Logger struct {
 	ch      chan store.QueryLogEntry
 	dropped atomic.Int64
 	privacy atomic.Value // string
+	hub     subHub
 }
 
 func New(qs store.QueryLogStore, o Options) *Logger {
@@ -86,6 +88,45 @@ func anonymize(ip string) string {
 	return netip.AddrFrom16(b).String()
 }
 
+// subscribers holds live-tail channels; publish is non-blocking (slow SSE
+// clients miss entries rather than backpressuring the DNS path).
+type subHub struct {
+	mu   sync.Mutex
+	subs map[int]chan store.QueryLogEntry
+	next int
+}
+
+func (l *Logger) Subscribe() (<-chan store.QueryLogEntry, func()) {
+	l.hub.mu.Lock()
+	defer l.hub.mu.Unlock()
+	if l.hub.subs == nil {
+		l.hub.subs = map[int]chan store.QueryLogEntry{}
+	}
+	id := l.hub.next
+	l.hub.next++
+	ch := make(chan store.QueryLogEntry, 64)
+	l.hub.subs[id] = ch
+	return ch, func() {
+		l.hub.mu.Lock()
+		defer l.hub.mu.Unlock()
+		if c, ok := l.hub.subs[id]; ok {
+			delete(l.hub.subs, id)
+			close(c)
+		}
+	}
+}
+
+func (l *Logger) Publish(e store.QueryLogEntry) {
+	l.hub.mu.Lock()
+	defer l.hub.mu.Unlock()
+	for _, ch := range l.hub.subs {
+		select {
+		case ch <- e:
+		default:
+		}
+	}
+}
+
 func (l *Logger) emit(e store.QueryLogEntry) {
 	for {
 		select {
@@ -129,6 +170,7 @@ func (l *Logger) Middleware() dnssrv.Middleware {
 				}
 			}
 			l.emit(e)
+			l.Publish(e)
 			return resp, err
 		})
 	}

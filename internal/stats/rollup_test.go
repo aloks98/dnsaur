@@ -26,6 +26,10 @@ func (f *fakeStatsStore) Counter(ctx context.Context, bucketFromSec int64, metri
 	return nil, nil
 }
 
+func (f *fakeStatsStore) Timeline(ctx context.Context, fromSec int64) (map[int64]map[string]int64, error) {
+	return nil, nil
+}
+
 // fakeSettingsStore holds in-memory settings and records SetInternal calls.
 type fakeSettingsStore struct {
 	values          map[string]string
@@ -72,6 +76,10 @@ func (f *fakeSettingsStore) Changes() <-chan int64 {
 
 func (f *fakeSettingsStore) SeedDefaults(ctx context.Context, defaults map[string]string) error {
 	return nil
+}
+
+func (f *fakeSettingsStore) All(ctx context.Context) (map[string]string, error) {
+	return f.values, nil
 }
 
 func TestRunnerHappyPath(t *testing.T) {

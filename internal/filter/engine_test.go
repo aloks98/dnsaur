@@ -32,6 +32,24 @@ func engineWith(t *testing.T, mode string) *Engine {
 	return e
 }
 
+func TestPausedUntil(t *testing.T) {
+	e := NewEngine()
+	e.Pause(0, time.Minute)
+	if until := e.PausedUntil(0); until.IsZero() {
+		t.Fatal("global pause not reported")
+	}
+	if until := e.PausedUntil(5); until.IsZero() {
+		t.Fatal("group pause should inherit global")
+	}
+	e.Pause(0, 0)
+	if until := e.PausedUntil(0); !until.IsZero() {
+		t.Fatal("resume didn't clear pause")
+	}
+	if until := e.PausedUntil(5); !until.IsZero() {
+		t.Fatal("group pause should clear with global")
+	}
+}
+
 func TestBlockNullIP(t *testing.T) {
 	e := engineWith(t, "null-ip")
 	h := e.Middleware()(passthrough(t))

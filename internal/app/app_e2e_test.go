@@ -44,7 +44,7 @@ func TestEndToEnd(t *testing.T) {
 	cfg.Storage.Driver = "sqlite"
 	cfg.Storage.DSN = dir + "/t.db"
 
-	a, err := New(ctx, cfg)
+	a, err := New(ctx, cfg, "test")
 	if err != nil {
 		t.Fatal(err)
 	}

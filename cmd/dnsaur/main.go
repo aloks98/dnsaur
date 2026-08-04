@@ -36,7 +36,7 @@ func run(ctx context.Context) error {
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: lvl})))
 	slog.Info("dnsaur starting", "version", Version)
 
-	a, err := app.New(ctx, cfg)
+	a, err := app.New(ctx, cfg, Version)
 	if err != nil {
 		return err
 	}

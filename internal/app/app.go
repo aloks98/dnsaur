@@ -2,13 +2,17 @@ package app
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"net"
+	"net/http"
 	"os"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/aloks98/dnsaur/internal/api"
+	"github.com/aloks98/dnsaur/internal/auth"
 	"github.com/aloks98/dnsaur/internal/cache"
 	"github.com/aloks98/dnsaur/internal/clients"
 	"github.com/aloks98/dnsaur/internal/config"
@@ -73,6 +77,7 @@ func (s *swappable) ServeDNS(ctx context.Context, req *dnssrv.Request) (*dnssrv.
 
 type App struct {
 	cfg       *config.Config
+	version   string
 	st        store.Store
 	registry  *clients.Registry
 	engine    *filter.Engine
@@ -81,13 +86,16 @@ type App struct {
 	logger    *qlog.Logger
 	fwd       *swappable
 	servers   []*dnssrv.Server
+	apiSrv    *http.Server
+	apiAddr   string
+	apiCancel context.CancelFunc
 	bg        []func(context.Context)
 	cancel    context.CancelFunc
 	ready     chan struct{}
 	wg        sync.WaitGroup
 }
 
-func New(ctx context.Context, cfg *config.Config) (*App, error) {
+func New(ctx context.Context, cfg *config.Config, version string) (*App, error) {
 	if err := os.MkdirAll(cfg.DataDir, 0o755); err != nil {
 		return nil, err
 	}
@@ -107,6 +115,7 @@ func New(ctx context.Context, cfg *config.Config) (*App, error) {
 	}
 	a := &App{
 		cfg:      cfg,
+		version:  version,
 		st:       st,
 		registry: clients.NewRegistry(st.Clients()),
 		engine:   filter.NewEngine(),
@@ -119,6 +128,30 @@ func New(ctx context.Context, cfg *config.Config) (*App, error) {
 }
 
 func (a *App) Store() store.Store { return a.st }
+
+// pruneExpiredTokens deletes expired auth tokens. Errors are logged and
+// swallowed: cleanup is best-effort housekeeping, not on the request path.
+func (a *App) pruneExpiredTokens(ctx context.Context) {
+	if err := a.st.Tokens().DeleteExpired(ctx, time.Now().UnixMilli()); err != nil {
+		slog.Warn("token cleanup failed", "err", err)
+	}
+}
+
+// runTokenCleanup prunes expired auth tokens once at startup and then daily,
+// mirroring qlog.Pruner's cadence for the query-log retention job.
+func (a *App) runTokenCleanup(ctx context.Context) {
+	t := time.NewTicker(24 * time.Hour)
+	defer t.Stop()
+	a.pruneExpiredTokens(ctx)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			a.pruneExpiredTokens(ctx)
+		}
+	}
+}
 
 func (a *App) getSetting(ctx context.Context, key string) string {
 	v, _, _ := a.st.Settings().Get(ctx, key)
@@ -247,6 +280,35 @@ func (a *App) Start(ctx context.Context) error {
 		a.servers = append(a.servers, s)
 	}
 
+	apiSrv := api.New(api.Deps{
+		Store: a.st, Auth: auth.New(a.st.Users(), a.st.Tokens()),
+		Engine: a.engine, Reloader: a, Logger: a.logger, Refresher: a.refresher,
+		Version: a.version,
+	})
+	ln, err := net.Listen("tcp", a.cfg.HTTPListen)
+	if err != nil {
+		return err
+	}
+	a.apiAddr = ln.Addr().String()
+	// apiCtx is the base context for every API request (via BaseContext
+	// below). Cancelling it in Shutdown propagates to every in-flight
+	// request's r.Context(), so long-lived handlers blocked on ctx.Done()
+	// (the SSE tail handler) unblock immediately instead of making
+	// apiSrv.Shutdown wait out its deadline for a connection that would
+	// otherwise never go idle on its own.
+	apiCtx, apiCancel := context.WithCancel(context.Background())
+	a.apiCancel = apiCancel
+	a.apiSrv = &http.Server{
+		Handler:           apiSrv.Handler(),
+		ReadHeaderTimeout: 5 * time.Second,
+		BaseContext:       func(net.Listener) context.Context { return apiCtx },
+	}
+	go func() {
+		if err := a.apiSrv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			slog.Error("api server exited", "err", err)
+		}
+	}()
+
 	pruner := qlog.NewPruner(a.st.QueryLog(), func() int64 { return a.getInt(ctx, "qlog.retention_days", 90) })
 	rollups := stats.NewRunner(a.st.Stats(), a.st.Settings(), time.Minute)
 	refreshEvery := time.Duration(a.getInt(ctx, "lists.refresh_hours", 24)) * time.Hour
@@ -255,6 +317,7 @@ func (a *App) Start(ctx context.Context) error {
 	a.bg = []func(context.Context){
 		a.logger.Run,
 		pruner.Run,
+		a.runTokenCleanup,
 		rollups.Run,
 		func(c context.Context) { a.refresher.Run(c, refreshEvery) },
 		func(c context.Context) {
@@ -300,7 +363,23 @@ func (a *App) DNSAddr() string {
 	return a.servers[0].Addr()
 }
 
+func (a *App) HTTPAddr() string { return a.apiAddr }
+
+func (a *App) ReloadClients(ctx context.Context) error  { return a.registry.Reload(ctx) }
+func (a *App) ReloadRecords(ctx context.Context) error  { return a.resolver.Reload(ctx) }
+func (a *App) RefreshFilters(ctx context.Context) error { return a.refresher.RefreshAll(ctx) }
+
 func (a *App) Shutdown(ctx context.Context) error {
+	if a.apiCancel != nil {
+		// Cancel in-flight request contexts first so handlers blocked on
+		// r.Context().Done() (the SSE tail handler) return promptly,
+		// letting apiSrv.Shutdown below complete well inside its deadline
+		// instead of waiting for those connections to go idle.
+		a.apiCancel()
+	}
+	if a.apiSrv != nil {
+		_ = a.apiSrv.Shutdown(ctx)
+	}
 	for _, s := range a.servers {
 		_ = s.Shutdown(ctx)
 	}

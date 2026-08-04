@@ -18,6 +18,8 @@ func (s *sqlStore) Records() RecordStore { return &recordStore{s} }
 func (s *sqlStore) Settings() SettingsStore { return &settingsStore{s: s} }
 func (s *sqlStore) QueryLog() QueryLogStore { return &queryLogStore{s} }
 func (s *sqlStore) Stats() StatsStore { return &statsStore{s: s} }
+func (s *sqlStore) Users() UserStore { return &userStore{s} }
+func (s *sqlStore) Tokens() TokenStore { return &tokenStore{s} }
 
 func (s *sqlStore) q(q string) string { return rebind(s.dialect, q) }
 
