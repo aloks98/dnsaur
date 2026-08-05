@@ -8,7 +8,10 @@ import { useTheme } from "./lib/theme";
 import { Account } from "./pages/account";
 import { Dashboard } from "./pages/dashboard";
 import { LocalDns } from "./pages/dns";
-import { Filtering } from "./pages/filtering";
+import { FilteringLayout } from "./pages/filtering";
+import { GroupsClientsTab } from "./pages/filtering/groups-clients";
+import { ListsTab } from "./pages/filtering/lists";
+import { RulesTab } from "./pages/filtering/rules";
 import { Login } from "./pages/login";
 import { QueryLog } from "./pages/queries";
 import { SettingsPage } from "./pages/settings";
@@ -56,7 +59,7 @@ export function App() {
     <>
       {/* The outer net. AppShell has its own per-route boundary (so one
           broken page keeps the chrome usable), but that one covers only the
-          Outlet: the always-mounted sidebar/header/command palette, and the
+          Outlet: the always-mounted top nav and command palette, and the
           entire unauthenticated branch below, sit outside it. React 19
           unmounts the whole root on an uncaught render error, so without
           this any throw in those places is a white page with no way back. */}
@@ -70,7 +73,16 @@ export function App() {
             <Route element={<AppShell />}>
               <Route index element={<Dashboard />} />
               <Route path="queries" element={<QueryLog />} />
-              <Route path="filtering" element={<Filtering />} />
+              {/* Filtering's three panels are routes, not local tab state,
+                  so each is deep-linkable and survives a reload. `/filtering`
+                  itself is only an entry point — it forwards to the first
+                  panel rather than rendering a fourth, empty thing. */}
+              <Route path="filtering" element={<FilteringLayout />}>
+                <Route index element={<Navigate to="/filtering/lists" replace />} />
+                <Route path="lists" element={<ListsTab />} />
+                <Route path="rules" element={<RulesTab />} />
+                <Route path="clients" element={<GroupsClientsTab />} />
+              </Route>
               <Route path="dns" element={<LocalDns />} />
               <Route path="settings" element={<SettingsPage />} />
               <Route path="account" element={<Account />} />

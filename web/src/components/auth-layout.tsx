@@ -1,5 +1,6 @@
 import type { ReactNode } from "react";
 import { cn } from "@e412/rnui-react";
+import { DnsaurLogo } from "./dnsaur-logo";
 
 interface AuthLayoutProps {
   /** Small uppercase label above the heading, e.g. "First-time setup". */
@@ -32,6 +33,11 @@ export function AuthLayout({
 
       <div className={cn("w-full", maxWidthClassName)}>
         <div className="mb-8 flex flex-col items-center gap-2 text-center">
+          {/* The mark's one moment at full size. First run is the only time
+              an operator sees dnsaur before any chrome exists, so the brand
+              is the tile itself here, not the 22px cell it becomes in the
+              top bar. It follows the live theme on its own. */}
+          <DnsaurLogo size={44} className="mb-2" />
           <span className="text-xs font-medium tracking-[0.14em] text-muted-foreground uppercase">
             {eyebrow}
           </span>

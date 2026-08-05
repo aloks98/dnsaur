@@ -48,6 +48,27 @@
 }
 
 /*
+ * The top bar's two nav strips (see components/top-nav.tsx).
+ *
+ * Four nav groups plus two status cells cannot fit a phone at 11px with
+ * .1em tracking, so the strips scroll horizontally rather than wrapping
+ * (which would break the fixed 42px/38px row heights the design specifies)
+ * or collapsing into a hamburger (which the design does not have). The
+ * scrollbar itself is suppressed: a persistent gutter inside a 38px row
+ * eats a tenth of it, and the row is one flick on the touch devices where
+ * this actually engages. Keyboard access is unaffected — focusing an
+ * off-screen link scrolls it into view.
+ */
+.dnsaur-scroll-x {
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.dnsaur-scroll-x::-webkit-scrollbar {
+  display: none;
+}
+
+/*
  * Query log — live-tail row insertion (see pages/queries.tsx).
  *
  * Only ever the single newest row carries `data-row-new="true"` (on its

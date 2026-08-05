@@ -20,12 +20,27 @@ function Harness({ open }: { open: boolean }) {
   );
 }
 
-test("opening the palette lists every page instead of throwing", async () => {
+test("opening the palette lists every page, grouped by nav section", async () => {
   renderWithProviders(<Harness open />);
 
   expect(await screen.findByPlaceholderText(/jump to a page/i)).toBeInTheDocument();
-  for (const label of ["Dashboard", "Query Log", "Filtering", "Local DNS", "Settings", "Account"]) {
+  // Every *leaf* page, including the three Filtering panels that are now
+  // routes of their own rather than one "Filtering" entry with local tabs.
+  for (const label of [
+    "Dashboard",
+    "Query Log",
+    "Lists",
+    "Rules",
+    "Groups & Clients",
+    "Local DNS",
+    "Settings",
+    "Account",
+  ]) {
     expect(screen.getByRole("option", { name: label })).toBeInTheDocument();
+  }
+  // ...under the same four headings the top bar's first row shows.
+  for (const heading of ["Monitor", "Filtering", "Network", "System"]) {
+    expect(screen.getByText(heading)).toBeInTheDocument();
   }
 });
 

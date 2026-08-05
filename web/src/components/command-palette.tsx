@@ -9,7 +9,7 @@ import {
   CommandItem,
   CommandList,
 } from "@e412/rnui-react";
-import { navItems } from "./sidebar-nav";
+import { NAV_GROUPS } from "../lib/nav";
 
 interface CommandPaletteProps {
   open: boolean;
@@ -51,17 +51,23 @@ export function CommandPalette({ open, onOpenChange }: CommandPaletteProps) {
         <CommandInput placeholder="Jump to a page…" />
         <CommandList>
           <CommandEmpty>No matching pages.</CommandEmpty>
-          <CommandGroup heading="Pages">
-            {navItems.map((item) => {
-              const Icon = item.icon;
-              return (
-                <CommandItem key={item.to} value={item.label} onSelect={() => goTo(item.to)}>
-                  <Icon />
-                  {item.label}
-                </CommandItem>
-              );
-            })}
-          </CommandGroup>
+          {/* One CommandGroup per nav group, so the palette's headings are
+              the same four sections the top bar shows — the palette is a
+              keyboard route into the nav, not a second, differently-shaped
+              index of it. */}
+          {NAV_GROUPS.map((group) => (
+            <CommandGroup key={group.id} heading={group.label}>
+              {group.items.map((item) => {
+                const Icon = item.icon;
+                return (
+                  <CommandItem key={item.to} value={item.label} onSelect={() => goTo(item.to)}>
+                    <Icon />
+                    {item.label}
+                  </CommandItem>
+                );
+              })}
+            </CommandGroup>
+          ))}
         </CommandList>
       </Command>
     </CommandDialog>

@@ -887,7 +887,7 @@ guarded); if it now fails, all non-auth cached data is dropped and the gate
 falls back to Login.
 
 **Polling** — three things poll, all at 30s: the five dashboard stats queries,
-`GET /health` (sidebar status, every screen), and `GET /blocking` (pause
+`GET /health` (the top bar's resolver cell, every screen), and `GET /blocking` (pause
 control, every screen plus one per group row). Everything else is
 fetch-on-mount with a 10s stale time and no window-focus refetch; `me` is the
 exception, refetching on focus only once it has succeeded.
@@ -911,8 +911,9 @@ typing in an input.
 |---|---|
 | Dashboard | `/` |
 | Query log | `/queries` |
-| Filtering → Lists | `/filtering` |
-| Filtering → Rules | `/filtering` |
+| Filtering → Lists | `/filtering/lists` (`/filtering` redirects here) |
+| Filtering → Rules | `/filtering/rules` |
+| Filtering → Groups & Clients | `/filtering/clients` |
 | Local DNS | `/dns` |
 | Settings | `/settings` |
 | Account & security | `/account` |
@@ -924,11 +925,10 @@ typing in an input.
 | Screen | What's missing |
 |---|---|
 | **Filtering → Groups & Clients** | CRUD works, but the per-group "Lists (n)" menu has **no error state**: it's disabled only while `isPending`, not on `isError`, and its toggle rebuilds the assignment set from `groupLists.data ?? []`. If that read failed, clicking one list PUTs `[thatOne]` and **silently drops every other assignment**. |
-| **Filtering (tab container)** | `<Tabs defaultValue="lists">` with no URL sync — tabs aren't deep-linkable and returning to `/filtering` always resets to Lists. |
 | **Dashboard health strip** | Shows filter-list coverage and an unreachable indicator. The spec's "upstreams healthy" signal **has no code at all** — there is no upstream-health endpoint. |
 | **Settings** | 11 keys work. The spec's "storage (read-only info)" section is absent, with a code comment noting no endpoint exists to source it. |
 | **Account** | TOTP and tokens are complete. **Change password is not implemented**; the page says so: *"Password changes aren't available yet — that's planned for a future update."* |
-| **Command palette** | Navigates to the 6 nav items only. The spec's "quick actions (pause, block a domain)" don't exist. |
+| **Command palette** | Navigates to the 8 leaf pages only, grouped by nav section. The spec's "quick actions (pause, block a domain)" don't exist. |
 
 ### Not started
 
@@ -940,8 +940,11 @@ typing in an input.
 | **Authoritative zones / DNSSEC** | no code |
 | **HA / cluster UI** | no code; the spec anticipated a health-strip stub, which does not exist |
 
-The nav contains exactly the six implemented routes — there are no dead nav
-entries pointing at unbuilt screens.
+The nav contains exactly the eight implemented routes, in four groups
+(Monitor: Dashboard, Query Log · Filtering: Lists, Rules, Groups & Clients ·
+Network: Local DNS · System: Settings, Account) — there are no dead nav
+entries pointing at unbuilt screens. Theme and log out live under System too;
+the shell has no sidebar and no avatar.
 
 ---
 

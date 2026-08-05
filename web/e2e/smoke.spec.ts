@@ -30,16 +30,20 @@ test("first-run setup, login, add a DNS record, dark mode persists across reload
   await page.getByRole("button", { name: /go to dashboard/i }).click();
   await expect(page.getByRole("heading", { name: "Dashboard" })).toBeVisible();
 
+  // The shell is two chrome rows, not a sidebar (see
+  // src/components/top-nav.tsx): row 1 holds the four nav *group* menus,
+  // row 2 the active group's pages as tabs. Account, theme and log out all
+  // live under System.
+  const topNav = page.locator('[data-slot="top-nav"]');
+  const systemMenu = topNav.getByRole("button", { name: "System" });
+
   // --- log out, then log back in through the real Login page -----------
   // The wizard's own silent sign-in (see pages/setup.tsx) already holds a
   // session at this point; it never exercises pages/login.tsx, so log out
   // and back in explicitly to cover the real login path the brief asks for.
-  //
-  // The account menu lives in the sidebar footer (see
-  // src/components/sidebar-nav.tsx), not the header, and its accessible
-  // name carries the signed-in username: "Account menu (e2e-admin)".
-  const sidebar = page.locator('[data-slot="sidebar"]');
-  await sidebar.getByRole("button", { name: `Account menu (${USERNAME})` }).click();
+  await systemMenu.click();
+  // The signed-in account is named in the menu, not in the (avatar-less) bar.
+  await expect(page.getByRole("menu").getByText(USERNAME)).toBeVisible();
   await page.getByRole("menuitem", { name: "Log out" }).click();
   await expect(page.getByRole("heading", { name: "Log in to dnsaur" })).toBeVisible();
 
@@ -48,9 +52,20 @@ test("first-run setup, login, add a DNS record, dark mode persists across reload
   await page.getByRole("button", { name: "Log in" }).click();
   await expect(page.getByRole("heading", { name: "Dashboard" })).toBeVisible();
 
+  // --- the row-1 search cell opens the ⌘K palette -----------------------
+  await topNav.getByRole("button", { name: /search/i }).click();
+  await expect(page.getByPlaceholder("Jump to a page…")).toBeVisible();
+  await page.keyboard.press("Escape");
+
   // --- add a local DNS record, see it listed ----------------------------
-  await page.getByRole("link", { name: "Local DNS" }).click();
+  // Local DNS is Network's only page, so it's reached through that group's
+  // menu — and once there, row 2 must still give it a tab of its own.
+  await topNav.getByRole("button", { name: "Network" }).click();
+  await page.getByRole("menuitem", { name: "Local DNS" }).click();
   await expect(page.getByRole("heading", { name: "Local DNS", exact: true })).toBeVisible();
+  await expect(
+    topNav.getByRole("navigation", { name: "Network" }).getByRole("link", { name: "Local DNS" }),
+  ).toHaveAttribute("aria-current", "page");
 
   await page.getByRole("button", { name: "Add record" }).click();
   const sheet = page.getByRole("dialog");
@@ -65,10 +80,12 @@ test("first-run setup, login, add a DNS record, dark mode persists across reload
   await expect(row.getByText("10.0.0.9")).toBeVisible();
 
   // --- dark mode toggles and persists across a reload -------------------
-  // Also in the sidebar footer now, right below the account menu.
+  // Also under System: the design's bar carries no standalone theme control.
   await expect(page.locator("html")).not.toHaveClass(/dark/);
-  await sidebar.getByRole("button", { name: /switch to dark theme/i }).click();
+  await systemMenu.click();
+  await page.getByRole("menuitem", { name: /switch to dark theme/i }).click();
   await expect(page.locator("html")).toHaveClass(/dark/);
+  await page.keyboard.press("Escape"); // the toggle deliberately stays open
 
   await page.reload();
   await expect(page.getByRole("heading", { name: "Local DNS", exact: true })).toBeVisible();

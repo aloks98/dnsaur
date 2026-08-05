@@ -1,6 +1,6 @@
 import { delay, http, HttpResponse } from "msw";
 import { afterEach, expect, test, vi } from "vitest";
-import { screen, waitFor } from "@testing-library/react";
+import { screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { Route, Routes } from "react-router";
 import { focusManager } from "@tanstack/react-query";
@@ -19,9 +19,61 @@ function Boom(): never {
   throw new Error("this page is broken");
 }
 
-test("authenticated user sees the app shell nav", async () => {
+test("authenticated user gets the two-row shell: nav groups above, the active group's pages below", async () => {
   renderWithProviders(<App />);
-  await waitFor(() => expect(screen.getByRole("link", { name: /query log/i })).toBeInTheDocument());
+
+  const primary = await screen.findByRole("navigation", { name: "Primary" });
+  expect(
+    within(primary)
+      .getAllByRole("button")
+      .map((button) => button.textContent),
+  ).toEqual(["Monitor", "Filtering", "Network", "System"]);
+
+  // Row 2 is the active group's pages, and "/" makes that Monitor.
+  const monitorTabs = screen.getByRole("navigation", { name: "Monitor" });
+  expect(within(monitorTabs).getByRole("link", { name: "Dashboard" })).toHaveAttribute(
+    "aria-current",
+    "page",
+  );
+  expect(within(monitorTabs).getByRole("link", { name: /query log/i })).toBeInTheDocument();
+});
+
+test("/filtering forwards to Lists, and each panel is a deep-linkable route", async () => {
+  const user = userEvent.setup();
+  renderWithProviders(<App />, { route: "/filtering" });
+
+  // The index redirects rather than rendering a fourth, empty thing.
+  const filteringTabs = await screen.findByRole("navigation", { name: "Filtering" });
+  await waitFor(() =>
+    expect(within(filteringTabs).getByRole("link", { name: "Lists" })).toHaveAttribute(
+      "aria-current",
+      "page",
+    ),
+  );
+  // "Refresh now" belongs to the Lists panel and to no other.
+  expect(await screen.findByRole("button", { name: /refresh now/i })).toBeInTheDocument();
+
+  // ...and the tabs are navigation, so the URL follows the panel.
+  await user.click(within(filteringTabs).getByRole("link", { name: "Groups & Clients" }));
+  await waitFor(() =>
+    expect(within(filteringTabs).getByRole("link", { name: "Groups & Clients" })).toHaveAttribute(
+      "aria-current",
+      "page",
+    ),
+  );
+  expect(within(filteringTabs).getByRole("link", { name: "Lists" })).not.toHaveAttribute(
+    "aria-current",
+  );
+});
+
+test("a deep-linked panel opens directly, instead of resetting to the first tab", async () => {
+  renderWithProviders(<App />, { route: "/filtering/rules" });
+
+  const filteringTabs = await screen.findByRole("navigation", { name: "Filtering" });
+  expect(within(filteringTabs).getByRole("link", { name: "Rules" })).toHaveAttribute(
+    "aria-current",
+    "page",
+  );
 });
 
 test("unauthenticated + setup-required shows setup", async () => {

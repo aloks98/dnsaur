@@ -40,8 +40,8 @@ export function useStatsTop(metric: TopMetric, n: number, hours: number) {
 
 // GET /health is unauthenticated liveness/version — the cheapest possible
 // "is the instance up" signal. Used by both the dashboard's health strip
-// and the sidebar's resolver status LED (see sidebar-nav.tsx), so it lives
-// here rather than being private to one page.
+// and the top bar's resolver cell (see top-nav.tsx), so it lives here
+// rather than being private to one page.
 export function useHealth() {
   return useQuery({
     queryKey: ["health"] as const,
