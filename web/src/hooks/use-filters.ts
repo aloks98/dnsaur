@@ -7,6 +7,16 @@ import type { List, Rule } from "../api/types";
 // strip, the setup wizard's starter blocklists, and the Filtering page's
 // Lists tab) and rules (used by the dashboard/query-log quick block/allow
 // actions and the Filtering page's Rules tab, Task 10).
+//
+// Error handling deliberately lives at the call site, not here — see the
+// "Data layer" section of web/README.md. These hooks stay pure data access
+// so the same hook can be reused by callers that need different handling:
+// deleting a list toasts the list's URL on the Filtering page, while the
+// setup wizard's bulk create reports a partial-failure count instead. A
+// toast in here would be wrong for one of them and duplicated for both.
+// Queries surface their own failures in the component (an inline error
+// state, or a stale-data banner over still-valid data); the only
+// app-global handler is the 401 session recovery in lib/query-client.ts.
 export const filterKeys = {
   lists: ["filters", "lists"] as const,
   /** The common prefix of every groupLists(n) key. react-query matches

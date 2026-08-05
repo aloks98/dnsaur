@@ -66,6 +66,35 @@ cd web && pnpm test && pnpm lint && pnpm format:check && pnpm typecheck && pnpm 
 go test -race ./... && ~/go/bin/golangci-lint run ./...
 ```
 
+## Data layer
+
+`src/api/types.ts` hand-mirrors the Go API's request/response shapes and
+`src/api/client.ts` is a thin typed `fetch` wrapper that throws `ApiError`
+(status + `{error}` body) on non-2xx. There's no codegen — the API and the
+dashboard live in one repo, so a contract change touches both together.
+
+Each resource gets a hook in `src/hooks/` over TanStack Query. **Those hooks
+are pure data access: they deliberately carry no toasts and no `onError`.**
+Error handling belongs at the call site, because the same hook serves callers
+that need to report failure differently — `useDeleteList` names the list's URL
+when the Filtering page uses it, while the setup wizard's bulk create reports a
+partial-failure count instead. Putting a toast in the hook would be wrong for
+one caller and duplicated for the other.
+
+So, by layer:
+
+- **Mutations** — the component passes `onError` to `mutate`/`mutateAsync` with
+  a message naming what failed. Bulk operations use `Promise.allSettled` and
+  report per-item outcomes (see `pages/settings.tsx`'s save).
+- **Queries** — the component renders the failure: a destructive alert when
+  there's no data to show (`isError && data === undefined`), or a
+  non-destructive `StaleDataAlert` **above** still-valid content when a
+  background refetch fails, so a blipped poll never replaces good data.
+- **App-global** — the only cross-cutting handler is in `lib/query-client.ts`:
+  a 401 from any query or mutation revalidates `me` once, and if the session is
+  really gone the auth gate falls back to Login and per-session cache is
+  dropped.
+
 ## Build + embed
 
 `pnpm build` produces `web/dist/`, which `web/embed.go` embeds via
