@@ -1,17 +1,50 @@
 @import "tailwindcss";
 @import "@e412/rnui-themes";
+
+/*
+ * Self-hosted webfonts. NOT the Google Fonts CDN, for two reasons:
+ * internal/api/static.go serves a Content-Security-Policy with no external
+ * hosts (a CDN <link> is blocked outright), and dnsaur ships as a single
+ * self-contained binary for homelabs that may never see the internet.
+ * @fontsource emits plain @font-face + local url(), so Vite fingerprints
+ * the woff2/woff into dist/assets and web/embed.go bakes them into the
+ * binary. Only the weights the design actually calls for, latin subset
+ * only — pulling a whole family here costs megabytes of embedded assets.
+ */
+@import "@fontsource/ibm-plex-sans/latin-400.css";
+@import "@fontsource/ibm-plex-sans/latin-500.css";
+@import "@fontsource/ibm-plex-sans/latin-600.css";
+@import "@fontsource/ibm-plex-mono/latin-400.css";
+@import "@fontsource/ibm-plex-mono/latin-500.css";
+@import "@fontsource/ibm-plex-mono/latin-600.css";
+@import "@fontsource/archivo/latin-600.css";
+@import "@fontsource/archivo/latin-700.css";
+@import "@fontsource/archivo/latin-800.css";
+
 @source "../../node_modules/@e412/rnui-react/dist";
 @import "./dnsaur-theme.css";
 
 /*
- * --destructive-solid-foreground (see dnsaur-theme.css) isn't part of
- * rnui-themes' own @theme mapping — it's app-specific, for the six
- * confirm-delete AlertDialogAction buttons that pair solid `bg-destructive`
- * with text (Task 14 fix round 1). Tailwind v4 merges multiple @theme
- * blocks, so this just extends the one rnui-themes already registers.
+ * Tokens rnui-themes' own @theme mapping doesn't register, so they'd have
+ * no `bg-*`/`text-*`/`font-*` utility without this block. Tailwind v4
+ * merges multiple @theme blocks, so this extends rather than replaces it.
+ *
+ * - --font-mono: rnui maps --font-sans and --font-heading but not mono,
+ *   which would leave `font-mono` on Tailwind's default stack. This design
+ *   puts every number, label and table cell in IBM Plex Mono, so the mono
+ *   face has to be reachable as a token, not just as a raw CSS variable.
+ * - --destructive-solid-foreground: app-specific, for the six confirm-delete
+ *   AlertDialogAction buttons that pair solid `bg-destructive` with text
+ *   (Task 14 fix round 1). See dnsaur-theme.css.
+ * - --border-muted / --chart-blocked / --chart-resolved: named tokens from
+ *   the locked design that have no rnui equivalent.
  */
 @theme inline {
+  --font-mono: var(--font-mono);
   --color-destructive-solid-foreground: var(--destructive-solid-foreground);
+  --color-border-muted: var(--border-muted);
+  --color-chart-blocked: var(--chart-blocked);
+  --color-chart-resolved: var(--chart-resolved);
 }
 
 /*
