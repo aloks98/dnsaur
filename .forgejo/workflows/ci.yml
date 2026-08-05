@@ -68,3 +68,38 @@ jobs:
           path: web/dist
       - name: Race tests
         run: go test -race ./...
+
+  # Playwright smoke test (web/e2e/smoke.spec.ts) against the real embedded
+  # build: webServer (web/playwright.config.ts) builds the actual dnsaur
+  # binary over the web-dist artifact from the `web` job and runs it, then
+  # a browser drives first-run setup → login → add a DNS record → dark
+  # mode persistence. Best-effort, not a merge gate — continue-on-error so
+  # a runner without reliable network access to download Chromium (or any
+  # other environment quirk) doesn't block the pipeline; see
+  # web/README.md's "End-to-end smoke test" section for the local-only
+  # fallback (`pnpm test:e2e`) this mirrors.
+  e2e:
+    runs-on: medium
+    needs: web
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version: "1.26" }
+      - uses: actions/setup-node@v4
+        with: { node-version: "20" }
+      - name: Enable corepack
+        run: corepack enable
+      - name: Install
+        working-directory: web
+        run: pnpm install --frozen-lockfile
+      - uses: actions/download-artifact@v4
+        with:
+          name: web-dist
+          path: web/dist
+      - name: Install Chromium
+        working-directory: web
+        run: npx playwright install --with-deps chromium
+      - name: Smoke test
+        working-directory: web
+        run: pnpm test:e2e

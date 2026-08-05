@@ -56,6 +56,13 @@ const WINDOWS = [
 type WindowValue = (typeof WINDOWS)[number]["value"];
 const DEFAULT_WINDOW: WindowValue = "24h";
 
+// `items` maps each value to its display label — without it, SelectValue
+// renders the raw stored value ("24h") instead of the option's label
+// (Task 12's finding; see settings.tsx/account.tsx for the same fix).
+const WINDOW_ITEMS: Record<WindowValue, string> = Object.fromEntries(
+  WINDOWS.map((w) => [w.value, w.label]),
+) as Record<WindowValue, string>;
+
 function hoursFor(value: WindowValue): number {
   return WINDOWS.find((w) => w.value === value)?.hours ?? 24;
 }
@@ -74,7 +81,7 @@ function WindowSelect({
   onChange: (value: WindowValue) => void;
 }) {
   return (
-    <Select value={value} onValueChange={(v) => onChange(v as WindowValue)}>
+    <Select items={WINDOW_ITEMS} value={value} onValueChange={(v) => onChange(v as WindowValue)}>
       <SelectTrigger aria-label="Time window" className="w-44">
         <SelectValue />
       </SelectTrigger>

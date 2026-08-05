@@ -5,6 +5,11 @@ dist-ssr
 *.local
 *.tsbuildinfo
 
+# Playwright (web/playwright.config.ts, web/e2e/)
+test-results/
+playwright-report/
+blob-report/
+
 # Editor
 .vscode/*
 !.vscode/extensions.json

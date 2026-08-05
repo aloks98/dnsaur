@@ -34,7 +34,12 @@ func (t *tokenStore) ListAPI(ctx context.Context, userID int64) ([]AuthToken, er
 		return nil, err
 	}
 	defer rows.Close()
-	var out []AuthToken
+	// Non-nil (not `var out []AuthToken`) so zero tokens marshals to JSON
+	// `[]`, not `null` — matches every other list endpoint (see
+	// sql.go's Groups/Clients/Lists/Rules/records.All for the same fix).
+	// Every account starts with zero API tokens, so this is the default
+	// state, not an edge case.
+	out := []AuthToken{}
 	for rows.Next() {
 		var tok AuthToken
 		if err := rows.Scan(&tok.ID, &tok.UserID, &tok.Kind, &tok.Name, &tok.TokenHash, &tok.Scope, &tok.CreatedAt, &tok.ExpiresAt, &tok.LastUsed); err != nil {

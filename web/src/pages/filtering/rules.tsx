@@ -77,6 +77,14 @@ const ACTION_META: Record<
   allow: { label: "Allow", variant: "success-light", icon: ShieldCheck },
 };
 
+// `items` maps each value to its display label — without it, SelectValue
+// renders the raw stored value ("block") instead of the option's label
+// (Task 12's finding; see settings.tsx/account.tsx for the same fix).
+const RULE_ACTION_ITEMS: Record<Rule["action"], string> = {
+  block: ACTION_META.block.label,
+  allow: ACTION_META.allow.label,
+};
+
 function validatePattern(value: string, isRegex: boolean): string | true {
   if (!value.trim()) return "Pattern is required";
   if (!isRegex) return true;
@@ -150,7 +158,11 @@ function AddRuleDialog({ groupId, groupName }: { groupId: number; groupName: str
               render={({ field }) => (
                 <FormItem>
                   <FormLabel>Action</FormLabel>
-                  <Select value={field.value} onValueChange={field.onChange}>
+                  <Select
+                    items={RULE_ACTION_ITEMS}
+                    value={field.value}
+                    onValueChange={field.onChange}
+                  >
                     <SelectTrigger aria-label="Action">
                       <SelectValue />
                     </SelectTrigger>
@@ -365,6 +377,11 @@ export function RulesTab() {
             Group
           </span>
           <Select
+            // `items` maps each value to its display label — without it,
+            // SelectValue renders the raw group id ("1") instead of the
+            // group's name (Task 12's finding; see settings.tsx/account.tsx
+            // for the same fix).
+            items={Object.fromEntries((groups.data ?? []).map((g) => [String(g.id), g.name]))}
             value={String(groupId)}
             onValueChange={(v) => setGroupId(Number(v))}
             disabled={groups.isPending || !groups.data || groups.data.length === 0}

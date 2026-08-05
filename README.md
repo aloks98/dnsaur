@@ -26,27 +26,36 @@ of truth — if it's not listed as shipped, it doesn't work yet.
 | Stats (hourly rollups) | Shipped |
 | Hot-reload of DB-managed settings | Shipped |
 | REST API + auth (sessions, scoped tokens, TOTP) | Shipped |
-| Web dashboard | Planned |
+| Web dashboard | Shipped |
 | HA config sync (primary/replica) | Planned |
 | DHCP | Planned |
 | Encrypted DNS (DoH/DoT upstream and serving) | Planned |
 | Authoritative zones + DNSSEC | Planned |
 
-There is no web dashboard or published Docker image yet, but you no longer
-need to hand-edit the database: the REST API under `/api/v1` (see
-[`docs/api.md`](docs/api.md)) is now the configuration surface — settings,
-client groups, filter lists, local records, and more are all managed over
-HTTP (curl or any HTTP client) for now, ahead of a proper dashboard.
+There's no published Docker image yet, but you no longer need to hand-edit
+the database or shell out to curl for everyday admin: a React dashboard
+(`web/`, embedded into the `dnsaur` binary and served alongside the API —
+see [`docs/architecture.md`](docs/architecture.md)) covers first-run setup,
+live query monitoring, per-client blocklists/allowlists/rules, local DNS
+records, and settings. The REST API under `/api/v1` (see
+[`docs/api.md`](docs/api.md)) is still there underneath it — settings,
+client groups, filter lists, local records, and more are all scriptable
+over HTTP (curl or any HTTP client) too, dashboard or not.
 
 ## Quick start
 
-Build from source (Go 1.26+):
+Build from source (Go 1.26+, Node 20+ and pnpm for the dashboard):
 
 ```sh
 git clone https://github.com/aloks98/dnsaur.git
 cd dnsaur
-go build ./cmd/dnsaur
+cd web && pnpm install && pnpm build && cd ..   # builds the dashboard into web/dist
+go build ./cmd/dnsaur                           # embeds web/dist into the binary
 ```
+
+(`go build ./cmd/dnsaur` alone also works — the dashboard just embeds
+empty and the binary serves API-only, since `web/dist` isn't committed to
+the repo. Run `pnpm build` first for a working dashboard.)
 
 Write a minimal `dnsaur.yaml` next to the binary:
 
@@ -70,6 +79,10 @@ database, seeds default settings (Cloudflare/Quad9 upstreams, a `default`
 client group), and starts serving DNS on `:53`. Point a client or your
 router's DNS setting at the host running dnsaur to try it.
 
+Open `http://<host>:8080` (or whatever `http_listen` is set to) in a
+browser for the dashboard — it walks you through creating an admin account
+on first visit.
+
 Docker images are planned (multi-arch, GHCR) but not published yet — for
 now, building from source is the only supported install path.
 
@@ -79,6 +92,7 @@ now, building from source is the only supported install path.
 - [`docs/configuration.md`](docs/configuration.md) — bootstrap YAML/env vars and DB-managed settings
 - [`docs/api.md`](docs/api.md) — REST API (auth, endpoints, examples)
 - [`docs/development.md`](docs/development.md) — build, test, lint, CI, contributing
+- [`web/README.md`](web/README.md) — dashboard dev workflow, scripts, Playwright smoke test
 
 ## License
 

@@ -11,9 +11,11 @@ itself, unauthenticated, at `GET /api/v1/openapi.yaml`
 (source: `internal/api/openapi.yaml`) — treat that as ground truth over
 this page for exact request/response shapes and status codes.
 
-There is still no web dashboard (see the status table in the
-[`README`](../README.md)) — the API is the configuration surface today,
-used via curl or any HTTP client.
+The web dashboard (`web/`, see the status table in the
+[`README`](../README.md) and [`docs/architecture.md`](architecture.md)) is
+built entirely on this API — it has no privileged access the API doesn't
+already expose. Everything the dashboard does is equally scriptable via
+curl or any HTTP client.
 
 ## Conventions
 

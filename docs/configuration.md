@@ -20,7 +20,7 @@ over built-in defaults, then overridden by environment variables.
 | YAML field | Env var | Default | Meaning |
 |---|---|---|---|
 | `dns_listen` | `DNSAUR_DNS_LISTEN` (comma-separated) | `[":53"]` | Addresses the DNS engine listens on (UDP+TCP) |
-| `http_listen` | `DNSAUR_HTTP_LISTEN` | `:8080` | Address the API/dashboard HTTP server listens on |
+| `http_listen` | `DNSAUR_HTTP_LISTEN` | `:8080` | Address the REST API *and* the web dashboard listen on — both are served by the same HTTP server (the dashboard is a static SPA embedded into the binary; the API answers under `/api/v1`, everything else falls through to the dashboard, see [`docs/architecture.md`](architecture.md)) |
 | `data_dir` | `DNSAUR_DATA_DIR` | `./data` | Directory for the SQLite DB file and cached blocklist downloads |
 | `log_level` | `DNSAUR_LOG_LEVEL` | `info` | slog level (`debug`, `info`, `warn`, `error`) |
 | `storage.driver` | `DNSAUR_STORAGE_DRIVER` | `sqlite` | `sqlite` or `postgres` |

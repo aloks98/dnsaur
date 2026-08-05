@@ -78,6 +78,14 @@ const KIND_META: Record<
   allow: { label: "Allow", variant: "success-light", icon: ShieldCheck },
 };
 
+// `items` maps each value to its display label — without it, SelectValue
+// renders the raw stored value ("block") instead of the option's label
+// (Task 12's finding; see settings.tsx/account.tsx for the same fix).
+const LIST_KIND_ITEMS: Record<List["kind"], string> = {
+  block: KIND_META.block.label,
+  allow: KIND_META.allow.label,
+};
+
 interface AddListValues {
   url: string;
   kind: "block" | "allow";
@@ -181,7 +189,11 @@ function AddListDialog() {
               render={({ field }) => (
                 <FormItem>
                   <FormLabel>Kind</FormLabel>
-                  <Select value={field.value} onValueChange={field.onChange}>
+                  <Select
+                    items={LIST_KIND_ITEMS}
+                    value={field.value}
+                    onValueChange={field.onChange}
+                  >
                     <SelectTrigger aria-label="List kind">
                       <SelectValue />
                     </SelectTrigger>

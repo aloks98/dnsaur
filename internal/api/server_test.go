@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/fstest"
 
 	"github.com/aloks98/dnsaur/internal/auth"
 	"github.com/aloks98/dnsaur/internal/filter"
@@ -113,6 +114,64 @@ func TestUnknownRouteIs404JSON(t *testing.T) {
 	w := doReq(t, srv.Handler(), "GET", "/api/v1/nope", "", nil)
 	if w.Code != 404 || w.Header().Get("Content-Type") != "application/json; charset=utf-8" {
 		t.Fatalf("%d %s", w.Code, w.Header().Get("Content-Type"))
+	}
+}
+
+// TestStaticMountDoesNotShadowAPI closes a gap left by Task 1 (flagged in
+// Task 14's brief): every other test in this package builds its Server via
+// testServer, which always leaves Deps.Static nil — so no committed test
+// ever exercised the SPA mount and the API routes together on the same
+// Server. That matters because Server.routes() registers the SPA's "/"
+// catch-all last, after the "/api/" JSON-404 catch-all; Go's ServeMux picks
+// the most specific pattern regardless of registration order, but a future
+// refactor that changed pattern specificity (e.g. widening an API pattern,
+// or narrowing the root mount) could silently let the SPA shadow /api
+// without any test noticing. This builds a Server with a real (fake)
+// embedded index and asserts both halves still work side by side: the API
+// still answers JSON, and a client-side route still falls back to the SPA's
+// index.html instead of hitting the SPA's own 404 or the API's JSON 404.
+func TestStaticMountDoesNotShadowAPI(t *testing.T) {
+	s, err := store.Open(context.Background(), "sqlite", t.TempDir()+"/t.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	static := fstest.MapFS{
+		"index.html": {Data: []byte("<!doctype html><title>dnsaur</title>")},
+	}
+	srv := New(Deps{
+		Store: s, Auth: auth.New(s.Users(), s.Tokens()), Engine: filter.NewEngine(),
+		Reloader: &fakeReloader{}, Version: "test", Static: static,
+	})
+
+	// The API must still answer JSON, not be shadowed by the SPA mount.
+	w := doReq(t, srv.Handler(), "GET", "/api/v1/health", "", nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("health: %d", w.Code)
+	}
+	if ct := w.Header().Get("Content-Type"); ct != "application/json; charset=utf-8" {
+		t.Fatalf("health content-type: %s", ct)
+	}
+	var body map[string]string
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil || body["status"] != "ok" {
+		t.Fatalf("health body: %s (err %v)", w.Body.String(), err)
+	}
+
+	// An unknown /api/ path must still 404 as JSON, not fall through to the
+	// SPA's index.html.
+	w = doReq(t, srv.Handler(), "GET", "/api/v1/nope", "", nil)
+	if w.Code != http.StatusNotFound || w.Header().Get("Content-Type") != "application/json; charset=utf-8" {
+		t.Fatalf("unknown api route: %d %s", w.Code, w.Header().Get("Content-Type"))
+	}
+
+	// A deep client-side route (e.g. /settings) must fall back to the SPA's
+	// index.html with a 200, not a 404.
+	w = doReq(t, srv.Handler(), "GET", "/settings", "", nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("deep route: %d", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "dnsaur") {
+		t.Fatalf("deep route body isn't the SPA index: %s", w.Body.String())
 	}
 }
 

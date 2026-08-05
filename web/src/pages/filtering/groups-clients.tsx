@@ -635,7 +635,15 @@ function ClientFormDialog({
               render={({ field }) => (
                 <FormItem>
                   <FormLabel>Group</FormLabel>
-                  <Select value={field.value} onValueChange={field.onChange}>
+                  <Select
+                    // `items` maps each value to its display label —
+                    // without it, SelectValue renders the raw group id
+                    // ("1") instead of the group's name (Task 12's finding;
+                    // see settings.tsx/account.tsx for the same fix).
+                    items={Object.fromEntries(groups.map((g) => [String(g.id), g.name]))}
+                    value={field.value}
+                    onValueChange={field.onChange}
+                  >
                     <SelectTrigger aria-label="Group">
                       <SelectValue />
                     </SelectTrigger>

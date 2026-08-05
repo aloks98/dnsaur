@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
 	"time"
@@ -104,5 +105,101 @@ func TestFilterAndRecordCRUD(t *testing.T) {
 		if err := s.Records().Delete(ctx, recID); !errors.Is(err, ErrNotFound) {
 			t.Fatalf("double delete: %v", err)
 		}
+	})
+}
+
+// mustMarshalArray json.Marshals v and fails the test unless the result is
+// exactly "[]" — the point of this helper (over just checking len(v) == 0)
+// is that a nil Go slice and an empty-but-non-nil one both have len 0, yet
+// encoding/json renders them completely differently ("null" vs "[]"). Every
+// list-returning store method must produce a real JSON array even with zero
+// rows, since API clients (the web dashboard chief among them) decode
+// straight into a typed slice and call .length/.map on it unconditionally.
+func mustMarshalArray(t *testing.T, v any) {
+	t.Helper()
+	b, err := json.Marshal(v)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if string(b) != "[]" {
+		t.Fatalf("got %s, want []  (a nil slice marshals to `null`, which crashes API clients that call .length/.map on an empty list without a null-check)", b)
+	}
+}
+
+// cleanupCRUDTables deletes every row from the tables TestEmptyListsMarshal
+// AsJSONArrayNotNull needs empty, child tables first to satisfy foreign
+// keys. sqlite already gets test isolation for free (each forEachDriver
+// case opens its own tmpdir DB, see openSQLite), but postgres is one
+// container shared by every test in the package for the whole run (see
+// TestMain/openPostgres) — without this, leftover rows from
+// TestClientGroupCRUD/TestFilterAndRecordCRUD/etc. would make the
+// "zero rows" assertions below flaky depending on test order, the same
+// defensive pattern statsstore_test.go's cleanupStats already uses for the
+// stats tables.
+func cleanupCRUDTables(t *testing.T, s Store) {
+	t.Helper()
+	ss := s.(*sqlStore)
+	ctx := context.Background()
+	for _, table := range []string{"group_lists", "rules", "clients", "local_records", "lists", "auth_tokens", "groups"} {
+		if _, err := ss.db.ExecContext(ctx, ss.q(`DELETE FROM `+table)); err != nil {
+			t.Fatalf("cleanup %s: %v", table, err)
+		}
+	}
+}
+
+// TestEmptyListsMarshalAsJSONArrayNotNull guards against a real regression
+// (found by actually driving the built dashboard in a browser against a
+// fresh instance, Task 14): every list-returning store method here used to
+// declare its accumulator as `var out []T`, which stays a nil slice — and
+// therefore marshals to JSON `null`, not `[]` — whenever a query matches
+// zero rows. A brand-new dnsaur instance has zero clients, zero rules, zero
+// local records, and zero API tokens by default, so this wasn't a rare edge
+// case: it broke the Local DNS, Filtering › Rules, Filtering › Groups &
+// Clients, and Account › API Tokens pages on first run, every time.
+func TestEmptyListsMarshalAsJSONArrayNotNull(t *testing.T) {
+	forEachDriver(t, func(t *testing.T, s Store) {
+		ctx := context.Background()
+		cleanupCRUDTables(t, s)
+		// With every relevant table now empty, each of these is the exact
+		// zero-row case that used to marshal as `null`.
+		groups, err := s.Clients().Groups(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		mustMarshalArray(t, groups)
+
+		clients, err := s.Clients().Clients(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		mustMarshalArray(t, clients)
+
+		lists, err := s.Filters().Lists(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		mustMarshalArray(t, lists)
+
+		gid, err := s.Clients().AddGroup(ctx, testGroupName("empty-lists-group"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		listsForGroup, err := s.Filters().ListsForGroup(ctx, gid)
+		if err != nil {
+			t.Fatal(err)
+		}
+		mustMarshalArray(t, listsForGroup)
+
+		rules, err := s.Filters().Rules(ctx, gid)
+		if err != nil {
+			t.Fatal(err)
+		}
+		mustMarshalArray(t, rules)
+
+		records, err := s.Records().All(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		mustMarshalArray(t, records)
 	})
 }

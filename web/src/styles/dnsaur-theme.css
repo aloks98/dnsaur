@@ -40,16 +40,26 @@
   --accent-foreground: oklch(0.25 0.03 260);
 
   --destructive: oklch(0.577 0.245 27.325);
-  --destructive-foreground: oklch(0.98 0.01 30);
+  /* rnui's Badge/JsonViewer use *-foreground only for the "-light"
+     (bg-X/10) and "-outline" (bg-background) variants — both of which sit
+     on a near-white surface in light mode, never on the solid --destructive
+     itself (the solid badge variant hardcodes text-white). It must
+     therefore be a dark, saturated tone, not a near-white one — matching
+     rnui's own reference theme (see ocean.css: light-mode
+     --destructive-foreground is oklch(42% .15 15), not a near-white value).
+     Task 14 found this as a real bug: with the near-white oklch(0.98 ...)
+     this file shipped with, the Filtering › Lists "Block" badge rendered as
+     pale pink text on a pale pink chip — effectively invisible. */
+  --destructive-foreground: oklch(0.42 0.19 27.325);
 
   --success: oklch(0.65 0.15 155);
-  --success-foreground: oklch(0.98 0.01 155);
+  --success-foreground: oklch(0.38 0.11 155);
 
   --info: oklch(0.6 0.15 230);
-  --info-foreground: oklch(0.98 0.01 230);
+  --info-foreground: oklch(0.36 0.12 230);
 
   --warning: oklch(0.78 0.16 80);
-  --warning-foreground: oklch(0.3 0.08 70);
+  --warning-foreground: oklch(0.32 0.09 80);
 
   --invert: oklch(0.2 0.02 260);
   --invert-foreground: oklch(0.98 0.01 250);
@@ -101,16 +111,23 @@
   --accent-foreground: oklch(0.95 0.008 250);
 
   --destructive: oklch(0.7 0.19 22);
-  --destructive-foreground: oklch(0.98 0.01 30);
+  /* Mirror image of the light-mode fix above: in dark mode the "-light"/
+     "-outline" surfaces these sit on are near-black, so the foreground
+     needs to stay bright — but success/info/warning previously went the
+     wrong direction entirely (oklch(0.16 ...), i.e. *dark* text on an
+     already-dark tinted chip), and destructive's near-white + off-hue
+     (H 30 vs the base's H 22) read as washed out. Hue now matches each
+     token's own base color. */
+  --destructive-foreground: oklch(0.82 0.16 22);
 
   --success: oklch(0.7 0.15 155);
-  --success-foreground: oklch(0.16 0.02 155);
+  --success-foreground: oklch(0.8 0.13 155);
 
   --info: oklch(0.68 0.15 230);
-  --info-foreground: oklch(0.16 0.02 230);
+  --info-foreground: oklch(0.78 0.13 230);
 
   --warning: oklch(0.8 0.15 80);
-  --warning-foreground: oklch(0.2 0.05 70);
+  --warning-foreground: oklch(0.85 0.13 80);
 
   --invert: oklch(0.9 0.01 250);
   --invert-foreground: oklch(0.18 0.02 260);

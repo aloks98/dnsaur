@@ -33,10 +33,22 @@ export function useLogin() {
 }
 
 export function useLogout() {
-  const qc = useQueryClient();
   return useMutation({
     mutationFn: () => api.post("/auth/logout"),
-    onSuccess: () => qc.clear(),
+    // A hard reload, not qc.clear()/invalidateQueries(authKeys.me) — this
+    // page mounts more than one useMe() observer (App's own auth gate,
+    // Header's account menu), and cache-clearing/invalidating the shared
+    // `me` query only reliably refreshed *some* of them: verified by hand
+    // (Playwright) that after logout the dashboard kept rendering with
+    // every one of its own queries silently 401ing in the background,
+    // Header's avatar correctly flipping to its logged-out "?" state while
+    // App's own gate never re-rendered at all — until a full page reload.
+    // Logout is rare enough that a reload's cost is a non-issue, and it
+    // sidesteps that cross-observer inconsistency entirely by starting the
+    // whole app fresh against the now-invalidated session.
+    onSuccess: () => {
+      window.location.assign("/");
+    },
   });
 }
 

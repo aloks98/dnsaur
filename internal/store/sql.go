@@ -54,7 +54,12 @@ func (c *clientStore) Groups(ctx context.Context) ([]Group, error) {
 		return nil, err
 	}
 	defer rows.Close()
-	var out []Group
+	// Initialized non-nil (not `var out []Group`) so a zero-row result
+	// marshals to JSON `[]`, not `null` — the API's list endpoints are
+	// documented (and consumed by the dashboard) as always returning an
+	// array. A brand-new instance with no groups yet is the exact case
+	// this matters for.
+	out := []Group{}
 	for rows.Next() {
 		var g Group
 		if err := rows.Scan(&g.ID, &g.Name, &g.Enabled); err != nil {
@@ -71,7 +76,8 @@ func (c *clientStore) Clients(ctx context.Context) ([]Client, error) {
 		return nil, err
 	}
 	defer rows.Close()
-	var out []Client
+	// Non-nil so zero clients marshals to `[]`, not `null` — see Groups above.
+	out := []Client{}
 	for rows.Next() {
 		var cl Client
 		if err := rows.Scan(&cl.ID, &cl.Name, &cl.Matcher, &cl.GroupID); err != nil {
@@ -104,7 +110,10 @@ func (f *filterStore) TouchList(ctx context.Context, id, refreshedAt, entryCount
 
 func (f *filterStore) scanLists(rows *sql.Rows) ([]List, error) {
 	defer rows.Close()
-	var out []List
+	// Non-nil so zero lists marshals to `[]`, not `null` — see Groups above.
+	// Backs both Lists() and ListsForGroup(), the latter of which is
+	// commonly empty (a group with no filter lists assigned yet).
+	out := []List{}
 	for rows.Next() {
 		var l List
 		if err := rows.Scan(&l.ID, &l.URL, &l.Kind, &l.Enabled, &l.LastRefreshed, &l.EntryCount); err != nil {
@@ -138,7 +147,10 @@ func (f *filterStore) Rules(ctx context.Context, groupID int64) ([]Rule, error) 
 		return nil, err
 	}
 	defer rows.Close()
-	var out []Rule
+	// Non-nil so zero rules marshals to `[]`, not `null` — see Groups above.
+	// Every group starts with no rules, so this is the common case, not an
+	// edge case.
+	out := []Rule{}
 	for rows.Next() {
 		var r Rule
 		if err := rows.Scan(&r.ID, &r.GroupID, &r.Action, &r.Pattern, &r.IsRegex); err != nil {
@@ -161,7 +173,9 @@ func (r *recordStore) All(ctx context.Context) ([]LocalRecord, error) {
 		return nil, err
 	}
 	defer rows.Close()
-	var out []LocalRecord
+	// Non-nil so zero records marshals to `[]`, not `null` — see Groups
+	// above. Every fresh instance starts with no local records.
+	out := []LocalRecord{}
 	for rows.Next() {
 		var rec LocalRecord
 		if err := rows.Scan(&rec.ID, &rec.Name, &rec.Type, &rec.Value, &rec.TTL); err != nil {

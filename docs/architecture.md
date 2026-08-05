@@ -6,7 +6,10 @@ for the full design rationale.
 
 dnsaur is a single Go binary. It runs a DNS engine, a storage layer,
 background jobs, and a REST API + auth server on top of the same storage
-layer (see [`docs/api.md`](api.md)). Planned services — DHCP, HA config
+layer (see [`docs/api.md`](api.md)). The web dashboard (`web/`, a React
+SPA) is built separately but embedded into that same binary via
+`//go:embed` and served by the same HTTP server as the API — there is no
+separate frontend process or listener. Planned services — DHCP, HA config
 sync — are additional listeners that feed the same internal packages
 rather than separate processes.
 
@@ -64,11 +67,12 @@ stages are purely additive — no rewiring of existing ones.
 | `internal/qlog` | Async query logging and retention pruning |
 | `internal/stats` | Hourly stats rollups from the query log |
 | `internal/store` | Storage interfaces plus SQLite/Postgres implementations, migrations, settings |
-| `internal/api` | HTTP REST API server + handlers (`/api/v1`: setup, settings, blocking, groups, clients, filters, records, queries, stats, tokens), embedded OpenAPI 3.1 doc |
+| `internal/api` | HTTP REST API server + handlers (`/api/v1`: setup, settings, blocking, groups, clients, filters, records, queries, stats, tokens), embedded OpenAPI 3.1 doc; also mounts the web dashboard's static files (`internal/api.StaticHandler`) on every non-`/api` path when `Deps.Static` is set |
 | `internal/auth` | Auth service: argon2id password hashing, session + scoped (read/write) API tokens, optional TOTP 2FA |
+| `web` | The dashboard's Go-side glue: `//go:embed all:dist` over the React SPA's Vite build output, exposed as `web.Dist() fs.FS` for `internal/app` to hand to `internal/api.Deps.Static`. The actual frontend source (React 19 + TypeScript + Tailwind + TanStack Query, see `web/README.md`) lives under `web/src`, built independently (`pnpm build`) before the Go build embeds its output |
 
 Planned, not yet present: `internal/dhcp` (Phase 2), `internal/sync`
-(Phase 1.5 HA config sync), `web/` (React SPA, embedded via `go:embed`).
+(Phase 1.5 HA config sync).
 
 ## Storage model
 
