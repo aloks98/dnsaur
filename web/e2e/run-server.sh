@@ -13,7 +13,10 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 # Wiping here still guarantees the fresh-instance-per-run the smoke test
 # needs (it starts from the first-run setup wizard, so any leftover admin
 # account would break it).
-work_dir="${TMPDIR:-/tmp}/dnsaur-e2e"
+# Namespaced by uid: /tmp is world-writable and sticky, so an unqualified
+# path already owned by another user would make the rm -rf below fail (and
+# abort the script under `set -e`) on a shared host.
+work_dir="${TMPDIR:-/tmp}/dnsaur-e2e-$(id -u)"
 rm -rf "$work_dir"
 mkdir -p "$work_dir"
 bin="$work_dir/dnsaur-e2e"

@@ -9,6 +9,7 @@ import (
 	"io/fs"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"testing/fstest"
@@ -106,6 +107,34 @@ func TestStaticHandlerGzipsAssets(t *testing.T) {
 	}
 	if !bytes.Equal(w.Body.Bytes(), original) {
 		t.Fatal("identity body differs from original")
+	}
+}
+
+// A HEAD must report the size the equivalent GET would return (RFC 9110
+// §9.3.2). ServeContent writes no body for HEAD, so compressing it left the
+// gzip writer emitting nothing but its own header+trailer — which net/http
+// then measured as Content-Length: 23 for every asset, whatever its size.
+func TestStaticHandlerHeadReportsIdentitySize(t *testing.T) {
+	original := []byte(strings.Repeat("console.log('dnsaur');\n", 500))
+	h := StaticHandler(fstest.MapFS{
+		"index.html":    {Data: []byte("<!doctype html><title>dnsaur</title>")},
+		"assets/app.js": {Data: original},
+	})
+
+	req := httptest.NewRequest("HEAD", "/assets/app.js", nil)
+	req.Header.Set("Accept-Encoding", "gzip, deflate, br")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status: %d", w.Code)
+	}
+	if got := w.Header().Get("Content-Encoding"); got != "" {
+		t.Fatalf("HEAD got Content-Encoding %q, want none", got)
+	}
+	want := strconv.Itoa(len(original))
+	if got := w.Header().Get("Content-Length"); got != want {
+		t.Fatalf("Content-Length = %q, want %q (the identity size)", got, want)
 	}
 }
 

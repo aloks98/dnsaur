@@ -135,8 +135,12 @@ func gzipStatic(next http.Handler) http.Handler {
 		// way, so shared caches must key on it even for identity responses.
 		w.Header().Add("Vary", "Accept-Encoding")
 		// Range requests are byte offsets into the *identity* encoding;
-		// compressing them would return the wrong bytes.
-		if !acceptsGzip(r) || r.Header.Get("Range") != "" {
+		// compressing them would return the wrong bytes. HEAD is excluded
+		// because ServeContent writes no body for it, so the only thing the
+		// gzip writer would emit is its own empty header+trailer — which
+		// net/http then reports as Content-Length: 23, instead of the size
+		// the equivalent GET would return (RFC 9110 §9.3.2).
+		if !acceptsGzip(r) || r.Method == http.MethodHead || r.Header.Get("Range") != "" {
 			next.ServeHTTP(w, r)
 			return
 		}

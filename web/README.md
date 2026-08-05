@@ -54,15 +54,15 @@ about DNS resolution itself, so either run as root, or also set
 | `pnpm build` | Typecheck (`tsc -b`) + production build to `dist/` |
 | `pnpm preview` | Preview the production build locally |
 | `pnpm typecheck` | Typecheck only, no emit |
-| `pnpm lint` | `oxlint src/` |
-| `pnpm format` / `pnpm format:check` | `oxfmt --write` / `--check` on `src/` |
+| `pnpm lint` | `oxlint src e2e *.config.ts` |
+| `pnpm format` / `pnpm format:check` | `oxfmt --write` / `--check` on `src e2e *.config.ts` |
 | `pnpm test` / `pnpm test:watch` | Vitest (component tests), once or in watch mode |
 | `pnpm test:e2e` | Playwright smoke test against the real embedded build — see below |
 
 Before committing, both gates need to pass:
 
 ```sh
-cd web && pnpm test && pnpm oxlint src/ && pnpm format:check && pnpm typecheck && pnpm build
+cd web && pnpm test && pnpm lint && pnpm format:check && pnpm typecheck && pnpm build
 go test -race ./... && ~/go/bin/golangci-lint run ./...
 ```
 
