@@ -57,7 +57,7 @@ func (s *Server) handleGroupCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	id, err := s.deps.Store.Clients().AddGroup(r.Context(), body.Name)
 	if err != nil {
-		storeErr(w, err)
+		storeErrDup(w, err, "a group with that name already exists")
 		return
 	}
 	s.reloadClients(r)
@@ -86,7 +86,7 @@ func (s *Server) handleGroupPatch(w http.ResponseWriter, r *http.Request) {
 	}
 	if body.Name != nil {
 		if err := s.deps.Store.Clients().RenameGroup(r.Context(), id, *body.Name); err != nil {
-			storeErr(w, err)
+			storeErrDup(w, err, "a group with that name already exists")
 			return
 		}
 	}
@@ -139,7 +139,7 @@ func (s *Server) handleClientCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	id, err := s.deps.Store.Clients().AddClient(r.Context(), body)
 	if err != nil {
-		storeErr(w, err)
+		storeErrDup(w, err, "another client already matches "+body.Matcher)
 		return
 	}
 	s.reloadClients(r)
@@ -159,7 +159,7 @@ func (s *Server) handleClientPut(w http.ResponseWriter, r *http.Request) {
 	}
 	body.ID = id
 	if err := s.deps.Store.Clients().UpdateClient(r.Context(), body); err != nil {
-		storeErr(w, err)
+		storeErrDup(w, err, "another client already matches "+body.Matcher)
 		return
 	}
 	s.reloadClients(r)

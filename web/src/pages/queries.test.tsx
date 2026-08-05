@@ -146,7 +146,7 @@ test("applying a decision filter calls GET /queries?decision=blocked and renders
   if (!menu) throw new Error("filter menu did not open");
   fireEvent.click(within(menu as HTMLElement).getByText("Decision"));
 
-  const decisionInput = await screen.findByPlaceholderText(/blocked, allowed, cached/i);
+  const decisionInput = await screen.findByPlaceholderText(/blocked, forwarded, cached/i);
   await user.type(decisionInput, "blocked");
 
   await waitFor(() => expect(urls.at(-1)).toContain("decision=blocked"));
@@ -271,7 +271,7 @@ test("the grid is virtualized: rows far past the scroll window aren't mounted un
   const menu = document.querySelector('[data-slot="dropdown-menu-content"]');
   if (!menu) throw new Error("filter menu did not open");
   fireEvent.click(within(menu as HTMLElement).getByText("Decision"));
-  const decisionInput = await screen.findByPlaceholderText(/blocked, allowed, cached/i);
+  const decisionInput = await screen.findByPlaceholderText(/blocked, forwarded, cached/i);
   fireEvent.change(decisionInput, { target: { value: "blocked" } });
 
   expect(await screen.findByText("host-0.example.com")).toBeInTheDocument();
@@ -307,7 +307,7 @@ test("clearing filters returns to live tail: the stream reopens and live rows re
   const menu = document.querySelector('[data-slot="dropdown-menu-content"]');
   if (!menu) throw new Error("filter menu did not open");
   fireEvent.click(within(menu as HTMLElement).getByText("Decision"));
-  const decisionInput = await screen.findByPlaceholderText(/blocked, allowed, cached/i);
+  const decisionInput = await screen.findByPlaceholderText(/blocked, forwarded, cached/i);
   fireEvent.change(decisionInput, { target: { value: "blocked" } });
 
   expect(await screen.findByText("paged-result.example.com")).toBeInTheDocument();
@@ -485,7 +485,7 @@ test("filtered results page past the first 100 matches instead of stopping there
   const menu = document.querySelector('[data-slot="dropdown-menu-content"]');
   if (!menu) throw new Error("filter menu did not open");
   fireEvent.click(within(menu as HTMLElement).getByText("Decision"));
-  const decisionInput = await screen.findByPlaceholderText(/blocked, allowed, cached/i);
+  const decisionInput = await screen.findByPlaceholderText(/blocked, forwarded, cached/i);
   fireEvent.change(decisionInput, { target: { value: "blocked" } });
 
   expect(await screen.findByText("hit-0.example.com")).toBeInTheDocument();
@@ -532,7 +532,7 @@ test("rows re-returned by an offset shift render once, not twice", async () => {
   const menu = document.querySelector('[data-slot="dropdown-menu-content"]');
   if (!menu) throw new Error("filter menu did not open");
   fireEvent.click(within(menu as HTMLElement).getByText("Decision"));
-  const decisionInput = await screen.findByPlaceholderText(/blocked, allowed, cached/i);
+  const decisionInput = await screen.findByPlaceholderText(/blocked, forwarded, cached/i);
   fireEvent.change(decisionInput, { target: { value: "blocked" } });
 
   expect(await screen.findByText("hit-0.example.com")).toBeInTheDocument();

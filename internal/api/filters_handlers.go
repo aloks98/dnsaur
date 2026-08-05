@@ -63,7 +63,7 @@ func (s *Server) handleListCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	id, err := s.deps.Store.Filters().AddList(r.Context(), store.List{URL: body.URL, Kind: body.Kind, Enabled: true})
 	if err != nil {
-		storeErr(w, err)
+		storeErrDup(w, err, "that list URL is already subscribed")
 		return
 	}
 	// Unlike the other list/rule mutations (cheap metadata ops refreshed

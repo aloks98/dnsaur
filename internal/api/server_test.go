@@ -242,6 +242,11 @@ func TestStoreErr(t *testing.T) {
 	}{
 		{"not found", store.ErrNotFound, http.StatusNotFound, "not found"},
 		{"in use", store.ErrInUse, http.StatusConflict, "resource in use"},
+		{"duplicate", store.ErrDuplicate, http.StatusConflict, "already exists"},
+		// A uniqueness violation arrives joined with the driver error, so
+		// the mapping has to survive wrapping — matching on the sentinel,
+		// not on the error string.
+		{"duplicate wrapped", errors.Join(store.ErrDuplicate, errors.New("UNIQUE constraint failed: groups.name")), http.StatusConflict, "already exists"},
 		{"other", errors.New("boom"), http.StatusServiceUnavailable, "storage unavailable"},
 	}
 	for _, tc := range cases {

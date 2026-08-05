@@ -542,7 +542,13 @@ function WhyContent({
 // --- filters -----------------------------------------------------------
 
 const FILTER_FIELDS: FilterFieldConfig<string>[] = [
-  { key: "decision", label: "Decision", type: "text", placeholder: "blocked, allowed, cached…" },
+  // Deliberately not "allowed": DecisionAllowed exists in the Go enum
+  // (internal/dnssrv/pipeline.go) but is never assigned — an allow rule only
+  // *skips* blocking, so the row is logged with whatever the downstream stage
+  // produced. Offering it here advertised a filter that always returns zero
+  // rows. These four are the decisions the resolver actually writes, plus
+  // "local" and "error".
+  { key: "decision", label: "Decision", type: "text", placeholder: "blocked, forwarded, cached…" },
   { key: "type", label: "Record type", type: "text", placeholder: "A, AAAA, CNAME…" },
   { key: "client", label: "Client IP", type: "text", placeholder: "192.168.1.10" },
 ];

@@ -237,8 +237,10 @@ Path ids must parse as int64 **and be > 0**, else 400 `bad id`. So `0`, `-1`,
 | 400 | `name cannot be empty` | PATCH with `"name": ""` |
 | 400 | `matcher must be an IP or CIDR and group_id set` | clients: **one string covers decode failure, bad matcher and bad group_id** |
 | 409 | `resource in use` | deleting group id 1, or a group with clients attached |
+| 409 | `a group with that name already exists` | duplicate name on create **or** rename |
+| 409 | `another client already matches <matcher>` | duplicate client matcher on create or update |
 | 404 | `not found` | |
-| 503 | `storage unavailable` | **including a duplicate name or matcher** — see §10 |
+| 503 | `storage unavailable` | genuine storage failures only |
 
 ---
 
@@ -269,6 +271,7 @@ Path ids must parse as int64 **and be > 0**, else 400 `bad id`. So `0`, `-1`,
 
 | Status | Error string |
 |---|---|
+| 409 | `that list URL is already subscribed` |
 | 400 | `url must be http(s)` |
 | 400 | `kind must be block or allow` |
 | 400 | `enabled required` (also the decode-failure message for PATCH) |
@@ -512,9 +515,9 @@ another user's token *and* any underlying storage failure.
 | `allowed` | **TODO — defined but never written.** No code path assigns it. An allow rule only *skips* blocking, so the row is logged with whatever the downstream stage produced. |
 
 > Verified live: filtering by each value returns `blocked` 2, `forwarded` 10,
-> `local` 2, and **`allowed` 0**. The query-log filter placeholder currently
-> reads `"blocked, allowed, cached…"` (`web/src/pages/queries.tsx:545`),
-> advertising a value that can never match — see §10.
+> `local` 2, and **`allowed` 0**. The query-log filter placeholder used to read
+> `"blocked, allowed, cached…"`, advertising a value that can never match; it
+> now reads `"blocked, forwarded, cached…"`.
 
 ### 3.2 Filter list
 
@@ -973,17 +976,20 @@ Collected because each one has already caused, or would cause, a wrong UI.
 These are places where the shipped `openapi.yaml`, or the UI, disagrees with the
 Go source. **The code is the source of truth.**
 
-1. **Unique-constraint violations return 503 `storage unavailable`, not 409.**
-   `storeErr` maps only `ErrNotFound` → 404 and `ErrInUse` → 409; everything
-   else falls to the default branch (`internal/api/server.go:135-144`).
-   Verified live: a duplicate group name, duplicate client matcher and duplicate
-   list URL all return **503 `storage unavailable`**. A user renaming a group to
-   an existing name is told storage is broken. *(Bug — worth fixing.)*
-2. **The query-log decision filter advertises `allowed`** in its placeholder
-   (`"blocked, allowed, cached…"`, `web/src/pages/queries.tsx:545`) but the
-   resolver never writes that value. *(Bug — cosmetic but always-empty.)*
+1. ~~Unique-constraint violations return 503 `storage unavailable`, not 409.~~
+   **Fixed.** `storeErr` mapped only `ErrNotFound` → 404 and `ErrInUse` → 409,
+   so every uniqueness violation fell to the default 503 branch — telling a
+   user who reused a group name that storage was broken. There is now a
+   `store.ErrDuplicate` sentinel, raised from the driver's typed error
+   (sqlite result codes `2067`/`1555`, postgres SQLSTATE `23505`) at the two
+   chokepoints every write passes through, and mapped to **409** with a
+   message naming the collision.
+2. ~~The query-log decision filter advertises `allowed`.~~ **Fixed** — the
+   placeholder no longer offers a value the resolver never writes. The
+   `allowed` enum member itself still exists unused in the Go source; see §3.1.
 3. `openapi.yaml` omits **503 `storage unavailable`** on most operations that
-   can return it, and omits it entirely from `POST /setup`.
+   can return it, and omits it entirely from `POST /setup`. It also does not
+   document the new **409** duplicate responses.
 4. `openapi.yaml` marks `group_id` **required** on `DELETE /blocking/pause`;
    the code makes it optional, defaulting to 0 (the global pause).
 5. `openapi.yaml` marks `group_id` required on `POST /blocking/pause`; only

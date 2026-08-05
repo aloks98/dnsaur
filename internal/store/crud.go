@@ -10,7 +10,7 @@ import (
 func (s *sqlStore) execOne(ctx context.Context, q string, args ...any) error {
 	res, err := s.db.ExecContext(ctx, s.q(q), args...)
 	if err != nil {
-		return err
+		return wrapDBErr(err)
 	}
 	n, err := res.RowsAffected()
 	if err != nil {

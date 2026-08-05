@@ -203,3 +203,45 @@ func TestEmptyListsMarshalAsJSONArrayNotNull(t *testing.T) {
 		mustMarshalArray(t, records)
 	})
 }
+
+// A uniqueness violation must surface as ErrDuplicate, not as a raw driver
+// error. The API maps the sentinel to 409; without it a duplicate name was
+// answered with 503 "storage unavailable", i.e. user input error reported as
+// infrastructure failure. Runs on both drivers because the detection differs:
+// sqlite result codes vs postgres SQLSTATE 23505.
+func TestDuplicateSurfacesAsErrDuplicate(t *testing.T) {
+	forEachDriver(t, func(t *testing.T, s Store) {
+		ctx := context.Background()
+		c := s.Clients()
+
+		name := testGroupName("dup")
+		if _, err := c.AddGroup(ctx, name); err != nil {
+			t.Fatalf("first AddGroup: %v", err)
+		}
+		if _, err := c.AddGroup(ctx, name); !errors.Is(err, ErrDuplicate) {
+			t.Fatalf("duplicate group name: err = %v, want ErrDuplicate", err)
+		}
+
+		gid, err := c.AddGroup(ctx, testGroupName("dup2"))
+		if err != nil {
+			t.Fatalf("AddGroup: %v", err)
+		}
+		matcher := "10.77.0." + testGroupName("")[len(testGroupName(""))-2:]
+		if _, err := c.AddClient(ctx, Client{Name: "a", Matcher: matcher, GroupID: gid}); err != nil {
+			t.Fatalf("first AddClient: %v", err)
+		}
+		if _, err := c.AddClient(ctx, Client{Name: "b", Matcher: matcher, GroupID: gid}); !errors.Is(err, ErrDuplicate) {
+			t.Fatalf("duplicate matcher: err = %v, want ErrDuplicate", err)
+		}
+
+		// Renames go through execOne, not insert — cover that path too.
+		if err := c.RenameGroup(ctx, gid, name); !errors.Is(err, ErrDuplicate) {
+			t.Fatalf("rename onto an existing name: err = %v, want ErrDuplicate", err)
+		}
+
+		// A genuine miss must still be ErrNotFound, not ErrDuplicate.
+		if err := c.RenameGroup(ctx, 99999, testGroupName("nobody")); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("rename missing group: err = %v, want ErrNotFound", err)
+		}
+	})
+}

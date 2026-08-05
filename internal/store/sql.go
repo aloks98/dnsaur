@@ -29,11 +29,11 @@ func (s *sqlStore) insert(ctx context.Context, q string, args ...any) (int64, er
 	if s.dialect == "postgres" {
 		var id int64
 		err := s.db.QueryRowContext(ctx, s.q(q+" RETURNING id"), args...).Scan(&id)
-		return id, err
+		return id, wrapDBErr(err)
 	}
 	res, err := s.db.ExecContext(ctx, s.q(q), args...)
 	if err != nil {
-		return 0, err
+		return 0, wrapDBErr(err)
 	}
 	return res.LastInsertId()
 }

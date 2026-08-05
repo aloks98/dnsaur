@@ -14,6 +14,13 @@ import (
 var (
 	ErrInUse    = errors.New("resource in use")
 	ErrNotFound = errors.New("not found")
+	// ErrDuplicate is a uniqueness violation — a group name, client matcher
+	// or list URL that already exists. It is user input error, so it must
+	// not be lumped in with genuine storage failures: without it the API
+	// answered "storage unavailable" (503) to someone who simply reused a
+	// name. Unique columns today: groups.name, clients.matcher, lists.url,
+	// users.username, auth_tokens.token_hash.
+	ErrDuplicate = errors.New("already exists")
 )
 
 // User represents an authenticated user.
