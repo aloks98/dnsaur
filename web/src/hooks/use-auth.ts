@@ -7,6 +7,11 @@ export const authKeys = {
   setup: ["setup"] as const,
 };
 
+/** `me`/`setup` drive the auth gate itself — everything else is session data. */
+export function isSessionData(queryKey: readonly unknown[]): boolean {
+  return queryKey[0] !== authKeys.me[0] && queryKey[0] !== authKeys.setup[0];
+}
+
 export function useMe() {
   return useQuery({
     queryKey: authKeys.me,
@@ -17,7 +22,18 @@ export function useMe() {
     // exactly when the session is most likely to have expired, and the auth
     // gate should notice before the user starts clicking. A 401 from any
     // other query revalidates this one too — see lib/query-client.ts.
-    refetchOnWindowFocus: true,
+    //
+    // Only ever revalidate a session that actually exists. query-core sets
+    // status back to "pending" on any refetch where data is undefined, which
+    // is precisely the unauthenticated state — so an unconditional `true`
+    // makes a plain tab-switch flip App's gate to its full-page spinner and
+    // unmount whatever is on screen. On Login that discards the typed
+    // credentials and the TOTP step; mid-setup it is worse, because step 1
+    // has already established a session, so the refetch *succeeds* and swaps
+    // the wizard for the dashboard with no blocklists or upstreams applied.
+    // Scoped this way there is no flicker at all: once `me` has succeeded,
+    // data is defined and the refetch stays "success" throughout.
+    refetchOnWindowFocus: (query) => query.state.status === "success",
   });
 }
 
@@ -34,7 +50,16 @@ export function useLogin() {
   return useMutation({
     mutationFn: (v: { username: string; password: string; totp_code?: string }) =>
       api.post("/auth/login", v),
-    onSuccess: () => qc.invalidateQueries({ queryKey: authKeys.me }),
+    // Drop the previous session's cached data before revalidating `me`.
+    // lib/query-client.ts does this too, but only on the path where some
+    // *other* query's 401 is what noticed the session died — when `me`'s own
+    // focus refetch is the first to notice, that path never fires, and the
+    // next sign-in would briefly render the last session's stats/clients/
+    // tokens from cache (gcTime 5m) before revalidating.
+    onSuccess: () => {
+      qc.removeQueries({ predicate: (query) => isSessionData(query.queryKey) });
+      return qc.invalidateQueries({ queryKey: authKeys.me });
+    },
   });
 }
 

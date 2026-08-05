@@ -1,8 +1,9 @@
-import { http, HttpResponse } from "msw";
+import { delay, http, HttpResponse } from "msw";
 import { afterEach, expect, test, vi } from "vitest";
 import { screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { Route, Routes } from "react-router";
+import { focusManager } from "@tanstack/react-query";
 import { server } from "./test/msw-server";
 import { renderWithProviders } from "./test/render";
 import { AppShell } from "./components/app-shell";
@@ -116,4 +117,36 @@ test("api unreachable (both auth/me and setup fail) shows the unreachable banner
   await waitFor(() => expect(screen.getByText(/can't reach/i)).toBeInTheDocument());
   expect(screen.queryByRole("link", { name: /query log/i })).not.toBeInTheDocument();
   expect(screen.queryByLabelText(/password/i)).not.toBeInTheDocument();
+});
+
+test("refocusing the tab on the login screen keeps the form (no gate flicker)", async () => {
+  // jsdom never fires visibilitychange, so drive query-core's focusManager
+  // directly — the same entry point the browser listener calls.
+  //
+  // The second /auth/me is deliberately slow: query-core flips an errored,
+  // data-less query back to `pending` while it refetches, but if the retry
+  // rejects instantly React batches pending+error into one commit and the
+  // spinner never renders, which would make this test pass either way.
+  let meCalls = 0;
+  server.use(
+    http.get("/api/v1/auth/me", async () => {
+      meCalls += 1;
+      if (meCalls > 1) await delay(40);
+      return unauthorized();
+    }),
+    http.get("/api/v1/setup", () => HttpResponse.json({ setup_required: false })),
+  );
+  renderWithProviders(<App />);
+
+  const password = await screen.findByLabelText(/password/i);
+  await userEvent.type(password, "hunter2");
+
+  focusManager.setFocused(false);
+  focusManager.setFocused(true);
+
+  // `me` has never succeeded, so refetching it on focus would flip the gate
+  // to its full-page spinner, unmount Login, and discard everything typed.
+  await new Promise((resolve) => setTimeout(resolve, 120));
+  expect(meCalls).toBe(1);
+  expect(screen.getByLabelText(/password/i)).toHaveValue("hunter2");
 });

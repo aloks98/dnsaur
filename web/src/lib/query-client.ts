@@ -1,14 +1,9 @@
 import { MutationCache, QueryCache, QueryClient } from "@tanstack/react-query";
 import { ApiError } from "../api/client";
-import { authKeys } from "../hooks/use-auth";
+import { authKeys, isSessionData } from "../hooks/use-auth";
 
 function isUnauthorized(error: unknown): boolean {
   return error instanceof ApiError && error.status === 401;
-}
-
-/** `me`/`setup` drive the auth gate itself — everything else is session data. */
-function isSessionData(queryKey: readonly unknown[]): boolean {
-  return queryKey[0] !== authKeys.me[0] && queryKey[0] !== authKeys.setup[0];
 }
 
 /**
