@@ -91,6 +91,7 @@ now, building from source is the only supported install path.
 - [`docs/architecture.md`](docs/architecture.md) — middleware pipeline, package map, storage model
 - [`docs/configuration.md`](docs/configuration.md) — bootstrap YAML/env vars and DB-managed settings
 - [`docs/api.md`](docs/api.md) — REST API (auth, endpoints, examples)
+- [`docs/ui-contract.md`](docs/ui-contract.md) — what the API and dashboard actually do today: every endpoint, field, enum and error string, with what's still unbuilt
 - [`docs/development.md`](docs/development.md) — build, test, lint, CI, contributing
 - [`web/README.md`](web/README.md) — dashboard dev workflow, scripts, Playwright smoke test
 
