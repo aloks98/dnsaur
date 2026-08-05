@@ -54,35 +54,37 @@
 /*
  * The design's type, tracking and density scale.
  *
- * These exist so screens never spell a raw px value. The Claude Design
- * source is a fixed 1240x844 artboard viewed scaled-up, so its literal
- * sizes (9px labels, 30px stat numerals, line-height 1 throughout) are
- * correct *for that artboard* but read cramped at 1:1 in a real browser —
- * and worse on a 2560px display. The steps below keep the design's
- * proportions and its uppercase-mono voice while sizing for actual
- * viewports, and give every step a real line-height instead of a flat 1.
+ * These exist so screens never spell a raw px value.
+ *
+ * The sizes are the Claude Design artboard's own, verbatim. They were
+ * briefly scaled up (10/11/12/13/17/40) on the theory that a fixed
+ * 1240x844 artboard viewed zoomed would read cramped at 1:1 — checked
+ * against the running UI, it read oversized instead, so this is back on
+ * the design's numbers. The one thing not taken from the artboard is
+ * line-height: it specifies a flat `1` everywhere, which crowds the
+ * multi-line cells, so each step carries a real one.
  *
  * Retuning the whole UI's density is a change to this block, not a sweep
  * through components. `--text-stat` alone drives the four KPI numerals.
  */
 @theme inline {
   /* Column headers, KPI labels, chart axes — always uppercase + tracked. */
-  --text-micro: 10px;
+  --text-micro: 9px;
   --text-micro--line-height: 1.2;
   /* Section and panel titles, nav tabs. */
-  --text-label: 11px;
+  --text-label: 10px;
   --text-label--line-height: 1.2;
   /* Top-nav groups and status readouts. */
-  --text-nav: 12px;
+  --text-nav: 11px;
   --text-nav--line-height: 1;
   /* Every table cell: timestamps, domains, IPs, decisions, durations. */
-  --text-data: 13px;
-  --text-data--line-height: 1.35;
+  --text-data: 11.5px;
+  --text-data--line-height: 1.3;
   /* The inspector's subject line. */
-  --text-lede: 17px;
+  --text-lede: 15px;
   --text-lede--line-height: 1.25;
   /* The four KPI numerals. */
-  --text-stat: 40px;
+  --text-stat: 30px;
   --text-stat--line-height: 1.05;
 
   /* Uppercase mono needs air; these are the only tracking values used. */
@@ -91,14 +93,28 @@
   --tracking-status: 0.06em;
   --tracking-tight: -0.02em;
 
-  /* Density. Chrome row heights grew with the type scale (the design's
-     42/38 assumed 11/10.5px text). Cell padding is the design's. */
-  --spacing-row-nav: 44px;
-  --spacing-row-tabs: 40px;
+  /* Density — the design's own values throughout. */
+  --spacing-row-nav: 42px;
+  --spacing-row-tabs: 38px;
   --spacing-cell-x: 18px;
   --spacing-cell-y: 13px;
   --spacing-panel-x: 14px;
   --spacing-panel-y: 7px;
+  /* The top bar's own gutter (components/top-nav.tsx, pause-control.tsx):
+     narrower than a data cell's 18px, because a chrome cell carries one
+     short uppercase word inside a 42px row. */
+  --spacing-chrome-x: 15px;
+  /* The dashboard's right-hand rail (TOP BLOCKED + TOP CLIENTS) — the
+     fixed half of the bottom split's `1fr / rail`. */
+  --spacing-rail: 340px;
+  /* Plot height of the query-volume chart. Lives here rather than as a
+     number prop so the chart resizes with the scale like everything else:
+     the BarChart is given height="100%" inside an `h-chart` box. */
+  --spacing-chart: 260px;
+
+  /* The 2px underline marking the active nav group / tab / window cell.
+     A box-shadow, not a border, so it doesn't move the cell's text. */
+  --shadow-nav-active: inset 0 -2px 0 var(--primary);
 }
 
 /*
