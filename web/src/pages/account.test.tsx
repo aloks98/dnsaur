@@ -1,12 +1,52 @@
 import { delay, http, HttpResponse } from "msw";
 import { toast } from "sonner";
 import { expect, test, vi } from "vitest";
-import { screen, waitFor, within } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { QueryClientProvider, type QueryClient } from "@tanstack/react-query";
+import type { ReactElement } from "react";
 import { server } from "../test/msw-server";
 import { renderWithProviders } from "../test/render";
+import { makeQueryClient } from "../lib/query-client";
 import type { ApiToken, MeResponse } from "../api/types";
 import { Account } from "./account";
+
+const TOTP_SECRET = "JBSWY3DPEHPK3PXP";
+
+/**
+ * renderWithProviders() owns its QueryClient privately; this variant hands
+ * it back, because "the secret is no longer rendered" and "the secret is
+ * gone" are different claims and only the second one is the fix. A
+ * useMutation keeps both its `.data` and the `variables` it was called with
+ * until an explicit reset(), so the only way to prove the reset happened is
+ * to read the mutation cache.
+ *
+ * `mutations.gcTime: 0` is not the production value. It only shortens the
+ * window between "this mutation has no observers left" (which is exactly
+ * what reset() produces) and query-core evicting it, from five minutes to
+ * the next tick, so the assertion is observable inside a test. Without the
+ * reset the dialog's observer stays subscribed for the whole page session,
+ * nothing becomes collectable, and the assertion fails — which is the
+ * regression this guards.
+ */
+function renderWithQueryClient(ui: ReactElement): { client: QueryClient } {
+  const client = makeQueryClient();
+  const defaults = client.getDefaultOptions();
+  client.setDefaultOptions({ ...defaults, mutations: { ...defaults.mutations, gcTime: 0 } });
+  render(<QueryClientProvider client={client}>{ui}</QueryClientProvider>);
+  return { client };
+}
+
+/** Every value any mutation on the page is still holding onto — results and
+ * the variables they were called with alike. */
+function mutationStateJson(client: QueryClient): string {
+  return JSON.stringify(
+    client
+      .getMutationCache()
+      .getAll()
+      .map((m) => ({ variables: m.state.variables, data: m.state.data })),
+  );
+}
 
 function mockMe(overrides: Partial<MeResponse> = {}) {
   const me: MeResponse = { id: 1, username: "admin", totp_enabled: false, ...overrides };
@@ -168,7 +208,51 @@ test("TOTP enable: dismissing without confirming clears the setup key and QR fro
   expect(screen.getByRole("button", { name: /^enable 2fa$/i })).toBeInTheDocument();
 });
 
-test("TOTP disable: a valid code disables 2FA and me refetches", async () => {
+// The leak the DOM assertions above can't see. TotpEnableDialog is rendered
+// unconditionally by TotpCard, so it never unmounts — and `mutate({ secret,
+// code })` parks the shared secret in the confirm mutation's `variables`,
+// which query-core carries through the "success" action untouched. Before
+// TotpCard owned (and reset) that mutation, the live shared secret stayed
+// readable via getMutationCache() and React DevTools for the rest of the
+// page session, right after enrollment succeeded.
+test("TOTP enable: the shared secret is gone from mutation state once enrollment finishes", async () => {
+  const user = userEvent.setup();
+  let totpEnabled = false;
+  server.use(
+    http.get("/api/v1/auth/me", () =>
+      HttpResponse.json({ id: 1, username: "admin", totp_enabled: totpEnabled }),
+    ),
+    http.post("/api/v1/auth/totp/start", () =>
+      HttpResponse.json({
+        secret: TOTP_SECRET,
+        otpauth_url: `otpauth://totp/dnsaur:admin?secret=${TOTP_SECRET}&issuer=dnsaur`,
+      }),
+    ),
+    http.post("/api/v1/auth/totp/confirm", () => {
+      totpEnabled = true;
+      return new HttpResponse(null, { status: 204 });
+    }),
+  );
+  mockTokens([]);
+
+  const { client } = renderWithQueryClient(<Account />);
+  await screen.findByText("Two-factor authentication");
+
+  await user.click(screen.getByRole("button", { name: /^enable 2fa$/i }));
+  const dialog = await screen.findByRole("dialog");
+  // Sanity check: while the flow is open the secret genuinely is in
+  // mutation state, so the assertion below is testing something.
+  expect(mutationStateJson(client)).toContain(TOTP_SECRET);
+
+  await user.type(within(dialog).getByLabelText(/verification code/i), "123456");
+  await user.click(within(dialog).getByRole("button", { name: /^confirm$/i }));
+
+  await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+  await waitFor(() => expect(mutationStateJson(client)).not.toContain(TOTP_SECRET));
+  expect(screen.queryByText(TOTP_SECRET)).not.toBeInTheDocument();
+});
+
+test("TOTP disable: a valid code disables 2FA, me refetches, and the code doesn't linger", async () => {
   const user = userEvent.setup();
   let totpEnabled = true;
   let disableBody: unknown;
@@ -184,7 +268,7 @@ test("TOTP disable: a valid code disables 2FA and me refetches", async () => {
   );
   mockTokens([]);
 
-  renderWithProviders(<Account />);
+  const { client } = renderWithQueryClient(<Account />);
   await screen.findByText("Two-factor authentication");
   await user.click(screen.getByRole("button", { name: /^disable 2fa$/i }));
 
@@ -195,6 +279,9 @@ test("TOTP disable: a valid code disables 2FA and me refetches", async () => {
   await waitFor(() => expect(disableBody).toEqual({ code: "654321" }));
   await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
   expect(await screen.findByRole("button", { name: /^enable 2fa$/i })).toBeInTheDocument();
+  // Lower stakes than the shared secret (single-use, time-limited) but the
+  // same lingering-variables leak, closed the same way.
+  await waitFor(() => expect(mutationStateJson(client)).not.toContain("654321"));
 });
 
 test("TOTP disable: an invalid code shows an inline error and keeps the dialog open", async () => {

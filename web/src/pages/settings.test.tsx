@@ -1,7 +1,7 @@
 import { delay, http, HttpResponse } from "msw";
 import { toast } from "sonner";
 import { expect, test, vi } from "vitest";
-import { screen, waitFor } from "@testing-library/react";
+import { screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { server } from "../test/msw-server";
 import { renderWithProviders } from "../test/render";
@@ -147,14 +147,71 @@ test("changing one field PUTs only that key and toasts success", async () => {
   await waitFor(() => expect(successSpy).toHaveBeenCalledWith("1 setting updated"));
 });
 
-// Required test (c): restart-required fields show the label.
+// The FormItem wrapping one labelled field — the badge, label, control,
+// description and message for that setting and nothing else. Asserting
+// inside it is what makes the restart-required test below about the
+// *mapping* rather than about a count: an admin told a field hot-reloads
+// when it doesn't (or vice versa) is the actual operational bug, and a
+// bare `toHaveLength(5)` stays green if the badge moves between fields.
+function fieldItem(label: string): HTMLElement {
+  const item = screen.getByText(label).closest('[data-slot="form-item"]');
+  if (!(item instanceof HTMLElement)) throw new Error(`no FormItem found for "${label}"`);
+  return item;
+}
+
+// Required test (c): restart-required fields show the label — and only
+// those fields do. The labelling is verified against internal/app/app.go:
+// applySettings re-reads blocking.*, upstreams, upstream.strategy,
+// qlog.privacy, clients and records on every settings write, while cache.*
+// is read once when Start() builds the cache and lists.refresh_hours once
+// when the refresh ticker is scheduled.
 test("cache.* and lists.refresh_hours show a Restart required label; nothing else does", async () => {
   mockSettings(fullSettings());
 
   renderWithProviders(<SettingsPage />);
   await screen.findByText("Upstreams");
 
-  expect(screen.getAllByText(/restart required/i)).toHaveLength(5);
+  const needsRestart = [
+    "Minimum cache TTL (seconds)",
+    "Maximum cache TTL (seconds)",
+    "Maximum cache entries",
+    "Serve stale for (seconds)",
+    "Refresh interval (hours)",
+  ];
+  const hotReloads = [
+    "Upstream resolvers",
+    "Upstream strategy",
+    "Blocking mode",
+    "Blocked response TTL (seconds)",
+    "Query log privacy",
+    "Retention (days)",
+  ];
+
+  for (const label of needsRestart) {
+    expect(within(fieldItem(label)).getByText(/restart required/i)).toBeInTheDocument();
+  }
+  for (const label of hotReloads) {
+    expect(within(fieldItem(label)).queryByText(/restart required/i)).not.toBeInTheDocument();
+  }
+  // Belt and braces: no *other* field grew one either.
+  expect(screen.getAllByText(/restart required/i)).toHaveLength(needsRestart.length);
+});
+
+// The upstream strategy description used to claim "Only Race is
+// implemented today". internal/upstream/forwarder.go implements all three
+// (race, failover, and fastest, the last sorting by EWMA latency), and
+// internal/app/app.go's applySettings rebuilds the forwarder with the new
+// strategy on every settings write — so the caveat was doubly wrong. UI
+// copy that talks an admin out of a working feature is worth pinning.
+test("the upstream strategy field doesn't claim the other strategies are unimplemented", async () => {
+  mockSettings(fullSettings());
+
+  renderWithProviders(<SettingsPage />);
+  await screen.findByText("Upstreams");
+
+  const item = fieldItem("Upstream strategy");
+  expect(within(item).queryByText(/only race/i)).not.toBeInTheDocument();
+  expect(within(item).queryByText(/not implemented|unimplemented/i)).not.toBeInTheDocument();
 });
 
 // Extra coverage: the same nonNegInt allowlist rule applies to every
@@ -212,4 +269,64 @@ test("a rejected PUT surfaces the server's error as a toast and keeps the field 
     ),
   );
   expect(ttlInput).toHaveValue(999999999999);
+});
+
+// The worst case of the "isError swaps out already-loaded content" family,
+// and the reason this page's guard is `data === undefined` rather than
+// `isError`. Every successful PUT invalidates the settings query, which
+// refetches immediately; query-core sets status:"error" if that refetch
+// fails even though `data` is still there. Gating the form on isSuccess
+// would unmount SettingsForm at exactly that moment — taking
+// react-hook-form's state and defaultsRef with it — and a partial save is
+// precisely when the admin still has an unsaved value in the box.
+test("a failing background refetch after a partial save keeps the form and its dirty value", async () => {
+  const user = userEvent.setup();
+  let getCount = 0;
+  server.use(
+    // First load succeeds; every refetch afterwards 500s.
+    http.get("/api/v1/settings", () => {
+      getCount += 1;
+      return getCount === 1
+        ? HttpResponse.json(fullSettings())
+        : HttpResponse.json({ error: "boom" }, { status: 500 });
+    }),
+    // blocking.ttl saves; upstreams is rejected, so it stays dirty.
+    http.put("/api/v1/settings", async ({ request }) => {
+      const body = (await request.json()) as { key: string };
+      return body.key === "upstreams"
+        ? HttpResponse.json({ error: "nope" }, { status: 400 })
+        : new HttpResponse(null, { status: 204 });
+    }),
+  );
+  const errorSpy = vi.spyOn(toast, "error");
+
+  renderWithProviders(<SettingsPage />);
+  await screen.findByText("Upstreams");
+
+  const upstreamsInput = screen.getByLabelText(/^upstream resolvers$/i);
+  await user.clear(upstreamsInput);
+  await user.type(upstreamsInput, "8.8.8.8:53");
+  const ttlInput = screen.getByLabelText(/^blocked response ttl/i);
+  await user.clear(ttlInput);
+  await user.type(ttlInput, "45");
+
+  await user.click(screen.getAllByRole("button", { name: /^save changes$/i })[0]);
+
+  await waitFor(() =>
+    expect(errorSpy).toHaveBeenCalledWith(expect.stringMatching(/couldn't save upstreams/i)),
+  );
+
+  // The refetch the successful PUT triggered has now failed (retry: 1, then
+  // error). The form must still be here, with the rejected value intact and
+  // still dirty — and the destructive "couldn't load settings" card, which
+  // would have replaced it, must not be.
+  await screen.findByText(/couldn't refresh settings/i, undefined, { timeout: 3000 });
+  expect(screen.queryByText(/couldn't load settings/i)).not.toBeInTheDocument();
+  expect(screen.getByLabelText(/^upstream resolvers$/i)).toHaveValue("8.8.8.8:53");
+  // One per SaveBar (top and bottom).
+  expect(screen.getAllByText(/you have unsaved changes/i)).toHaveLength(2);
+  expect(screen.getAllByRole("button", { name: /^save changes$/i })[0]).toBeEnabled();
+  // The value that *did* save moved its baseline, so it's no longer dirty
+  // but still shows what the admin typed.
+  expect(screen.getByLabelText(/^blocked response ttl/i)).toHaveValue(45);
 });

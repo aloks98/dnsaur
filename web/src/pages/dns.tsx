@@ -424,6 +424,34 @@ function RecordFormSheet({
   );
 }
 
+// --- background-refetch failure -------------------------------------------
+
+/**
+ * A *background* refetch failed while data from an earlier successful fetch
+ * is still in hand. Every mutation here invalidates the records query, which
+ * refetches immediately; query-core flips `status` to "error" if that
+ * refetch fails, even though `data` is intact — so gating the destructive
+ * "couldn't load" Alert on `isError` alone would swap a populated, still
+ * correct table for an error card right after a successful save
+ * (refetchOnReconnect, on by default, is a second trigger). The destructive
+ * Alert is reserved for `isError && data === undefined` — genuinely nothing
+ * to show — and this quiet banner covers the rest, above the table.
+ */
+function StaleDataAlert({ onRetry, isRetrying }: { onRetry: () => void; isRetrying: boolean }) {
+  return (
+    <Alert variant="warning">
+      <TriangleAlert />
+      <AlertTitle>Couldn&apos;t refresh local DNS records</AlertTitle>
+      <AlertDescription>
+        <p>Showing what last loaded successfully.</p>
+        <Button type="button" variant="outline" size="sm" onClick={onRetry} disabled={isRetrying}>
+          {isRetrying ? "Retrying…" : "Try again"}
+        </Button>
+      </AlertDescription>
+    </Alert>
+  );
+}
+
 // --- table -----------------------------------------------------------------
 
 function RecordsTable({
@@ -505,8 +533,21 @@ export function LocalDns() {
   const deleteRecord = useDeleteRecord();
 
   const [addOpen, setAddOpen] = useState(false);
+  // Open state is deliberately separate from the target rather than derived
+  // from `editTarget !== null`: the sheet stays mounted through base-ui's
+  // exit transition, so nulling the target on close would re-render the
+  // still-visible panel as the *add* variant — retitling "Edit record" to
+  // "Add record" and "Save" to "Add record" on the way out, including
+  // straight after a successful save. The target is replaced on the next
+  // open instead of cleared on close.
   const [editTarget, setEditTarget] = useState<LocalRecord | null>(null);
+  const [editOpen, setEditOpen] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<LocalRecord | null>(null);
+
+  function onEditRequest(record: LocalRecord) {
+    setEditTarget(record);
+    setEditOpen(true);
+  }
 
   function onConfirmDelete() {
     if (!deleteTarget) return;
@@ -520,7 +561,7 @@ export function LocalDns() {
     });
   }
 
-  const isEmpty = records.isSuccess && records.data.length === 0;
+  const isEmpty = records.data?.length === 0;
 
   let body: ReactNode;
   if (records.isPending) {
@@ -531,7 +572,7 @@ export function LocalDns() {
         ))}
       </div>
     );
-  } else if (records.isError) {
+  } else if (records.data === undefined) {
     body = (
       <Alert variant="destructive">
         <TriangleAlert />
@@ -557,7 +598,7 @@ export function LocalDns() {
     body = (
       <RecordsTable
         records={records.data}
-        onEdit={setEditTarget}
+        onEdit={onEditRequest}
         onDeleteRequest={setDeleteTarget}
       />
     );
@@ -579,7 +620,7 @@ export function LocalDns() {
       <div className="flex flex-col gap-4">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <p className="text-sm text-muted-foreground">
-            {records.isSuccess && records.data.length > 0
+            {records.data && records.data.length > 0
               ? `${records.data.length} ${records.data.length === 1 ? "record" : "records"}`
               : "Checked first, ahead of filter rules and upstream forwarding."}
           </p>
@@ -591,15 +632,15 @@ export function LocalDns() {
           )}
         </div>
 
+        {records.isError && records.data !== undefined && (
+          <StaleDataAlert onRetry={() => void records.refetch()} isRetrying={records.isFetching} />
+        )}
+
         {body}
       </div>
 
       <RecordFormSheet record={null} open={addOpen} onOpenChange={setAddOpen} />
-      <RecordFormSheet
-        record={editTarget}
-        open={editTarget !== null}
-        onOpenChange={(next) => !next && setEditTarget(null)}
-      />
+      <RecordFormSheet record={editTarget} open={editOpen} onOpenChange={setEditOpen} />
 
       <AlertDialog
         open={deleteTarget !== null}

@@ -263,6 +263,66 @@ test("editing a record PUTs /records/{id} with the updated fields", async () => 
   expect(requestUrl).toMatch(/\/api\/v1\/records\/7$/);
 });
 
+// base-ui keeps the panel mounted through its exit transition, so whatever
+// the sheet renders while it's on the way out is visible. Deriving `open`
+// from `editTarget !== null` meant closing nulled the target *and* left the
+// panel on screen, re-rendering it as the add variant: the header flipped
+// "Edit record" -> "Add record" and the button "Save" -> "Add record" on
+// every close, including right after a successful save.
+test("closing the edit sheet keeps its Edit copy through the exit transition", async () => {
+  const user = userEvent.setup();
+  mockRecords([record({ id: 7, name: "printer.home.lan" })]);
+
+  renderWithProviders(<LocalDns />);
+  await screen.findByText("printer.home.lan");
+
+  await user.click(screen.getByRole("button", { name: /^edit printer\.home\.lan$/i }));
+  const sheet = await screen.findByRole("dialog");
+  expect(within(sheet).getByRole("heading", { name: /^edit record$/i })).toBeInTheDocument();
+
+  await user.click(within(sheet).getByRole("button", { name: /^cancel$/i }));
+
+  const closing = screen.getByRole("dialog");
+  expect(within(closing).getByRole("heading", { name: /^edit record$/i })).toBeInTheDocument();
+  expect(within(closing).getByRole("button", { name: /^save$/i })).toBeInTheDocument();
+
+  await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+});
+
+// A background refetch failing must not destroy content that's already
+// loaded. Every mutation here invalidates the records query, so a blip on
+// that refetch used to swap a correct, populated table for "Couldn't load
+// local DNS records. Try refreshing the page." — with the rows sitting in
+// the cache the whole time.
+test("a failing background refetch keeps the table and offers a retry instead", async () => {
+  const user = userEvent.setup();
+  let getCount = 0;
+  server.use(
+    http.get("/api/v1/records", () => {
+      getCount += 1;
+      return getCount === 1
+        ? HttpResponse.json([record({ id: 7, name: "printer.home.lan" })])
+        : HttpResponse.json({ error: "boom" }, { status: 500 });
+    }),
+    http.delete("/api/v1/records/7", () => new HttpResponse(null, { status: 204 })),
+  );
+
+  renderWithProviders(<LocalDns />);
+  await screen.findByText("printer.home.lan");
+
+  await user.click(screen.getByRole("button", { name: /^delete printer\.home\.lan$/i }));
+  const confirmDialog = await screen.findByRole("alertdialog");
+  await user.click(within(confirmDialog).getByRole("button", { name: /^delete$/i }));
+
+  expect(
+    await screen.findByText(/couldn't refresh local dns records/i, undefined, { timeout: 3000 }),
+  ).toBeInTheDocument();
+  expect(screen.queryByText(/couldn't load local dns records/i)).not.toBeInTheDocument();
+  expect(screen.getByRole("table")).toBeInTheDocument();
+  expect(screen.getByText("printer.home.lan")).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: /try again/i })).toBeInTheDocument();
+});
+
 test("deleting a record asks for confirmation, then DELETEs /records/{id}", async () => {
   const user = userEvent.setup();
   let deleted = false;

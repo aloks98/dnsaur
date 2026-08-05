@@ -100,6 +100,40 @@ function friendlyDeleteError(err: unknown, fallback: string): string {
   return err instanceof ApiError ? err.message : fallback;
 }
 
+/**
+ * A *background* refetch failed while data from an earlier successful fetch
+ * is still in hand. Every mutation on this tab invalidates the groups or
+ * clients query, which refetches immediately; query-core flips `status` to
+ * "error" if that refetch fails, even though `data` is intact — so gating
+ * the destructive "couldn't load" Alert on `isError` alone would swap a
+ * populated, still correct panel for an error card right after a successful
+ * edit (refetchOnReconnect, on by default, is a second trigger). The
+ * destructive Alert is reserved for `isError && data === undefined` —
+ * genuinely nothing to show — and this quiet banner covers the rest.
+ */
+function StaleDataAlert({
+  what,
+  onRetry,
+  isRetrying,
+}: {
+  what: string;
+  onRetry: () => void;
+  isRetrying: boolean;
+}) {
+  return (
+    <Alert variant="warning">
+      <TriangleAlert />
+      <AlertTitle>Couldn&apos;t refresh {what}</AlertTitle>
+      <AlertDescription>
+        <p>Showing what last loaded successfully.</p>
+        <Button type="button" variant="outline" size="sm" onClick={onRetry} disabled={isRetrying}>
+          {isRetrying ? "Retrying…" : "Try again"}
+        </Button>
+      </AlertDescription>
+    </Alert>
+  );
+}
+
 // --- Groups panel --------------------------------------------------------
 
 interface GroupFormValues {
@@ -262,7 +296,17 @@ function GroupListsMenu({ group, allLists }: { group: Group; allLists: List[] })
     const next = checked ? [...current, listId] : current.filter((id) => id !== listId);
     setGroupLists.mutate(
       { groupId: group.id, listIds: next },
-      { onError: () => toast.error(`Couldn't update lists for ${group.name}`) },
+      {
+        // The checkbox is driven purely by server data, so nothing moves
+        // until the invalidated groupLists query comes back — without this
+        // the click reads as a no-op in the meantime. Every other mutation
+        // on this tab confirms itself the same way.
+        onSuccess: () =>
+          toast.success(
+            checked ? `List applied to ${group.name}` : `List removed from ${group.name}`,
+          ),
+        onError: () => toast.error(`Couldn't update lists for ${group.name}`),
+      },
     );
   }
 
@@ -416,7 +460,7 @@ function GroupsPanel({ groupsQuery }: { groupsQuery: UseQueryResult<Group[]> }) 
         ))}
       </div>
     );
-  } else if (groupsQuery.isError) {
+  } else if (groupsQuery.data === undefined) {
     body = (
       <Alert variant="destructive">
         <TriangleAlert />
@@ -450,8 +494,15 @@ function GroupsPanel({ groupsQuery }: { groupsQuery: UseQueryResult<Group[]> }) 
           <h2 className="text-sm font-semibold text-foreground">Groups</h2>
           <p className="text-sm text-muted-foreground">Policy scopes clients are assigned to.</p>
         </div>
-        {groupsQuery.isSuccess && groupsQuery.data.length > 0 && <AddGroupDialog />}
+        {groupsQuery.data && groupsQuery.data.length > 0 && <AddGroupDialog />}
       </div>
+      {groupsQuery.isError && groupsQuery.data !== undefined && (
+        <StaleDataAlert
+          what="groups"
+          onRetry={() => void groupsQuery.refetch()}
+          isRetrying={groupsQuery.isFetching}
+        />
+      )}
       {body}
     </section>
   );
@@ -502,7 +553,17 @@ function isValidIPv6(value: string): boolean {
 
 /** Mirrors the server's own validMatcher check (net/netip.ParseAddr or
  * ParsePrefix, see internal/api/clients_handlers.go) closely enough to
- * catch typos before they round-trip as a 400. */
+ * catch typos before they round-trip as a 400.
+ *
+ * The two halves are deliberately *not* symmetric, because netip's own
+ * aren't: ParseAddr accepts an RFC 4007 zone id ("fe80::1%eth0"), while
+ * ParsePrefix rejects one outright (go.dev/issue/51899) and additionally
+ * rejects a prefix length with a leading sign or leading zero, which
+ * strconv.Atoi would otherwise have swallowed. Both extra rejections are
+ * mirrored below — not to be strict for its own sake, but because the
+ * server's 400 for either reads "matcher must be an IP or CIDR and
+ * group_id set", which sounds like "that isn't an IP/CIDR" for a matcher
+ * whose zone id this very form accepts on its own. */
 function validateMatcher(value: string): string | true {
   const trimmed = value.trim();
   if (!trimmed) return "Matcher is required";
@@ -515,7 +576,16 @@ function validateMatcher(value: string): string | true {
     return "Enter a valid IP address or CIDR range, e.g. 192.168.1.10 or 192.168.1.0/24";
   }
   if (prefix !== undefined) {
+    if (isV6 && addr.includes("%")) {
+      return "Zone IDs can't be combined with a CIDR range — drop the /prefix, or the %zone";
+    }
     if (!/^\d+$/.test(prefix)) return "CIDR prefix must be a number";
+    // netip.ParsePrefix rejects any multi-character prefix not starting
+    // 1-9, so "/024" and "/+4" are errors there even though they'd parse
+    // as 24 and 4 by themselves. "/0" alone is fine.
+    if (prefix.length > 1 && !/^[1-9]/.test(prefix)) {
+      return "CIDR prefix can't have a leading zero — write /24, not /024";
+    }
     const prefixNum = Number(prefix);
     const max = isV4 ? 32 : 128;
     if (prefixNum > max) return `CIDR prefix must be between 0 and ${max}`;
@@ -739,11 +809,24 @@ function ClientsPanel({ groups, groupsLoading }: { groups: Group[]; groupsLoadin
   const clients = useClients();
   const deleteClient = useDeleteClient();
   const [addOpen, setAddOpen] = useState(false);
+  // Open state is deliberately separate from the target rather than derived
+  // from `editTarget !== null`: the dialog stays mounted through base-ui's
+  // exit transition, so nulling the target on close would re-render the
+  // still-visible panel as the *add* variant — retitling "Edit client" to
+  // "Add client" and "Save" to "Add client" on the way out, including
+  // straight after a successful save. The target is replaced on the next
+  // open instead of cleared on close.
   const [editTarget, setEditTarget] = useState<Client | null>(null);
+  const [editOpen, setEditOpen] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<Client | null>(null);
 
   const groupsById = useMemo(() => new Map(groups.map((g) => [g.id, g])), [groups]);
   const noGroups = !groupsLoading && groups.length === 0;
+
+  function onEditRequest(client: Client) {
+    setEditTarget(client);
+    setEditOpen(true);
+  }
 
   function onConfirmDelete() {
     if (!deleteTarget) return;
@@ -757,7 +840,7 @@ function ClientsPanel({ groups, groupsLoading }: { groups: Group[]; groupsLoadin
     });
   }
 
-  const isEmpty = clients.isSuccess && clients.data.length === 0;
+  const isEmpty = clients.data?.length === 0;
 
   let body: ReactNode;
   if (clients.isPending) {
@@ -768,7 +851,7 @@ function ClientsPanel({ groups, groupsLoading }: { groups: Group[]; groupsLoadin
         ))}
       </div>
     );
-  } else if (clients.isError) {
+  } else if (clients.data === undefined) {
     body = (
       <Alert variant="destructive">
         <TriangleAlert />
@@ -799,7 +882,7 @@ function ClientsPanel({ groups, groupsLoading }: { groups: Group[]; groupsLoadin
       <ClientsTable
         clients={clients.data}
         groupsById={groupsById}
-        onEdit={setEditTarget}
+        onEdit={onEditRequest}
         onDeleteRequest={setDeleteTarget}
       />
     );
@@ -828,14 +911,22 @@ function ClientsPanel({ groups, groupsLoading }: { groups: Group[]; groupsLoadin
         )}
       </div>
 
+      {clients.isError && clients.data !== undefined && (
+        <StaleDataAlert
+          what="clients"
+          onRetry={() => void clients.refetch()}
+          isRetrying={clients.isFetching}
+        />
+      )}
+
       {body}
 
       <ClientFormDialog client={null} groups={groups} open={addOpen} onOpenChange={setAddOpen} />
       <ClientFormDialog
         client={editTarget}
         groups={groups}
-        open={editTarget !== null}
-        onOpenChange={(next) => !next && setEditTarget(null)}
+        open={editOpen}
+        onOpenChange={setEditOpen}
       />
 
       <AlertDialog

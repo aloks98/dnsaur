@@ -96,6 +96,42 @@ function CopyableCode({ value, label }: { value: string; label: string }) {
   );
 }
 
+// --- background-refetch failure -------------------------------------------
+
+/**
+ * A *background* refetch failed while data from an earlier successful fetch
+ * is still in hand. query-core flips `status` to "error" on that failure
+ * even though `data` is intact, so gating the destructive "couldn't load"
+ * Alert on `isError` alone would replace a populated, still-correct section
+ * with an error card the moment one mutation-triggered refetch (or a
+ * refetchOnReconnect) blips. The destructive Alert is reserved for
+ * `isError && data === undefined` — genuinely nothing to show — and this
+ * quiet banner covers the rest, sitting above content that's still worth
+ * reading.
+ */
+function StaleDataAlert({
+  what,
+  onRetry,
+  isRetrying,
+}: {
+  what: string;
+  onRetry: () => void;
+  isRetrying: boolean;
+}) {
+  return (
+    <Alert variant="warning">
+      <TriangleAlert />
+      <AlertTitle>Couldn&apos;t refresh {what}</AlertTitle>
+      <AlertDescription>
+        <p>Showing what last loaded successfully.</p>
+        <Button type="button" variant="outline" size="sm" onClick={onRetry} disabled={isRetrying}>
+          {isRetrying ? "Retrying…" : "Try again"}
+        </Button>
+      </AlertDescription>
+    </Alert>
+  );
+}
+
 // --- two-factor authentication -----------------------------------------
 
 /** otpauth:// URL -> an `<img>`-ready data URL, via `qrcode`'s pure string
@@ -176,25 +212,35 @@ function CodeField({
  * secret (see TotpCard.onStartEnroll), so this never has to render a
  * mid-flight loading state of its own for the secret itself, only for the
  * QR image derived from it. `enrollment.secret` is the "must live only in
- * component state" value the brief calls out: TotpCard drops the local copy
- * (`setEnrollment(null)`) *and* resets the underlying totpStart mutation
- * (`totpStart.reset()`) the moment this dialog closes for any reason — see
- * TotpCard.onEnableOpenChange. Both matter: useMutation's own `.data` isn't
- * a react-query cache entry, but it is retained by the hook instance until
- * reset() is called, independent of whatever local state stops rendering
- * it — clearing `enrollment` alone would leave the secret sitting in
- * totpStart.data.
+ * component state" value the brief calls out, and it has *three* holders,
+ * all of which TotpCard.onEnableOpenChange clears together the moment this
+ * dialog closes for any reason:
+ *
+ *   1. `enrollment` — the local copy this component renders from.
+ *   2. `totpStart.data` — the mutation result the secret arrived in.
+ *   3. `totpConfirm.variables` — the `{ secret, code }` passed to mutate(),
+ *      which query-core carries through the "success" action untouched.
+ *
+ * All three matter, and none of them clears itself: a useMutation's `.data`
+ * and `.variables` are retained by the hook instance until a new mutate()
+ * or an explicit reset(), regardless of what local state stopped rendering
+ * them, and this dialog is mounted unconditionally by TotpCard so it never
+ * unmounts either. That's why both mutations are owned by TotpCard and
+ * passed down rather than being called here — a second useTotpConfirm()
+ * call site would be an unrelated instance that resetting wouldn't touch
+ * (the same reasoning as TokensCard's createToken; see NewTokenDialog).
  */
 function TotpEnableDialog({
   open,
   onOpenChange,
   enrollment,
+  totpConfirm,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   enrollment: { secret: string; otpauth_url: string } | null;
+  totpConfirm: ReturnType<typeof useTotpConfirm>;
 }) {
-  const totpConfirm = useTotpConfirm();
   const form = useForm<CodeFormValues>({ defaultValues: { code: "" } });
   const qrDataUrl = useQrDataUrl(open ? (enrollment?.otpauth_url ?? null) : null);
 
@@ -297,14 +343,20 @@ function TotpEnableDialog({
   );
 }
 
+/** Same ownership story as TotpEnableDialog above: `totpDisable` is created
+ * by TotpCard and reset there when this closes, so the entered code doesn't
+ * sit in `totpDisable.variables` afterward. Lower stakes than the shared
+ * secret (a TOTP code is single-use and time-limited) but the same leak,
+ * and free to close once the pattern is in place. */
 function TotpDisableDialog({
   open,
   onOpenChange,
+  totpDisable,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
+  totpDisable: ReturnType<typeof useTotpDisable>;
 }) {
-  const totpDisable = useTotpDisable();
   const form = useForm<CodeFormValues>({ defaultValues: { code: "" } });
 
   useEffect(() => {
@@ -352,7 +404,18 @@ function TotpDisableDialog({
             <CodeField control={form.control} />
             <DialogFooter>
               <DialogClose render={<Button type="button" variant="outline" />}>Cancel</DialogClose>
-              <Button type="submit" variant="destructive" disabled={totpDisable.isPending}>
+              {/* Solid, not rnui's `destructive` Button variant — that one
+                  is *tinted* (bg-destructive/10 with destructive-colored
+                  text), which would make removing a second factor read
+                  softer than the six AlertDialogAction confirms elsewhere
+                  on this page and in filtering/dns. Same class list they
+                  use, so every destructive confirm in the app carries the
+                  same weight. */}
+              <Button
+                type="submit"
+                className="bg-destructive text-destructive-solid-foreground hover:bg-destructive/90"
+                disabled={totpDisable.isPending}
+              >
                 {totpDisable.isPending ? "Disabling…" : "Disable 2FA"}
               </Button>
             </DialogFooter>
@@ -364,7 +427,12 @@ function TotpDisableDialog({
 }
 
 function TotpCard({ enabled }: { enabled: boolean }) {
+  // All three TOTP mutations are owned here, not inside the dialogs that
+  // use them, so this component can reset() the exact instances that hold
+  // the secret once a flow ends — see onEnableOpenChange.
   const totpStart = useTotpStart();
+  const totpConfirm = useTotpConfirm();
+  const totpDisable = useTotpDisable();
   const [enrollment, setEnrollment] = useState<{ secret: string; otpauth_url: string } | null>(
     null,
   );
@@ -387,15 +455,27 @@ function TotpCard({ enabled }: { enabled: boolean }) {
     if (!next) {
       // The secret lives only for the flow's duration — dropped the moment
       // the dialog closes, whether that's a successful confirm, Cancel,
-      // Escape, or a click outside. Two things hold it, so both are
+      // Escape, or a click outside. Three things hold it, so all three are
       // cleared: `enrollment` (the local copy this component reads to
-      // render the dialog) and totpStart's own mutation result
-      // (`totpStart.data` — useMutation retains it until a new mutate() or
-      // an explicit reset(), regardless of what local state stops
-      // rendering it; see TotpEnableDialog's doc comment).
+      // render the dialog), totpStart's mutation result (`totpStart.data`
+      // — the response the secret arrived in), and totpConfirm's mutation
+      // *variables* (`{ secret, code }`, which query-core keeps verbatim
+      // after a successful mutate). useMutation retains both `.data` and
+      // `.variables` until a new mutate() or an explicit reset(),
+      // regardless of what local state stops rendering them, and
+      // TotpEnableDialog is mounted unconditionally so it never unmounts
+      // either — see its doc comment.
       setEnrollment(null);
       totpStart.reset();
+      totpConfirm.reset();
     }
+  }
+
+  function onDisableOpenChange(next: boolean) {
+    setDisableOpen(next);
+    // Same reasoning, one step down in stakes: drops the entered code from
+    // totpDisable.variables rather than leaving it in mutation state.
+    if (!next) totpDisable.reset();
   }
 
   return (
@@ -435,8 +515,13 @@ function TotpCard({ enabled }: { enabled: boolean }) {
         open={enableOpen}
         onOpenChange={onEnableOpenChange}
         enrollment={enrollment}
+        totpConfirm={totpConfirm}
       />
-      <TotpDisableDialog open={disableOpen} onOpenChange={setDisableOpen} />
+      <TotpDisableDialog
+        open={disableOpen}
+        onOpenChange={onDisableOpenChange}
+        totpDisable={totpDisable}
+      />
     </Card>
   );
 }
@@ -752,7 +837,7 @@ function TokensCard() {
     });
   }
 
-  const isEmpty = tokens.isSuccess && tokens.data.length === 0;
+  const isEmpty = tokens.data?.length === 0;
 
   let body: ReactNode;
   if (tokens.isPending) {
@@ -763,7 +848,10 @@ function TokensCard() {
         ))}
       </div>
     );
-  } else if (tokens.isError) {
+  } else if (tokens.data === undefined) {
+    // isError with no data — the first load itself failed, so there's
+    // nothing to fall back to. A background failure with data still in
+    // hand takes the StaleDataAlert path below instead.
     body = (
       <Alert variant="destructive">
         <TriangleAlert />
@@ -809,7 +897,16 @@ function TokensCard() {
           </CardAction>
         )}
       </CardHeader>
-      <CardContent>{body}</CardContent>
+      <CardContent className="flex flex-col gap-4">
+        {tokens.isError && tokens.data !== undefined && (
+          <StaleDataAlert
+            what="API tokens"
+            onRetry={() => void tokens.refetch()}
+            isRetrying={tokens.isFetching}
+          />
+        )}
+        {body}
+      </CardContent>
 
       <NewTokenDialog
         createToken={createToken}
@@ -910,7 +1007,7 @@ export function Account() {
 
       {me.isPending && <AccountSkeleton />}
 
-      {me.isError && (
+      {me.isError && me.data === undefined && (
         <Alert variant="destructive">
           <TriangleAlert />
           <AlertTitle>Couldn&apos;t load your account</AlertTitle>
@@ -918,8 +1015,20 @@ export function Account() {
         </Alert>
       )}
 
-      {me.isSuccess && (
+      {/* `data !== undefined`, not `isSuccess` — a failed background
+          refetch (every TOTP mutation invalidates `me`) flips isSuccess
+          false while data is still perfectly good, and unmounting these
+          cards mid-flow would throw away the enrollment dialog's state
+          along with them. */}
+      {me.data !== undefined && (
         <>
+          {me.isError && (
+            <StaleDataAlert
+              what="your account"
+              onRetry={() => void me.refetch()}
+              isRetrying={me.isFetching}
+            />
+          )}
           <TotpCard enabled={me.data.totp_enabled} />
           <TokensCard />
         </>

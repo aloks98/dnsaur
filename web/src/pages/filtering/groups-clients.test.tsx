@@ -419,6 +419,98 @@ test("an IPv6 matcher with a zone id is accepted and posts /clients", async () =
   );
 });
 
+// The flip side of the zone-id support just above, and easy to get wrong
+// precisely because of it: netip.ParseAddr takes a zone, but ParsePrefix
+// refuses one outright (go.dev/issue/51899). Letting "fe80::1%eth0/64"
+// through means the server answers "matcher must be an IP or CIDR and
+// group_id set" — which reads as "that isn't an IP/CIDR" for a form that
+// just accepted the same zone id without the range.
+test("an IPv6 zone id combined with a CIDR range is rejected client-side", async () => {
+  const user = userEvent.setup();
+  let posted = false;
+  mockGroups([group({ id: 1, name: "Default" })]);
+  mockClients([client()]);
+  mockNoLists();
+  server.use(
+    http.post("/api/v1/clients", () => {
+      posted = true;
+      return HttpResponse.json({ id: 99 }, { status: 201 });
+    }),
+  );
+
+  renderWithProviders(<GroupsClientsTab />);
+  await screen.findByText("Kid's laptop");
+
+  await user.click(screen.getByRole("button", { name: /^add client$/i }));
+  const dialog = await screen.findByRole("dialog");
+  await user.type(within(dialog).getByLabelText(/^name$/i), "Zoned range");
+  await user.type(within(dialog).getByLabelText(/^matcher$/i), "fe80::1%eth0/64");
+  await user.click(within(dialog).getByRole("button", { name: /^add client$/i }));
+
+  expect(await within(dialog).findByText(/zone ids can't be combined/i)).toBeInTheDocument();
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  expect(posted).toBe(false);
+});
+
+// ParsePrefix rejects any multi-character prefix length that doesn't start
+// 1-9, because strconv.Atoi would otherwise quietly accept the padding.
+// "/024" is the realistic typo; the server's message wouldn't hint at it.
+test("a zero-padded CIDR prefix is rejected client-side", async () => {
+  const user = userEvent.setup();
+  let posted = false;
+  mockGroups([group({ id: 1, name: "Default" })]);
+  mockClients([client()]);
+  mockNoLists();
+  server.use(
+    http.post("/api/v1/clients", () => {
+      posted = true;
+      return HttpResponse.json({ id: 99 }, { status: 201 });
+    }),
+  );
+
+  renderWithProviders(<GroupsClientsTab />);
+  await screen.findByText("Kid's laptop");
+
+  await user.click(screen.getByRole("button", { name: /^add client$/i }));
+  const dialog = await screen.findByRole("dialog");
+  await user.type(within(dialog).getByLabelText(/^name$/i), "Padded range");
+  await user.type(within(dialog).getByLabelText(/^matcher$/i), "192.168.1.0/024");
+  await user.click(within(dialog).getByRole("button", { name: /^add client$/i }));
+
+  expect(await within(dialog).findByText(/leading zero/i)).toBeInTheDocument();
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  expect(posted).toBe(false);
+});
+
+// "/0" is a single character, so it must survive the leading-zero check —
+// netip.ParsePrefix accepts it (a match-everything prefix).
+test("a bare /0 prefix is still accepted", async () => {
+  const user = userEvent.setup();
+  let requestBody: unknown;
+  mockGroups([group({ id: 1, name: "Default" })]);
+  mockClients([client()]);
+  mockNoLists();
+  server.use(
+    http.post("/api/v1/clients", async ({ request }) => {
+      requestBody = await request.json();
+      return HttpResponse.json({ id: 99 }, { status: 201 });
+    }),
+  );
+
+  renderWithProviders(<GroupsClientsTab />);
+  await screen.findByText("Kid's laptop");
+
+  await user.click(screen.getByRole("button", { name: /^add client$/i }));
+  const dialog = await screen.findByRole("dialog");
+  await user.type(within(dialog).getByLabelText(/^name$/i), "Everything");
+  await user.type(within(dialog).getByLabelText(/^matcher$/i), "0.0.0.0/0");
+  await user.click(within(dialog).getByRole("button", { name: /^add client$/i }));
+
+  await waitFor(() =>
+    expect(requestBody).toEqual({ name: "Everything", matcher: "0.0.0.0/0", group_id: 1 }),
+  );
+});
+
 test("editing a client PUTs /clients/{id} with the updated fields", async () => {
   const user = userEvent.setup();
   let requestBody: unknown;

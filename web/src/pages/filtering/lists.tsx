@@ -125,6 +125,32 @@ function listsSummary(lists: List[]): string {
   return `${lists.length} ${lists.length === 1 ? "list" : "lists"} · ${totalEntries.toLocaleString()} entries · refreshed ${relativeTime(newestRefresh)}`;
 }
 
+/**
+ * A *background* refetch failed while data from an earlier successful fetch
+ * is still in hand. Every mutation here invalidates the lists query, which
+ * refetches immediately; query-core flips `status` to "error" if that
+ * refetch fails, even though `data` is intact — so gating the destructive
+ * "couldn't load" Alert on `isError` alone would swap a populated, still
+ * correct table for an error card right after a successful add or delete
+ * (refetchOnReconnect, on by default, is a second trigger). The destructive
+ * Alert is reserved for `isError && data === undefined` — genuinely nothing
+ * to show — and this quiet banner covers the rest, above the table.
+ */
+function StaleDataAlert({ onRetry, isRetrying }: { onRetry: () => void; isRetrying: boolean }) {
+  return (
+    <Alert variant="warning">
+      <TriangleAlert />
+      <AlertTitle>Couldn&apos;t refresh filter lists</AlertTitle>
+      <AlertDescription>
+        <p>Showing what last loaded successfully.</p>
+        <Button type="button" variant="outline" size="sm" onClick={onRetry} disabled={isRetrying}>
+          {isRetrying ? "Retrying…" : "Try again"}
+        </Button>
+      </AlertDescription>
+    </Alert>
+  );
+}
+
 function AddListDialog() {
   const [open, setOpen] = useState(false);
   const addList = useAddList();
@@ -339,7 +365,7 @@ export function ListsTab() {
     });
   }
 
-  const isEmpty = lists.isSuccess && lists.data.length === 0;
+  const isEmpty = lists.data?.length === 0;
 
   let body: ReactNode;
   if (lists.isPending) {
@@ -350,7 +376,7 @@ export function ListsTab() {
         ))}
       </div>
     );
-  } else if (lists.isError) {
+  } else if (lists.data === undefined) {
     body = (
       <Alert variant="destructive">
         <TriangleAlert />
@@ -382,7 +408,7 @@ export function ListsTab() {
     <div className="flex flex-col gap-4">
       <div className="flex flex-wrap items-center justify-between gap-3">
         <p className="text-sm text-muted-foreground">
-          {lists.isSuccess && lists.data.length > 0
+          {lists.data && lists.data.length > 0
             ? listsSummary(lists.data)
             : "Blocklists and allowlists dnsaur fetches and refreshes automatically."}
         </p>
@@ -400,6 +426,10 @@ export function ListsTab() {
           {!isEmpty && <AddListDialog />}
         </div>
       </div>
+
+      {lists.isError && lists.data !== undefined && (
+        <StaleDataAlert onRetry={() => void lists.refetch()} isRetrying={lists.isFetching} />
+      )}
 
       {body}
 

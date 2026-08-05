@@ -154,12 +154,15 @@ const SETTING_GROUPS: SettingGroup[] = [
         key: "upstream.strategy",
         kind: "select",
         label: "Upstream strategy",
-        // Kept to two short sentences on purpose — this sits in a narrow
-        // grid column, and one long run-on wraps into a ragged stack of
-        // short lines there. The "not implemented yet" caveat still needs
-        // to be said (silently picking a no-op strategy is a real
-        // gotcha), just said briefly.
-        description: "How dnsaur picks among upstream resolvers. Only Race is implemented today.",
+        // Kept short on purpose — this sits in a narrow grid column, and a
+        // long run-on wraps into a ragged stack there. The per-strategy
+        // detail lives in the option labels below, so this only has to say
+        // what the setting decides and that changing it takes effect
+        // immediately (applySettings rebuilds the forwarder on every
+        // settings write — see internal/app/app.go). All three strategies
+        // are implemented in internal/upstream/forwarder.go; an earlier
+        // version of this line wrongly claimed only Race was.
+        description: "Which upstream answers a query. Takes effect immediately.",
         options: [
           { value: "race", label: "Race — query all, use the fastest reply" },
           { value: "failover", label: "Failover — try in order, fall back on failure" },
@@ -571,6 +574,35 @@ function SaveBar({
   );
 }
 
+// --- background-refetch failure -------------------------------------------
+
+/**
+ * A *background* refetch of GET /settings failed while the response from an
+ * earlier successful fetch is still in hand. query-core flips `status` to
+ * "error" on that failure even though `data` is intact — and here that
+ * matters more than anywhere else in the app: gating the form on
+ * `isSuccess` would unmount SettingsForm on one blipped refetch, taking
+ * react-hook-form's state and `defaultsRef` with it. After a partial save
+ * (some keys stored, one rejected and still dirty) that silently discards
+ * the admin's unsaved value. So the destructive Alert is reserved for
+ * `isError && data === undefined` — the first load never landed — and this
+ * quiet banner covers the rest, above a form that stays exactly as it was.
+ */
+function StaleDataAlert({ onRetry, isRetrying }: { onRetry: () => void; isRetrying: boolean }) {
+  return (
+    <Alert variant="warning">
+      <TriangleAlert />
+      <AlertTitle>Couldn&apos;t refresh settings</AlertTitle>
+      <AlertDescription>
+        <p>Showing what last loaded successfully. Any edits below are untouched.</p>
+        <Button type="button" variant="outline" size="sm" onClick={onRetry} disabled={isRetrying}>
+          {isRetrying ? "Retrying…" : "Try again"}
+        </Button>
+      </AlertDescription>
+    </Alert>
+  );
+}
+
 // --- page ------------------------------------------------------------------
 
 /**
@@ -597,7 +629,7 @@ export function SettingsPage() {
 
       {settings.isPending && <SettingsSkeleton />}
 
-      {settings.isError && (
+      {settings.isError && settings.data === undefined && (
         <Alert variant="destructive">
           <TriangleAlert />
           <AlertTitle>Couldn&apos;t load settings</AlertTitle>
@@ -605,7 +637,17 @@ export function SettingsPage() {
         </Alert>
       )}
 
-      {settings.isSuccess && <SettingsForm settings={settings.data} />}
+      {settings.data !== undefined && (
+        <>
+          {settings.isError && (
+            <StaleDataAlert
+              onRetry={() => void settings.refetch()}
+              isRetrying={settings.isFetching}
+            />
+          )}
+          <SettingsForm settings={settings.data} />
+        </>
+      )}
     </div>
   );
 }

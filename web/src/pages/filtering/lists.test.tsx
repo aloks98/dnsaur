@@ -147,6 +147,39 @@ test("refresh now posts /filters/refresh and shows a toast once it's accepted", 
   await waitFor(() => expect(successSpy).toHaveBeenCalledWith(expect.stringMatching(/refresh/i)));
 });
 
+// The 202 means "scheduled", not "done" — internal/filter/refresh.go writes
+// each list's new last_refreshed/entry_count as its download finishes. The
+// mutation used to invalidate nothing, on the theory that "the lists table
+// catches up on its own next poll/interaction"; there is no such poll
+// (useLists has no refetchInterval, and refetchOnWindowFocus is off), so
+// the row kept reading "refreshed 3d ago" straight after a successful
+// refresh until the tab remounted.
+test("refresh now re-reads the lists table once the server has had a moment", async () => {
+  const user = userEvent.setup();
+  let refreshedAt = 0;
+  server.use(
+    http.get("/api/v1/filters/lists", () =>
+      HttpResponse.json([
+        list({ last_refreshed: refreshedAt || Date.now() - 3 * 24 * 60 * 60 * 1000 }),
+      ]),
+    ),
+    http.post("/api/v1/filters/refresh", () => {
+      refreshedAt = Date.now();
+      return HttpResponse.json({ status: "refreshing" }, { status: 202 });
+    }),
+  );
+
+  renderWithProviders(<ListsTab />);
+  // Two matches: the header summary line and the table's own cell.
+  expect(await screen.findAllByText(/3d ago/i)).toHaveLength(2);
+
+  await user.click(screen.getByRole("button", { name: /refresh now/i }));
+
+  // The first delayed re-read lands about a second later.
+  await waitFor(() => expect(screen.getAllByText(/just now/i)).toHaveLength(2), { timeout: 4000 });
+  expect(screen.queryAllByText(/3d ago/i)).toHaveLength(0);
+}, 10_000);
+
 test("deleting a list asks for confirmation, then DELETEs /filters/lists/{id}", async () => {
   const user = userEvent.setup();
   let deleted = false;
