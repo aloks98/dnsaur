@@ -5,9 +5,11 @@ See also: [`README.md`](../README.md) · [`docs/architecture.md`](architecture.m
 ## Prerequisites
 
 - **Go 1.26** (matches `go.mod` and CI).
-- **Node 20+ and pnpm** (`corepack enable`), for the web dashboard —
-  see [`web/README.md`](../web/README.md) for its own dev workflow,
-  scripts, and Playwright smoke test.
+- **Node `^20.19.0 || >=22.12.0`** (Vite 8's engines range) **and pnpm**
+  (`corepack enable`), for the web dashboard. CI runs Node 24; Node 20 is
+  past end-of-life, so prefer 22+ locally. See
+  [`web/README.md`](../web/README.md) for the dashboard's own dev
+  workflow, scripts, and Playwright smoke test.
 - **Docker**, only if you want to run the Postgres-backed store tests —
   they use `testcontainers-go` to spin up a real Postgres and are skipped
   automatically when Docker isn't available.
@@ -21,8 +23,9 @@ go build ./cmd/dnsaur
 ```
 
 `go build` also works with no prior `pnpm build` (`web/dist/.gitkeep` keeps
-the embed from failing on a fresh checkout), but the binary then serves an
-empty dashboard — fine for API-only work, not for anything dashboard-facing.
+the embed from failing on a fresh checkout), but the binary then serves
+API-only — every dashboard route returns 404 until real assets exist in
+`web/dist`. Fine for backend work, not for anything dashboard-facing.
 
 ## Test
 
@@ -54,23 +57,28 @@ serving as a passive mirror (no CI runs there — Forgejo is the source of
 truth for build status). Jobs, triggered on push to `main` and on pull
 requests:
 
-- **`web`** (runner label `tiny-no-docker`): checkout, Node 20 + pnpm
-  setup, `oxlint`, `format:check`, `typecheck`, `pnpm test` (Vitest), then
-  `pnpm build` — the real `web/dist` is uploaded as an artifact for the
+- **`web`** (runner label `tiny-no-docker`): checkout, Node 24 + pnpm
+  setup, `pnpm lint`, `format:check`, `typecheck`, `pnpm test` (Vitest),
+  then `pnpm build` — the real `web/dist` is uploaded as an artifact for the
   jobs below.
-- **`checks`** (runner label `tiny-no-docker`, needs `web`): checkout, Go
-  1.26 setup, downloads the `web-dist` artifact into `web/dist`,
-  `golangci-lint` v2.12, `go vet ./...`, and a `CGO_ENABLED=0` build (so
-  the binary embeds the real dashboard, not the empty placeholder).
-- **`test`** (runner label `medium`, needs `web`): checkout, Go 1.26 setup,
-  downloads `web-dist`, `go test -race ./...`.
+- **`checks`** (runner label `tiny-no-docker`): checkout, Go 1.26 setup,
+  `golangci-lint` v2.12, `go vet ./...`, and a `CGO_ENABLED=0` build.
+- **`test`** (runner label `medium`): checkout, Go 1.26 setup,
+  `go test -race ./...`.
 - **`e2e`** (runner label `medium`, needs `web`, `continue-on-error:
   true`): checkout, Go + Node/pnpm setup, downloads `web-dist`, installs
   Chromium (`npx playwright install --with-deps chromium`), runs the
   Playwright smoke test (`web/e2e/smoke.spec.ts`) against a real built
-  `dnsaur` binary. Best-effort, not a hard merge gate — a runner without
-  reliable network access to fetch Chromium shouldn't block everything
-  else.
+  `dnsaur` binary, and always uploads `web/playwright-report` +
+  `web/test-results` (traces) so a failure leaves something to look at.
+  Best-effort, not a hard merge gate — a runner without reliable network
+  access to fetch Chromium shouldn't block everything else.
+
+`checks` and `test` deliberately **do not** depend on `web`: the Go side
+builds and tests fine against the committed `web/dist/.gitkeep` placeholder
+(no Go test asserts on real dashboard assets), so a frontend hiccup can
+never silently skip backend verification on a PR. Only `e2e` genuinely
+consumes the `web-dist` artifact.
 
 ## Commit and PR conventions
 

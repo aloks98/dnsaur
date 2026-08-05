@@ -19,7 +19,8 @@ served by `internal/api` alongside the REST API.
 
 ## Prerequisites
 
-- Node 20+
+- Node `^20.19.0 || >=22.12.0` (Vite 8's engines range). CI runs Node 24;
+  Node 20 is past end-of-life, so prefer 22+.
 - pnpm (`corepack enable` or install directly)
 
 ## Develop
@@ -70,11 +71,13 @@ go test -race ./... && ~/go/bin/golangci-lint run ./...
 `pnpm build` produces `web/dist/`, which `web/embed.go` embeds via
 `//go:embed all:dist` and exposes as `web.Dist() fs.FS`. The Go binary
 serves it through `internal/api.StaticHandler` (mounted on non-`/api`
-paths) with an `index.html` fallback for client-side routes. `go build`
-works even without a prior `pnpm build` — `dist/.gitkeep` keeps the
-directory present so the embed never fails — but the served app will be
-empty (backend-only build) until real assets exist there. CI builds the
-real assets before the Go build runs.
+paths) with an `index.html` fallback for client-side routes, gzip
+compression, and browser hardening headers (CSP, `nosniff`,
+`Referrer-Policy`, `X-Frame-Options`). `go build` works even without a
+prior `pnpm build` — `dist/.gitkeep` keeps the directory present so the
+embed never fails — but the binary then serves API-only: with no
+`index.html` to fall back to, every dashboard route returns 404 until real
+assets exist there. CI builds the real assets before the `e2e` job runs.
 
 See [`../docs/development.md`](../docs/development.md) for the Go side.
 

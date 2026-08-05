@@ -44,7 +44,7 @@ over HTTP (curl or any HTTP client) too, dashboard or not.
 
 ## Quick start
 
-Build from source (Go 1.26+, Node 20+ and pnpm for the dashboard):
+Build from source (Go 1.26+, Node 22+ and pnpm for the dashboard):
 
 ```sh
 git clone https://github.com/aloks98/dnsaur.git

@@ -53,7 +53,7 @@ the DB, bumps a config version, and live components reload automatically —
 |---|---|---|
 | `instance.id` | random UUID, generated per install | Stable identifier for this instance (used by future HA sync) |
 | `upstreams` | `1.1.1.1:53,1.0.0.1:53,9.9.9.9:53` | Comma-separated upstream resolver addresses (host:port; bare IPv6 and missing ports are normalized) |
-| `upstream.strategy` | `race` | Upstream selection strategy (`race` today; `failover`/`fastest` planned) |
+| `upstream.strategy` | `race` | Upstream selection strategy: `race` (query all healthy upstreams in parallel, first good answer wins), `failover` (try them in configured order, fall through on error/SERVFAIL), or `fastest` (try them ordered by measured EWMA latency, fastest first) |
 | `blocking.mode` | `null-ip` | How blocked queries are answered: `null-ip` (`0.0.0.0`) or `nxdomain` |
 | `blocking.ttl` | `30` | TTL (seconds) returned on blocked responses |
 | `cache.min_ttl` **†** | `0` | Minimum TTL (seconds) enforced on cached responses |

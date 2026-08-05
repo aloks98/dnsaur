@@ -10,9 +10,9 @@
     "postbuild": "mkdir -p dist && touch dist/.gitkeep",
     "preview": "vite preview",
     "typecheck": "tsc -b --noEmit",
-    "lint": "oxlint src/",
-    "format": "oxfmt --write src/",
-    "format:check": "oxfmt --check src/",
+    "lint": "oxlint src e2e *.config.ts",
+    "format": "oxfmt --write src e2e *.config.ts",
+    "format:check": "oxfmt --check src e2e *.config.ts",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:e2e": "playwright test"

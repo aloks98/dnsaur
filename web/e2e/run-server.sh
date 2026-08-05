@@ -7,7 +7,15 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-work_dir="$(mktemp -d)"
+# A stable path wiped up front, not `mktemp -d`: line 27 `exec`s into the
+# server, so no EXIT trap could ever fire to clean up — a fresh temp dir per
+# run would leak ~30 MB (built binary + SQLite DB) on every `pnpm test:e2e`.
+# Wiping here still guarantees the fresh-instance-per-run the smoke test
+# needs (it starts from the first-run setup wizard, so any leftover admin
+# account would break it).
+work_dir="${TMPDIR:-/tmp}/dnsaur-e2e"
+rm -rf "$work_dir"
+mkdir -p "$work_dir"
 bin="$work_dir/dnsaur-e2e"
 
 CGO_ENABLED=0 go build -C "$repo_root" -o "$bin" ./cmd/dnsaur
