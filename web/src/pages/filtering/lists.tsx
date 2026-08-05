@@ -422,7 +422,7 @@ export function ListsTab() {
           <AlertDialogFooter>
             <AlertDialogCancel>Cancel</AlertDialogCancel>
             <AlertDialogAction
-              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+              className="bg-destructive text-destructive-solid-foreground hover:bg-destructive/90"
               onClick={onConfirmDelete}
               disabled={deleteList.isPending}
             >

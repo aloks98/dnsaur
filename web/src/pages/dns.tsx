@@ -332,6 +332,14 @@ function RecordFormSheet({
                   <FormItem>
                     <FormLabel>Type</FormLabel>
                     <Select
+                      // `items` maps each value to its display label —
+                      // without it, SelectValue renders the raw stored value
+                      // instead of the label (Task 12's finding; see
+                      // settings.tsx/account.tsx for the same fix). Harmless
+                      // today since RECORD_TYPES' values and labels are
+                      // identical strings, but silently regresses the moment
+                      // a friendlier label is introduced.
+                      items={Object.fromEntries(RECORD_TYPES.map((t) => [t, t]))}
                       value={field.value}
                       onValueChange={(next) => {
                         field.onChange(next);
@@ -612,7 +620,7 @@ export function LocalDns() {
           <AlertDialogFooter>
             <AlertDialogCancel>Cancel</AlertDialogCancel>
             <AlertDialogAction
-              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+              className="bg-destructive text-destructive-solid-foreground hover:bg-destructive/90"
               onClick={onConfirmDelete}
               disabled={deleteRecord.isPending}
             >

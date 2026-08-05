@@ -51,6 +51,23 @@
      this file shipped with, the Filtering › Lists "Block" badge rendered as
      pale pink text on a pale pink chip — effectively invisible. */
   --destructive-foreground: oklch(0.42 0.19 27.325);
+  /* Task 14 fix round 1: --destructive-foreground above is tuned for the
+     light *-light/-outline* surfaces and is NOT safe on solid --destructive
+     itself — pairing them (as this app's own AlertDialogAction "confirm
+     delete" buttons did) gave 1.84:1 in light mode / 1.40:1 in dark mode,
+     both far below WCAG AA. rnui's own Badge solid variant never hits this
+     problem because it hardcodes `text-white` rather than reusing
+     *-foreground (see badge.tsx: `destructive: 'bg-destructive text-white'`)
+     — but plain white fails contrast in *this* theme's dark mode, because
+     dark --destructive here is a light salmon (L 0.7), not a dark red. So
+     this is a dedicated token, not a `text-white` reuse: pure white in
+     light mode (bg is dark-saturated red, 4.76:1 solid / 4.54:1 on the
+     hover:bg-destructive/90 state), a hue-matched near-black in dark mode
+     (bg is light salmon, 6.68:1 solid / 5.65:1 on hover) — mirroring how
+     --primary-foreground already flips white/near-black between modes for
+     the same reason (solid saturated bg needs a near-neutral, not a
+     hue-matched mid-tone, to hit AA at both the default and hover states). */
+  --destructive-solid-foreground: oklch(1 0 0);
 
   --success: oklch(0.65 0.15 155);
   --success-foreground: oklch(0.38 0.11 155);
@@ -119,6 +136,14 @@
      (H 30 vs the base's H 22) read as washed out. Hue now matches each
      token's own base color. */
   --destructive-foreground: oklch(0.82 0.16 22);
+  /* See the light-mode block above for the full explanation — this pairs
+     with the solid `bg-destructive` on the six confirm-delete buttons only,
+     never with --destructive-foreground. Dark mode's --destructive is a
+     light salmon (L 0.7), so it needs dark text, not white: a hue-matched
+     near-black at the same lightness --primary-foreground already uses for
+     its own dark-mode solid-button text (L 0.16), giving 6.68:1 solid /
+     5.65:1 on the hover:bg-destructive/90 state. */
+  --destructive-solid-foreground: oklch(0.16 0.02 22);
 
   --success: oklch(0.7 0.15 155);
   --success-foreground: oklch(0.8 0.13 155);

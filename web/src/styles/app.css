@@ -4,6 +4,17 @@
 @import "./dnsaur-theme.css";
 
 /*
+ * --destructive-solid-foreground (see dnsaur-theme.css) isn't part of
+ * rnui-themes' own @theme mapping — it's app-specific, for the six
+ * confirm-delete AlertDialogAction buttons that pair solid `bg-destructive`
+ * with text (Task 14 fix round 1). Tailwind v4 merges multiple @theme
+ * blocks, so this just extends the one rnui-themes already registers.
+ */
+@theme inline {
+  --color-destructive-solid-foreground: var(--destructive-solid-foreground);
+}
+
+/*
  * Query log — live-tail row insertion (see pages/queries.tsx).
  *
  * Only ever the single newest row carries `data-row-new="true"` (on its
