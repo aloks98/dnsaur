@@ -2,7 +2,8 @@ import { useCallback, useSyncExternalStore } from "react";
 
 export type Theme = "light" | "dark";
 
-export const THEME_STORAGE_KEY = "dnsaur-theme";
+// Key spelled as the design spec asks ("dnsaur.theme").
+export const THEME_STORAGE_KEY = "dnsaur.theme";
 
 function isTheme(value: string | null): value is Theme {
   return value === "light" || value === "dark";

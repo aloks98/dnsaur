@@ -35,7 +35,14 @@
   --font-sans: "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
   --font-mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, "Liberation Mono", Menlo, monospace;
   --font-heading: "Archivo", "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
-  --radius: 0.625rem;
+  /* Squared, everywhere. The design is built out of 1px rules meeting at
+     hard corners; a radius anywhere reads as a card, which is the thing
+     this layout deliberately isn't. rnui derives --radius-sm/md/lg/xl/2xl
+     from this one value, so zeroing it here squares every component at
+     once — including the ones that hardcode `rounded-xl!` with !important
+     (the command palette), because those still resolve through --radius.
+     `rounded-full` is unaffected and stays available for avatars. */
+  --radius: 0;
 
   --background: oklch(0.9823 0.0041 157.18); /* #f7faf8 locked */
   --foreground: oklch(0.1759 0.0253 156.26); /* #07140c locked */

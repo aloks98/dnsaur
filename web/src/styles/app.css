@@ -45,6 +45,60 @@
   --color-border-muted: var(--border-muted);
   --color-chart-blocked: var(--chart-blocked);
   --color-chart-resolved: var(--chart-resolved);
+  /* The design's own name for the "stale" tone. rnui calls it --warning;
+     this alias means components can spell it the way the design spec does
+     without a second source of truth. */
+  --color-warn: var(--warning);
+}
+
+/*
+ * The design's type, tracking and density scale.
+ *
+ * These exist so screens never spell a raw px value. The Claude Design
+ * source is a fixed 1240x844 artboard viewed scaled-up, so its literal
+ * sizes (9px labels, 30px stat numerals, line-height 1 throughout) are
+ * correct *for that artboard* but read cramped at 1:1 in a real browser —
+ * and worse on a 2560px display. The steps below keep the design's
+ * proportions and its uppercase-mono voice while sizing for actual
+ * viewports, and give every step a real line-height instead of a flat 1.
+ *
+ * Retuning the whole UI's density is a change to this block, not a sweep
+ * through components. `--text-stat` alone drives the four KPI numerals.
+ */
+@theme inline {
+  /* Column headers, KPI labels, chart axes — always uppercase + tracked. */
+  --text-micro: 10px;
+  --text-micro--line-height: 1.2;
+  /* Section and panel titles, nav tabs. */
+  --text-label: 11px;
+  --text-label--line-height: 1.2;
+  /* Top-nav groups and status readouts. */
+  --text-nav: 12px;
+  --text-nav--line-height: 1;
+  /* Every table cell: timestamps, domains, IPs, decisions, durations. */
+  --text-data: 13px;
+  --text-data--line-height: 1.35;
+  /* The inspector's subject line. */
+  --text-lede: 17px;
+  --text-lede--line-height: 1.25;
+  /* The four KPI numerals. */
+  --text-stat: 40px;
+  --text-stat--line-height: 1.05;
+
+  /* Uppercase mono needs air; these are the only tracking values used. */
+  --tracking-label: 0.16em;
+  --tracking-chrome: 0.1em;
+  --tracking-status: 0.06em;
+  --tracking-tight: -0.02em;
+
+  /* Density. Chrome row heights grew with the type scale (the design's
+     42/38 assumed 11/10.5px text). Cell padding is the design's. */
+  --spacing-row-nav: 44px;
+  --spacing-row-tabs: 40px;
+  --spacing-cell-x: 18px;
+  --spacing-cell-y: 13px;
+  --spacing-panel-x: 14px;
+  --spacing-panel-y: 7px;
 }
 
 /*
