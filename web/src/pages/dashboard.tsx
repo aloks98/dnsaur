@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import type { ReactNode } from "react";
 import type { LucideIcon } from "lucide-react";
 import { Activity, CircleAlert, Globe, ShieldBan, ShieldCheck, Users, Zap } from "lucide-react";
@@ -39,6 +39,8 @@ import { useAddRule, useLists } from "../hooks/use-filters";
 import { useGroups } from "../hooks/use-groups";
 import { useHealth, useStatsOverview, useStatsTimeline, useStatsTop } from "../hooks/use-stats";
 import { relativeTime } from "../lib/format";
+import { useTheme, type Theme } from "../lib/theme";
+import { StaleDataAlert } from "../components/stale-data-alert";
 
 // The group every quick rule targets unless the user picks another one.
 // Group 1 is the structural default (see hooks/use-groups.ts) and the group
@@ -211,7 +213,9 @@ function StatTiles({
     );
   }
 
-  if (overview.isError) {
+  // isPending is already ruled out, so no data means the *first* fetch failed
+  // and there are genuinely no numbers to show.
+  if (overview.data === undefined) {
     return (
       <Alert variant="destructive">
         <CircleAlert />
@@ -225,31 +229,40 @@ function StatTiles({
   const phrase = windowPhrase(hours);
 
   return (
-    <div className="grid grid-cols-2 gap-4 sm:grid-cols-4 [&_.text-2xl]:tabular-nums">
-      <StatCard
-        title="Total queries"
-        value={total.toLocaleString()}
-        description={phrase}
-        icon={<Activity />}
-      />
-      <StatCard
-        title="Blocked"
-        value={pct(blocked, total)}
-        description={`${blocked.toLocaleString()} blocked ${phrase}`}
-        icon={<ShieldBan className="text-destructive" />}
-      />
-      <StatCard
-        title="Cache hit rate"
-        value={pct(cached, total)}
-        description={`${cached.toLocaleString()} served from cache`}
-        icon={<Zap className="text-info" />}
-      />
-      <StatCard
-        title="Active clients"
-        value={clients.toLocaleString()}
-        description="distinct client IPs"
-        icon={<Users />}
-      />
+    <div className="flex flex-col gap-4">
+      {overview.isError && (
+        <StaleDataAlert
+          what="stats"
+          onRetry={() => void overview.refetch()}
+          isRetrying={overview.isFetching}
+        />
+      )}
+      <div className="grid grid-cols-2 gap-4 sm:grid-cols-4 [&_.text-2xl]:tabular-nums">
+        <StatCard
+          title="Total queries"
+          value={total.toLocaleString()}
+          description={phrase}
+          icon={<Activity />}
+        />
+        <StatCard
+          title="Blocked"
+          value={pct(blocked, total)}
+          description={`${blocked.toLocaleString()} blocked ${phrase}`}
+          icon={<ShieldBan className="text-destructive" />}
+        />
+        <StatCard
+          title="Cache hit rate"
+          value={pct(cached, total)}
+          description={`${cached.toLocaleString()} served from cache`}
+          icon={<Zap className="text-info" />}
+        />
+        <StatCard
+          title="Active clients"
+          value={clients.toLocaleString()}
+          description="distinct client IPs"
+          icon={<Users />}
+        />
+      </div>
     </div>
   );
 }
@@ -260,6 +273,68 @@ function StatTiles({
 // the same total the tiles above report — and the red band reads as block
 // share: one glance answers both "how busy" and "how much is being
 // filtered".
+
+// Canvas2D cannot resolve CSS custom properties, and rnui's AreaChart feeds
+// each series' `color` straight into an ECharts LinearGradient for the area
+// fill (see @e412/rnui-react's area-chart), where zrender hands it to
+// CanvasGradient.addColorStop. A real browser answers "var(--chart-1)" with
+// `SyntaxError: ... could not be parsed as a color`, thrown from a layout
+// effect — which React escalates to the nearest ErrorBoundary, replacing the
+// entire dashboard with "Something went wrong". An empty timeline draws an
+// EmptyState instead of a chart, so a fresh instance looked healthy and only
+// started crashing once it had served its first query. The tokens' *values*
+// are plain oklch(), which canvas does accept; they just have to be resolved
+// before they get there.
+const CHART_TOKENS = {
+  notBlocked: "--chart-1",
+  blocked: "--destructive",
+  errors: "--warning",
+} as const;
+
+// Only reached when no stylesheet has been applied (jsdom under test, an SSR
+// pass): getPropertyValue answers "" for an unknown token, and "" is no more
+// paintable than var(). Mirrors styles/dnsaur-theme.css's own two blocks, so
+// even the fallback path stays theme-correct.
+const CHART_FALLBACKS: Record<Theme, Record<keyof typeof CHART_TOKENS, string>> = {
+  light: {
+    notBlocked: "oklch(0.55 0.16 265)",
+    blocked: "oklch(0.577 0.245 27.325)",
+    errors: "oklch(0.78 0.16 80)",
+  },
+  dark: {
+    notBlocked: "oklch(0.68 0.16 265)",
+    blocked: "oklch(0.7 0.19 22)",
+    errors: "oklch(0.8 0.15 80)",
+  },
+};
+
+function readColorToken(token: string, fallback: string): string {
+  if (typeof document === "undefined") return fallback;
+  const value = getComputedStyle(document.documentElement).getPropertyValue(token).trim();
+  // A token defined in terms of another var() is exactly as unpaintable as
+  // the reference we're trying to get rid of.
+  return value === "" || value.includes("var(") ? fallback : value;
+}
+
+/**
+ * Resolved, canvas-safe series colors, re-read on every theme change: light
+ * and dark define different values for all three tokens, so one read at mount
+ * would leave the chart painted in the previous theme after a toggle. The
+ * theme store applies the theme to <html> *before* notifying subscribers
+ * (lib/theme.ts), so by the time this recomputes getComputedStyle already
+ * reports the new values.
+ */
+function useChartColors(): Record<keyof typeof CHART_TOKENS, string> {
+  const { theme } = useTheme();
+  return useMemo(() => {
+    const fallback = CHART_FALLBACKS[theme];
+    return {
+      notBlocked: readColorToken(CHART_TOKENS.notBlocked, fallback.notBlocked),
+      blocked: readColorToken(CHART_TOKENS.blocked, fallback.blocked),
+      errors: readColorToken(CHART_TOKENS.errors, fallback.errors),
+    };
+  }, [theme]);
+}
 
 function bucketLabel(bucketSec: number, hours: number): string {
   const date = new Date(bucketSec * 1000);
@@ -299,10 +374,15 @@ function TimelineCard({
   timeline: UseQueryResult<TimelineBucket[], Error>;
   hours: number;
 }) {
+  const colors = useChartColors();
+
   let body: ReactNode;
   if (timeline.isPending) {
     body = <Skeleton className="h-[280px] w-full" />;
-  } else if (timeline.isError) {
+  } else if (timeline.data === undefined) {
+    // isPending is already ruled out, so no data means the *first* load
+    // failed — there is genuinely nothing to draw. A background poll that
+    // fails with buckets still cached takes the StaleDataAlert path below.
     body = (
       <Alert variant="destructive">
         <CircleAlert />
@@ -337,14 +417,14 @@ function TimelineCard({
             // color blindness, the most common form. Red vs. indigo stays
             // distinguishable, and the legend + tooltip below back it with
             // text either way.
-            { name: "Not blocked", data: notBlockedSeries, color: "var(--chart-1)" },
-            { name: "Blocked", data: blockedSeries, color: "var(--destructive)" },
+            { name: "Not blocked", data: notBlockedSeries, color: colors.notBlocked },
+            { name: "Blocked", data: blockedSeries, color: colors.blocked },
             // Amber, never red: a failed resolve is a broken query, not a
             // policy decision (same convention as the query log's badges).
             // Only carried when there are any — an always-flat zero series
             // is legend noise on a healthy instance.
             ...(totalErrors > 0
-              ? [{ name: "Errors", data: errorSeries, color: "var(--warning)" }]
+              ? [{ name: "Errors", data: errorSeries, color: colors.errors }]
               : []),
           ]}
           stacked
@@ -363,7 +443,16 @@ function TimelineCard({
           Blocked, not-blocked, and failed queries over time — the same total as the tiles above.
         </CardDescription>
       </CardHeader>
-      <CardContent>{body}</CardContent>
+      <CardContent className="flex flex-col gap-4">
+        {timeline.isError && timeline.data !== undefined && (
+          <StaleDataAlert
+            what="the timeline"
+            onRetry={() => void timeline.refetch()}
+            isRetrying={timeline.isFetching}
+          />
+        )}
+        {body}
+      </CardContent>
     </Card>
   );
 }
@@ -377,6 +466,9 @@ interface TopTableAction {
   doneVariant: BadgeProps["variant"];
   status: Record<string, "pending" | "done">;
   onAction: (pattern: string) => void;
+  /** Set while the target group can't be determined — see Dashboard. */
+  disabled?: boolean;
+  disabledReason?: string;
 }
 
 function TopTable({
@@ -413,7 +505,9 @@ function TopTable({
         ))}
       </div>
     );
-  } else if (query.isError) {
+  } else if (query.data === undefined) {
+    // First load failed outright. A poll that fails with rows still cached
+    // keeps them on screen under the StaleDataAlert below instead.
     body = <p className="px-4 pb-4 text-sm text-muted-foreground">Couldn&apos;t load this list.</p>;
   } else if (query.data.length === 0) {
     body = (
@@ -452,7 +546,8 @@ function TopTable({
                         type="button"
                         size="sm"
                         variant="outline"
-                        disabled={rowStatus === "pending"}
+                        disabled={rowStatus === "pending" || action.disabled}
+                        title={action.disabled ? action.disabledReason : undefined}
                         onClick={() => action.onAction(entry.key)}
                       >
                         <action.icon />
@@ -477,7 +572,18 @@ function TopTable({
           {title}
         </CardTitle>
       </CardHeader>
-      <CardContent className="px-0">{body}</CardContent>
+      <CardContent className="px-0">
+        {query.isError && query.data !== undefined && (
+          <div className="px-4 pb-4">
+            <StaleDataAlert
+              what={title.toLowerCase()}
+              onRetry={() => void query.refetch()}
+              isRetrying={query.isFetching}
+            />
+          </div>
+        )}
+        {body}
+      </CardContent>
     </Card>
   );
 }
@@ -500,6 +606,19 @@ export function Dashboard() {
   // A group can be deleted from the Filtering page while this is mounted.
   const selectedGroup = availableGroups.find((g) => g.id === ruleGroupId);
   const effectiveGroupId = selectedGroup?.id ?? DEFAULT_GROUP_ID;
+  // Without the group list there is no picker (it only renders once there's a
+  // choice) and `effectiveGroupId` collapses to DEFAULT_GROUP_ID — so a click
+  // in that window would write into group 1 and toast an unqualified "Blocked
+  // example.com", reinstating exactly the silent default the picker exists to
+  // remove. On a multi-group instance that rule lands somewhere the clicked
+  // domain's clients may never be governed by. Refuse instead of guessing.
+  const groupsUnavailable = groups.isPending || groups.isError;
+  const quickActionBlock = {
+    disabled: groupsUnavailable,
+    disabledReason: groups.isError
+      ? "Couldn't load groups — reload to write rules from here"
+      : "Loading groups…",
+  };
 
   const addRule = useAddRule();
   const [ruleStatus, setRuleStatus] = useState<Record<string, "pending" | "done">>({});
@@ -582,6 +701,7 @@ export function Dashboard() {
             doneVariant: "destructive-light",
             status: ruleStatus,
             onAction: (pattern) => quickRule("block", pattern),
+            ...quickActionBlock,
           }}
         />
         <TopTable
@@ -600,6 +720,7 @@ export function Dashboard() {
             doneVariant: "success-light",
             status: ruleStatus,
             onAction: (pattern) => quickRule("allow", pattern),
+            ...quickActionBlock,
           }}
         />
         <TopTable

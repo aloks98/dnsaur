@@ -223,6 +223,15 @@ interface QueryTableMeta {
   onBlock: (entry: QueryEntry) => void;
   onAllow: (entry: QueryEntry) => void;
   onWhy: (entry: QueryEntry) => void;
+  /**
+   * Set while GET /clients hasn't landed. Every rule is scoped to the group
+   * that governs the row's client (see groupForEntry), so with no client list
+   * there is no group to write into — the actions would fail on click with
+   * "this client's group is unknown", which describes a deleted client, not a
+   * sibling request that is still in flight or has failed.
+   */
+  actionsDisabled: boolean;
+  actionsDisabledReason?: string;
 }
 
 function tableMeta(table: Table<QueryEntry>): QueryTableMeta {
@@ -307,8 +316,11 @@ const QUERY_COLUMNS: ColumnDef<QueryEntry>[] = [
     size: 216,
     cell: ({ row, table }) => {
       const entry = row.original;
-      const { rowStatus, onBlock, onAllow, onWhy } = tableMeta(table);
+      const { rowStatus, onBlock, onAllow, onWhy, actionsDisabled, actionsDisabledReason } =
+        tableMeta(table);
       const status = rowStatus[entry.id];
+      const disabled = status === "pending" || actionsDisabled;
+      const title = actionsDisabled ? actionsDisabledReason : undefined;
       return (
         <div className="flex items-center justify-end gap-1">
           {status === "blocked" ? (
@@ -321,7 +333,8 @@ const QUERY_COLUMNS: ColumnDef<QueryEntry>[] = [
                 type="button"
                 size="sm"
                 variant="outline"
-                disabled={status === "pending"}
+                disabled={disabled}
+                title={title}
                 onClick={() => onBlock(entry)}
               >
                 <ShieldBan />
@@ -331,7 +344,8 @@ const QUERY_COLUMNS: ColumnDef<QueryEntry>[] = [
                 type="button"
                 size="sm"
                 variant="outline"
-                disabled={status === "pending"}
+                disabled={disabled}
+                title={title}
                 onClick={() => onAllow(entry)}
               >
                 <ShieldCheck />
@@ -569,7 +583,19 @@ export function QueryLog() {
   const [searchDraft, setSearchDraft] = useState("");
   const [search, setSearch] = useState("");
   const [paused, setPaused] = useState(false);
+  // Open state is deliberately separate from the target rather than derived
+  // from `whyEntry !== null`: the drawer stays mounted through vaul's exit
+  // transition, so nulling the entry on close would blank the still-visible
+  // panel and slide an empty sheet off screen. The entry is replaced on the
+  // next open instead of cleared on close (same treatment as dns.tsx's edit
+  // sheet and groups-clients.tsx's client dialog).
   const [whyEntry, setWhyEntry] = useState<QueryEntry | null>(null);
+  const [whyOpen, setWhyOpen] = useState(false);
+
+  const openWhy = useCallback((entry: QueryEntry) => {
+    setWhyEntry(entry);
+    setWhyOpen(true);
+  }, []);
 
   // Light debounce so the domain search doesn't fire a LIKE query per
   // keystroke — the rnui Filters chips (decision/type/client) are
@@ -658,12 +684,41 @@ export function QueryLog() {
 
   const onBlock = useCallback((e: QueryEntry) => quickRule("block", e), [quickRule]);
   const onAllow = useCallback((e: QueryEntry) => quickRule("allow", e), [quickRule]);
+  // Without the client list, groupForEntry can only answer null for any row
+  // that names a client — which the quick rules report as "this client's group
+  // is unknown", a message about a *deleted* client. When the real cause is a
+  // /clients request that is still in flight or has failed, that's both wrong
+  // and unactionable, so the actions are held closed and say why instead.
+  const clientsUnavailable = clients.isPending || clients.isError;
   const gridMeta: QueryTableMeta = useMemo(
-    () => ({ rowStatus, newRowId, onBlock, onAllow, onWhy: setWhyEntry }),
-    [rowStatus, newRowId, onBlock, onAllow],
+    () => ({
+      rowStatus,
+      newRowId,
+      onBlock,
+      onAllow,
+      onWhy: openWhy,
+      actionsDisabled: clientsUnavailable,
+      actionsDisabledReason: clients.isError
+        ? "Couldn't load clients — reload to write rules from here"
+        : "Loading clients…",
+    }),
+    [rowStatus, newRowId, onBlock, onAllow, openWhy, clientsUnavailable, clients.isError],
   );
 
-  const pagedEntries = useMemo(() => paged.data?.pages.flat() ?? [], [paged.data]);
+  // Deduplicated by id, not a bare flat(): the search endpoint pages by
+  // `ORDER BY id DESC LIMIT ? OFFSET ?` (internal/store/search.go) with the
+  // running row count as the next offset, so any query logged between the
+  // page-1 and page-2 fetches shifts every row down one and page 2 re-returns
+  // the tail of page 1. getRowId is String(row.id), so those duplicates reach
+  // react-table and the virtualizer as duplicate keys — React logs a
+  // duplicate-key warning and the same domain renders twice around the page
+  // boundary. Deduping here rather than in the pageParam keeps hasNextPage
+  // correct: termination still reads the *raw* page length, so a page that is
+  // short only because it overlapped isn't mistaken for the end of results.
+  const pagedEntries = useMemo(
+    () => Array.from(new Map((paged.data?.pages.flat() ?? []).map((e) => [e.id, e])).values()),
+    [paged.data],
+  );
   const entries = hasActiveFilters ? pagedEntries : live.entries;
   const isLoading = hasActiveFilters && paged.isPending;
   const liveState = liveStateBadge(paused, live.state);
@@ -775,11 +830,7 @@ export function QueryLog() {
         hasMore={hasActiveFilters ? paged.hasNextPage : undefined}
       />
 
-      <Drawer
-        open={whyEntry !== null}
-        onOpenChange={(open) => !open && setWhyEntry(null)}
-        direction="right"
-      >
+      <Drawer open={whyOpen} onOpenChange={setWhyOpen} direction="right">
         <DrawerContent>
           {whyEntry && (
             <>

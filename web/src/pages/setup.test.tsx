@@ -220,3 +220,43 @@ test("a partway failure still attaches the lists that were created, and says so"
   );
   expect(screen.getByText(/you're all set/i)).toBeInTheDocument();
 });
+
+// Both lists are created, but the group assignment fails — so they sit in the
+// catalog filtering nothing. "Couldn't save starter setup — you can add lists
+// later" reads as "nothing happened" and sends the admin off to create them a
+// second time; the actionable fact is that they exist and need applying.
+test("lists created but not attached say so, instead of reporting nothing happened", async () => {
+  const user = userEvent.setup();
+  let creates = 0;
+
+  server.use(
+    http.post("/api/v1/setup", () => HttpResponse.json({ status: "created" }, { status: 201 })),
+    http.post("/api/v1/auth/login", () => HttpResponse.json({ status: "ok" })),
+    http.post("/api/v1/filters/lists", () => {
+      creates += 1;
+      return HttpResponse.json({ id: creates }, { status: 201 });
+    }),
+    http.put("/api/v1/groups/:id/lists", () =>
+      HttpResponse.json({ error: "boom" }, { status: 500 }),
+    ),
+    http.put("/api/v1/settings", () => new HttpResponse(null, { status: 204 })),
+  );
+  const errorSpy = vi.spyOn(toast, "error");
+
+  renderWithProviders(<Setup />);
+  await fillAccountForm(user);
+  await screen.findByText(/starter blocklists/i);
+
+  await user.click(screen.getByRole("button", { name: /continue/i }));
+
+  await waitFor(() =>
+    expect(errorSpy).toHaveBeenCalledWith(
+      "2 blocklists were created but couldn't be applied to the default group — apply them in Filtering",
+    ),
+  );
+  expect(errorSpy).not.toHaveBeenCalledWith(
+    "Couldn't save starter setup — you can add lists later in Filtering",
+  );
+  expect(creates).toBe(2);
+  expect(screen.getByText(/you're all set/i)).toBeInTheDocument();
+});

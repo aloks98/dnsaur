@@ -499,3 +499,123 @@ test("filtered results page past the first 100 matches instead of stopping there
   await waitFor(() => expect(urls.some((u) => u.includes("offset=100"))).toBe(true));
   expect(await screen.findByText(/all matching queries loaded/i)).toBeInTheDocument();
 });
+
+// internal/store/search.go pages with `ORDER BY id DESC LIMIT ? OFFSET ?`,
+// and the next offset is the running row count — so any query logged between
+// the page-1 and page-2 fetches shifts every row down and page 2 re-returns
+// the tail of page 1. getRowId is String(row.id), so an un-deduplicated
+// flat() hands react-table and the virtualizer duplicate keys: React logs a
+// duplicate-key warning and the same domain renders twice at the boundary.
+test("rows re-returned by an offset shift render once, not twice", async () => {
+  const urls: string[] = [];
+  const page = (start: number, count: number) =>
+    Array.from({ length: count }, (_, i) =>
+      entry({ id: start + i, q_name: `hit-${start + i}.example.com`, decision: "blocked" }),
+    );
+  server.use(
+    http.get("/api/v1/queries", ({ request }) => {
+      const url = new URL(request.url);
+      urls.push(request.url);
+      if (url.searchParams.get("decision") !== "blocked") return HttpResponse.json([]);
+      const offset = Number(url.searchParams.get("offset") ?? 0);
+      // Page 1: ids 0-99. Five new queries land before page 2 is asked for,
+      // so offset=100 now points five rows earlier in the shifted result set
+      // and re-returns ids 95-99 ahead of the genuinely new rows.
+      return HttpResponse.json(offset === 0 ? page(0, 100) : page(95, 12));
+    }),
+  );
+
+  renderWithProviders(<QueryLog />);
+  await firstSource();
+
+  fireEvent.click(screen.getByRole("button", { name: /filter/i }));
+  const menu = document.querySelector('[data-slot="dropdown-menu-content"]');
+  if (!menu) throw new Error("filter menu did not open");
+  fireEvent.click(within(menu as HTMLElement).getByText("Decision"));
+  const decisionInput = await screen.findByPlaceholderText(/blocked, allowed, cached/i);
+  fireEvent.change(decisionInput, { target: { value: "blocked" } });
+
+  expect(await screen.findByText("hit-0.example.com")).toBeInTheDocument();
+
+  const viewport = document.querySelector('[data-slot="scroll-area-viewport"]');
+  if (!viewport) throw new Error("scroll viewport not found");
+  fireEvent.scroll(viewport, { target: { scrollTop: 4_000 } });
+  await waitFor(() => expect(urls.some((u) => u.includes("offset=100"))).toBe(true));
+
+  // Bring the page boundary into the virtualizer's window and count the
+  // overlapping ids: each must be mounted exactly once.
+  fireEvent.scroll(viewport, { target: { scrollTop: 3_100 } });
+  await waitFor(() => expect(screen.getAllByText("hit-99.example.com")).toHaveLength(1));
+  expect(screen.getAllByText("hit-95.example.com")).toHaveLength(1);
+  // The rows that were genuinely new in page 2 are still there — deduping
+  // must not drop them along with the overlap.
+  fireEvent.scroll(viewport, { target: { scrollTop: 3_400 } });
+  expect(await screen.findByText("hit-106.example.com")).toBeInTheDocument();
+});
+
+// groupForEntry returns null both for a client this instance no longer knows
+// about *and* for a /clients request that hasn't landed. Leaving the actions
+// live in the second case fails the click with "this client's group is
+// unknown" — a message about a deleted client, which is neither true nor
+// actionable when the real cause is a failed sibling request.
+test("quick actions are held closed while the client list is unavailable", async () => {
+  const posted: string[] = [];
+  server.use(
+    http.get("/api/v1/clients", () => HttpResponse.json({ error: "boom" }, { status: 500 })),
+    http.post("/api/v1/groups/:id/rules", ({ params }) => {
+      posted.push(String(params.id));
+      return HttpResponse.json({ id: 1 }, { status: 201 });
+    }),
+  );
+  const errorSpy = vi.spyOn(toast, "error");
+
+  renderWithProviders(<QueryLog />);
+  const source = await firstSource();
+  act(() => source.emitOpen());
+  act(() => source.emit(entry({ id: 1, client_id: 7, q_name: "pending.example" })));
+
+  const row = (await screen.findByText("pending.example")).closest("tr");
+  if (!row) throw new Error("row not found");
+  const block = within(row).getByRole("button", { name: /block/i });
+  await waitFor(() => expect(block).toBeDisabled(), { timeout: 3000 });
+
+  fireEvent.click(block);
+  expect(posted).toHaveLength(0);
+  expect(errorSpy).not.toHaveBeenCalledWith(
+    expect.stringMatching(/this client's group is unknown/i),
+  );
+});
+
+// The drawer's `open` flag is deliberately separate from `whyEntry` so vaul
+// can slide a still-populated panel out instead of blanking it mid-transition
+// (the treatment dns.tsx and groups-clients.tsx already got). The cost of no
+// longer clearing the entry on close is a target that could go stale, so the
+// reopen path is what needs guarding: under jsdom vaul tears the panel down
+// synchronously, so the exit transition itself has nothing observable to
+// assert against.
+test("reopening the why drawer shows the newly clicked row, not the previous one", async () => {
+  const user = userEvent.setup();
+  renderWithProviders(<QueryLog />);
+  const source = await firstSource();
+  act(() => source.emitOpen());
+  act(() => source.emit(entry({ id: 1, client_id: 1, q_name: "first.example.com" })));
+  act(() => source.emit(entry({ id: 2, client_id: 1, q_name: "second.example.com" })));
+
+  const firstRow = (await screen.findByText("first.example.com")).closest("tr");
+  if (!firstRow) throw new Error("row not found");
+  await user.click(within(firstRow).getByRole("button", { name: /why/i }));
+
+  const drawer = await screen.findByRole("dialog");
+  expect(within(drawer).getByText("first.example.com")).toBeInTheDocument();
+
+  await user.keyboard("{Escape}");
+  await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+
+  const secondRow = screen.getByText("second.example.com").closest("tr");
+  if (!secondRow) throw new Error("row not found");
+  await user.click(within(secondRow).getByRole("button", { name: /why/i }));
+
+  const reopened = await screen.findByRole("dialog");
+  expect(within(reopened).getByText("second.example.com")).toBeInTheDocument();
+  expect(within(reopened).queryByText("first.example.com")).not.toBeInTheDocument();
+});

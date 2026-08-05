@@ -52,6 +52,7 @@ import { ApiError } from "../../api/client";
 import type { Rule } from "../../api/types";
 import { useAddRule, useDeleteRule, useRules } from "../../hooks/use-filters";
 import { useGroups } from "../../hooks/use-groups";
+import { StaleDataAlert } from "../../components/stale-data-alert";
 
 // The server compiles a regex rule's pattern with Go's regexp package (see
 // internal/api/filters_handlers.go's handleRuleCreate); `new RegExp` isn't a
@@ -298,32 +299,6 @@ function RulesTable({
 }
 
 /**
- * A *background* refetch failed while data from an earlier successful fetch
- * is still in hand. Adding or deleting a rule invalidates this group's rules
- * query, which refetches immediately; query-core flips `status` to "error"
- * if that refetch fails, even though `data` is intact — so gating the
- * destructive "couldn't load" Alert on `isError` alone would swap a
- * populated, still correct table for an error card right after a successful
- * add or delete (refetchOnReconnect, on by default, is a second trigger).
- * The destructive Alert is reserved for `isError && data === undefined` —
- * genuinely nothing to show — and this quiet banner covers the rest.
- */
-function StaleDataAlert({ onRetry, isRetrying }: { onRetry: () => void; isRetrying: boolean }) {
-  return (
-    <Alert variant="warning">
-      <TriangleAlert />
-      <AlertTitle>Couldn&apos;t refresh rules</AlertTitle>
-      <AlertDescription>
-        <p>Showing what last loaded successfully.</p>
-        <Button type="button" variant="outline" size="sm" onClick={onRetry} disabled={isRetrying}>
-          {isRetrying ? "Retrying…" : "Try again"}
-        </Button>
-      </AlertDescription>
-    </Alert>
-  );
-}
-
-/**
  * Filtering › Rules — per-domain and regex allow/block rules, scoped to one
  * group at a time via the Select at the top. Consumes use-filters.ts's
  * useRules/useAddRule/useDeleteRule (Task 9) rather than redefining them;
@@ -428,7 +403,11 @@ export function RulesTab() {
       </div>
 
       {rules.isError && rules.data !== undefined && (
-        <StaleDataAlert onRetry={() => void rules.refetch()} isRetrying={rules.isFetching} />
+        <StaleDataAlert
+          what="rules"
+          onRetry={() => void rules.refetch()}
+          isRetrying={rules.isFetching}
+        />
       )}
 
       {body}

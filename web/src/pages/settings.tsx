@@ -41,6 +41,7 @@ import {
 import { ApiError } from "../api/client";
 import type { Settings } from "../api/types";
 import { useSettings, useUpdateSetting } from "../hooks/use-settings";
+import { StaleDataAlert } from "../components/stale-data-alert";
 
 // --- field model -------------------------------------------------------
 // One row per key in internal/api/settings_handlers.go's editableSettings
@@ -574,35 +575,6 @@ function SaveBar({
   );
 }
 
-// --- background-refetch failure -------------------------------------------
-
-/**
- * A *background* refetch of GET /settings failed while the response from an
- * earlier successful fetch is still in hand. query-core flips `status` to
- * "error" on that failure even though `data` is intact — and here that
- * matters more than anywhere else in the app: gating the form on
- * `isSuccess` would unmount SettingsForm on one blipped refetch, taking
- * react-hook-form's state and `defaultsRef` with it. After a partial save
- * (some keys stored, one rejected and still dirty) that silently discards
- * the admin's unsaved value. So the destructive Alert is reserved for
- * `isError && data === undefined` — the first load never landed — and this
- * quiet banner covers the rest, above a form that stays exactly as it was.
- */
-function StaleDataAlert({ onRetry, isRetrying }: { onRetry: () => void; isRetrying: boolean }) {
-  return (
-    <Alert variant="warning">
-      <TriangleAlert />
-      <AlertTitle>Couldn&apos;t refresh settings</AlertTitle>
-      <AlertDescription>
-        <p>Showing what last loaded successfully. Any edits below are untouched.</p>
-        <Button type="button" variant="outline" size="sm" onClick={onRetry} disabled={isRetrying}>
-          {isRetrying ? "Retrying…" : "Try again"}
-        </Button>
-      </AlertDescription>
-    </Alert>
-  );
-}
-
 // --- page ------------------------------------------------------------------
 
 /**
@@ -641,6 +613,8 @@ export function SettingsPage() {
         <>
           {settings.isError && (
             <StaleDataAlert
+              what="settings"
+              description="Showing what last loaded successfully. Any edits below are untouched."
               onRetry={() => void settings.refetch()}
               isRetrying={settings.isFetching}
             />

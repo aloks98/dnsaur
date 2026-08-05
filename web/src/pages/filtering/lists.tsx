@@ -66,6 +66,7 @@ import {
   useToggleList,
 } from "../../hooks/use-filters";
 import { relativeTime } from "../../lib/format";
+import { StaleDataAlert } from "../../components/stale-data-alert";
 
 // Block/allow badge treatment — same red/green thread as the query log's
 // decision badges (see pages/queries.tsx's DECISION_BADGE), so a list's
@@ -123,32 +124,6 @@ function listsSummary(lists: List[]): string {
   const totalEntries = lists.reduce((sum, l) => sum + l.entry_count, 0);
   const newestRefresh = lists.reduce((max, l) => Math.max(max, l.last_refreshed), 0);
   return `${lists.length} ${lists.length === 1 ? "list" : "lists"} · ${totalEntries.toLocaleString()} entries · refreshed ${relativeTime(newestRefresh)}`;
-}
-
-/**
- * A *background* refetch failed while data from an earlier successful fetch
- * is still in hand. Every mutation here invalidates the lists query, which
- * refetches immediately; query-core flips `status` to "error" if that
- * refetch fails, even though `data` is intact — so gating the destructive
- * "couldn't load" Alert on `isError` alone would swap a populated, still
- * correct table for an error card right after a successful add or delete
- * (refetchOnReconnect, on by default, is a second trigger). The destructive
- * Alert is reserved for `isError && data === undefined` — genuinely nothing
- * to show — and this quiet banner covers the rest, above the table.
- */
-function StaleDataAlert({ onRetry, isRetrying }: { onRetry: () => void; isRetrying: boolean }) {
-  return (
-    <Alert variant="warning">
-      <TriangleAlert />
-      <AlertTitle>Couldn&apos;t refresh filter lists</AlertTitle>
-      <AlertDescription>
-        <p>Showing what last loaded successfully.</p>
-        <Button type="button" variant="outline" size="sm" onClick={onRetry} disabled={isRetrying}>
-          {isRetrying ? "Retrying…" : "Try again"}
-        </Button>
-      </AlertDescription>
-    </Alert>
-  );
 }
 
 function AddListDialog() {
@@ -428,7 +403,11 @@ export function ListsTab() {
       </div>
 
       {lists.isError && lists.data !== undefined && (
-        <StaleDataAlert onRetry={() => void lists.refetch()} isRetrying={lists.isFetching} />
+        <StaleDataAlert
+          what="filter lists"
+          onRetry={() => void lists.refetch()}
+          isRetrying={lists.isFetching}
+        />
       )}
 
       {body}

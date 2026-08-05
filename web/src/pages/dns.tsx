@@ -60,6 +60,7 @@ import {
 import { ApiError } from "../api/client";
 import type { LocalRecord } from "../api/types";
 import { useAddRecord, useDeleteRecord, useRecords, useUpdateRecord } from "../hooks/use-records";
+import { StaleDataAlert } from "../components/stale-data-alert";
 
 // --- validation --------------------------------------------------------
 // Mirrors internal/api/records_handlers.go's normalizeRecord closely enough
@@ -424,34 +425,6 @@ function RecordFormSheet({
   );
 }
 
-// --- background-refetch failure -------------------------------------------
-
-/**
- * A *background* refetch failed while data from an earlier successful fetch
- * is still in hand. Every mutation here invalidates the records query, which
- * refetches immediately; query-core flips `status` to "error" if that
- * refetch fails, even though `data` is intact — so gating the destructive
- * "couldn't load" Alert on `isError` alone would swap a populated, still
- * correct table for an error card right after a successful save
- * (refetchOnReconnect, on by default, is a second trigger). The destructive
- * Alert is reserved for `isError && data === undefined` — genuinely nothing
- * to show — and this quiet banner covers the rest, above the table.
- */
-function StaleDataAlert({ onRetry, isRetrying }: { onRetry: () => void; isRetrying: boolean }) {
-  return (
-    <Alert variant="warning">
-      <TriangleAlert />
-      <AlertTitle>Couldn&apos;t refresh local DNS records</AlertTitle>
-      <AlertDescription>
-        <p>Showing what last loaded successfully.</p>
-        <Button type="button" variant="outline" size="sm" onClick={onRetry} disabled={isRetrying}>
-          {isRetrying ? "Retrying…" : "Try again"}
-        </Button>
-      </AlertDescription>
-    </Alert>
-  );
-}
-
 // --- table -----------------------------------------------------------------
 
 function RecordsTable({
@@ -633,7 +606,11 @@ export function LocalDns() {
         </div>
 
         {records.isError && records.data !== undefined && (
-          <StaleDataAlert onRetry={() => void records.refetch()} isRetrying={records.isFetching} />
+          <StaleDataAlert
+            what="local DNS records"
+            onRetry={() => void records.refetch()}
+            isRetrying={records.isFetching}
+          />
         )}
 
         {body}

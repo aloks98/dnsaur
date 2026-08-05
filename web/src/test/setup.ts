@@ -54,6 +54,24 @@ if (typeof document.elementFromPoint !== "function") {
 // (chart data is asserted on props/text, not canvas output; see
 // pages/dashboard.test.tsx), so a no-op context is sufficient to let
 // mount/update/dispose run without throwing.
+//
+// The one thing this stub deliberately does NOT no-op is gradient color
+// stops. Canvas2D cannot resolve CSS custom properties: a real browser
+// throws `SyntaxError: ... 'var(--chart-1)' could not be parsed as a color`
+// out of CanvasGradient.addColorStop, which React's commit-phase error
+// propagation turns into the ErrorBoundary fallback replacing the whole
+// page. An `addColorStop: () => {}` stub swallowed exactly that, so the
+// dashboard shipped crashing on any instance that had served a single
+// query while 139 tests stayed green. Rejecting the same values the browser
+// rejects is what makes pages/dashboard-chart.test.tsx a real guard.
+function assertCanvasColor(_offset: number, color: string): void {
+  if (typeof color === "string" && color.includes("var(")) {
+    throw new SyntaxError(
+      `Failed to execute 'addColorStop' on 'CanvasGradient': The value provided ('${color}') could not be parsed as a color.`,
+    );
+  }
+}
+
 if (typeof HTMLCanvasElement !== "undefined") {
   const noopCanvasContext = (): CanvasRenderingContext2D => {
     const state: Record<string | symbol, unknown> = {};
@@ -66,7 +84,7 @@ if (typeof HTMLCanvasElement !== "undefined") {
           prop === "createRadialGradient" ||
           prop === "createPattern"
         ) {
-          return () => ({ addColorStop: () => {} });
+          return () => ({ addColorStop: assertCanvasColor });
         }
         if (prop === "getImageData") return () => ({ data: new Uint8ClampedArray(4) });
         return () => undefined;

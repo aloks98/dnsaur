@@ -88,6 +88,7 @@ import {
   useToggleGroup,
 } from "../../hooks/use-groups";
 import { PauseControl } from "../../components/pause-control";
+import { StaleDataAlert } from "../../components/stale-data-alert";
 
 // The seeded, structural group — the server refuses to delete it
 // (internal/store/crud.go's DeleteGroup treats id 1 specially), so its row
@@ -98,40 +99,6 @@ const DEFAULT_GROUP_ID = 1;
 function friendlyDeleteError(err: unknown, fallback: string): string {
   if (err instanceof ApiError && err.status === 409) return fallback;
   return err instanceof ApiError ? err.message : fallback;
-}
-
-/**
- * A *background* refetch failed while data from an earlier successful fetch
- * is still in hand. Every mutation on this tab invalidates the groups or
- * clients query, which refetches immediately; query-core flips `status` to
- * "error" if that refetch fails, even though `data` is intact — so gating
- * the destructive "couldn't load" Alert on `isError` alone would swap a
- * populated, still correct panel for an error card right after a successful
- * edit (refetchOnReconnect, on by default, is a second trigger). The
- * destructive Alert is reserved for `isError && data === undefined` —
- * genuinely nothing to show — and this quiet banner covers the rest.
- */
-function StaleDataAlert({
-  what,
-  onRetry,
-  isRetrying,
-}: {
-  what: string;
-  onRetry: () => void;
-  isRetrying: boolean;
-}) {
-  return (
-    <Alert variant="warning">
-      <TriangleAlert />
-      <AlertTitle>Couldn&apos;t refresh {what}</AlertTitle>
-      <AlertDescription>
-        <p>Showing what last loaded successfully.</p>
-        <Button type="button" variant="outline" size="sm" onClick={onRetry} disabled={isRetrying}>
-          {isRetrying ? "Retrying…" : "Try again"}
-        </Button>
-      </AlertDescription>
-    </Alert>
-  );
 }
 
 // --- Groups panel --------------------------------------------------------

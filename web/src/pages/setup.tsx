@@ -207,6 +207,14 @@ export function Setup() {
       );
     } else if (attached > 0) {
       toast.error("Starter blocklists saved, but the upstreams weren't — set them in Settings");
+    } else if (created.length > 0) {
+      // The lists exist in the catalog but the group assignment failed, so
+      // they filter nothing. "Couldn't save starter setup" would send the
+      // admin off to create them a second time; what's actually needed is to
+      // apply the ones already sitting there.
+      toast.error(
+        `${created.length} ${created.length === 1 ? "blocklist was" : "blocklists were"} created but couldn't be applied to the default group — apply ${created.length === 1 ? "it" : "them"} in Filtering`,
+      );
     } else if (chosen.length === 0) {
       toast.error("Couldn't save the upstreams — you can set them in Settings");
     } else {

@@ -74,6 +74,7 @@ import { useMe } from "../hooks/use-auth";
 import { useCreateToken, useRevokeToken, useTokens } from "../hooks/use-tokens";
 import { useTotpConfirm, useTotpDisable, useTotpStart } from "../hooks/use-totp";
 import { relativeTime } from "../lib/format";
+import { StaleDataAlert } from "../components/stale-data-alert";
 
 // --- shared: copyable secret/token block ------------------------------
 
@@ -93,42 +94,6 @@ function CopyableCode({ value, label }: { value: string; label: string }) {
       </code>
       <CopyButton value={value} label={`Copy ${label}`} copiedLabel="Copied!" />
     </div>
-  );
-}
-
-// --- background-refetch failure -------------------------------------------
-
-/**
- * A *background* refetch failed while data from an earlier successful fetch
- * is still in hand. query-core flips `status` to "error" on that failure
- * even though `data` is intact, so gating the destructive "couldn't load"
- * Alert on `isError` alone would replace a populated, still-correct section
- * with an error card the moment one mutation-triggered refetch (or a
- * refetchOnReconnect) blips. The destructive Alert is reserved for
- * `isError && data === undefined` — genuinely nothing to show — and this
- * quiet banner covers the rest, sitting above content that's still worth
- * reading.
- */
-function StaleDataAlert({
-  what,
-  onRetry,
-  isRetrying,
-}: {
-  what: string;
-  onRetry: () => void;
-  isRetrying: boolean;
-}) {
-  return (
-    <Alert variant="warning">
-      <TriangleAlert />
-      <AlertTitle>Couldn&apos;t refresh {what}</AlertTitle>
-      <AlertDescription>
-        <p>Showing what last loaded successfully.</p>
-        <Button type="button" variant="outline" size="sm" onClick={onRetry} disabled={isRetrying}>
-          {isRetrying ? "Retrying…" : "Try again"}
-        </Button>
-      </AlertDescription>
-    </Alert>
   );
 }
 

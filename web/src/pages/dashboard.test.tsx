@@ -1,10 +1,14 @@
 import { http, HttpResponse } from "msw";
 import { toast } from "sonner";
 import { expect, test, vi } from "vitest";
-import { screen, waitFor, within } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { QueryClientProvider } from "@tanstack/react-query";
+import { MemoryRouter } from "react-router";
 import { server } from "../test/msw-server";
 import { renderWithProviders } from "../test/render";
+import { makeQueryClient } from "../lib/query-client";
+import { useTheme } from "../lib/theme";
 import { Dashboard } from "./dashboard";
 
 // ECharts (which rnui's AreaChart wraps) needs a real 2D canvas context to
@@ -17,10 +21,10 @@ vi.mock("@e412/rnui-react", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@e412/rnui-react")>();
   return {
     ...actual,
-    AreaChart: ({ series }: { series: { name: string; data: number[] }[] }) => (
+    AreaChart: ({ series }: { series: { name: string; data: number[]; color?: string }[] }) => (
       <div data-testid="timeline-chart">
         {series.map((s) => (
-          <div key={s.name}>
+          <div key={s.name} data-series={s.name} data-color={s.color}>
             {s.name}: {s.data.join(",")}
           </div>
         ))}
@@ -28,6 +32,15 @@ vi.mock("@e412/rnui-react", async (importOriginal) => {
     ),
   };
 });
+
+function seriesColor(name: string): string {
+  return (
+    screen
+      .getByTestId("timeline-chart")
+      .querySelector(`[data-series="${name}"]`)
+      ?.getAttribute("data-color") ?? ""
+  );
+}
 
 test("renders stat tiles with a computed blocked percentage", async () => {
   renderWithProviders(<Dashboard />);
@@ -254,4 +267,184 @@ test("a single-group instance shows no group picker", async () => {
 
   await screen.findByText("example.com");
   expect(screen.queryByRole("combobox", { name: /rule group/i })).not.toBeInTheDocument();
+});
+
+// --- background-poll failures ---------------------------------------------
+
+// Unlike every other page (which only refetches after a mutation), the
+// dashboard polls unprompted forever: use-stats.ts puts a 30s refetchInterval
+// on the overview, the timeline, and all three top queries. query-core sets
+// status:"error" on a failed *background* refetch even though `data` is still
+// in hand, so gating on isError alone made one blipped poll swap the four
+// tiles for "Couldn't load stats", the chart for "Couldn't load the timeline"
+// and every top table for "Couldn't load this list" — then swap them back 30s
+// later, on the app's landing page. Invalidating the cached stats queries
+// against a now-failing server drives exactly the path the poll does, without
+// waiting 30 seconds for it.
+test("a failing background poll keeps the tiles, chart, and top tables", async () => {
+  let failing = false;
+  const boom = () => HttpResponse.json({ error: "boom" }, { status: 500 });
+  server.use(
+    http.get("/api/v1/stats/overview", () =>
+      failing
+        ? boom()
+        : HttpResponse.json({
+            total: 1000,
+            blocked: 250,
+            cached: 400,
+            forwarded: 350,
+            clients: 12,
+          }),
+    ),
+    http.get("/api/v1/stats/timeline", () =>
+      failing
+        ? boom()
+        : HttpResponse.json([
+            { bucket: Math.floor(Date.now() / 1000), decisions: { allowed: 10, blocked: 5 } },
+          ]),
+    ),
+    http.get("/api/v1/stats/top", ({ request }) => {
+      if (failing) return boom();
+      const metric = new URL(request.url).searchParams.get("metric");
+      return HttpResponse.json(
+        metric === "domain" ? [{ key: "example.com", count: 320 }] : [{ key: "other", count: 1 }],
+      );
+    }),
+  );
+
+  const client = makeQueryClient();
+  render(
+    <QueryClientProvider client={client}>
+      <MemoryRouter>
+        <Dashboard />
+      </MemoryRouter>
+    </QueryClientProvider>,
+  );
+
+  expect(await screen.findByText("25%")).toBeInTheDocument();
+  expect(await screen.findByText("Blocked: 5")).toBeInTheDocument();
+  expect(await screen.findByText("example.com")).toBeInTheDocument();
+
+  failing = true;
+  await act(async () => {
+    await client.invalidateQueries({ queryKey: ["stats"] });
+  });
+
+  // Every section that had data still shows it, under a quiet retry banner.
+  await waitFor(() =>
+    expect(screen.getAllByText(/couldn't refresh/i).length).toBeGreaterThanOrEqual(3),
+  );
+  expect(screen.getByText("25%")).toBeInTheDocument(); // tiles
+  expect(screen.getByText("1,000")).toBeInTheDocument();
+  expect(screen.getByText("Blocked: 5")).toBeInTheDocument(); // chart
+  expect(screen.getByText("example.com")).toBeInTheDocument(); // top table
+
+  // None of the destructive "nothing to show" states replaced them.
+  expect(screen.queryByText(/couldn't load stats/i)).not.toBeInTheDocument();
+  expect(screen.queryByText(/couldn't load the timeline/i)).not.toBeInTheDocument();
+  expect(screen.queryByText(/couldn't load this list/i)).not.toBeInTheDocument();
+});
+
+// The mirror image: when the *first* load fails there is nothing to keep, so
+// the destructive states are still the right answer. `undefined?.length === 0`
+// is false, so an errored first load must never be mistaken for "empty".
+test("a first load that fails still shows the destructive states, not empty ones", async () => {
+  server.use(
+    http.get("/api/v1/stats/overview", () => HttpResponse.json({ error: "boom" }, { status: 500 })),
+    http.get("/api/v1/stats/timeline", () => HttpResponse.json({ error: "boom" }, { status: 500 })),
+    http.get("/api/v1/stats/top", () => HttpResponse.json({ error: "boom" }, { status: 500 })),
+  );
+
+  renderWithProviders(<Dashboard />);
+
+  expect(
+    await screen.findByText(/couldn't load stats/i, undefined, { timeout: 3000 }),
+  ).toBeInTheDocument();
+  expect(screen.getByText(/couldn't load the timeline/i)).toBeInTheDocument();
+  expect(screen.getAllByText(/couldn't load this list/i)).toHaveLength(3);
+  expect(screen.queryByText(/no query activity yet/i)).not.toBeInTheDocument();
+  expect(screen.queryByText(/no domains yet/i)).not.toBeInTheDocument();
+  expect(screen.queryByText(/couldn't refresh/i)).not.toBeInTheDocument();
+});
+
+// --- quick actions vs. an unavailable group list ---------------------------
+
+// availableGroups is `groups.data ?? []`, which hides the group picker while
+// /groups is pending or errored — and with no picker, effectiveGroupId falls
+// back to DEFAULT_GROUP_ID. A click in that window wrote into group 1 and
+// toasted an unqualified "Blocked example.com" on an instance that may have
+// several groups: exactly the silent default the picker exists to remove.
+test("quick actions are disabled while the group list is unavailable", async () => {
+  const user = userEvent.setup();
+  const posted: string[] = [];
+  server.use(
+    http.get("/api/v1/groups", () => HttpResponse.json({ error: "boom" }, { status: 500 })),
+    http.post("/api/v1/groups/:id/rules", ({ params }) => {
+      posted.push(String(params.id));
+      return HttpResponse.json({ id: 1 }, { status: 201 });
+    }),
+  );
+  // spyOn keeps the same mock across tests in this file, so earlier tests'
+  // successful quick actions are still recorded on it.
+  const successSpy = vi.spyOn(toast, "success").mockClear();
+
+  renderWithProviders(<Dashboard />);
+  const row = (await screen.findByText("example.com")).closest("tr");
+  if (!row) throw new Error("row not found");
+
+  const block = within(row).getByRole("button", { name: /block/i });
+  await waitFor(() => expect(block).toBeDisabled());
+
+  await user.click(block);
+  expect(posted).toEqual([]);
+  expect(successSpy).not.toHaveBeenCalled();
+});
+
+// --- chart colors ----------------------------------------------------------
+
+// Canvas2D cannot resolve CSS custom properties: zrender feeds each series
+// color into CanvasGradient.addColorStop for the area fill, where
+// "var(--chart-1)" throws a SyntaxError out of a layout effect and the
+// ErrorBoundary replaces the whole page with "Something went wrong". The
+// dashboard did this on any instance that had served one query (an empty
+// timeline draws an EmptyState, so a fresh instance looked fine).
+// pages/dashboard-chart.test.tsx guards the crash itself against the real
+// chart; this asserts the contract that prevents it.
+test("chart series colors are resolved, never raw var() references", async () => {
+  renderWithProviders(<Dashboard />);
+  await screen.findByTestId("timeline-chart");
+
+  for (const name of ["Not blocked", "Blocked"]) {
+    expect(seriesColor(name)).not.toContain("var(");
+    expect(seriesColor(name)).not.toBe("");
+  }
+});
+
+// Light and dark define different values for --chart-1/--destructive/
+// --warning, so a single read at mount leaves the chart painted in the old
+// theme's colors after a toggle.
+test("chart series colors are re-read when the theme changes", async () => {
+  function ThemeSwitch() {
+    const { setTheme } = useTheme();
+    return (
+      <button type="button" onClick={() => setTheme("dark")}>
+        go dark
+      </button>
+    );
+  }
+  const user = userEvent.setup();
+
+  renderWithProviders(
+    <>
+      <ThemeSwitch />
+      <Dashboard />
+    </>,
+  );
+  await screen.findByTestId("timeline-chart");
+  const lightBlocked = seriesColor("Blocked");
+
+  await user.click(screen.getByRole("button", { name: /go dark/i }));
+
+  await waitFor(() => expect(seriesColor("Blocked")).not.toBe(lightBlocked));
+  expect(seriesColor("Blocked")).not.toContain("var(");
 });
