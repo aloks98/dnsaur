@@ -72,6 +72,26 @@ function assertCanvasColor(_offset: number, color: string): void {
   }
 }
 
+// The same rule, one level up, for the *solid* paint properties — and here
+// the stub is deliberately STRICTER than a browser. A real Canvas2D silently
+// ignores an unparseable `fillStyle`, keeping whatever was set before, so a
+// bar chart handed `var(--chart-blocked)` doesn't crash: it just paints every
+// bar the wrong colour, with nothing anywhere saying so. That's a worse
+// failure than the gradient one, not a better one — it ships looking almost
+// right. Since nothing in this app ever has a legitimate reason to put a
+// custom property into canvas paint, refusing it outright turns a silent
+// mispaint into a failing test.
+const PAINT_PROPS = new Set(["fillStyle", "strokeStyle", "shadowColor"]);
+
+function assertPaintValue(prop: string, value: unknown): void {
+  if (PAINT_PROPS.has(prop) && typeof value === "string" && value.includes("var(")) {
+    throw new SyntaxError(
+      `canvas ${prop} was given an unresolved CSS custom property ('${value}'). ` +
+        "Resolve tokens to concrete values before handing them to a chart.",
+    );
+  }
+}
+
 if (typeof HTMLCanvasElement !== "undefined") {
   const noopCanvasContext = (): CanvasRenderingContext2D => {
     const state: Record<string | symbol, unknown> = {};
@@ -90,6 +110,7 @@ if (typeof HTMLCanvasElement !== "undefined") {
         return () => undefined;
       },
       set(target, prop, value) {
+        if (typeof prop === "string") assertPaintValue(prop, value);
         target[prop] = value;
         return true;
       },

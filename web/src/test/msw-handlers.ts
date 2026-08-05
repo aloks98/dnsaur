@@ -20,11 +20,22 @@ import type { BlockingStatus } from "../hooks/use-blocking";
 // the dashboard's chart/percentage math has something non-trivial to chew
 // on by default; tests that care about specific numbers override via
 // server.use().
+//
+// Buckets are unix-*seconds* hour starts, exactly as the real handler emits
+// them (`strftime('%s', ..., 'start of hour')` — see
+// internal/api/queries_handlers.go). They used to be `now - n*3600`, which
+// is only hour-*spaced*, not hour-*aligned*; that was invisible while the
+// chart plotted rows in arrival order, and became a silent all-zeroes chart
+// the moment the dashboard started keying missing hours by their start.
+export const HOUR_SEC = 3600;
+
+export function hourStart(hoursAgo = 0): number {
+  return Math.floor(Date.now() / 1000 / HOUR_SEC) * HOUR_SEC - hoursAgo * HOUR_SEC;
+}
+
 function defaultTimeline(): TimelineBucket[] {
-  const nowSec = Math.floor(Date.now() / 1000);
-  const hourSec = 3600;
   return [4, 3, 2, 1, 0].map((hoursAgo) => ({
-    bucket: nowSec - hoursAgo * hourSec,
+    bucket: hourStart(hoursAgo),
     decisions: { allowed: 120, blocked: 30, cached: 90, forwarded: 40, stale: 5 },
   }));
 }

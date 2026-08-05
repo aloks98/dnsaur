@@ -804,7 +804,7 @@ no `onMutate` and no `setQueryData` in the whole client.
 
 | Screen | Action | Endpoint | Failure string (verbatim) |
 |---|---|---|---|
-| Dashboard → Top domains | Block | `POST /groups/{id}/rules` | `Couldn't block ${pattern}` |
+| Dashboard → Live queries | Block (Allow on an already-blocked row) | `POST /groups/{id}/rules` | `Couldn't block ${q_name}` |
 | Dashboard → Top blocked | Allow | same | `Couldn't allow ${pattern}` |
 | Dashboard → Top clients | — | — | **no row action exists** |
 | Query log | Block / Allow | `POST /groups/{id}/rules` | `Couldn't ${verb} ${entry.q_name}` |
@@ -856,9 +856,10 @@ The client distinguishes two error cases, and the distinction is load-bearing:
 
 | Screen | Pending | Empty | First load failed | Background refetch failed |
 |---|---|---|---|---|
-| Dashboard tiles | 4 skeletons | n/a | `Couldn't load stats` | stale banner |
-| Dashboard timeline | skeleton | `No query activity yet` | `Couldn't load the timeline` | stale banner |
-| Dashboard top tables | 4 row skeletons | `No domains yet` / `No blocked domains yet` / `No clients yet` | plain text `Couldn't load this list.` | stale banner |
+| Dashboard stat strip | 4 skeletons | n/a (`—` for both percentages when `total` is 0) | `Couldn't load stats` | stale banner |
+| Dashboard query volume | skeleton | `No query activity yet` | `Couldn't load the timeline` | stale banner |
+| Dashboard rail panels | 4 row skeletons | `Nothing blocked in this window yet` / `No clients have queried in this window yet` | plain text `Couldn't load this list.` | stale banner |
+| Dashboard live queries | n/a (the stream, not a query) | `Listening — queries appear here as dnsaur answers them` | n/a | n/a |
 | Query log | skeleton **only in filtered mode** | `Waiting for traffic` (live) / `No matching queries` (filtered) | `Couldn't load queries` | **nothing — no stale banner exists here** |
 | Lists | 4 skeletons | `No filter lists yet` | `Couldn't load filter lists` | stale banner |
 | Rules | 4 skeletons | `No rules for this group yet` | `Couldn't load rules` | stale banner |
@@ -886,8 +887,9 @@ A **mid-session 401** from any query revalidates `me` once (re-entrancy
 guarded); if it now fails, all non-auth cached data is dropped and the gate
 falls back to Login.
 
-**Polling** — three things poll, all at 30s: the five dashboard stats queries,
-`GET /health` (the top bar's resolver cell, every screen), and `GET /blocking` (pause
+**Polling** — three things poll, all at 30s: the four dashboard stats queries
+(overview, timeline, top blocked, top clients),
+`GET /health` (the top bar's row-1 `DNS OK` readout, every screen), and `GET /blocking` (pause
 control, every screen plus one per group row). Everything else is
 fetch-on-mount with a 10s stale time and no window-focus refetch; `me` is the
 exception, refetching on focus only once it has succeeded.
@@ -925,7 +927,7 @@ typing in an input.
 | Screen | What's missing |
 |---|---|
 | **Filtering → Groups & Clients** | CRUD works, but the per-group "Lists (n)" menu has **no error state**: it's disabled only while `isPending`, not on `isError`, and its toggle rebuilds the assignment set from `groupLists.data ?? []`. If that read failed, clicking one list PUTs `[thatOne]` and **silently drops every other assignment**. |
-| **Dashboard health strip** | Shows filter-list coverage and an unreachable indicator. The spec's "upstreams healthy" signal **has no code at all** — there is no upstream-health endpoint. |
+| **Dashboard health** | Reduced to the shell's two row-1 readouts (blocking state, and `DNS OK`/`DNS down` from `GET /health`). Filter-list freshness moved off the dashboard with the redesign and now lives only on Filtering → Lists. The spec's "upstreams healthy" signal **has no code at all** — there is no upstream-health endpoint. |
 | **Settings** | 11 keys work. The spec's "storage (read-only info)" section is absent, with a code comment noting no endpoint exists to source it. |
 | **Account** | TOTP and tokens are complete. **Change password is not implemented**; the page says so: *"Password changes aren't available yet — that's planned for a future update."* |
 | **Command palette** | Navigates to the 8 leaf pages only, grouped by nav section. The spec's "quick actions (pause, block a domain)" don't exist. |
@@ -945,6 +947,43 @@ The nav contains exactly the eight implemented routes, in four groups
 Network: Local DNS · System: Settings, Account) — there are no dead nav
 entries pointing at unbuilt screens. Theme and log out live under System too;
 the shell has no sidebar and no avatar.
+
+### Dashboard layout (`/`)
+
+A full-bleed grid of hairline-separated bands, no cards, everything mono:
+
+1. **Stat strip** — `QUERIES` / `BLOCKED` / `CACHE HIT RATE` / `ACTIVE CLIENTS`
+   from `GET /stats/overview`. Both percentages divide by `total`, which sums
+   *every* decision including `local` and `error` — so `blocked + cached +
+   forwarded ≤ total`, and no "allowed" figure is ever derived by subtraction.
+2. **Query volume** — rnui `BarChart`, `RESOLVED` stacked under `BLOCKED`
+   ("resolved" = every non-`blocked` decision, errors included, so the two
+   bands total the strip above). `GET /stats/timeline` returns only hours that
+   had traffic, keyed by a unix-**seconds** hour start, and never zero-fills;
+   the missing hours are synthesised client-side so the axis stays continuous.
+   The header labels the granularity `hourly buckets` — the design says
+   "15-min", but the endpoint cannot produce them.
+3. **Bottom split** — `LIVE QUERIES` (the shared SSE tail, newest 12 rows,
+   time / domain / client / decision / duration) beside a 320px rail holding
+   `TOP BLOCKED` (6) and `TOP CLIENTS` (5). Rail rows carry an inline
+   proportional bar sized against the largest value *in that panel*.
+
+**Decision colours** (live rows): `blocked`/`error` destructive, `stale` warn,
+`cached` muted, `forwarded` foreground, `local` primary. There is no `allowed`
+— the resolver never writes it.
+
+**The rate readout** next to `LIVE QUERIES` has no endpoint: it is measured
+from arrivals on the tail over a rolling 30s window, and renders nothing until
+it has been listening for 10s.
+
+**Top clients** resolve to a device name only via an exact-IP matcher in
+`GET /clients`; a CIDR matcher covers an address without identifying it, so
+those rows show the bare IP.
+
+**The window** (1h / 24h / 7d) lives in the URL as `?window=`, written by the
+shell's second chrome row and read by the page. Anything unrecognised falls
+back to 24h. That row also carries the app's one filled cell,
+`VIEW QUERY LOG →`; both are shown on `/` only.
 
 ---
 

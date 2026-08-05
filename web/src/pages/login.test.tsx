@@ -62,7 +62,7 @@ test("successful login resolves the mutation and the auth gate swaps from login 
   await fillCredentials(user);
 
   await waitFor(() => expect(successSpy).toHaveBeenCalledWith("Logged in"));
-  await waitFor(() => expect(screen.getByRole("link", { name: /query log/i })).toBeInTheDocument());
+  await waitFor(() => expect(screen.getByRole("link", { name: "Query Log" })).toBeInTheDocument());
 });
 
 test("TOTP: a 428 on the first submit reveals a verification-code step, and resubmitting with the code succeeds", async () => {

@@ -37,9 +37,9 @@ interface PauseControlProps {
 
 /**
  * Blocking pause/resume: one control that *is* the state readout and the
- * action, rather than a status dot sitting next to a separate button. The
- * shell's second row owns the app's only other status cell (resolver health
- * — see top-nav.tsx); a second identical-looking indicator for a different
+ * action, rather than a status dot sitting next to a separate button. It
+ * sits directly beside the app's only other status cell (resolver health —
+ * see top-nav.tsx); a second identical-looking indicator for a different
  * thing next to it read as duplication.
  *
  * The wording is about *blocking* specifically, never a bare "Pause":
@@ -154,13 +154,15 @@ export function PauseControl({ groupId = 0, variant = "button" }: PauseControlPr
 
 /**
  * The top bar's row-1 cell skin: square edges, one hairline on the left,
- * uppercase mono at the design's 11px/500/.06em. Not a Button — the chrome
- * is a strip of divided cells, and a rounded outlined control dropped into
- * it looks like something that fell in from another screen.
+ * uppercase mono at `text-xs`/`tracking-wider` — the same pair the resolver
+ * readout beside it uses, one notch tighter than the nav cells' tracking so
+ * a whole phrase ("Status unavailable") still fits the row. Not a Button:
+ * the chrome is a strip of divided cells, and a rounded outlined control
+ * dropped into it looks like something that fell in from another screen.
  */
 const CHROME_CELL =
   "flex h-full shrink-0 items-center gap-1.5 whitespace-nowrap border-l border-border " +
-  "px-[15px] font-mono text-[11px] font-medium tracking-[0.06em] uppercase transition-colors " +
+  "px-4 font-mono text-xs font-medium tracking-wider uppercase transition-colors " +
   "hover:bg-accent/60 disabled:opacity-60 " +
   "outline-none focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-ring";
 
@@ -192,7 +194,7 @@ function triggerView(
       icon: CircleAlert,
       label: "Status unavailable",
       buttonTone: "text-muted-foreground",
-      // Loud enough not to be skimmed past in a 42px bar, and impossible to
+      // Loud enough not to be skimmed past in a one-row bar, and impossible to
       // read as a confident "blocking is on".
       chromeTone: "text-destructive",
     };

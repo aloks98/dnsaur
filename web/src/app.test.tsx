@@ -38,6 +38,24 @@ test("authenticated user gets the two-row shell: nav groups above, the active gr
   expect(within(monitorTabs).getByRole("link", { name: /query log/i })).toBeInTheDocument();
 });
 
+// The dashboard is a full-bleed grid of hairline rules that have to meet
+// the viewport edges; the shell's 24px page gutter would leave every one of
+// them floating inside a frame, and a non-flex <main> would stop the split
+// claiming the leftover height its vertical rule needs.
+test("the dashboard route gets no page gutter; every other page keeps it", async () => {
+  const { unmount } = renderWithProviders(<App />);
+  await screen.findByRole("navigation", { name: "Primary" });
+
+  const dashboardMain = screen.getByRole("main");
+  expect(dashboardMain.className).not.toContain("p-6");
+  expect(dashboardMain.className).toContain("flex-col");
+  unmount();
+
+  renderWithProviders(<App />, { route: "/dns" });
+  await screen.findByRole("navigation", { name: "Network" });
+  expect(screen.getByRole("main").className).toContain("p-6");
+});
+
 test("/filtering forwards to Lists, and each panel is a deep-linkable route", async () => {
   const user = userEvent.setup();
   renderWithProviders(<App />, { route: "/filtering" });
@@ -112,16 +130,22 @@ test("a session that dies mid-session returns to login instead of stranding a sh
   );
 
   renderWithProviders(<App />);
-  await screen.findByRole("link", { name: /query log/i });
+  await screen.findByRole("link", { name: "Query Log" });
 
   // The session is revoked (logged out elsewhere, token revoked, DB reset);
-  // the next panel fetch is the first thing to notice.
+  // the next panel fetch is the first thing to notice. The window selector
+  // lives in the chrome now and writes `?window=` — the dashboard refetches
+  // off that, so this still drives a real authenticated request.
   signedIn = false;
-  await user.click(screen.getByRole("combobox", { name: /time window/i }));
-  await user.click(await screen.findByRole("option", { name: /last hour/i }));
+  await user.click(screen.getByRole("button", { name: "Last hour" }));
 
-  await waitFor(() => expect(screen.getByLabelText(/^password$/i)).toBeInTheDocument());
-  expect(screen.queryByRole("link", { name: /query log/i })).not.toBeInTheDocument();
+  // Two sequential round trips before the form can appear: the 401 from the
+  // stats refetch, then the re-run of /auth/me the interceptor triggers —
+  // with the gate's spinner in between. One second isn't reliably enough.
+  await waitFor(() => expect(screen.getByLabelText(/^password$/i)).toBeInTheDocument(), {
+    timeout: 3000,
+  });
+  expect(screen.queryByRole("link", { name: "Query Log" })).not.toBeInTheDocument();
 });
 
 test("a page that throws is contained by the shell's boundary, and navigating away clears it", async () => {
@@ -139,7 +163,7 @@ test("a page that throws is contained by the shell's boundary, and navigating aw
 
   expect(await screen.findByText(/something went wrong/i)).toBeInTheDocument();
   // The chrome outside the boundary is still mounted and still usable...
-  await user.click(screen.getByRole("link", { name: /query log/i }));
+  await user.click(screen.getByRole("link", { name: "Query Log" }));
 
   // ...and the boundary doesn't pin its fallback over the next route.
   expect(await screen.findByText("Recovered page")).toBeInTheDocument();
@@ -167,7 +191,7 @@ test("api unreachable (both auth/me and setup fail) shows the unreachable banner
   );
   renderWithProviders(<App />);
   await waitFor(() => expect(screen.getByText(/can't reach/i)).toBeInTheDocument());
-  expect(screen.queryByRole("link", { name: /query log/i })).not.toBeInTheDocument();
+  expect(screen.queryByRole("link", { name: "Query Log" })).not.toBeInTheDocument();
   expect(screen.queryByLabelText(/password/i)).not.toBeInTheDocument();
 });
 

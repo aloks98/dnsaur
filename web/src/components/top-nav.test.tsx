@@ -2,7 +2,7 @@ import { http, HttpResponse } from "msw";
 import { toast } from "sonner";
 import { afterEach, expect, test, vi } from "vitest";
 import { fireEvent, screen, waitFor, within } from "@testing-library/react";
-import { useLocation } from "react-router";
+import { useLocation, useNavigationType } from "react-router";
 import { server } from "../test/msw-server";
 import { renderWithProviders } from "../test/render";
 import { TopNav } from "./top-nav";
@@ -30,6 +30,10 @@ function renderTopNav({ route = "/", onOpen = () => {} } = {}) {
     return (
       <>
         <span data-testid="pathname">{location.pathname}</span>
+        <span data-testid="search">{location.search}</span>
+        {/* "PUSH" vs "REPLACE" is how the router itself reports whether the
+            last navigation added a back-stack entry. */}
+        <span data-testid="nav-type">{useNavigationType()}</span>
         <TopNav onOpenCommandPalette={onOpen} />
       </>
     );
@@ -109,6 +113,15 @@ test("the active group is marked and row 2 shows its pages as links", async () =
   expect(within(monitorTabs).getByRole("link", { name: "Query Log" })).not.toHaveAttribute(
     "aria-current",
   );
+
+  // The marker is a 2px bottom border, and *every* cell carries one — the
+  // inactive ones transparent — so lighting a tab never nudges its text.
+  const dashboardTab = within(monitorTabs).getByRole("link", { name: "Dashboard" });
+  const queryLogTab = within(monitorTabs).getByRole("link", { name: /query log/i });
+  expect(dashboardTab.className).toContain("border-b-primary");
+  expect(dashboardTab.className).toContain("border-b-2");
+  expect(queryLogTab.className).toContain("border-b-transparent");
+  expect(queryLogTab.className).toContain("border-b-2");
   // No other group's pages leak into the second row.
   expect(within(monitorTabs).queryByRole("link", { name: "Settings" })).not.toBeInTheDocument();
 });
@@ -246,26 +259,105 @@ test("a real logout failure keeps the user put and says so", async () => {
   expect(assign).not.toHaveBeenCalled();
 });
 
-test("row 2 ends in the resolver readout, which reports GET /health honestly", async () => {
+test("the resolver readout names its subject and reports GET /health honestly", async () => {
   renderTopNav();
-  await waitFor(() => expect(screen.getByRole("status")).toHaveTextContent(/resolving/i));
+  await waitFor(() => expect(screen.getByRole("status")).toHaveTextContent(/dns ok/i));
+  // A bare "Resolving" read as an action in progress, not a state.
+  expect(screen.getByRole("status")).not.toHaveTextContent(/resolving/i);
 });
 
 test("an unreachable resolver says so rather than staying green", async () => {
   server.use(http.get("/api/v1/health", () => HttpResponse.json({ error: "x" }, { status: 500 })));
 
   renderTopNav();
-  await waitFor(() => expect(screen.getByRole("status")).toHaveTextContent(/unreachable/i));
-  expect(screen.getByRole("status")).not.toHaveTextContent(/resolving/i);
+  await waitFor(() => expect(screen.getByRole("status")).toHaveTextContent(/dns down/i));
+  expect(screen.getByRole("status")).not.toHaveTextContent(/dns ok/i);
 });
 
-test("the blocking readout sits in row 1 and keeps its own four states", async () => {
+// Stage 2 parked resolver health in row 2's one filled cell for want of a
+// home. Row 2 is the *contextual* row and that cell is the design's only
+// call to action, so health moved up beside blocking — the shell's two "is
+// this thing working" readouts, in one place and in one visual language.
+test("the two health readouts sit together in row 1, neither of them filled", async () => {
   renderTopNav();
-  // Full state coverage lives in pause-control.test.tsx; this only pins that
-  // the shell mounts it, in the chrome skin, still saying what it does.
+
   const blocking = screen.getByRole("button", { name: /open blocking controls/i });
+  const resolver = screen.getByRole("status");
   await waitFor(() => expect(blocking).toHaveTextContent(/blocking active/i));
+  await waitFor(() => expect(resolver).toHaveTextContent(/dns ok/i));
+
+  // Same row (row 1 is the header's first child), and adjacent within it.
+  const row1 = screen.getByRole("navigation", { name: "Primary" }).parentElement;
+  expect(row1).toContainElement(blocking);
+  expect(row1).toContainElement(resolver);
+  expect(blocking.compareDocumentPosition(resolver) & Node.DOCUMENT_POSITION_FOLLOWING).toBe(
+    Node.DOCUMENT_POSITION_FOLLOWING,
+  );
+
+  // Neither shouts over the other: the one solid fill belongs to the CTA.
+  expect(resolver.className).not.toContain("bg-primary");
+  expect(resolver.className).toContain("text-primary");
   // The strings stay sentence case (accessible names, assertions); the cell
   // is what uppercases them.
   expect(blocking.className).toContain("uppercase");
+});
+
+// --- row 2's contextual cells ------------------------------------------------
+
+test("the dashboard's chrome carries the window selector and the filled CTA", async () => {
+  renderTopNav({ route: "/" });
+
+  const windows = screen.getByRole("group", { name: "Time window" });
+  expect(
+    within(windows)
+      .getAllByRole("button")
+      .map((b) => b.textContent),
+  ).toEqual(["1h", "24h", "7d"]);
+  // 24h is the default, and it is the one marked as chosen.
+  expect(within(windows).getByRole("button", { name: "Last 24 hours" })).toHaveAttribute(
+    "aria-pressed",
+    "true",
+  );
+  expect(within(windows).getByRole("button", { name: "Last hour" })).toHaveAttribute(
+    "aria-pressed",
+    "false",
+  );
+
+  const cta = screen.getByRole("link", { name: /view query log/i });
+  expect(cta).toHaveAttribute("href", "/queries");
+  expect(cta.className).toContain("bg-primary");
+});
+
+test("picking a window writes it to the URL, replacing rather than stacking history", async () => {
+  renderTopNav({ route: "/" });
+
+  fireEvent.click(screen.getByRole("button", { name: "Last 7 days" }));
+
+  await waitFor(() => expect(screen.getByTestId("search")).toHaveTextContent("?window=7d"));
+  expect(screen.getByRole("button", { name: "Last 7 days" })).toHaveAttribute(
+    "aria-pressed",
+    "true",
+  );
+  // No back-stack entry: the window is a view setting, not a place you can
+  // go "back" from.
+  expect(screen.getByTestId("nav-type")).toHaveTextContent("REPLACE");
+});
+
+test("a window already in the URL is the one shown as chosen", async () => {
+  renderTopNav({ route: "/?window=1h" });
+
+  expect(screen.getByRole("button", { name: "Last hour" })).toHaveAttribute("aria-pressed", "true");
+  expect(screen.getByRole("button", { name: "Last 24 hours" })).toHaveAttribute(
+    "aria-pressed",
+    "false",
+  );
+});
+
+// Both cells are about the dashboard: a stats window governs nothing on
+// Settings, and "view query log" is noise on the query log itself.
+test("no other screen gets the window selector or the CTA", async () => {
+  renderTopNav({ route: "/settings" });
+
+  expect(screen.queryByRole("group", { name: "Time window" })).not.toBeInTheDocument();
+  expect(screen.queryByRole("link", { name: /view query log/i })).not.toBeInTheDocument();
 });

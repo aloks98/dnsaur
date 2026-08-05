@@ -10,6 +10,15 @@ import {
   Users,
 } from "lucide-react";
 
+/**
+ * The dashboard. Named because two other places need to recognise it: the
+ * chrome hangs that screen's own cells off it (components/top-nav.tsx), and
+ * the shell drops its page padding for it (components/app-shell.tsx) — the
+ * dashboard is a full-bleed grid of hairline-separated bands, and a padded
+ * <main> would leave every one of those rules floating in a 24px gutter.
+ */
+export const DASHBOARD_PATH = "/";
+
 export interface NavItem {
   to: string;
   label: string;

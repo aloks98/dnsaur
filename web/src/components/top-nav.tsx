@@ -1,5 +1,5 @@
 import { ChevronDown, LogOut } from "lucide-react";
-import { NavLink, useLocation } from "react-router";
+import { NavLink, useLocation, useSearchParams } from "react-router";
 import { toast } from "sonner";
 import {
   Avatar,
@@ -15,7 +15,14 @@ import {
 } from "@e412/rnui-react";
 import { isAlreadyLoggedOut, useLogout, useMe, useMeInitials } from "../hooks/use-auth";
 import { useHealth } from "../hooks/use-stats";
-import { findActiveGroup, isNavItemActive, NAV_GROUPS, type NavGroup } from "../lib/nav";
+import {
+  DASHBOARD_PATH,
+  findActiveGroup,
+  isNavItemActive,
+  NAV_GROUPS,
+  type NavGroup,
+} from "../lib/nav";
+import { parseWindow, WINDOW_PARAM, WINDOWS } from "../lib/stats-window";
 import { DnsaurLogo } from "./dnsaur-logo";
 import { PauseControl } from "./pause-control";
 import { ThemeToggle } from "./theme-toggle";
@@ -24,16 +31,35 @@ interface TopNavProps {
   onOpenCommandPalette: () => void;
 }
 
-/** Shared by every cell in both rows: mono, uppercase, wide tracking. */
+/**
+ * Shared by every cell in both rows: mono, uppercase, tracked, one type
+ * step. Both strips sit at `text-xs` — the framework's smallest step, and
+ * the one the whole chrome is written in. What separates row 1 from row 2
+ * is weight and surface (row 2 is on `--card`), not size.
+ */
 const CELL =
-  "flex shrink-0 items-center whitespace-nowrap font-mono uppercase transition-colors " +
+  "flex shrink-0 items-center whitespace-nowrap px-4 font-mono text-xs font-normal " +
+  "tracking-widest uppercase transition-colors " +
+  // Every cell carries the active-marker border at all times, transparent
+  // until it's the one you're on, so marking a cell never moves its text.
+  // The colour is set per side (`border-b-*`, and `border-l-border` /
+  // `border-r-border` on the dividers below) rather than with the all-sides
+  // `border-border`: that would repaint this bottom edge too, drawing a
+  // 2px rule under every cell in the bar.
+  "border-b-2 border-b-transparent " +
   "outline-none focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-ring";
+
+/** Every cell that can be "the one you're on" marks it the same way. */
+const CELL_ACTIVE = "font-semibold text-foreground border-b-primary";
+const CELL_QUIET = "text-muted-foreground hover:text-foreground";
 
 /**
  * The app shell's chrome: two hairline-bordered rows in place of the old
  * sidebar. Row 1 is identity + the four nav *groups* + the global right-hand
- * cells (search, blocking); row 2 is the active group's pages as tabs, plus
- * the contextual right-hand cells.
+ * readouts (search, blocking, resolver health); row 2 is the active group's
+ * pages as tabs, plus the contextual right-hand cells — on the dashboard,
+ * the stats window selector and the one filled primary cell in the whole
+ * shell, which the design spends on that screen's CTA.
  *
  * Semantics are deliberately real, not divs-with-onClick: the groups are
  * menu buttons (base-ui Menu — arrow keys, Escape, typeahead, focus return),
@@ -51,6 +77,10 @@ const CELL =
 export function TopNav({ onOpenCommandPalette }: TopNavProps) {
   const { pathname } = useLocation();
   const activeGroup = findActiveGroup(pathname);
+  // Row 2's right-hand cells are contextual, and both of these are about the
+  // dashboard: a stats window has nothing to govern on Settings, and a
+  // "view query log" CTA is noise on the query log itself.
+  const onDashboard = pathname === DASHBOARD_PATH;
 
   return (
     <header
@@ -58,13 +88,13 @@ export function TopNav({ onOpenCommandPalette }: TopNavProps) {
       className="sticky top-0 z-20 shrink-0 bg-background text-foreground"
     >
       {/* ---- Row 1: identity, groups, global readouts ------------------- */}
-      <div className="flex h-[42px] items-stretch border-b border-border">
-        <div className={cn(CELL, "gap-2 border-r border-border px-3.5")}>
+      <div className="flex h-11 items-stretch border-b border-border">
+        <div className={cn(CELL, "gap-2 border-r border-r-border")}>
           <DnsaurLogo size={22} />
           {/* Below `sm` the tile carries the identity on its own and the
               wordmark's ~55px go to the nav strip instead — `sr-only`, not
               `hidden`, so it stays in the accessible name and the DOM. */}
-          <span className="font-heading text-[13px] font-bold tracking-[-0.02em] normal-case max-sm:sr-only">
+          <span className="font-heading text-sm font-bold tracking-tight normal-case max-sm:sr-only">
             dnsaur
           </span>
         </div>
@@ -79,11 +109,7 @@ export function TopNav({ onOpenCommandPalette }: TopNavProps) {
           <button
             type="button"
             onClick={onOpenCommandPalette}
-            className={cn(
-              CELL,
-              "border-l border-border px-[15px] text-[11px] font-normal tracking-[0.1em]",
-              "text-muted-foreground hover:text-foreground",
-            )}
+            className={cn(CELL, "border-l border-l-border", CELL_QUIET)}
           >
             {/* Same trick as the wordmark, below desktop: at tablet
                 width those ~75px are the difference between all four groups
@@ -96,35 +122,97 @@ export function TopNav({ onOpenCommandPalette }: TopNavProps) {
               readout and pause/resume menu in one — just wearing the
               chrome's cell skin. See components/pause-control.tsx. */}
           <PauseControl variant="chrome" />
+          {/* Resolver liveness sits next to blocking rather than in row 2:
+              they are the shell's two "is this thing working" readouts and
+              read as a pair, and row 2's terminal cell is the design's one
+              filled cell — spent below on the dashboard's CTA, not on a
+              status that is green nearly all the time. */}
+          <ResolverStatusCell />
         </div>
       </div>
 
       {/* ---- Row 2: the active group's pages ---------------------------- */}
-      <div className="flex h-[38px] items-stretch border-b border-border bg-card">
+      <div className="flex h-10 items-stretch border-b border-border bg-card">
         <nav aria-label={activeGroup.label} className="dnsaur-scroll-x flex min-w-0 items-stretch">
           {activeGroup.items.map((item) => (
             <NavLink
               key={item.to}
               to={item.to}
               end={item.end}
-              className={cn(
-                CELL,
-                "px-[15px] text-[10.5px] font-normal tracking-[0.1em]",
-                "text-muted-foreground hover:text-foreground",
-                isNavItemActive(pathname, item) &&
-                  "font-semibold text-foreground shadow-[inset_0_-2px_0_var(--primary)]",
-              )}
+              className={cn(CELL, CELL_QUIET, isNavItemActive(pathname, item) && CELL_ACTIVE)}
             >
               {item.label}
             </NavLink>
           ))}
         </nav>
 
-        <div className="ml-auto flex shrink-0 items-stretch">
-          <ResolverStatusCell />
-        </div>
+        {onDashboard && (
+          <div className="ml-auto flex shrink-0 items-stretch">
+            <WindowCells />
+            {/* The design's single filled cell, and the dashboard's one
+                call to action: the numbers above are a summary, the log is
+                where you actually go to look. */}
+            <NavLink
+              to="/queries"
+              className={cn(
+                CELL,
+                "border-l border-l-border bg-primary font-semibold text-primary-foreground",
+                "hover:bg-primary/90",
+              )}
+            >
+              View query log <span aria-hidden="true">→</span>
+            </NavLink>
+          </div>
+        )}
       </div>
     </header>
+  );
+}
+
+/**
+ * The 1h / 24h / 7d selector, as three chrome cells rather than a Select:
+ * three options with two-character labels is a segmented control, and a
+ * dropdown inside a 38px strip of divided cells reads as a foreign control.
+ *
+ * The value lives in the URL (see lib/stats-window.ts) — this row is in the
+ * shell and the numbers it governs are in the routed page below it.
+ * `replace` keeps a window switch out of the back stack: it is a view
+ * setting, not a navigation.
+ */
+function WindowCells() {
+  const [params, setParams] = useSearchParams();
+  const active = parseWindow(params.get(WINDOW_PARAM));
+
+  return (
+    // A real <fieldset> rather than role="group": same grouping semantics,
+    // one fewer ARIA attribute. `min-w-0` undoes the UA's
+    // `min-inline-size: min-content`, which preflight doesn't touch and
+    // which would stop this shrinking with the rest of the row.
+    <fieldset aria-label="Time window" className="flex min-w-0 items-stretch">
+      {WINDOWS.map((w) => (
+        <button
+          key={w.value}
+          type="button"
+          // The cell shows "24h"; the accessible name says "Last 24 hours",
+          // because "24h" read aloud on its own says nothing about what it
+          // does to the page.
+          aria-label={w.label}
+          aria-pressed={w.value === active}
+          onClick={() => {
+            const next = new URLSearchParams(params);
+            next.set(WINDOW_PARAM, w.value);
+            setParams(next, { replace: true });
+          }}
+          className={cn(
+            CELL,
+            "border-l border-l-border",
+            w.value === active ? CELL_ACTIVE : CELL_QUIET,
+          )}
+        >
+          {w.short}
+        </button>
+      ))}
+    </fieldset>
   );
 }
 
@@ -143,12 +231,7 @@ function NavGroupMenu({ group, active }: { group: NavGroup; active: boolean }) {
     <DropdownMenu>
       <DropdownMenuTrigger
         data-active={active}
-        className={cn(
-          CELL,
-          "gap-1.5 border-r border-border px-[15px] text-[11px] font-normal tracking-[0.1em]",
-          "text-muted-foreground hover:text-foreground",
-          active && "font-semibold text-foreground shadow-[inset_0_-2px_0_var(--primary)]",
-        )}
+        className={cn(CELL, "gap-1.5 border-r border-r-border", CELL_QUIET, active && CELL_ACTIVE)}
       >
         {group.label}
         <ChevronDown className="size-3 opacity-60" />
@@ -235,20 +318,25 @@ function LogOutItem() {
 }
 
 /**
- * Row 2's terminal filled cell: is the *resolver* answering (GET /health)?
+ * Row 1's second readout: is the *resolver* answering (GET /health)?
  *
  * This is the app's only liveness signal and it used to be the sidebar
- * footer's single status dot; the footer is gone, so it takes the design's
- * one filled cell at the end of the second row. It is deliberately not a
- * second dot next to the blocking readout — blocking's paused/active state
- * is part of the pause control itself (see pause-control.tsx).
+ * footer's single status dot. It sits beside the blocking readout, in the
+ * same flat text-only vocabulary that control uses (see pause-control.tsx's
+ * `chromeTone`) — the two together answer "is dnsaur working right now",
+ * and giving one of them a solid fill would make it shout over the other.
  *
- * "Unreachable" swaps the fill to destructive: a red-on-emerald mismatch is
- * the point, a confident primary-green "UNREACHABLE" would not be.
+ * "DNS down" goes destructive rather than merely grey: the whole point of
+ * the readout is that it must be impossible to skim past when it's bad.
+ *
+ * The wording names the subject, and it used to not: a bare "RESOLVING"
+ * reads as an action in progress ("…resolving what? is it stuck?") rather
+ * than as a state. "DNS OK" / "DNS down" parallel the blocking readout
+ * beside it, so the pair scans as two answers to the same question.
  */
 function ResolverStatusCell() {
   const health = useHealth();
-  const label = health.isPending ? "Checking…" : health.isError ? "Unreachable" : "Resolving";
+  const label = health.isPending ? "Checking DNS…" : health.isError ? "DNS down" : "DNS OK";
 
   return (
     // <output> rather than a div with role="status": same implicit role,
@@ -256,12 +344,12 @@ function ResolverStatusCell() {
     <output
       className={cn(
         CELL,
-        "border-l border-border px-[15px] text-[10.5px] font-semibold tracking-[0.1em]",
+        "border-l border-l-border text-xs font-medium tracking-wider",
         health.isError
-          ? "bg-destructive text-destructive-solid-foreground"
+          ? "text-destructive"
           : health.isPending
-            ? "bg-muted text-muted-foreground"
-            : "bg-primary text-primary-foreground",
+            ? "text-muted-foreground"
+            : "text-primary",
       )}
     >
       <span className="sr-only">Resolver: </span>
