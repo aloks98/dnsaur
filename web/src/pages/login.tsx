@@ -69,12 +69,14 @@ function useStepTransition(step: Step) {
  *
  * POST /auth/login can reply three different ways: 200 (session cookie set —
  * useLogin invalidates `me` and the app's auth gate swaps to the
- * authenticated routes on its own, no navigation needed here), 401 (bad
- * username/password), or 428 (the account has TOTP enabled and no/invalid
- * code was supplied). A 428 is not a "failure" the first time it happens —
- * it's an expected step in the flow — so it silently reveals the
- * verification-code step rather than toasting an error. A *second* 428
- * (i.e. the code itself was wrong) is a real failure and does toast.
+ * authenticated routes on its own, no navigation needed here), 428 (the
+ * account has TOTP enabled and *no* code was supplied), or 401 (anything
+ * else the server rejects: wrong username, wrong password — and wrong TOTP
+ * code, since internal/auth/service.go maps a supplied-but-invalid code to
+ * ErrBadCredentials, not ErrTOTPRequired). A 428 is not a "failure" — it's an
+ * expected step — so it silently reveals the verification-code step. A 401
+ * *while on that step* is a rejected code: it keeps the user there with the
+ * password intact, rather than bouncing them back to retype everything.
  *
  * Username and password stay registered in the form (react-hook-form keeps
  * unmounted field values by default) across the step change, since the
@@ -114,14 +116,20 @@ export function Login() {
         onSuccess: () => toast.success("Logged in"),
         onError: (err) => {
           if (err instanceof ApiError && err.status === 428) {
-            const invalidCode = step === "totp";
             form.resetField("totpCode");
             setStep("totp");
-            if (invalidCode) {
-              const message = "Invalid verification code — try again.";
-              setFormError({ setupRequired: false, message });
-              toast.error(message);
-            }
+            return;
+          }
+          // A *wrong* code is 401, not 428: internal/auth/service.go only
+          // returns ErrTOTPRequired when no code was supplied at all, so a
+          // supplied-but-invalid one comes back as plain bad credentials.
+          // Stay on the code step (the password is still valid and must not
+          // be thrown away) and say what actually went wrong.
+          if (err instanceof ApiError && err.status === 401 && step === "totp") {
+            const message = "Invalid verification code — try again.";
+            setFormError({ setupRequired: false, message });
+            form.resetField("totpCode");
+            toast.error(message);
             return;
           }
           if (err instanceof ApiError && err.status === 409) {

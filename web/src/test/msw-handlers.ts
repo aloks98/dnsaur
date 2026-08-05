@@ -1,5 +1,7 @@
 import { http, HttpResponse } from "msw";
 import type {
+  Client,
+  Group,
   HealthStatus,
   List,
   MeResponse,
@@ -27,6 +29,23 @@ function defaultTimeline(): TimelineBucket[] {
   }));
 }
 
+/**
+ * Blocking-pause status, scoped per group exactly like the real handler
+ * (internal/api/settings_handlers.go reads `group_id` and asks the engine
+ * for *that* group's pause). The shell Header polls the global scope
+ * (group 0) on every authenticated page, while the Filtering page mounts
+ * one PauseControl per group — a group-blind fixture would let a control
+ * that reads the wrong scope pass. Pass a map to make specific groups
+ * paused: `server.use(blockingHandler({ 3: Date.now() + 60_000 }))`.
+ */
+export function blockingHandler(pausedUntilByGroup: Record<number, number> = {}) {
+  return http.get("/api/v1/blocking", ({ request }) => {
+    const groupId = Number(new URL(request.url).searchParams.get("group_id") ?? 0);
+    const status: BlockingStatus = { paused_until: pausedUntilByGroup[groupId] ?? 0 };
+    return HttpResponse.json(status);
+  });
+}
+
 export const handlers = [
   http.get("/api/v1/auth/me", () => {
     const me: MeResponse = { id: 1, username: "admin", totp_enabled: false };
@@ -49,11 +68,16 @@ export const handlers = [
   }),
 
   http.get("/api/v1/stats/overview", () => {
+    // blocked + cached + forwarded is deliberately *less* than total: the
+    // real handler (internal/api/queries_handlers.go) sums every decision
+    // into total, including allowed/error/local, and reports only three of
+    // them individually. A fixture where the three add up exactly would
+    // green-light percentage math that can't hold on a real instance.
     const overview: StatsOverview = {
       total: 1000,
       blocked: 250,
       cached: 400,
-      forwarded: 350,
+      forwarded: 250,
       clients: 12,
     };
     return HttpResponse.json(overview);
@@ -108,12 +132,19 @@ export const handlers = [
     return HttpResponse.json(entries);
   }),
 
-  // Global blocking-pause status (group 0) — the shell Header's pause
-  // control (Task 9) polls this on every authenticated page, so it needs a
-  // default "active" fixture even for tests that have nothing to do with
-  // pausing (onUnhandledRequest is "error", see test/setup.ts).
-  http.get("/api/v1/blocking", () => {
-    const status: BlockingStatus = { paused_until: 0 };
-    return HttpResponse.json(status);
+  // Groups and clients. The query log resolves each row's group through its
+  // client (see pages/queries.tsx), and the dashboard's quick rules need to
+  // know whether more than one group exists — both are default-handled here
+  // because onUnhandledRequest is "error" (see test/setup.ts).
+  http.get("/api/v1/groups", () => {
+    const groups: Group[] = [{ id: 1, name: "default", enabled: true }];
+    return HttpResponse.json(groups);
   }),
+
+  http.get("/api/v1/clients", () => {
+    const clients: Client[] = [{ id: 1, name: "Laptop", matcher: "192.168.1.10", group_id: 1 }];
+    return HttpResponse.json(clients);
+  }),
+
+  blockingHandler(),
 ];

@@ -158,26 +158,61 @@ export function Setup() {
     void qc.invalidateQueries({ queryKey: authKeys.me });
   }
 
+  /**
+   * Best-effort, and honest about how far it got.
+   *
+   * A list that is created but never assigned to a group is dead weight —
+   * it exists in the catalog and filters nothing. So a failure partway
+   * through the loop no longer abandons the ids already created: whatever
+   * was created still gets attached, and the toast says what actually
+   * landed instead of implying the whole step was a no-op.
+   */
   async function applyStarterSetup() {
-    try {
-      const chosen = STARTER_LISTS.filter((l) => selectedLists[l.key]);
-      const ids: number[] = [];
-      for (const list of chosen) {
-        const created = await addList.mutateAsync({ url: list.url, kind: "block" });
-        ids.push(created.id);
+    const chosen = STARTER_LISTS.filter((l) => selectedLists[l.key]);
+    const created: number[] = [];
+    let failed = false;
+
+    for (const list of chosen) {
+      try {
+        const res = await addList.mutateAsync({ url: list.url, kind: "block" });
+        created.push(res.id);
+      } catch {
+        failed = true;
       }
-      if (ids.length > 0) {
-        await assignGroupLists.mutateAsync({ groupId: STARTER_GROUP_ID, listIds: ids });
-      }
-      if (upstreams.trim().length > 0) {
-        await updateSetting.mutateAsync({ key: "upstreams", value: upstreams.trim() });
-      }
-      toast.success("Starter blocklists and upstreams saved");
-    } catch {
-      toast.error("Couldn't save starter setup — you can add lists later in Filtering");
-    } finally {
-      setStep(3);
     }
+
+    let attached = created.length;
+    if (created.length > 0) {
+      try {
+        await assignGroupLists.mutateAsync({ groupId: STARTER_GROUP_ID, listIds: created });
+      } catch {
+        failed = true;
+        attached = 0;
+      }
+    }
+
+    if (upstreams.trim().length > 0) {
+      try {
+        await updateSetting.mutateAsync({ key: "upstreams", value: upstreams.trim() });
+      } catch {
+        failed = true;
+      }
+    }
+
+    if (!failed) {
+      toast.success("Starter blocklists and upstreams saved");
+    } else if (attached > 0 && attached < chosen.length) {
+      toast.error(
+        `Only ${attached} of ${chosen.length} starter blocklists were saved — you can add the rest later in Filtering`,
+      );
+    } else if (attached > 0) {
+      toast.error("Starter blocklists saved, but the upstreams weren't — set them in Settings");
+    } else if (chosen.length === 0) {
+      toast.error("Couldn't save the upstreams — you can set them in Settings");
+    } else {
+      toast.error("Couldn't save starter setup — you can add lists later in Filtering");
+    }
+    setStep(3);
   }
 
   return (

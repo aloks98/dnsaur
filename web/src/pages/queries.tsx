@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { getCoreRowModel, useReactTable, type ColumnDef } from "@tanstack/react-table";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { getCoreRowModel, useReactTable, type ColumnDef, type Table } from "@tanstack/react-table";
 import {
   Activity,
   ArrowUpRight,
@@ -46,16 +46,38 @@ import {
   type FilterFieldConfig,
   type StatusIndicatorProps,
 } from "@e412/rnui-react";
-import type { List, QueryEntry, Rule } from "../api/types";
+import type { Client, List, QueryEntry, Rule } from "../api/types";
 import type { SseState } from "../api/sse";
+import { useClients } from "../hooks/use-clients";
 import { useAddRule, useRules, useLists } from "../hooks/use-filters";
 import { useLiveTail, useQuerySearch, type QuerySearchFilter } from "../hooks/use-queries";
 
-// The one group the setup wizard ever creates today (see use-stats.ts's
-// own STARTER_GROUP_ID convention) — rules/lists resolution for the "why?"
-// drawer is scoped to it until Task 9's Filtering page introduces
-// multi-group management in the UI.
-const STARTER_GROUP_ID = 1;
+// The group a query is attributed to when its client matched no client
+// entry at all — internal/clients/registry.go's Lookup falls back to
+// ClientInfo{GroupID: 1} (with a zero ID) for those, so the query log must
+// use the same fallback or its rules would land somewhere the resolver
+// never consults for that client.
+const DEFAULT_GROUP_ID = 1;
+
+/**
+ * The group whose rules actually govern this row, resolved through the
+ * row's client — NOT a hardcoded group 1.
+ *
+ * `QueryEntry.client_id` is the *client's* id (internal/qlog/qlog.go), so
+ * the group comes from that client's `group_id`. Returns null when the row
+ * names a client this instance can't resolve (deleted since, or the client
+ * list hasn't loaded yet): writing a rule into a guessed group would be a
+ * silent no-op for that client, so callers must refuse rather than claim
+ * success.
+ */
+function groupForEntry(entry: QueryEntry, clientGroups: Map<number, number>): number | null {
+  if (!entry.client_id) return DEFAULT_GROUP_ID;
+  return clientGroups.get(entry.client_id) ?? null;
+}
+
+function clientGroupMap(clients: Client[] | undefined): Map<number, number> {
+  return new Map((clients ?? []).map((c) => [c.id, c.group_id]));
+}
 
 // --- decision badges ---------------------------------------------------
 // A seven-way vocabulary (see internal/dnssrv/pipeline.go for the decision
@@ -185,142 +207,159 @@ function formatTime(atMs: number): string {
 
 type RowStatus = "pending" | "blocked" | "allowed";
 
-function buildColumns(opts: {
+/**
+ * Everything a cell needs that changes while the table is mounted. It
+ * travels through the table's `meta` rather than being closed over by the
+ * column defs, because a column def array built per render is poison here:
+ * `cell` functions are used as component *types*, so a fresh arrow function
+ * per render makes React unmount and remount every visible row (losing focus
+ * and restarting the row-flash animation), on top of rebuilding
+ * getAllColumns/getHeaderGroups — and the live tail re-renders on every
+ * batch of arrivals. With the defs constant, only the cells' output changes.
+ */
+interface QueryTableMeta {
   rowStatus: Record<number, RowStatus>;
   newRowId: number | null;
   onBlock: (entry: QueryEntry) => void;
   onAllow: (entry: QueryEntry) => void;
   onWhy: (entry: QueryEntry) => void;
-}): ColumnDef<QueryEntry>[] {
-  const { rowStatus, newRowId, onBlock, onAllow, onWhy } = opts;
-  return [
-    {
-      id: "rail",
-      header: "",
-      size: 10,
-      cell: ({ row }) => (
-        <DecisionRail decision={row.original.decision} isNew={row.original.id === newRowId} />
-      ),
-    },
-    {
-      accessorKey: "at",
-      header: "Time",
-      size: 88,
-      cell: ({ row }) => (
-        <span className="font-mono text-xs tabular-nums text-muted-foreground">
-          {formatTime(row.original.at)}
-        </span>
-      ),
-    },
-    {
-      accessorKey: "client_ip",
-      header: "Client",
-      size: 118,
-      cell: ({ row }) => <span className="font-mono text-xs">{row.original.client_ip}</span>,
-    },
-    {
-      accessorKey: "q_name",
-      header: "Domain",
-      cell: ({ row }) => (
-        <span className="font-mono text-xs" title={row.original.q_name}>
-          {row.original.q_name}
-        </span>
-      ),
-    },
-    {
-      accessorKey: "q_type",
-      header: "Type",
-      size: 60,
-      cell: ({ row }) => (
-        <span className="font-mono text-xs text-muted-foreground">{row.original.q_type}</span>
-      ),
-    },
-    {
-      accessorKey: "decision",
-      header: "Decision",
-      size: 108,
-      cell: ({ row }) => <DecisionBadge decision={row.original.decision} />,
-    },
-    {
-      accessorKey: "upstream",
-      header: "Upstream",
-      size: 124,
-      cell: ({ row }) => (
-        <span className="font-mono text-xs text-muted-foreground">
-          {row.original.upstream || "—"}
-        </span>
-      ),
-    },
-    {
-      accessorKey: "duration_ms",
-      header: "Latency",
-      size: 76,
-      meta: { headerClassName: "text-right", cellClassName: "text-right" },
-      cell: ({ row }) => (
-        <span className="font-mono text-xs tabular-nums text-muted-foreground">
-          {row.original.duration_ms}ms
-        </span>
-      ),
-    },
-    {
-      id: "actions",
-      header: "",
-      size: 216,
-      cell: ({ row }) => {
-        const entry = row.original;
-        const status = rowStatus[entry.id];
-        return (
-          <div className="flex items-center justify-end gap-1">
-            {status === "blocked" ? (
-              <Badge variant="destructive-light">Blocked</Badge>
-            ) : status === "allowed" ? (
-              <Badge variant="success-light">Allowed</Badge>
-            ) : (
-              <>
-                <Button
-                  type="button"
-                  size="sm"
-                  variant="outline"
-                  disabled={status === "pending"}
-                  onClick={() => onBlock(entry)}
-                >
-                  <ShieldBan />
-                  Block
-                </Button>
-                <Button
-                  type="button"
-                  size="sm"
-                  variant="outline"
-                  disabled={status === "pending"}
-                  onClick={() => onAllow(entry)}
-                >
-                  <ShieldCheck />
-                  Allow
-                </Button>
-              </>
-            )}
-            <Tooltip>
-              <TooltipTrigger
-                render={
-                  <Button
-                    type="button"
-                    size="icon-sm"
-                    variant="ghost"
-                    aria-label={`Why was ${entry.q_name} ${entry.decision}?`}
-                    onClick={() => onWhy(entry)}
-                  />
-                }
-              >
-                <HelpCircle />
-              </TooltipTrigger>
-              <TooltipContent>Why this decision?</TooltipContent>
-            </Tooltip>
-          </div>
-        );
-      },
-    },
-  ];
 }
+
+function tableMeta(table: Table<QueryEntry>): QueryTableMeta {
+  return table.options.meta as QueryTableMeta;
+}
+
+const QUERY_COLUMNS: ColumnDef<QueryEntry>[] = [
+  {
+    id: "rail",
+    header: "",
+    size: 10,
+    cell: ({ row, table }) => (
+      <DecisionRail
+        decision={row.original.decision}
+        isNew={row.original.id === tableMeta(table).newRowId}
+      />
+    ),
+  },
+  {
+    accessorKey: "at",
+    header: "Time",
+    size: 88,
+    cell: ({ row }) => (
+      <span className="font-mono text-xs tabular-nums text-muted-foreground">
+        {formatTime(row.original.at)}
+      </span>
+    ),
+  },
+  {
+    accessorKey: "client_ip",
+    header: "Client",
+    size: 118,
+    cell: ({ row }) => <span className="font-mono text-xs">{row.original.client_ip}</span>,
+  },
+  {
+    accessorKey: "q_name",
+    header: "Domain",
+    cell: ({ row }) => (
+      <span className="font-mono text-xs" title={row.original.q_name}>
+        {row.original.q_name}
+      </span>
+    ),
+  },
+  {
+    accessorKey: "q_type",
+    header: "Type",
+    size: 60,
+    cell: ({ row }) => (
+      <span className="font-mono text-xs text-muted-foreground">{row.original.q_type}</span>
+    ),
+  },
+  {
+    accessorKey: "decision",
+    header: "Decision",
+    size: 108,
+    cell: ({ row }) => <DecisionBadge decision={row.original.decision} />,
+  },
+  {
+    accessorKey: "upstream",
+    header: "Upstream",
+    size: 124,
+    cell: ({ row }) => (
+      <span className="font-mono text-xs text-muted-foreground">
+        {row.original.upstream || "—"}
+      </span>
+    ),
+  },
+  {
+    accessorKey: "duration_ms",
+    header: "Latency",
+    size: 76,
+    meta: { headerClassName: "text-right", cellClassName: "text-right" },
+    cell: ({ row }) => (
+      <span className="font-mono text-xs tabular-nums text-muted-foreground">
+        {row.original.duration_ms}ms
+      </span>
+    ),
+  },
+  {
+    id: "actions",
+    header: "",
+    size: 216,
+    cell: ({ row, table }) => {
+      const entry = row.original;
+      const { rowStatus, onBlock, onAllow, onWhy } = tableMeta(table);
+      const status = rowStatus[entry.id];
+      return (
+        <div className="flex items-center justify-end gap-1">
+          {status === "blocked" ? (
+            <Badge variant="destructive-light">Blocked</Badge>
+          ) : status === "allowed" ? (
+            <Badge variant="success-light">Allowed</Badge>
+          ) : (
+            <>
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                disabled={status === "pending"}
+                onClick={() => onBlock(entry)}
+              >
+                <ShieldBan />
+                Block
+              </Button>
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                disabled={status === "pending"}
+                onClick={() => onAllow(entry)}
+              >
+                <ShieldCheck />
+                Allow
+              </Button>
+            </>
+          )}
+          <Tooltip>
+            <TooltipTrigger
+              render={
+                <Button
+                  type="button"
+                  size="icon-sm"
+                  variant="ghost"
+                  aria-label={`Why was ${entry.q_name} ${entry.decision}?`}
+                  onClick={() => onWhy(entry)}
+                />
+              }
+            >
+              <HelpCircle />
+            </TooltipTrigger>
+            <TooltipContent>Why this decision?</TooltipContent>
+          </Tooltip>
+        </div>
+      );
+    },
+  },
+];
 
 // --- shared grid -----------------------------------------------------------
 // Virtualized per the brief: every SSE message can replace the whole
@@ -336,6 +375,12 @@ function buildColumns(opts: {
 // loading state. So the loading skeleton is rendered here explicitly,
 // swapped in for the grid entirely while paged search is still in flight,
 // rather than relying on DataGrid's (virtual-body-unaware) isLoading prop.
+//
+// Those same isFetchingMore/hasMore props are what makes filtered search
+// page: scrolling to the end asks useQuerySearch for the next offset
+// instead of stopping dead at the first 100 matches, and a short final page
+// swaps the loader for "All matching queries loaded" so the end of the
+// results is stated rather than implied.
 
 const ROW_HEIGHT_ESTIMATE = 34; // dense row: ~12px vertical padding + text-xs line height + 1px border
 
@@ -343,16 +388,24 @@ function QueryDataGridPanel({
   entries,
   isLoading,
   emptyState,
-  columns,
+  meta,
+  onFetchMore,
+  isFetchingMore,
+  hasMore,
 }: {
   entries: QueryEntry[];
   isLoading: boolean;
   emptyState: ReactNode;
-  columns: ColumnDef<QueryEntry>[];
+  meta: QueryTableMeta;
+  /** Paged mode only — omitted for the live tail, which has no "more". */
+  onFetchMore?: () => void;
+  isFetchingMore?: boolean;
+  hasMore?: boolean;
 }) {
   const table = useReactTable({
     data: entries,
-    columns,
+    columns: QUERY_COLUMNS,
+    meta,
     getRowId: (row) => String(row.id),
     getCoreRowModel: getCoreRowModel(),
   });
@@ -363,6 +416,8 @@ function QueryDataGridPanel({
       recordCount={entries.length}
       isLoading={isLoading}
       emptyMessage={emptyState}
+      fetchingMoreMessage="Loading more matches…"
+      allRowsLoadedMessage="All matching queries loaded"
       tableLayout={{ dense: true, width: "auto" }}
     >
       <DataGridContainer>
@@ -374,7 +429,13 @@ function QueryDataGridPanel({
           </div>
         ) : (
           <DataGridScrollArea className="h-[34rem]">
-            <DataGridTableVirtual estimateSize={ROW_HEIGHT_ESTIMATE} overscan={12} />
+            <DataGridTableVirtual
+              estimateSize={ROW_HEIGHT_ESTIMATE}
+              overscan={12}
+              onFetchMore={onFetchMore}
+              isFetchingMore={isFetchingMore}
+              hasMore={hasMore}
+            />
           </DataGridScrollArea>
         )}
       </DataGridContainer>
@@ -384,7 +445,18 @@ function QueryDataGridPanel({
 
 // --- "why?" drawer -----------------------------------------------------------
 
-function WhyContent({ entry, rule, list }: { entry: QueryEntry; rule?: Rule; list?: List }) {
+function WhyContent({
+  entry,
+  rule,
+  ruleLoading,
+  list,
+}: {
+  entry: QueryEntry;
+  rule?: Rule;
+  /** The row's group's rules are still being fetched — see whyGroupId. */
+  ruleLoading?: boolean;
+  list?: List;
+}) {
   const { label, variant, icon: Icon } = decisionBadge(entry.decision);
 
   let matchBody: ReactNode;
@@ -395,10 +467,14 @@ function WhyContent({ entry, rule, list }: { entry: QueryEntry; rule?: Rule; lis
         <code className="font-mono text-foreground">{rule.pattern}</code>
         {rule.is_regex ? " (regex)" : ""}.
       </p>
+    ) : ruleLoading ? (
+      // Never claim the rule is missing while its group's rules are still
+      // in flight — the drawer opens before that request comes back.
+      <p className="text-sm text-muted-foreground">Looking up the matching rule…</p>
     ) : (
       <p className="text-sm text-muted-foreground">
-        Matched rule #{entry.rule_id}, which isn&apos;t available right now (it may belong to
-        another group).
+        Matched rule #{entry.rule_id}, which isn&apos;t available right now (it may have been
+        deleted).
       </p>
     );
   } else if (entry.list_id > 0) {
@@ -479,6 +555,10 @@ function liveStateBadge(
   if (paused) return { dotState: "idle", label: "Paused" };
   if (state === "open") return { dotState: "active", label: "Streaming" };
   if (state === "reconnecting") return { dotState: "fixing", label: "Reconnecting…" };
+  // "failed" = the stream gave up retrying (see api/sse.ts). Said plainly,
+  // with a manual retry beside it, rather than pretending a reconnect is
+  // still coming — the usual cause is a session that no longer exists.
+  if (state === "failed") return { dotState: "down", label: "Live tail disconnected" };
   return { dotState: "down", label: "Disconnected" };
 }
 
@@ -528,7 +608,15 @@ export function QueryLog() {
     return () => clearTimeout(t);
   }, [latestLiveId, hasActiveFilters, paused]);
 
-  const rules = useRules(STARTER_GROUP_ID);
+  // Every quick rule and the "why?" drawer are scoped to the group that
+  // actually governs the row's client (see groupForEntry) — a rule written
+  // into group 1 for a client that lives in group 3 is a no-op the UI would
+  // otherwise report as a success.
+  const clients = useClients();
+  const clientGroups = useMemo(() => clientGroupMap(clients.data), [clients.data]);
+  const whyGroupId = whyEntry ? groupForEntry(whyEntry, clientGroups) : null;
+
+  const rules = useRules(whyGroupId ?? DEFAULT_GROUP_ID);
   const lists = useLists();
   const rulesById = useMemo(() => new Map((rules.data ?? []).map((r) => [r.id, r])), [rules.data]);
   const listsById = useMemo(() => new Map((lists.data ?? []).map((l) => [l.id, l])), [lists.data]);
@@ -536,40 +624,47 @@ export function QueryLog() {
   const addRule = useAddRule();
   const [rowStatus, setRowStatus] = useState<Record<number, RowStatus>>({});
 
-  function quickRule(action: "allow" | "block", entry: QueryEntry) {
-    setRowStatus((s) => ({ ...s, [entry.id]: "pending" }));
-    addRule.mutate(
-      { groupId: STARTER_GROUP_ID, action, pattern: entry.q_name },
-      {
-        onSuccess: () => {
-          setRowStatus((s) => ({ ...s, [entry.id]: action === "block" ? "blocked" : "allowed" }));
-          toast.success(action === "block" ? `Blocked ${entry.q_name}` : `Allowed ${entry.q_name}`);
+  const quickRule = useCallback(
+    (action: "allow" | "block", entry: QueryEntry) => {
+      const verb = action === "block" ? "block" : "allow";
+      const groupId = groupForEntry(entry, clientGroups);
+      if (groupId === null) {
+        toast.error(`Couldn't ${verb} ${entry.q_name} — this client's group is unknown`);
+        return;
+      }
+      setRowStatus((s) => ({ ...s, [entry.id]: "pending" }));
+      addRule.mutate(
+        { groupId, action, pattern: entry.q_name },
+        {
+          onSuccess: () => {
+            setRowStatus((s) => ({ ...s, [entry.id]: action === "block" ? "blocked" : "allowed" }));
+            toast.success(
+              action === "block" ? `Blocked ${entry.q_name}` : `Allowed ${entry.q_name}`,
+            );
+          },
+          onError: () => {
+            setRowStatus((s) => {
+              const next = { ...s };
+              delete next[entry.id];
+              return next;
+            });
+            toast.error(`Couldn't ${verb} ${entry.q_name}`);
+          },
         },
-        onError: () => {
-          setRowStatus((s) => {
-            const next = { ...s };
-            delete next[entry.id];
-            return next;
-          });
-          toast.error(
-            action === "block"
-              ? `Couldn't block ${entry.q_name}`
-              : `Couldn't allow ${entry.q_name}`,
-          );
-        },
-      },
-    );
-  }
+      );
+    },
+    [addRule, clientGroups],
+  );
 
-  const columns = buildColumns({
-    rowStatus,
-    newRowId,
-    onBlock: (e) => quickRule("block", e),
-    onAllow: (e) => quickRule("allow", e),
-    onWhy: setWhyEntry,
-  });
+  const onBlock = useCallback((e: QueryEntry) => quickRule("block", e), [quickRule]);
+  const onAllow = useCallback((e: QueryEntry) => quickRule("allow", e), [quickRule]);
+  const gridMeta: QueryTableMeta = useMemo(
+    () => ({ rowStatus, newRowId, onBlock, onAllow, onWhy: setWhyEntry }),
+    [rowStatus, newRowId, onBlock, onAllow],
+  );
 
-  const entries = hasActiveFilters ? (paged.data ?? []) : live.entries;
+  const pagedEntries = useMemo(() => paged.data?.pages.flat() ?? [], [paged.data]);
+  const entries = hasActiveFilters ? pagedEntries : live.entries;
   const isLoading = hasActiveFilters && paged.isPending;
   const liveState = liveStateBadge(paused, live.state);
 
@@ -653,6 +748,11 @@ export function QueryLog() {
           ) : (
             <div className="flex items-center gap-3">
               <StatusIndicator state={liveState.dotState} label={liveState.label} size="sm" />
+              {!paused && live.state === "failed" && (
+                <Button type="button" variant="outline" size="sm" onClick={live.reconnect}>
+                  Reconnect
+                </Button>
+              )}
               <Switch
                 checked={!paused}
                 onCheckedChange={(checked) => setPaused(!checked)}
@@ -669,7 +769,10 @@ export function QueryLog() {
         entries={entries}
         isLoading={isLoading}
         emptyState={emptyState}
-        columns={columns}
+        meta={gridMeta}
+        onFetchMore={hasActiveFilters ? () => void paged.fetchNextPage() : undefined}
+        isFetchingMore={paged.isFetchingNextPage}
+        hasMore={hasActiveFilters ? paged.hasNextPage : undefined}
       />
 
       <Drawer
@@ -688,6 +791,7 @@ export function QueryLog() {
                 <WhyContent
                   entry={whyEntry}
                   rule={whyEntry.rule_id > 0 ? rulesById.get(whyEntry.rule_id) : undefined}
+                  ruleLoading={rules.isPending || rules.isFetching}
                   list={whyEntry.list_id > 0 ? listsById.get(whyEntry.list_id) : undefined}
                 />
               </div>

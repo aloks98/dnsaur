@@ -162,6 +162,7 @@ test("a failure while saving starter setup still lets the wizard finish, with an
     http.post("/api/v1/setup", () => HttpResponse.json({ status: "created" }, { status: 201 })),
     http.post("/api/v1/auth/login", () => HttpResponse.json({ status: "ok" })),
     http.post("/api/v1/filters/lists", () => HttpResponse.json({ error: "boom" }, { status: 500 })),
+    http.put("/api/v1/settings", () => new HttpResponse(null, { status: 204 })),
   );
   const errorSpy = vi.spyOn(toast, "error");
 
@@ -175,6 +176,47 @@ test("a failure while saving starter setup still lets the wizard finish, with an
     expect(errorSpy).toHaveBeenCalledWith(
       "Couldn't save starter setup — you can add lists later in Filtering",
     ),
+  );
+  expect(screen.getByText(/you're all set/i)).toBeInTheDocument();
+});
+
+test("a partway failure still attaches the lists that were created, and says so", async () => {
+  const user = userEvent.setup();
+  let creates = 0;
+  let assignedGroupId: number | undefined;
+  let assignedListIds: number[] | undefined;
+
+  server.use(
+    http.post("/api/v1/setup", () => HttpResponse.json({ status: "created" }, { status: 201 })),
+    http.post("/api/v1/auth/login", () => HttpResponse.json({ status: "ok" })),
+    // The first starter list is created; the second one fails. The first
+    // must still be attached to the group — a list that exists in the
+    // catalog but belongs to no group filters precisely nothing.
+    http.post("/api/v1/filters/lists", () => {
+      creates += 1;
+      return creates === 1
+        ? HttpResponse.json({ id: 1 }, { status: 201 })
+        : HttpResponse.json({ error: "boom" }, { status: 500 });
+    }),
+    http.put("/api/v1/groups/:id/lists", async ({ params, request }) => {
+      assignedGroupId = Number(params.id);
+      assignedListIds = ((await request.json()) as { list_ids: number[] }).list_ids;
+      return new HttpResponse(null, { status: 204 });
+    }),
+    http.put("/api/v1/settings", () => new HttpResponse(null, { status: 204 })),
+  );
+  const errorSpy = vi.spyOn(toast, "error");
+
+  renderWithProviders(<Setup />);
+  await fillAccountForm(user);
+  await screen.findByText(/starter blocklists/i);
+
+  await user.click(screen.getByRole("button", { name: /continue/i }));
+
+  await waitFor(() => expect(assignedListIds).toEqual([1]));
+  expect(assignedGroupId).toBe(1);
+  expect(errorSpy).toHaveBeenCalledWith(
+    "Only 1 of 2 starter blocklists were saved — you can add the rest later in Filtering",
   );
   expect(screen.getByText(/you're all set/i)).toBeInTheDocument();
 });

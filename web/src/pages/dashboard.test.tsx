@@ -174,3 +174,84 @@ test("a failed quick action shows an error toast and lets the user retry", async
   // Still offers the action — did not get stuck showing a false "Blocked" state.
   expect(within(row).getByRole("button", { name: /block/i })).toBeInTheDocument();
 });
+
+test("errors ride as their own series so the chart's total matches the Total queries tile", async () => {
+  server.use(
+    http.get("/api/v1/stats/overview", () =>
+      // The tile's denominator: the backend sums *every* decision into
+      // `total`, errors included (internal/api/queries_handlers.go).
+      HttpResponse.json({ total: 20, blocked: 5, cached: 2, forwarded: 0, clients: 3 }),
+    ),
+    http.get("/api/v1/stats/timeline", () =>
+      HttpResponse.json([
+        {
+          bucket: Math.floor(Date.now() / 1000),
+          decisions: { allowed: 10, blocked: 5, error: 3, cached: 2 },
+        },
+      ]),
+    ),
+  );
+
+  renderWithProviders(<Dashboard />);
+
+  expect(await screen.findByText("Errors: 3")).toBeInTheDocument();
+  // 12 + 5 + 3 = 20, the same number the tile above reports for the window.
+  expect(screen.getByRole("figure", { name: /20 queries/ })).toBeInTheDocument();
+});
+
+test("a healthy window carries no Errors series at all", async () => {
+  server.use(
+    http.get("/api/v1/stats/timeline", () =>
+      HttpResponse.json([
+        {
+          bucket: Math.floor(Date.now() / 1000),
+          decisions: { allowed: 10, blocked: 5, cached: 2 },
+        },
+      ]),
+    ),
+  );
+
+  renderWithProviders(<Dashboard />);
+
+  expect(await screen.findByText("Blocked: 5")).toBeInTheDocument();
+  expect(screen.queryByText(/^Errors:/)).not.toBeInTheDocument();
+});
+
+test("with several groups the quick rule targets the chosen one, not always group 1", async () => {
+  const user = userEvent.setup();
+  const posted: { groupId: string; body: unknown }[] = [];
+  server.use(
+    http.get("/api/v1/groups", () =>
+      HttpResponse.json([
+        { id: 1, name: "default", enabled: true },
+        { id: 2, name: "kids", enabled: true },
+      ]),
+    ),
+    http.post("/api/v1/groups/:id/rules", async ({ params, request }) => {
+      posted.push({ groupId: String(params.id), body: await request.json() });
+      return HttpResponse.json({ id: 1 }, { status: 201 });
+    }),
+  );
+  const successSpy = vi.spyOn(toast, "success");
+
+  renderWithProviders(<Dashboard />);
+
+  // The picker only appears once there is a choice to make.
+  await user.click(await screen.findByRole("combobox", { name: /rule group/i }));
+  await user.click(await screen.findByRole("option", { name: "kids" }));
+
+  const row = (await screen.findByText("example.com")).closest("tr");
+  if (!row) throw new Error("row not found");
+  await user.click(within(row).getByRole("button", { name: /block/i }));
+
+  await waitFor(() => expect(posted).toHaveLength(1));
+  expect(posted[0]).toEqual({ groupId: "2", body: { action: "block", pattern: "example.com" } });
+  expect(successSpy).toHaveBeenCalledWith("Blocked example.com in kids");
+});
+
+test("a single-group instance shows no group picker", async () => {
+  renderWithProviders(<Dashboard />);
+
+  await screen.findByText("example.com");
+  expect(screen.queryByRole("combobox", { name: /rule group/i })).not.toBeInTheDocument();
+});

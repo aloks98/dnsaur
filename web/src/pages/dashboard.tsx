@@ -34,16 +34,16 @@ import {
   TableRow,
   type BadgeProps,
 } from "@e412/rnui-react";
-import type { StatsOverview, TimelineBucket, TopEntry } from "../api/types";
+import type { Group, StatsOverview, TimelineBucket, TopEntry } from "../api/types";
 import { useAddRule, useLists } from "../hooks/use-filters";
+import { useGroups } from "../hooks/use-groups";
 import { useHealth, useStatsOverview, useStatsTimeline, useStatsTop } from "../hooks/use-stats";
 import { relativeTime } from "../lib/format";
 
-// The one group the setup wizard ever creates today (see the query log's
-// own STARTER_GROUP_ID convention in pages/queries.tsx) — the dashboard's
-// per-domain quick block/allow action targets it until group selection
-// exists in the UI (Task 10).
-const QUICK_RULE_GROUP_ID = 1;
+// The group every quick rule targets unless the user picks another one.
+// Group 1 is the structural default (see hooks/use-groups.ts) and the group
+// unmatched clients resolve to (internal/clients/registry.go).
+const DEFAULT_GROUP_ID = 1;
 
 // --- window selector -------------------------------------------------------
 
@@ -93,6 +93,44 @@ function WindowSelect({
         ))}
       </SelectContent>
     </Select>
+  );
+}
+
+// --- quick-rule group selector ---------------------------------------------
+// The top-domain tables aggregate across every client, so — unlike the query
+// log, where each row names a client and therefore a group — there is
+// nothing here to resolve a group *from*. Writing silently into group 1 once
+// the Filtering page lets users keep several groups meant a rule that
+// reported success and did nothing for anyone outside the default. So the
+// target is picked explicitly, and only surfaces once there is a choice to
+// make (a single-group instance sees no extra control at all).
+
+function RuleGroupSelect({
+  groups,
+  value,
+  onChange,
+}: {
+  groups: Group[];
+  value: number;
+  onChange: (groupId: number) => void;
+}) {
+  const items = Object.fromEntries(groups.map((g) => [String(g.id), g.name]));
+  return (
+    <div className="flex flex-wrap items-center gap-2">
+      <span className="text-sm text-muted-foreground">Quick block/allow applies to</span>
+      <Select items={items} value={String(value)} onValueChange={(v) => onChange(Number(v))}>
+        <SelectTrigger aria-label="Rule group" className="w-44">
+          <SelectValue />
+        </SelectTrigger>
+        <SelectContent>
+          {groups.map((g) => (
+            <SelectItem key={g.id} value={String(g.id)}>
+              {g.name}
+            </SelectItem>
+          ))}
+        </SelectContent>
+      </Select>
+    </div>
   );
 }
 
@@ -217,9 +255,10 @@ function StatTiles({
 }
 
 // --- timeline chart ------------------------------------------------------------
-// Stacked not-blocked (bottom, indigo) + blocked (top, destructive) area, so
-// the total-height reads as query volume and the red cap reads as block
-// share — one glance answers both "how busy" and "how much is being
+// Stacked not-blocked (bottom, indigo) + blocked (destructive) + errors
+// (amber, only when non-zero), so the total height reads as query volume —
+// the same total the tiles above report — and the red band reads as block
+// share: one glance answers both "how busy" and "how much is being
 // filtered".
 
 function bucketLabel(bucketSec: number, hours: number): string {
@@ -234,17 +273,23 @@ function timelineSeries(buckets: TimelineBucket[], hours: number) {
   const sorted = [...buckets].sort((a, b) => a.bucket - b.bucket);
   const categories = sorted.map((b) => bucketLabel(b.bucket, hours));
   const blockedSeries = sorted.map((b) => b.decisions.blocked ?? 0);
+  const errorSeries = sorted.map((b) => b.decisions.error ?? 0);
   // "Not blocked" = every decision except blocked *and* error — a failed
   // upstream/resolve attempt isn't a query dnsaur let through, so counting
   // it as "allowed" would be misleading. (Decision kinds: allowed, blocked,
   // local, cached, stale, forwarded, error — see internal/dnssrv/pipeline.go.)
+  // Errors are carried as their own series rather than dropped, so the three
+  // stacked series still add up to the same denominator the "Total queries"
+  // tile uses (internal/api/queries_handlers.go sums *every* decision into
+  // `total`) — on an instance with upstream failures the chart and the tile
+  // used to disagree about the same window.
   const notBlockedSeries = sorted.map((b, i) => {
     const total = Object.entries(b.decisions)
       .filter(([decision]) => decision !== "error")
       .reduce((sum, [, n]) => sum + n, 0);
     return total - (blockedSeries[i] ?? 0);
   });
-  return { categories, notBlockedSeries, blockedSeries };
+  return { categories, notBlockedSeries, blockedSeries, errorSeries };
 }
 
 function TimelineCard({
@@ -273,12 +318,16 @@ function TimelineCard({
       />
     );
   } else {
-    const { categories, notBlockedSeries, blockedSeries } = timelineSeries(timeline.data, hours);
+    const { categories, notBlockedSeries, blockedSeries, errorSeries } = timelineSeries(
+      timeline.data,
+      hours,
+    );
     const totalNotBlocked = notBlockedSeries.reduce((s, n) => s + n, 0);
     const totalBlocked = blockedSeries.reduce((s, n) => s + n, 0);
+    const totalErrors = errorSeries.reduce((s, n) => s + n, 0);
     body = (
       <figure
-        aria-label={`Query volume over time: ${totalNotBlocked.toLocaleString()} not blocked, ${totalBlocked.toLocaleString()} blocked`}
+        aria-label={`Query volume over time: ${(totalNotBlocked + totalBlocked + totalErrors).toLocaleString()} queries — ${totalNotBlocked.toLocaleString()} not blocked, ${totalBlocked.toLocaleString()} blocked, ${totalErrors.toLocaleString()} errored`}
       >
         <AreaChart
           categories={categories}
@@ -290,6 +339,13 @@ function TimelineCard({
             // text either way.
             { name: "Not blocked", data: notBlockedSeries, color: "var(--chart-1)" },
             { name: "Blocked", data: blockedSeries, color: "var(--destructive)" },
+            // Amber, never red: a failed resolve is a broken query, not a
+            // policy decision (same convention as the query log's badges).
+            // Only carried when there are any — an always-flat zero series
+            // is legend noise on a healthy instance.
+            ...(totalErrors > 0
+              ? [{ name: "Errors", data: errorSeries, color: "var(--warning)" }]
+              : []),
           ]}
           stacked
           height={280}
@@ -303,7 +359,9 @@ function TimelineCard({
     <Card>
       <CardHeader>
         <CardTitle>Query volume</CardTitle>
-        <CardDescription>Blocked vs. not-blocked queries over time.</CardDescription>
+        <CardDescription>
+          Blocked, not-blocked, and failed queries over time — the same total as the tiles above.
+        </CardDescription>
       </CardHeader>
       <CardContent>{body}</CardContent>
     </Card>
@@ -436,17 +494,29 @@ export function Dashboard() {
   const topBlocked = useStatsTop("blocked_domain", 10, hours);
   const topClients = useStatsTop("client", 10, hours);
 
+  const groups = useGroups();
+  const availableGroups = groups.data ?? [];
+  const [ruleGroupId, setRuleGroupId] = useState(DEFAULT_GROUP_ID);
+  // A group can be deleted from the Filtering page while this is mounted.
+  const selectedGroup = availableGroups.find((g) => g.id === ruleGroupId);
+  const effectiveGroupId = selectedGroup?.id ?? DEFAULT_GROUP_ID;
+
   const addRule = useAddRule();
   const [ruleStatus, setRuleStatus] = useState<Record<string, "pending" | "done">>({});
 
   function quickRule(action: "allow" | "block", pattern: string) {
+    // Named in the toast only when there was a choice — on a single-group
+    // instance "in default" is noise, not information.
+    const scope = availableGroups.length > 1 && selectedGroup ? ` in ${selectedGroup.name}` : "";
     setRuleStatus((s) => ({ ...s, [pattern]: "pending" }));
     addRule.mutate(
-      { groupId: QUICK_RULE_GROUP_ID, action, pattern },
+      { groupId: effectiveGroupId, action, pattern },
       {
         onSuccess: () => {
           setRuleStatus((s) => ({ ...s, [pattern]: "done" }));
-          toast.success(action === "block" ? `Blocked ${pattern}` : `Allowed ${pattern}`);
+          toast.success(
+            action === "block" ? `Blocked ${pattern}${scope}` : `Allowed ${pattern}${scope}`,
+          );
         },
         onError: () => {
           setRuleStatus((s) => {
@@ -487,6 +557,14 @@ export function Dashboard() {
       <StatTiles overview={overview} hours={hours} />
 
       <TimelineCard timeline={timeline} hours={hours} />
+
+      {availableGroups.length > 1 && (
+        <RuleGroupSelect
+          groups={availableGroups}
+          value={effectiveGroupId}
+          onChange={setRuleGroupId}
+        />
+      )}
 
       <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
         <TopTable

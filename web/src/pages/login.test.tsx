@@ -99,12 +99,25 @@ test("TOTP: a 428 on the first submit reveals a verification-code step, and resu
   ]);
 });
 
-test("TOTP: an invalid code on the second submit keeps the user on the code step with an inline error", async () => {
+// The status here is the whole point: internal/auth/service.go returns
+// ErrTOTPRequired *only* when no code was supplied, so a supplied-but-wrong
+// code comes back as ErrBadCredentials → 401 (auth_handlers.go). A second
+// 428 is a response the backend cannot produce, and mocking one used to
+// green-light a branch real users never reached — they got the generic
+// "Invalid username or password", a wiped password, and a trip back to the
+// credentials step.
+test("TOTP: a rejected code (401) keeps the user on the code step with the password intact", async () => {
   const user = userEvent.setup();
+  const bodies: { username: string; password: string; totp_code?: string }[] = [];
   server.use(
-    http.post("/api/v1/auth/login", () =>
-      HttpResponse.json({ error: "totp code required" }, { status: 428 }),
-    ),
+    http.post("/api/v1/auth/login", async ({ request }) => {
+      bodies.push(
+        (await request.json()) as { username: string; password: string; totp_code?: string },
+      );
+      return bodies.length === 1
+        ? HttpResponse.json({ error: "totp code required" }, { status: 428 })
+        : HttpResponse.json({ error: "invalid credentials" }, { status: 401 });
+    }),
   );
   const errorSpy = vi.spyOn(toast, "error");
 
@@ -118,7 +131,20 @@ test("TOTP: an invalid code on the second submit keeps the user on the code step
   expect(await screen.findByText(/invalid verification code/i)).toBeInTheDocument();
   // Still on the code step, not bounced back to credentials.
   expect(screen.getByLabelText(/verification code/i)).toBeInTheDocument();
+  expect(screen.queryByLabelText(/^password$/i)).not.toBeInTheDocument();
   expect(errorSpy).toHaveBeenCalledWith("Invalid verification code — try again.");
+
+  // And the password survived: retrying the code re-sends it, so the user
+  // never has to retype anything but the code itself.
+  await user.type(screen.getByLabelText(/verification code/i), "123456");
+  await user.click(screen.getByRole("button", { name: /verify/i }));
+
+  await waitFor(() => expect(bodies).toHaveLength(3));
+  expect(bodies[2]).toEqual({
+    username: "admin",
+    password: "supersecret1",
+    totp_code: "123456",
+  });
 });
 
 test("409 (no admin account yet) surfaces a message pointing at first-run setup", async () => {

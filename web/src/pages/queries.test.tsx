@@ -1,7 +1,7 @@
 import { act } from "react";
 import { http, HttpResponse } from "msw";
 import { toast } from "sonner";
-import { beforeAll, beforeEach, expect, test, vi } from "vitest";
+import { afterEach, beforeAll, beforeEach, expect, test, vi } from "vitest";
 import { fireEvent, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { server } from "../test/msw-server";
@@ -52,6 +52,10 @@ beforeEach(() => {
   FakeEventSource.instances = [];
   vi.stubGlobal("EventSource", FakeEventSource);
 });
+
+// Toast spies are per-test; without this they accumulate calls across the
+// whole file and "was never called" assertions can never fail.
+afterEach(() => vi.restoreAllMocks());
 
 function entry(overrides: Partial<QueryEntry> = {}): QueryEntry {
   return {
@@ -320,4 +324,178 @@ test("clearing filters returns to live tail: the stream reopens and live rows re
   act(() => newSource.emit(entry({ id: 100, q_name: "resumed-live.example.com" })));
 
   expect(await screen.findByText("resumed-live.example.com")).toBeInTheDocument();
+});
+
+test("a fresh install shows the waiting-for-traffic empty state", async () => {
+  renderWithProviders(<QueryLog />);
+
+  const source = await firstSource();
+  act(() => source.emitOpen());
+
+  // DataGridTableVirtual has its own empty branch, separate from the plain
+  // grid's — the exact path that regressed twice on this branch.
+  expect(await screen.findByText(/waiting for traffic/i)).toBeInTheDocument();
+  expect(screen.getByText(/live queries will appear here/i)).toBeInTheDocument();
+});
+
+test("unmounting the page closes the live stream", async () => {
+  const { unmount } = renderWithProviders(<QueryLog />);
+
+  const source = await firstSource();
+  act(() => source.emitOpen());
+  expect(source.closed).toBe(false);
+
+  unmount();
+
+  expect(source.closed).toBe(true);
+});
+
+test("a dropped stream is reported as reconnecting", async () => {
+  renderWithProviders(<QueryLog />);
+
+  const source = await firstSource();
+  act(() => source.emitOpen());
+  expect(await screen.findByText(/streaming/i)).toBeInTheDocument();
+
+  act(() => source.emitError());
+
+  expect(await screen.findByText(/reconnecting/i)).toBeInTheDocument();
+});
+
+test("blocking a row writes the rule into that row's client group, not group 1", async () => {
+  const user = userEvent.setup();
+  const posted: { groupId: string; body: unknown }[] = [];
+  server.use(
+    http.get("/api/v1/clients", () =>
+      HttpResponse.json([{ id: 7, name: "Kids tablet", matcher: "192.168.1.40", group_id: 3 }]),
+    ),
+    http.post("/api/v1/groups/:id/rules", async ({ params, request }) => {
+      posted.push({ groupId: String(params.id), body: await request.json() });
+      return HttpResponse.json({ id: 1 }, { status: 201 });
+    }),
+  );
+
+  renderWithProviders(<QueryLog />);
+  const source = await firstSource();
+  act(() => source.emitOpen());
+  act(() => source.emit(entry({ id: 1, client_id: 7, q_name: "ads.kids.example" })));
+
+  const row = (await screen.findByText("ads.kids.example")).closest("tr");
+  if (!row) throw new Error("row not found");
+  await user.click(within(row).getByRole("button", { name: /block/i }));
+
+  await waitFor(() => expect(posted).toHaveLength(1));
+  expect(posted[0]).toEqual({
+    groupId: "3",
+    body: { action: "block", pattern: "ads.kids.example" },
+  });
+});
+
+test("a row whose client can't be resolved refuses the action instead of faking success", async () => {
+  const user = userEvent.setup();
+  const posted: string[] = [];
+  server.use(
+    http.post("/api/v1/groups/:id/rules", async ({ params }) => {
+      posted.push(String(params.id));
+      return HttpResponse.json({ id: 1 }, { status: 201 });
+    }),
+  );
+  const errorSpy = vi.spyOn(toast, "error");
+  const successSpy = vi.spyOn(toast, "success");
+
+  renderWithProviders(<QueryLog />);
+  const source = await firstSource();
+  act(() => source.emitOpen());
+  // client_id 999 belongs to no client this instance knows about (deleted
+  // since the query was logged) — there is no group to write a rule into.
+  act(() => source.emit(entry({ id: 1, client_id: 999, q_name: "orphan.example" })));
+
+  const row = (await screen.findByText("orphan.example")).closest("tr");
+  if (!row) throw new Error("row not found");
+  await user.click(within(row).getByRole("button", { name: /block/i }));
+
+  await waitFor(() =>
+    expect(errorSpy).toHaveBeenCalledWith(
+      "Couldn't block orphan.example — this client's group is unknown",
+    ),
+  );
+  expect(posted).toHaveLength(0);
+  expect(successSpy).not.toHaveBeenCalled();
+  expect(within(row).queryByText("Blocked")).not.toBeInTheDocument();
+});
+
+test("the why drawer resolves rules from the row's own group", async () => {
+  const user = userEvent.setup();
+  const ruleRequests: string[] = [];
+  server.use(
+    http.get("/api/v1/clients", () =>
+      HttpResponse.json([{ id: 7, name: "Kids tablet", matcher: "192.168.1.40", group_id: 3 }]),
+    ),
+    http.get("/api/v1/groups/:id/rules", ({ params }) => {
+      ruleRequests.push(String(params.id));
+      return HttpResponse.json(
+        params.id === "3"
+          ? [{ id: 5, group_id: 3, action: "block", pattern: "ads.kids.example", is_regex: false }]
+          : [],
+      );
+    }),
+  );
+
+  renderWithProviders(<QueryLog />);
+  const source = await firstSource();
+  act(() => source.emitOpen());
+  act(() =>
+    source.emit(
+      entry({ id: 1, client_id: 7, q_name: "ads.kids.example", decision: "blocked", rule_id: 5 }),
+    ),
+  );
+
+  const row = (await screen.findByText("ads.kids.example")).closest("tr");
+  if (!row) throw new Error("row not found");
+  await user.click(within(row).getByRole("button", { name: /why/i }));
+
+  // Resolved out of group 3 — group 1's rules would have rendered the
+  // "isn't available right now" fallback for every non-default group.
+  await waitFor(() => expect(screen.getByText(/matched a block rule for/i)).toBeInTheDocument());
+  expect(ruleRequests).toContain("3");
+});
+
+test("filtered results page past the first 100 matches instead of stopping there", async () => {
+  const urls: string[] = [];
+  const page = (start: number, count: number) =>
+    Array.from({ length: count }, (_, i) =>
+      entry({ id: start + i, q_name: `hit-${start + i}.example.com`, decision: "blocked" }),
+    );
+  server.use(
+    http.get("/api/v1/queries", ({ request }) => {
+      const url = new URL(request.url);
+      urls.push(request.url);
+      if (url.searchParams.get("decision") !== "blocked") return HttpResponse.json([]);
+      const offset = Number(url.searchParams.get("offset") ?? 0);
+      // A full first page (== limit) means "there may be more"; the short
+      // second page is the end of the results.
+      return HttpResponse.json(offset === 0 ? page(0, 100) : page(100, 12));
+    }),
+  );
+
+  renderWithProviders(<QueryLog />);
+  await firstSource();
+
+  fireEvent.click(screen.getByRole("button", { name: /filter/i }));
+  const menu = document.querySelector('[data-slot="dropdown-menu-content"]');
+  if (!menu) throw new Error("filter menu did not open");
+  fireEvent.click(within(menu as HTMLElement).getByText("Decision"));
+  const decisionInput = await screen.findByPlaceholderText(/blocked, allowed, cached/i);
+  fireEvent.change(decisionInput, { target: { value: "blocked" } });
+
+  expect(await screen.findByText("hit-0.example.com")).toBeInTheDocument();
+  // A full first page must not be presented as the whole result set.
+  expect(screen.queryByText(/all matching queries loaded/i)).not.toBeInTheDocument();
+
+  const viewport = document.querySelector('[data-slot="scroll-area-viewport"]');
+  if (!viewport) throw new Error("scroll viewport not found");
+  fireEvent.scroll(viewport, { target: { scrollTop: 4_000 } });
+
+  await waitFor(() => expect(urls.some((u) => u.includes("offset=100"))).toBe(true));
+  expect(await screen.findByText(/all matching queries loaded/i)).toBeInTheDocument();
 });

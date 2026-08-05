@@ -49,16 +49,58 @@ const listeners = new Set<Listener>();
 let currentTheme: Theme = getInitialTheme();
 applyTheme(currentTheme);
 
+function notify(): void {
+  listeners.forEach((listener) => listener());
+}
+
 function setThemeInternal(next: Theme): void {
   currentTheme = next;
   applyTheme(next);
   persistTheme(next);
-  listeners.forEach((listener) => listener());
+  notify();
+}
+
+// One MediaQueryList for the module's lifetime: window.matchMedia() hands
+// back a *new* object per call, so a fresh one per subscribe would attach
+// listeners to instances nothing can ever detach from.
+let darkModeMedia: MediaQueryList | null | undefined;
+
+function darkModeQuery(): MediaQueryList | null {
+  if (darkModeMedia === undefined) {
+    darkModeMedia =
+      typeof window === "undefined" || typeof window.matchMedia !== "function"
+        ? null
+        : window.matchMedia("(prefers-color-scheme: dark)");
+  }
+  return darkModeMedia;
+}
+
+// While the user has made no explicit choice, the app *follows* the OS
+// rather than sampling it once at import time and freezing: flipping the
+// system to dark at sunset used to leave dnsaur bright until a reload.
+// A stored theme is an explicit override and always wins.
+function handleSystemThemeChange(event: MediaQueryListEvent): void {
+  if (getStoredTheme() !== null) return;
+  const next: Theme = event.matches ? "dark" : "light";
+  if (next === currentTheme) return;
+  currentTheme = next;
+  applyTheme(next);
+  notify();
 }
 
 function subscribe(listener: Listener): () => void {
+  // Re-adding the same function reference is a no-op per the DOM spec, so
+  // this stays a single registration however many components subscribe. It
+  // is never removed: the store itself outlives every component, and the
+  // handler is a cheap no-op once an explicit theme is stored.
+  const media = darkModeQuery();
+  if (media && typeof media.addEventListener === "function") {
+    media.addEventListener("change", handleSystemThemeChange);
+  }
   listeners.add(listener);
-  return () => listeners.delete(listener);
+  return () => {
+    listeners.delete(listener);
+  };
 }
 
 function getSnapshot(): Theme {

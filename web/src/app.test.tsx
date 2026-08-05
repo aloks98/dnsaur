@@ -1,9 +1,22 @@
 import { http, HttpResponse } from "msw";
-import { expect, test } from "vitest";
+import { afterEach, expect, test, vi } from "vitest";
 import { screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { Route, Routes } from "react-router";
 import { server } from "./test/msw-server";
 import { renderWithProviders } from "./test/render";
+import { AppShell } from "./components/app-shell";
 import { App } from "./app";
+
+afterEach(() => vi.restoreAllMocks());
+
+function unauthorized() {
+  return HttpResponse.json({ error: "authentication required" }, { status: 401 });
+}
+
+function Boom(): never {
+  throw new Error("this page is broken");
+}
 
 test("authenticated user sees the app shell nav", async () => {
   renderWithProviders(<App />);
@@ -26,6 +39,72 @@ test("unauthenticated + setup-done shows login", async () => {
   );
   renderWithProviders(<App />);
   await waitFor(() => expect(screen.getByLabelText(/password/i)).toBeInTheDocument());
+});
+
+test("a session that dies mid-session returns to login instead of stranding a shell of 401s", async () => {
+  const user = userEvent.setup();
+  let signedIn = true;
+  server.use(
+    http.get("/api/v1/auth/me", () =>
+      signedIn
+        ? HttpResponse.json({ id: 1, username: "admin", totp_enabled: false })
+        : unauthorized(),
+    ),
+    http.get("/api/v1/setup", () => HttpResponse.json({ setup_required: false })),
+    http.get("/api/v1/stats/overview", () =>
+      signedIn
+        ? HttpResponse.json({ total: 10, blocked: 1, cached: 2, forwarded: 3, clients: 1 })
+        : unauthorized(),
+    ),
+  );
+
+  renderWithProviders(<App />);
+  await screen.findByRole("link", { name: /query log/i });
+
+  // The session is revoked (logged out elsewhere, token revoked, DB reset);
+  // the next panel fetch is the first thing to notice.
+  signedIn = false;
+  await user.click(screen.getByRole("combobox", { name: /time window/i }));
+  await user.click(await screen.findByRole("option", { name: /last hour/i }));
+
+  await waitFor(() => expect(screen.getByLabelText(/^password$/i)).toBeInTheDocument());
+  expect(screen.queryByRole("link", { name: /query log/i })).not.toBeInTheDocument();
+});
+
+test("a page that throws is contained by the shell's boundary, and navigating away clears it", async () => {
+  const user = userEvent.setup();
+  vi.spyOn(console, "error").mockImplementation(() => {});
+
+  renderWithProviders(
+    <Routes>
+      <Route element={<AppShell />}>
+        <Route index element={<Boom />} />
+        <Route path="queries" element={<h1>Recovered page</h1>} />
+      </Route>
+    </Routes>,
+  );
+
+  expect(await screen.findByText(/something went wrong/i)).toBeInTheDocument();
+  // The chrome outside the boundary is still mounted and still usable...
+  await user.click(screen.getByRole("link", { name: /query log/i }));
+
+  // ...and the boundary doesn't pin its fallback over the next route.
+  expect(await screen.findByText("Recovered page")).toBeInTheDocument();
+  expect(screen.queryByText(/something went wrong/i)).not.toBeInTheDocument();
+});
+
+test("a crash on an unauthenticated screen is caught, not left as a blank page", async () => {
+  vi.spyOn(console, "error").mockImplementation(() => {});
+  server.use(
+    http.get("/api/v1/auth/me", () => unauthorized()),
+    // A malformed payload the gate reads straight through: without an
+    // app-level boundary React 19 answers this by unmounting the whole root.
+    http.get("/api/v1/setup", () => HttpResponse.json(null)),
+  );
+
+  renderWithProviders(<App />);
+
+  expect(await screen.findByText(/something went wrong/i)).toBeInTheDocument();
 });
 
 test("api unreachable (both auth/me and setup fail) shows the unreachable banner, not the shell or login", async () => {

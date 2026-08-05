@@ -1,10 +1,16 @@
 import type { QueryEntry } from "./types";
 
-export type SseState = "open" | "reconnecting" | "closed";
+export type SseState = "open" | "reconnecting" | "closed" | "failed";
 
 const TAIL_PATH = "/api/v1/queries/tail";
 const INITIAL_BACKOFF_MS = 1_000;
 const MAX_BACKOFF_MS = 30_000;
+// EventSource.onerror carries no status code, so a 401 (expired session) is
+// indistinguishable from a network blip — retrying forever would leave a
+// dead session spinning "Reconnecting…" until the tab is closed. After this
+// many consecutive failures with no successful open in between, give up and
+// report a terminal state the UI can offer an explicit retry from.
+const MAX_CONSECUTIVE_FAILURES = 6;
 
 /**
  * Subscribes to the live query-log tail: `GET /api/v1/queries/tail`, a
@@ -14,7 +20,10 @@ const MAX_BACKOFF_MS = 30_000;
  *
  * Reconnects on error with a doubling, capped backoff (1s → 30s) so a
  * server restart or network blip doesn't hammer the endpoint, reporting
- * each transition through `onState`. Returns an unsubscribe function that
+ * each transition through `onState` — and stops after
+ * MAX_CONSECUTIVE_FAILURES with a terminal "failed" state, since the most
+ * likely cause of an endpoint that never comes back is a session that no
+ * longer exists. Returns an unsubscribe function that
  * closes the connection and cancels any pending reconnect — call it on
  * unmount, or whenever the caller no longer wants live data (e.g. the
  * query log switching into filtered/paged mode).
@@ -34,6 +43,7 @@ export function subscribeQueries(
   let source: EventSource | null = null;
   let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
   let backoffMs = INITIAL_BACKOFF_MS;
+  let failures = 0;
   let unsubscribed = false;
 
   function connect() {
@@ -41,6 +51,7 @@ export function subscribeQueries(
 
     source.onopen = () => {
       backoffMs = INITIAL_BACKOFF_MS;
+      failures = 0;
       onState("open");
     };
 
@@ -56,6 +67,11 @@ export function subscribeQueries(
       source?.close();
       source = null;
       if (unsubscribed) return;
+      failures += 1;
+      if (failures >= MAX_CONSECUTIVE_FAILURES) {
+        onState("failed");
+        return;
+      }
       onState("reconnecting");
       reconnectTimer = setTimeout(() => {
         backoffMs = Math.min(backoffMs * 2, MAX_BACKOFF_MS);

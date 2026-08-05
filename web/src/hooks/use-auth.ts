@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { api } from "../api/client";
+import { api, ApiError } from "../api/client";
 import type { MeResponse, SetupState } from "../api/types";
 
 export const authKeys = {
@@ -12,6 +12,12 @@ export function useMe() {
     queryKey: authKeys.me,
     queryFn: () => api.get<MeResponse>("/auth/me"),
     retry: false,
+    // The one query that opts back into focus revalidation (the client-wide
+    // default is off): coming back to a tab that has been open for days is
+    // exactly when the session is most likely to have expired, and the auth
+    // gate should notice before the user starts clicking. A 401 from any
+    // other query revalidates this one too — see lib/query-client.ts.
+    refetchOnWindowFocus: true,
   });
 }
 
@@ -34,7 +40,19 @@ export function useLogin() {
 
 export function useLogout() {
   return useMutation({
-    mutationFn: () => api.post("/auth/logout"),
+    // POST /auth/logout is itself behind requireAuth (internal/api/
+    // auth_handlers.go), so an already-dead session answers 401 — which is
+    // the state logging out was trying to reach. Treating that as failure
+    // left the user stuck on a shell full of 401ing panels with a "Couldn't
+    // sign out — try again" toast and no way back to the login screen.
+    mutationFn: async () => {
+      try {
+        await api.post("/auth/logout");
+      } catch (err) {
+        if (err instanceof ApiError && err.status === 401) return;
+        throw err;
+      }
+    },
     // A hard reload, not qc.clear()/invalidateQueries(authKeys.me) — this
     // page mounts more than one useMe() observer (App's own auth gate,
     // Header's account menu), and cache-clearing/invalidating the shared
