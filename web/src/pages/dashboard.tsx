@@ -145,19 +145,21 @@ function pct(numerator: number, denominator: number): string {
 }
 
 // --- health strip ------------------------------------------------------------
-// Honest, cheap signals only: GET /health (liveness) and GET /filters/lists
-// (last_refreshed). No synthetic uptime or fabricated telemetry.
+// Honest, cheap signals only: GET /filters/lists (last_refreshed). No
+// synthetic uptime or fabricated telemetry.
+//
+// Liveness deliberately does NOT appear here. The sidebar footer's status
+// dot is derived from the same GET /health and is visible on every page, so
+// rendering it again on the dashboard put two dots on screen carrying one
+// signal — review called that out. The strip keeps what is genuinely
+// dashboard-specific (filter-list coverage and freshness) and defers
+// liveness to the shell, except when health is actually bad: a "lists
+// unavailable" line with no explanation is confusing when the real cause is
+// that the whole instance is unreachable.
 
 function HealthStrip() {
   const health = useHealth();
   const lists = useLists();
-
-  const instanceState = health.isPending ? "fixing" : health.isError ? "down" : "active";
-  const instanceLabel = health.isPending
-    ? "Checking instance…"
-    : health.isError
-      ? "Instance unreachable"
-      : "Instance up";
 
   let listsLabel: string;
   if (lists.isPending) {
@@ -173,11 +175,11 @@ function HealthStrip() {
 
   return (
     <div className="flex flex-wrap items-center gap-x-5 gap-y-1.5 text-sm text-muted-foreground">
-      <StatusIndicator state={instanceState} label={instanceLabel} size="sm" />
-      <span aria-hidden="true" className="text-border">
-        ·
-      </span>
-      <span>{listsLabel}</span>
+      {health.isError ? (
+        <StatusIndicator state="down" label="Instance unreachable" size="sm" />
+      ) : (
+        <span>{listsLabel}</span>
+      )}
     </div>
   );
 }
