@@ -1,15 +1,34 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32">
-  <defs>
-    <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0%" stop-color="#4338ca" />
-      <stop offset="100%" stop-color="#06b6d4" />
-    </linearGradient>
-  </defs>
-  <rect width="32" height="32" rx="8" fill="url(#g)" />
-  <path
-    d="M9 21c0-5 2-9 7-9s7 3 7 7c0 1.5-1 2.5-2.5 2.5H16v2h-2v-2h-1.5C11 21.5 9 22.5 9 21Z"
-    fill="white"
-    fill-opacity="0.92"
-  />
-  <circle cx="18.5" cy="14.5" r="1" fill="#0f172a" />
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <!-- dnsaur mark. Palette + geometry locked by
+       docs/superpowers/specs/2026-08-05-logo-design.md — keep in sync with
+       web/src/components/dnsaur-logo.tsx and docs/assets/logo*.svg. -->
+  <style>
+    .tile { fill: #2FE26F }
+    .body { fill: #101010 }
+    .spike { fill: #0A5B2C }
+    .shade { fill: #000000 }
+    .eye { fill: #F2FBF5 }
+    .pupil { fill: #101010 }
+    @media (prefers-color-scheme: dark) {
+      .tile { fill: #0F2B1C }
+      .body { fill: #2FE26F }
+      .spike { fill: #A9F5C7 }
+      .shade { fill: #1FA84F }
+      .pupil { fill: #07140C }
+    }
+  </style>
+  <rect class="tile" width="64" height="64" rx="10" />
+  <clipPath id="tile"><rect width="64" height="64" rx="10" /></clipPath>
+  <g clip-path="url(#tile)">
+    <g class="spike">
+      <path d="M -4.4 3.6 Q 0 -8 4.4 3.6 Q 0 6.4 -4.4 3.6 Z" transform="translate(25.3 8.2) rotate(-8)" />
+      <path d="M -4.4 3.6 Q 0 -8 4.4 3.6 Q 0 6.4 -4.4 3.6 Z" transform="translate(34.8 15.2) rotate(50)" />
+      <path d="M -4.4 3.6 Q 0 -8 4.4 3.6 Q 0 6.4 -4.4 3.6 Z" transform="translate(38.6 31.8) rotate(72)" />
+      <path d="M -4.4 3.6 Q 0 -8 4.4 3.6 Q 0 6.4 -4.4 3.6 Z" transform="translate(42 48.8) rotate(78)" />
+    </g>
+    <path class="body" d="M 24 66 C 24 50 22 40 24 30 C 23 27 20 25 17 22.5 C 13.5 20.5 13 15.5 16.5 12.5 C 19.5 8.6 28.5 8.2 33 11.6 C 36.2 15.2 36.5 20 35 25.5 C 39 38 43 50 45 66 Z" />
+    <circle class="shade" cx="15.2" cy="16.8" r="1" />
+    <circle class="eye" cx="25" cy="16" r="4.5" />
+    <circle class="pupil" cx="23.6" cy="16.5" r="2.2" />
+  </g>
 </svg>
