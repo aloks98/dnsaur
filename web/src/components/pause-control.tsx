@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
-import { Pause, Play, Timer } from "lucide-react";
+import type { LucideIcon } from "lucide-react";
+import { ChevronDown, CircleAlert, Pause, Play, Timer } from "lucide-react";
 import { toast } from "sonner";
 import {
   Button,
@@ -10,7 +11,6 @@ import {
   DropdownMenuLabel,
   DropdownMenuSeparator,
   DropdownMenuTrigger,
-  StatusIndicator,
 } from "@e412/rnui-react";
 import { useBlockingStatus, usePauseBlocking, useResumeBlocking } from "../hooks/use-blocking";
 import { formatCountdown } from "../lib/format";
@@ -28,14 +28,17 @@ interface PauseControlProps {
 }
 
 /**
- * Blocking pause/resume. Follows the app's existing split between *state*
- * and *action* rather than baking both into one button: a StatusIndicator
- * dot (the same primitive the sidebar's resolver status and the query
- * log's live/paused readout use — see sidebar-nav.tsx, pages/queries.tsx)
- * carries the live state, amber/pulsing ("fixing") while paused since a
- * pause is inherently temporary and about to end, next to a small,
- * always-labeled "Pause" menu button — the same pattern as the query log's
- * "Filter" button, whose label never changes even when filters are active.
+ * Blocking pause/resume: one button that *is* the state readout and the
+ * action, rather than a status dot sitting next to a separate button. The
+ * sidebar footer owns the app's only status dot (resolver health — see
+ * sidebar-nav.tsx); a second identical-looking dot for a different thing
+ * next to it read as duplication.
+ *
+ * The wording is about *blocking* specifically, never a bare "Pause":
+ * dnsaur also serves local DNS and will grow zones, so "paused" on its own
+ * is genuinely ambiguous about what stopped.
+ *
+ *     [⏸ Blocking active ▾]   [▶ Paused · 4:32 ▾]   [⚠ Status unavailable ▾]
  *
  * GET /blocking polls every 30s (see use-blocking.ts); between polls, a
  * local 1s ticker keeps the countdown itself smooth without hammering the
@@ -62,6 +65,14 @@ export function PauseControl({ groupId = 0 }: PauseControlProps) {
   const remainingMs = Math.max(0, pausedUntil - now);
   const busy = pauseBlocking.isPending || resumeBlocking.isPending;
 
+  // A failed or not-yet-answered GET /blocking must not render as a
+  // confident "Blocking active" — that's the one state this button can't
+  // honestly claim without having read it. It stays operable either way:
+  // pause/resume are still worth attempting, and the mutations carry their
+  // own error toasts.
+  const { icon: StateIcon, label, tone } = triggerView(status, isPaused, remainingMs);
+  const stateKnown = status.isSuccess;
+
   function onPause(minutes: number) {
     pauseBlocking.mutate(
       { groupId, minutes },
@@ -81,54 +92,66 @@ export function PauseControl({ groupId = 0 }: PauseControlProps) {
   }
 
   return (
-    <div className="flex items-center gap-2">
-      <StatusIndicator
-        state={isPaused ? "fixing" : "active"}
-        label={isPaused ? `Paused · ${formatCountdown(remainingMs)}` : "Blocking active"}
-        size="sm"
-        labelClassName="tabular-nums"
-      />
-      <DropdownMenu>
-        <DropdownMenuTrigger
-          render={
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              disabled={busy}
-              aria-label="Pause blocking"
-            />
-          }
-        >
-          <Pause />
-          Pause
-        </DropdownMenuTrigger>
-        <DropdownMenuContent align="end">
-          {/* Menu.GroupLabel (rnui's DropdownMenuLabel) requires a
-              Menu.Group ancestor even for a single ungrouped label. */}
-          <DropdownMenuGroup>
-            <DropdownMenuLabel>
-              {isPaused ? "Blocking is paused" : "Pause blocking"}
-            </DropdownMenuLabel>
-          </DropdownMenuGroup>
-          <DropdownMenuSeparator />
-          {PAUSE_OPTIONS.map((opt) => (
-            <DropdownMenuItem
-              key={opt.minutes}
-              disabled={busy}
-              onClick={() => onPause(opt.minutes)}
-            >
-              <Timer />
-              {opt.label}
-            </DropdownMenuItem>
-          ))}
-          <DropdownMenuSeparator />
-          <DropdownMenuItem disabled={busy || !isPaused} onClick={onResume}>
-            <Play />
-            Resume
+    <DropdownMenu>
+      <DropdownMenuTrigger
+        render={
+          <Button type="button" variant="outline" size="sm" disabled={busy} className={tone} />
+        }
+      >
+        <StateIcon />
+        <span className="tabular-nums">{label}</span>
+        {/* The visible text is the state; the accessible name still has to
+            say what activating the control does. */}
+        <span className="sr-only">, open blocking controls</span>
+        <ChevronDown className="opacity-60" />
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end">
+        {/* Menu.GroupLabel (rnui's DropdownMenuLabel) requires a
+            Menu.Group ancestor even for a single ungrouped label. */}
+        <DropdownMenuGroup>
+          <DropdownMenuLabel>
+            {isPaused ? "Blocking is paused" : "Pause blocking"}
+          </DropdownMenuLabel>
+        </DropdownMenuGroup>
+        <DropdownMenuSeparator />
+        {PAUSE_OPTIONS.map((opt) => (
+          <DropdownMenuItem key={opt.minutes} disabled={busy} onClick={() => onPause(opt.minutes)}>
+            <Timer />
+            {opt.label}
           </DropdownMenuItem>
-        </DropdownMenuContent>
-      </DropdownMenu>
-    </div>
+        ))}
+        <DropdownMenuSeparator />
+        {/* Only greyed out when we *know* there is nothing to resume. */}
+        <DropdownMenuItem disabled={busy || (stateKnown && !isPaused)} onClick={onResume}>
+          <Play />
+          Resume blocking
+        </DropdownMenuItem>
+      </DropdownMenuContent>
+    </DropdownMenu>
   );
+}
+
+interface TriggerView {
+  icon: LucideIcon;
+  label: string;
+  /** Extra button classes — amber while paused, since a pause is temporary
+   * and about to end (the tone the old StatusIndicator's "fixing" carried). */
+  tone?: string;
+}
+
+function triggerView(
+  status: ReturnType<typeof useBlockingStatus>,
+  isPaused: boolean,
+  remainingMs: number,
+): TriggerView {
+  if (status.isPending) return { icon: Pause, label: "Checking…", tone: "text-muted-foreground" };
+  if (status.isError)
+    return { icon: CircleAlert, label: "Status unavailable", tone: "text-muted-foreground" };
+  if (isPaused)
+    return {
+      icon: Play,
+      label: `Paused · ${formatCountdown(remainingMs)}`,
+      tone: "border-warning/40 bg-warning/10 text-warning-foreground hover:bg-warning/20 dark:bg-warning/20",
+    };
+  return { icon: Pause, label: "Blocking active" };
 }

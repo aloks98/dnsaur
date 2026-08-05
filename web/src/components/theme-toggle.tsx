@@ -1,23 +1,23 @@
 import { Moon, Sun } from "lucide-react";
-import { Button } from "@e412/rnui-react";
+import { SidebarMenuButton } from "@e412/rnui-react";
 import { useTheme } from "../lib/theme";
 
 export function ThemeToggle() {
   const { theme, toggleTheme } = useTheme();
   const isDark = theme === "dark";
+  const label = isDark ? "Switch to light theme" : "Switch to dark theme";
 
-  // Icon button (not rnui's Switch) is deliberate: it matches the other
-  // icon-only controls in the header's utility cluster (pause, account).
+  // A sidebar menu button rather than a standalone icon button: this now
+  // lives in the sidebar footer next to the account menu, and
+  // SidebarMenuButton is what shrinks to an icon-only target — with
+  // `tooltip` standing in for the clipped text — in `collapsible="icon"`
+  // mode. The label is the action, not the state, so it doubles as the
+  // accessible name in both the expanded and collapsed rail (no aria-label
+  // diverging from what's on screen).
   return (
-    <Button
-      type="button"
-      variant="ghost"
-      size="icon-sm"
-      aria-label={isDark ? "Switch to light theme" : "Switch to dark theme"}
-      aria-pressed={isDark}
-      onClick={toggleTheme}
-    >
+    <SidebarMenuButton onClick={toggleTheme} tooltip={label}>
       {isDark ? <Sun /> : <Moon />}
-    </Button>
+      <span>{label}</span>
+    </SidebarMenuButton>
   );
 }

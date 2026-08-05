@@ -12,10 +12,30 @@ export function isSessionData(queryKey: readonly unknown[]): boolean {
   return queryKey[0] !== authKeys.me[0] && queryKey[0] !== authKeys.setup[0];
 }
 
+/** The signed-in user, plus everything the UI derives from them. */
+export interface Me extends MeResponse {
+  /** Two-letter avatar initials. */
+  initials: string;
+}
+
+/** Initials shown before `me` has resolved (or once it has failed). */
+export const UNKNOWN_INITIALS = "?";
+
+// Module scope, not an inline arrow: query-core re-runs `select` whenever
+// its identity changes, so a stable reference keeps this to one call per
+// fetch instead of one per render.
+function withDerived(me: MeResponse): Me {
+  return { ...me, initials: me.username.slice(0, 2).toUpperCase() };
+}
+
 export function useMe() {
   return useQuery({
     queryKey: authKeys.me,
     queryFn: () => api.get<MeResponse>("/auth/me"),
+    // Avatar initials belong to the account, not to whichever component
+    // happens to draw an avatar — derived once here so every call site
+    // (sidebar footer today, anything else later) agrees on them.
+    select: withDerived,
     retry: false,
     // The one query that opts back into focus revalidation (the client-wide
     // default is off): coming back to a tab that has been open for days is
@@ -35,6 +55,11 @@ export function useMe() {
     // data is defined and the refetch stays "success" throughout.
     refetchOnWindowFocus: (query) => query.state.status === "success",
   });
+}
+
+/** Avatar initials for the signed-in user, or `?` while `me` is unresolved. */
+export function useMeInitials(): string {
+  return useMe().data?.initials ?? UNKNOWN_INITIALS;
 }
 
 export function useSetupState() {
@@ -63,34 +88,44 @@ export function useLogin() {
   });
 }
 
+/**
+ * POST /auth/logout is itself behind requireAuth (internal/api/
+ * auth_handlers.go), so an already-dead session answers 401 — which is the
+ * state logging out was trying to reach, i.e. success wearing an error's
+ * status code. Exported so the call site's error toast can stay silent for
+ * the one failure that isn't one, without re-deriving the rule.
+ */
+export function isAlreadyLoggedOut(error: unknown): boolean {
+  return error instanceof ApiError && error.status === 401;
+}
+
+// A hard reload, not qc.clear()/invalidateQueries(authKeys.me) — this page
+// mounts more than one useMe() observer (App's own auth gate, the sidebar
+// footer's account menu), and cache-clearing/invalidating the shared `me`
+// query only reliably refreshed *some* of them: verified by hand
+// (Playwright) that after logout the dashboard kept rendering with every
+// one of its own queries silently 401ing in the background, the avatar
+// correctly flipping to its logged-out "?" state while App's own gate never
+// re-rendered at all — until a full page reload. Logout is rare enough that
+// a reload's cost is a non-issue, and it sidesteps that cross-observer
+// inconsistency entirely by starting the whole app fresh against the
+// now-invalidated session.
+function leaveForLoginScreen() {
+  window.location.assign("/");
+}
+
 export function useLogout() {
   return useMutation({
-    // POST /auth/logout is itself behind requireAuth (internal/api/
-    // auth_handlers.go), so an already-dead session answers 401 — which is
-    // the state logging out was trying to reach. Treating that as failure
-    // left the user stuck on a shell full of 401ing panels with a "Couldn't
-    // sign out — try again" toast and no way back to the login screen.
-    mutationFn: async () => {
-      try {
-        await api.post("/auth/logout");
-      } catch (err) {
-        if (err instanceof ApiError && err.status === 401) return;
-        throw err;
-      }
-    },
-    // A hard reload, not qc.clear()/invalidateQueries(authKeys.me) — this
-    // page mounts more than one useMe() observer (App's own auth gate,
-    // Header's account menu), and cache-clearing/invalidating the shared
-    // `me` query only reliably refreshed *some* of them: verified by hand
-    // (Playwright) that after logout the dashboard kept rendering with
-    // every one of its own queries silently 401ing in the background,
-    // Header's avatar correctly flipping to its logged-out "?" state while
-    // App's own gate never re-rendered at all — until a full page reload.
-    // Logout is rare enough that a reload's cost is a non-issue, and it
-    // sidesteps that cross-observer inconsistency entirely by starting the
-    // whole app fresh against the now-invalidated session.
-    onSuccess: () => {
-      window.location.assign("/");
+    mutationFn: () => api.post("/auth/logout"),
+    onSuccess: leaveForLoginScreen,
+    // A 401 means the session was already gone, so the logout has in fact
+    // happened — finish the same way rather than leaving the user stuck on
+    // a shell full of 401ing panels with a "Couldn't sign out — try again"
+    // toast and no way back to the login screen. Anything else (server
+    // down, 500) is a real failure and falls through to the call site,
+    // which owns the messaging.
+    onError: (error) => {
+      if (isAlreadyLoggedOut(error)) leaveForLoginScreen();
     },
   });
 }

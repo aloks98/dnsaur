@@ -34,7 +34,12 @@ test("first-run setup, login, add a DNS record, dark mode persists across reload
   // The wizard's own silent sign-in (see pages/setup.tsx) already holds a
   // session at this point; it never exercises pages/login.tsx, so log out
   // and back in explicitly to cover the real login path the brief asks for.
-  await page.getByRole("button", { name: "Account menu" }).click();
+  //
+  // The account menu lives in the sidebar footer (see
+  // src/components/sidebar-nav.tsx), not the header, and its accessible
+  // name carries the signed-in username: "Account menu (e2e-admin)".
+  const sidebar = page.locator('[data-slot="sidebar"]');
+  await sidebar.getByRole("button", { name: `Account menu (${USERNAME})` }).click();
   await page.getByRole("menuitem", { name: "Log out" }).click();
   await expect(page.getByRole("heading", { name: "Log in to dnsaur" })).toBeVisible();
 
@@ -60,8 +65,9 @@ test("first-run setup, login, add a DNS record, dark mode persists across reload
   await expect(row.getByText("10.0.0.9")).toBeVisible();
 
   // --- dark mode toggles and persists across a reload -------------------
+  // Also in the sidebar footer now, right below the account menu.
   await expect(page.locator("html")).not.toHaveClass(/dark/);
-  await page.getByRole("button", { name: /switch to dark theme/i }).click();
+  await sidebar.getByRole("button", { name: /switch to dark theme/i }).click();
   await expect(page.locator("html")).toHaveClass(/dark/);
 
   await page.reload();
