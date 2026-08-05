@@ -19,9 +19,10 @@ px) across ~15 drafts.
   the tile.
 - Geometry: lean neck (base spans x≈24–45 at the tile bottom), rounded
   head with flat-ish top, large white eye with dark pupil, small nostril
-  dot, four soft spikes (`M -4.2 3 Q 0 -7 4.2 3 Q 0 5.2 -4.2 3 Z`,
-  translated/rotated onto the spine) drawn behind the body so their bases
-  tuck under the silhouette.
+  dot, four soft spikes (`M -4.4 3.6 Q 0 -8 4.4 3.6 Q 0 6.4 -4.4 3.6 Z`,
+  translated/rotated onto the spine) drawn behind the body, sunk deep
+  enough that their curved bases tuck fully under the silhouette with no
+  gaps at any zoom.
 - Master source of truth is the SVG committed to the repo (see
   Deliverables); raster exports derive from it.
 
