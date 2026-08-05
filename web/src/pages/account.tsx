@@ -176,9 +176,14 @@ function CodeField({
  * secret (see TotpCard.onStartEnroll), so this never has to render a
  * mid-flight loading state of its own for the secret itself, only for the
  * QR image derived from it. `enrollment.secret` is the "must live only in
- * component state" value the brief calls out: it is never written to
- * react-query's cache, and TotpCard drops it (`setEnrollment(null)`) the
- * moment this dialog closes for any reason.
+ * component state" value the brief calls out: TotpCard drops the local copy
+ * (`setEnrollment(null)`) *and* resets the underlying totpStart mutation
+ * (`totpStart.reset()`) the moment this dialog closes for any reason — see
+ * TotpCard.onEnableOpenChange. Both matter: useMutation's own `.data` isn't
+ * a react-query cache entry, but it is retained by the hook instance until
+ * reset() is called, independent of whatever local state stops rendering
+ * it — clearing `enrollment` alone would leave the secret sitting in
+ * totpStart.data.
  */
 function TotpEnableDialog({
   open,
@@ -379,10 +384,18 @@ function TotpCard({ enabled }: { enabled: boolean }) {
 
   function onEnableOpenChange(next: boolean) {
     setEnableOpen(next);
-    // The secret lives only in this component's state for the flow's
-    // duration — dropped the moment the dialog closes, whether that's a
-    // successful confirm, Cancel, Escape, or a click outside.
-    if (!next) setEnrollment(null);
+    if (!next) {
+      // The secret lives only for the flow's duration — dropped the moment
+      // the dialog closes, whether that's a successful confirm, Cancel,
+      // Escape, or a click outside. Two things hold it, so both are
+      // cleared: `enrollment` (the local copy this component reads to
+      // render the dialog) and totpStart's own mutation result
+      // (`totpStart.data` — useMutation retains it until a new mutate() or
+      // an explicit reset(), regardless of what local state stops
+      // rendering it; see TotpEnableDialog's doc comment).
+      setEnrollment(null);
+      totpStart.reset();
+    }
   }
 
   return (
@@ -478,15 +491,21 @@ function tokenFormDefaults(): TokenFormValues {
 }
 
 function NewTokenDialog({
+  createToken,
   open,
   onOpenChange,
   onCreated,
 }: {
+  // Lifted from a local useCreateToken() call up to TokensCard and passed
+  // down, so TokensCard can reset() this exact mutation instance once the
+  // reveal dialog closes — a useMutation() call site owns its own `.data`;
+  // a second, separate useCreateToken() call in TokensCard would create an
+  // unrelated instance and not actually clear anything.
+  createToken: ReturnType<typeof useCreateToken>;
   open: boolean;
   onOpenChange: (open: boolean) => void;
   onCreated: (result: { id: number; token: string }) => void;
 }) {
-  const createToken = useCreateToken();
   const form = useForm<TokenFormValues>({ defaultValues: tokenFormDefaults() });
 
   useEffect(() => {
@@ -589,6 +608,14 @@ function NewTokenDialog({
  * plain "Close" affordance in the footer: the one button there names the
  * consequence directly, and the Alert above states the fact rather than
  * dramatizing it — the stakes carry the design, not extra chrome.
+ * `showCloseButton={false}` on DialogContent turns off rnui's default
+ * top-right X icon, so the deliberate footer button really is the only
+ * *labeled* dismissal — the design intent this component already claimed
+ * before the X was actually suppressed. (Escape / backdrop click still
+ * close it, same as every other dialog on this page; trapping the dialog
+ * open entirely would be a bigger, separate UX call this fix doesn't make.)
+ * The caller (TokensCard) is responsible for resetting the createToken
+ * mutation whenever this closes — see its onOpenChange.
  */
 function TokenRevealDialog({
   result,
@@ -599,7 +626,7 @@ function TokenRevealDialog({
 }) {
   return (
     <Dialog open={result !== null} onOpenChange={onOpenChange}>
-      <DialogContent>
+      <DialogContent showCloseButton={false}>
         <DialogHeader>
           <DialogTitle>Copy your token now</DialogTitle>
           {/* States context, not the warning — the Alert right below owns
@@ -692,9 +719,26 @@ function TokensTable({
 function TokensCard() {
   const tokens = useTokens();
   const revokeToken = useRevokeToken();
+  // Lifted up from NewTokenDialog (not called there directly) so it can be
+  // reset() here, once the reveal dialog closes — see onDismissReveal.
+  const createToken = useCreateToken();
   const [addOpen, setAddOpen] = useState(false);
   const [revealResult, setRevealResult] = useState<{ id: number; token: string } | null>(null);
   const [revokeTarget, setRevokeTarget] = useState<ApiToken | null>(null);
+
+  // TanStack Query's useMutation keeps its `.data` (here, the plaintext
+  // token) alive in memory for the lifetime of the component that called
+  // it — it is cleared only by a new mutate() or an explicit reset(),
+  // never automatically just because the UI that *displayed* it went away.
+  // Clearing `revealResult` alone (the local render state) leaves the
+  // plaintext still sitting in createToken.data, inspectable via React
+  // DevTools. Both are cleared together here, whenever the reveal dialog
+  // closes for any reason (the footer button, Escape, or a backdrop click).
+  function onDismissReveal(open: boolean) {
+    if (open) return;
+    setRevealResult(null);
+    createToken.reset();
+  }
 
   function onConfirmRevoke() {
     if (!revokeTarget) return;
@@ -767,11 +811,13 @@ function TokensCard() {
       </CardHeader>
       <CardContent>{body}</CardContent>
 
-      <NewTokenDialog open={addOpen} onOpenChange={setAddOpen} onCreated={setRevealResult} />
-      <TokenRevealDialog
-        result={revealResult}
-        onOpenChange={(open) => !open && setRevealResult(null)}
+      <NewTokenDialog
+        createToken={createToken}
+        open={addOpen}
+        onOpenChange={setAddOpen}
+        onCreated={setRevealResult}
       />
+      <TokenRevealDialog result={revealResult} onOpenChange={onDismissReveal} />
 
       <AlertDialog
         open={revokeTarget !== null}

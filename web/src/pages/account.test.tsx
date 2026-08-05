@@ -133,6 +133,41 @@ test("TOTP enable: start then confirm with a code refetches me and flips the car
   expect(await screen.findByRole("button", { name: /^disable 2fa$/i })).toBeInTheDocument();
 });
 
+// Symmetric to the reveal-dialog regression guard above: dismissing the
+// enable dialog without confirming (Cancel) must reset totpStart (see
+// TotpCard.onEnableOpenChange), not just the local `enrollment` state —
+// the setup key and QR must be gone from the DOM, and starting over must
+// not resurrect the old secret.
+test("TOTP enable: dismissing without confirming clears the setup key and QR from the DOM", async () => {
+  const user = userEvent.setup();
+  mockMe({ totp_enabled: false });
+  server.use(
+    http.post("/api/v1/auth/totp/start", () =>
+      HttpResponse.json({
+        secret: "JBSWY3DPEHPK3PXP",
+        otpauth_url: "otpauth://totp/dnsaur:admin?secret=JBSWY3DPEHPK3PXP&issuer=dnsaur",
+      }),
+    ),
+  );
+  mockTokens([]);
+
+  renderWithProviders(<Account />);
+  await screen.findByText("Two-factor authentication");
+
+  await user.click(screen.getByRole("button", { name: /^enable 2fa$/i }));
+  const dialog = await screen.findByRole("dialog");
+  expect(within(dialog).getByText("JBSWY3DPEHPK3PXP")).toBeInTheDocument();
+  expect(await within(dialog).findByRole("img", { name: /qr code/i })).toBeInTheDocument();
+
+  await user.click(within(dialog).getByRole("button", { name: /^cancel$/i }));
+
+  await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+  expect(screen.queryByText("JBSWY3DPEHPK3PXP")).not.toBeInTheDocument();
+  expect(screen.queryByRole("img", { name: /qr code/i })).not.toBeInTheDocument();
+  // Still off — nothing was confirmed.
+  expect(screen.getByRole("button", { name: /^enable 2fa$/i })).toBeInTheDocument();
+});
+
 test("TOTP disable: a valid code disables 2FA and me refetches", async () => {
   const user = userEvent.setup();
   let totpEnabled = true;
@@ -297,6 +332,15 @@ test("creating a token reveals the plaintext exactly once, then it's gone", asyn
 
   // The row now exists, but only its name/scope show — never the plaintext.
   expect(await screen.findByText("Home Assistant")).toBeInTheDocument();
+  expect(screen.queryByText("dnsaur_pat_abcdef123456")).not.toBeInTheDocument();
+
+  // Regression guard for the mutation-data-lingers finding: dismissing the
+  // reveal dialog resets createToken (see TokensCard.onDismissReveal), not
+  // just the local `revealResult` state that gates rendering it. Reopening
+  // "New token" afterward must not surface the earlier plaintext anywhere.
+  await user.click(screen.getByRole("button", { name: /new token/i }));
+  const reopenedDialog = await screen.findByRole("dialog");
+  expect(within(reopenedDialog).getByText(/new token/i)).toBeInTheDocument();
   expect(screen.queryByText("dnsaur_pat_abcdef123456")).not.toBeInTheDocument();
 });
 
