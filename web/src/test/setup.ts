@@ -112,3 +112,11 @@ if (typeof HTMLCanvasElement !== "undefined") {
 if (typeof Element !== "undefined" && typeof Element.prototype.getAnimations !== "function") {
   Element.prototype.getAnimations = () => [];
 }
+
+// jsdom does not implement Element.scrollIntoView (cmdk calls it whenever
+// the command palette's active item changes, including on first mount).
+// A no-op is sufficient: no test asserts on scroll position, only on which
+// item is selected.
+if (typeof Element !== "undefined" && typeof Element.prototype.scrollIntoView !== "function") {
+  Element.prototype.scrollIntoView = () => {};
+}
