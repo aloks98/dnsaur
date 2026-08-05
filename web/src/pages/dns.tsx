@@ -13,6 +13,8 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 import { useForm } from "react-hook-form";
+import { zodResolver } from "@hookform/resolvers/zod";
+import { z } from "zod";
 import {
   Alert,
   AlertDescription,
@@ -61,6 +63,7 @@ import { ApiError } from "../api/client";
 import type { LocalRecord } from "../api/types";
 import { useAddRecord, useDeleteRecord, useRecords, useUpdateRecord } from "../hooks/use-records";
 import { StaleDataAlert } from "../components/stale-data-alert";
+import { isValidIPv4, isValidIPv6 } from "../lib/schemas";
 
 // --- validation --------------------------------------------------------
 // Mirrors internal/api/records_handlers.go's normalizeRecord closely enough
@@ -71,7 +74,12 @@ import { StaleDataAlert } from "../components/stale-data-alert";
 // wrongly blocked a valid zone-id matcher), the bias throughout is toward
 // *not* rejecting something the server would accept.
 
-const RECORD_TYPES: LocalRecord["type"][] = ["A", "AAAA", "CNAME", "TXT"];
+const RECORD_TYPES = [
+  "A",
+  "AAAA",
+  "CNAME",
+  "TXT",
+] as const satisfies readonly LocalRecord["type"][];
 
 /** The server lowercases the name and trims a trailing dot itself before
  * validating (and re-derives the wildcard/base-domain split from that
@@ -80,85 +88,64 @@ const RECORD_TYPES: LocalRecord["type"][] = ["A", "AAAA", "CNAME", "TXT"];
  * TrimSuffix(TrimSpace(name), "."), then strip a leading "*." wildcard,
  * then require the remainder to be non-empty, contain a dot, and be free
  * of spaces/slashes/backslashes. */
-function validateRecordName(value: string): string | true {
-  const withoutTrailingDot = value.trim().replace(/\.$/, "");
-  const name = withoutTrailingDot.replace(/^\*\./, "");
-  if (!name || !name.includes(".") || /[ /\\]/.test(name)) {
-    return "Enter a domain, e.g. nas.home.lan (a *.parent wildcard is allowed)";
-  }
-  return true;
-}
+const recordNameSchema = z
+  .string()
+  .trim()
+  .refine((value) => {
+    const name = value.replace(/\.$/, "").replace(/^\*\./, "");
+    return name !== "" && name.includes(".") && !/[ /\\]/.test(name);
+  }, "Enter a domain, e.g. nas.home.lan (a *.parent wildcard is allowed)");
 
-function isValidIPv4(value: string): boolean {
-  const match = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(value);
-  if (!match) return false;
-  return match.slice(1).every((octet) => {
-    if (octet.length > 1 && octet.startsWith("0")) return false;
-    const n = Number(octet);
-    return n >= 0 && n <= 255;
-  });
-}
+const ttlSchema = z
+  .string()
+  .trim()
+  .regex(/^\d+$/, "TTL must be a whole number of seconds")
+  .refine(
+    (value) => Number(value) >= 1 && Number(value) <= 86400,
+    "TTL must be between 1 and 86400 seconds",
+  );
 
-/** The server parses AAAA values with Go's net.ParseIP (not netip.ParseAddr
- * — unlike the client-matcher validator in groups-clients.tsx), which has
- * no concept of an RFC 4007 zone id, so a "%eth0" suffix isn't accepted
- * here either.
+/** What the Value field must hold depends on the type selected beside it,
+ * so it's checked at the object level (with an explicit `path`) rather
+ * than as a standalone field schema — that's what gives the refinement
+ * both fields at once.
  *
- * A literal "." is NOT rejected: RFC 4291 §2.2 defines a dotted-quad tail
- * form, and real, useful addresses use it — e.g. the NAT64 well-known
- * prefix "64:ff9b::192.0.2.1" or "2001:db8::192.168.1.1" both parse fine
- * on the server (net.ParseIP succeeds, To4() == nil, so the AAAA check
- * accepts them). An earlier version of this validator excluded any "."
- * outright on the theory that "real IPv6 literals never contain a dot" —
- * that premise was wrong and blocked exactly these valid addresses from
- * ever reaching the server (caught in review). The one case a dot *should*
- * disqualify — an IPv4-mapped address like "::ffff:192.168.1.1", where
- * Go's To4() returns non-nil and the server 400s it as AAAA — isn't worth
- * special-casing here: reliably distinguishing "mapped" from "embedded"
- * dotted-quad forms needs a real IPv6 parser (bit-level, not textual), and
- * getting that narrowing wrong in either direction repeats the same
- * mistake. Left to the server: a false accept here just surfaces as a 400
- * toast, which is strictly better than a false reject that silently blocks
- * a legitimate record. */
-function isValidIPv6(value: string): boolean {
-  if (!value.includes(":")) return false;
-  try {
-    // The URL host parser validates bracketed IPv6 syntax for us — a
-    // pragmatic stand-in for a real IPv6 parser that's good enough to
-    // catch typos before the round trip.
-    new URL(`http://[${value}]`);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-function validateRecordValue(type: LocalRecord["type"], value: string): string | true {
-  const trimmed = value.trim();
+ * AAAA is checked with the no-zone form of isValidIPv6: the server parses
+ * AAAA values with Go's net.ParseIP (not netip.ParseAddr, unlike the
+ * client matcher in groups-clients.tsx), which has no concept of an RFC
+ * 4007 zone id. The one case that *is* knowingly under-strict is the
+ * IPv4-mapped address ("::ffff:192.168.1.1"), which Go's To4() catches and
+ * 400s as an AAAA: telling "mapped" from the legitimate "embedded"
+ * dotted-quad forms needs a real, bit-level IPv6 parser, and getting that
+ * narrowing wrong in either direction is how the NAT64 false-reject bug
+ * happened in the first place. Left to the server: a false accept costs
+ * one 400 toast, a false reject blocks a valid record outright. */
+function recordValueError(type: LocalRecord["type"], value: string): string | null {
   switch (type) {
     case "A":
-      return isValidIPv4(trimmed) ? true : "Enter a valid IPv4 address, e.g. 192.168.1.10";
+      return isValidIPv4(value) ? null : "Enter a valid IPv4 address, e.g. 192.168.1.10";
     case "AAAA":
-      return isValidIPv6(trimmed) ? true : "Enter a valid IPv6 address, e.g. 2001:db8::1";
-    case "CNAME": {
-      const target = trimmed.replace(/\.$/, "");
-      return target.includes(".")
-        ? true
+      return isValidIPv6(value) ? null : "Enter a valid IPv6 address, e.g. 2001:db8::1";
+    case "CNAME":
+      return value.replace(/\.$/, "").includes(".")
+        ? null
         : "Enter the domain this name points to, e.g. target.example.com";
-    }
     case "TXT":
-      return trimmed ? true : "Enter the text value to return";
-    default:
-      return true;
+      return value ? null : "Enter the text value to return";
   }
 }
 
-function validateTtl(value: string): string | true {
-  const trimmed = value.trim();
-  if (!/^\d+$/.test(trimmed)) return "TTL must be a whole number of seconds";
-  const n = Number(trimmed);
-  return n >= 1 && n <= 86400 ? true : "TTL must be between 1 and 86400 seconds";
-}
+const recordFormSchema = z
+  .object({
+    name: recordNameSchema,
+    type: z.enum(RECORD_TYPES),
+    value: z.string().trim(),
+    ttl: ttlSchema,
+  })
+  .superRefine((values, ctx) => {
+    const error = recordValueError(values.type, values.value);
+    if (error) ctx.addIssue({ code: "custom", message: error, path: ["value"] });
+  });
 
 // --- type badge ----------------------------------------------------------
 // One neutral variant for all four types — this is a category tag, not a
@@ -185,12 +172,7 @@ function RecordTypeBadge({ type }: { type: LocalRecord["type"] }) {
 
 // --- add/edit sheet --------------------------------------------------------
 
-interface RecordFormValues {
-  name: string;
-  type: LocalRecord["type"];
-  value: string;
-  ttl: string;
-}
+type RecordFormValues = z.infer<typeof recordFormSchema>;
 
 const DEFAULT_TTL = 300;
 
@@ -254,7 +236,10 @@ function RecordFormSheet({
   const addRecord = useAddRecord();
   const updateRecord = useUpdateRecord();
   const isEdit = record !== null;
-  const form = useForm<RecordFormValues>({ defaultValues: recordFormDefaults(record) });
+  const form = useForm<RecordFormValues>({
+    resolver: zodResolver(recordFormSchema),
+    defaultValues: recordFormDefaults(record),
+  });
   const type = form.watch("type");
 
   useEffect(() => {
@@ -306,7 +291,6 @@ function RecordFormSheet({
               <FormField
                 control={form.control}
                 name="name"
-                rules={{ validate: validateRecordName }}
                 render={({ field }) => (
                   <FormItem>
                     <FormLabel>Name</FormLabel>
@@ -344,14 +328,24 @@ function RecordFormSheet({
                       value={field.value}
                       onValueChange={(next) => {
                         field.onChange(next);
-                        // The value field's rules depend on the current type
-                        // (react-hook-form passes the live form values into
-                        // `validate`, not a stale closure — see
-                        // validateRecordValue's call site below), so a
-                        // shown error should re-evaluate immediately against
-                        // the newly selected type rather than waiting for
-                        // the next submit attempt.
-                        if (form.formState.errors.value) void form.trigger("value");
+                        // The value field's rule depends on the current type
+                        // (the resolver re-runs recordFormSchema against the
+                        // live form values, so it sees the type just set
+                        // here rather than a stale closure), so a shown error
+                        // should re-evaluate immediately against the newly
+                        // selected type rather than waiting for the next
+                        // submit attempt.
+                        //
+                        // getFieldState() rather than formState.errors:
+                        // `form.formState` is a snapshot of the last render
+                        // this component actually did, and it doesn't
+                        // re-render on every error change (it never reads
+                        // .errors while rendering, so it isn't subscribed to
+                        // them) — so mid-event it can still say "no error"
+                        // while the field is visibly showing one, and the
+                        // re-check would silently never happen.
+                        // getFieldState reads the form's live state instead.
+                        if (form.getFieldState("value").invalid) void form.trigger("value");
                       }}
                     >
                       <SelectTrigger aria-label="Record type">
@@ -372,10 +366,6 @@ function RecordFormSheet({
               <FormField
                 control={form.control}
                 name="value"
-                rules={{
-                  validate: (value: string, formValues) =>
-                    validateRecordValue(formValues.type, value),
-                }}
                 render={({ field }) => (
                   <FormItem>
                     <FormLabel>{valueMeta.label}</FormLabel>
@@ -396,7 +386,6 @@ function RecordFormSheet({
               <FormField
                 control={form.control}
                 name="ttl"
-                rules={{ validate: validateTtl }}
                 render={({ field }) => (
                   <FormItem>
                     <FormLabel>TTL (seconds)</FormLabel>

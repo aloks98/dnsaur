@@ -10,6 +10,8 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 import { useForm } from "react-hook-form";
+import { zodResolver } from "@hookform/resolvers/zod";
+import { z } from "zod";
 import {
   Alert,
   AlertDescription,
@@ -89,6 +91,7 @@ import {
 } from "../../hooks/use-groups";
 import { PauseControl } from "../../components/pause-control";
 import { StaleDataAlert } from "../../components/stale-data-alert";
+import { isValidIPv4, isValidIPv6, requiredText } from "../../lib/schemas";
 
 // The seeded, structural group — the server refuses to delete it
 // (internal/store/crud.go's DeleteGroup treats id 1 specially), so its row
@@ -103,18 +106,19 @@ function friendlyDeleteError(err: unknown, fallback: string): string {
 
 // --- Groups panel --------------------------------------------------------
 
-interface GroupFormValues {
-  name: string;
-}
+const nameSchema = requiredText("Name is required");
 
-function validateName(value: string): string | true {
-  return value.trim() ? true : "Name is required";
-}
+const groupFormSchema = z.object({ name: nameSchema });
+
+type GroupFormValues = z.infer<typeof groupFormSchema>;
 
 function AddGroupDialog() {
   const [open, setOpen] = useState(false);
   const addGroup = useAddGroup();
-  const form = useForm<GroupFormValues>({ defaultValues: { name: "" } });
+  const form = useForm<GroupFormValues>({
+    resolver: zodResolver(groupFormSchema),
+    defaultValues: { name: "" },
+  });
 
   function onOpenChange(next: boolean) {
     setOpen(next);
@@ -154,7 +158,6 @@ function AddGroupDialog() {
             <FormField
               control={form.control}
               name="name"
-              rules={{ validate: validateName }}
               render={({ field }) => (
                 <FormItem>
                   <FormLabel>Name</FormLabel>
@@ -188,7 +191,10 @@ function RenameGroupDialog({
   onOpenChange: (open: boolean) => void;
 }) {
   const renameGroup = useRenameGroup();
-  const form = useForm<GroupFormValues>({ defaultValues: { name: group.name } });
+  const form = useForm<GroupFormValues>({
+    resolver: zodResolver(groupFormSchema),
+    defaultValues: { name: group.name },
+  });
 
   // Re-sync whenever the dialog opens (rather than on every group.name
   // change) — externally triggered opens (the row's edit button) don't run
@@ -226,7 +232,6 @@ function RenameGroupDialog({
             <FormField
               control={form.control}
               name="name"
-              rules={{ validate: validateName }}
               render={({ field }) => (
                 <FormItem>
                   <FormLabel>Name</FormLabel>
@@ -477,53 +482,15 @@ function GroupsPanel({ groupsQuery }: { groupsQuery: UseQueryResult<Group[]> }) 
 
 // --- Clients panel ---------------------------------------------------------
 
-interface ClientFormValues {
-  name: string;
-  matcher: string;
-  groupId: string;
-}
-
-function isValidIPv4(value: string): boolean {
-  const match = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(value);
-  if (!match) return false;
-  return match.slice(1).every((octet) => {
-    if (octet.length > 1 && octet.startsWith("0")) return false;
-    const n = Number(octet);
-    return n >= 0 && n <= 255;
-  });
-}
-
-function isValidIPv6(value: string): boolean {
-  // A zone id (RFC 4007 — e.g. "fe80::1%eth0" scopes a link-local address
-  // to a specific interface) isn't part of the address itself. Go's
-  // net/netip.ParseAddr accepts any non-empty zone suffix after `%` (and
-  // the server does too, see internal/api/clients_handlers.go's
-  // validMatcher) — but the WHATWG URL host parser rejects a literal,
-  // non-percent-encoded `%` inside IPv6 brackets. Strip the zone off and
-  // validate it separately so a legitimate zone-scoped matcher isn't
-  // rejected client-side while the server would accept it.
-  const zoneIndex = value.indexOf("%");
-  const address = zoneIndex === -1 ? value : value.slice(0, zoneIndex);
-  const zone = zoneIndex === -1 ? null : value.slice(zoneIndex + 1);
-  if (zone !== null && zone === "") return false;
-  if (!address.includes(":")) return false;
-  try {
-    // The URL parser validates bracketed IPv6 host syntax for us — a
-    // pragmatic stand-in for a real IPv6 parser (Go's net/netip on the
-    // server) that's good enough to catch typos before the round trip.
-    new URL(`http://[${address}]`);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 /** Mirrors the server's own validMatcher check (net/netip.ParseAddr or
  * ParsePrefix, see internal/api/clients_handlers.go) closely enough to
  * catch typos before they round-trip as a 400.
  *
- * The two halves are deliberately *not* symmetric, because netip's own
- * aren't: ParseAddr accepts an RFC 4007 zone id ("fe80::1%eth0"), while
+ * One refinement rather than a chain of them, because the steps aren't
+ * independent: each only makes sense once the one before it has passed,
+ * and each has its own specific message. The two halves are also
+ * deliberately *not* symmetric, because netip's own aren't: ParseAddr
+ * accepts an RFC 4007 zone id ("fe80::1%eth0" — hence `allowZone`), while
  * ParsePrefix rejects one outright (go.dev/issue/51899) and additionally
  * rejects a prefix length with a leading sign or leading zero, which
  * strconv.Atoi would otherwise have swallowed. Both extra rejections are
@@ -531,34 +498,44 @@ function isValidIPv6(value: string): boolean {
  * server's 400 for either reads "matcher must be an IP or CIDR and
  * group_id set", which sounds like "that isn't an IP/CIDR" for a matcher
  * whose zone id this very form accepts on its own. */
-function validateMatcher(value: string): string | true {
-  const trimmed = value.trim();
-  if (!trimmed) return "Matcher is required";
-  const parts = trimmed.split("/");
-  if (parts.length > 2) return "Enter a single IP address or CIDR range, e.g. 192.168.1.0/24";
-  const [addr, prefix] = parts;
-  const isV4 = isValidIPv4(addr);
-  const isV6 = !isV4 && isValidIPv6(addr);
-  if (!isV4 && !isV6) {
-    return "Enter a valid IP address or CIDR range, e.g. 192.168.1.10 or 192.168.1.0/24";
-  }
-  if (prefix !== undefined) {
-    if (isV6 && addr.includes("%")) {
-      return "Zone IDs can't be combined with a CIDR range — drop the /prefix, or the %zone";
+const matcherSchema = z
+  .string()
+  .trim()
+  .superRefine((value, ctx) => {
+    const fail = (message: string) => ctx.addIssue({ code: "custom", message });
+    if (!value) return fail("Matcher is required");
+    const parts = value.split("/");
+    if (parts.length > 2) {
+      return fail("Enter a single IP address or CIDR range, e.g. 192.168.1.0/24");
     }
-    if (!/^\d+$/.test(prefix)) return "CIDR prefix must be a number";
+    const [addr, prefix] = parts;
+    const isV4 = isValidIPv4(addr);
+    const isV6 = !isV4 && isValidIPv6(addr, { allowZone: true });
+    if (!isV4 && !isV6) {
+      return fail("Enter a valid IP address or CIDR range, e.g. 192.168.1.10 or 192.168.1.0/24");
+    }
+    if (prefix === undefined) return;
+    if (isV6 && addr.includes("%")) {
+      return fail("Zone IDs can't be combined with a CIDR range — drop the /prefix, or the %zone");
+    }
+    if (!/^\d+$/.test(prefix)) return fail("CIDR prefix must be a number");
     // netip.ParsePrefix rejects any multi-character prefix not starting
     // 1-9, so "/024" and "/+4" are errors there even though they'd parse
     // as 24 and 4 by themselves. "/0" alone is fine.
     if (prefix.length > 1 && !/^[1-9]/.test(prefix)) {
-      return "CIDR prefix can't have a leading zero — write /24, not /024";
+      return fail("CIDR prefix can't have a leading zero — write /24, not /024");
     }
-    const prefixNum = Number(prefix);
     const max = isV4 ? 32 : 128;
-    if (prefixNum > max) return `CIDR prefix must be between 0 and ${max}`;
-  }
-  return true;
-}
+    if (Number(prefix) > max) return fail(`CIDR prefix must be between 0 and ${max}`);
+  });
+
+const clientFormSchema = z.object({
+  name: nameSchema,
+  matcher: matcherSchema,
+  groupId: z.string(),
+});
+
+type ClientFormValues = z.infer<typeof clientFormSchema>;
 
 function clientFormDefaults(client: Client | null, fallbackGroupId: number): ClientFormValues {
   return {
@@ -585,6 +562,7 @@ function ClientFormDialog({
   const isEdit = client !== null;
   const fallbackGroupId = groups[0]?.id ?? DEFAULT_GROUP_ID;
   const form = useForm<ClientFormValues>({
+    resolver: zodResolver(clientFormSchema),
     defaultValues: clientFormDefaults(client, fallbackGroupId),
   });
 
@@ -633,7 +611,6 @@ function ClientFormDialog({
             <FormField
               control={form.control}
               name="name"
-              rules={{ validate: validateName }}
               render={({ field }) => (
                 <FormItem>
                   <FormLabel>Name</FormLabel>
@@ -647,7 +624,6 @@ function ClientFormDialog({
             <FormField
               control={form.control}
               name="matcher"
-              rules={{ validate: validateMatcher }}
               render={({ field }) => (
                 <FormItem>
                   <FormLabel>Matcher</FormLabel>

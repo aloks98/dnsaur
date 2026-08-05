@@ -10,6 +10,8 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 import { useForm } from "react-hook-form";
+import { zodResolver } from "@hookform/resolvers/zod";
+import { z } from "zod";
 import {
   Alert,
   AlertDescription,
@@ -87,32 +89,38 @@ const LIST_KIND_ITEMS: Record<List["kind"], string> = {
   allow: KIND_META.allow.label,
 };
 
-interface AddListValues {
-  url: string;
-  kind: "block" | "allow";
-}
-
-const ADD_LIST_DEFAULTS: AddListValues = { url: "", kind: "block" };
-
 /** Mirrors the server's own check (net/url.Parse + scheme/host, see
  * internal/api/filters_handlers.go's handleListCreate) so a bad URL never
  * even reaches the network — the 400 the server would return is instead
- * caught inline, before submit. */
-function validateListUrl(value: string): string | true {
-  const trimmed = value.trim();
-  if (!trimmed) return "URL is required";
-  let parsed: URL;
-  try {
-    parsed = new URL(trimmed);
-  } catch {
-    return "Enter a valid URL, e.g. https://example.com/hosts";
-  }
-  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
-    return "URL must start with http:// or https://";
-  }
-  if (!parsed.host) return "URL must include a host";
-  return true;
-}
+ * caught inline, before submit. One refinement rather than a chain of
+ * them: each step depends on the previous one having parsed, and each has
+ * its own specific message to hand back. */
+const listUrlSchema = z
+  .string()
+  .trim()
+  .superRefine((value, ctx) => {
+    const fail = (message: string) => ctx.addIssue({ code: "custom", message });
+    if (!value) return fail("URL is required");
+    let parsed: URL;
+    try {
+      parsed = new URL(value);
+    } catch {
+      return fail("Enter a valid URL, e.g. https://example.com/hosts");
+    }
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+      return fail("URL must start with http:// or https://");
+    }
+    if (!parsed.host) return fail("URL must include a host");
+  });
+
+const addListSchema = z.object({
+  url: listUrlSchema,
+  kind: z.enum(["block", "allow"]),
+});
+
+type AddListValues = z.infer<typeof addListSchema>;
+
+const ADD_LIST_DEFAULTS: AddListValues = { url: "", kind: "block" };
 
 /** "3 lists · 142,340 entries · refreshed 4m ago" — the same shape as the
  * dashboard health strip's own list summary (see hooks/use-filters.ts's
@@ -129,7 +137,10 @@ function listsSummary(lists: List[]): string {
 function AddListDialog() {
   const [open, setOpen] = useState(false);
   const addList = useAddList();
-  const form = useForm<AddListValues>({ defaultValues: ADD_LIST_DEFAULTS });
+  const form = useForm<AddListValues>({
+    resolver: zodResolver(addListSchema),
+    defaultValues: ADD_LIST_DEFAULTS,
+  });
 
   function onOpenChange(next: boolean) {
     setOpen(next);
@@ -173,7 +184,6 @@ function AddListDialog() {
             <FormField
               control={form.control}
               name="url"
-              rules={{ validate: validateListUrl }}
               render={({ field }) => (
                 <FormItem>
                   <FormLabel>URL</FormLabel>

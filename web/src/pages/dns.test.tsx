@@ -57,6 +57,57 @@ test("an A record with an IPv6 value shows an inline error and never posts", asy
   expect(screen.getByRole("dialog")).toBeInTheDocument();
 });
 
+// The Value rule is chosen by the Type select beside it, so a *shown*
+// error has to be re-judged against the newly picked type the moment it
+// changes — otherwise the record the admin has now made valid still reads
+// as rejected until they submit again. Regression-worthy because the
+// re-check hangs off a read of the form's error state, and the obvious
+// read (form.formState.errors) is a render-time snapshot that can lag
+// behind inside an event handler; see the Select's onValueChange.
+test("switching the type clears a value error the new type accepts", async () => {
+  const user = userEvent.setup();
+  mockRecords([record()]);
+
+  renderWithProviders(<LocalDns />);
+  await screen.findByText("nas.home.lan");
+
+  await user.click(screen.getByRole("button", { name: /^add record$/i }));
+  const dialog = await screen.findByRole("dialog");
+
+  await user.type(within(dialog).getByLabelText(/^name$/i), "v6.home.lan");
+  await user.type(within(dialog).getByLabelText(/^ipv4 address$/i), "2001:db8::1");
+  await user.click(within(dialog).getByRole("button", { name: /^add record$/i }));
+  expect(await within(dialog).findByText(/enter a valid ipv4 address/i)).toBeInTheDocument();
+
+  await user.click(within(dialog).getByRole("combobox", { name: /record type/i }));
+  await user.click(await screen.findByRole("option", { name: /^aaaa$/i }));
+
+  await waitFor(() =>
+    expect(within(dialog).queryByText(/enter a valid ipv4 address/i)).not.toBeInTheDocument(),
+  );
+});
+
+// Every field reports on the same submit: the type-dependent value check
+// spans two fields, so it can't be skipped just because a *different*
+// field (name, ttl) failed in the same pass — an admin fixing one error
+// at a time, submit by submit, is the failure mode this guards.
+test("an empty form reports the name, value and ttl errors at once", async () => {
+  const user = userEvent.setup();
+  mockRecords([record()]);
+
+  renderWithProviders(<LocalDns />);
+  await screen.findByText("nas.home.lan");
+
+  await user.click(screen.getByRole("button", { name: /^add record$/i }));
+  const dialog = await screen.findByRole("dialog");
+  await user.clear(within(dialog).getByLabelText(/^ttl/i));
+  await user.click(within(dialog).getByRole("button", { name: /^add record$/i }));
+
+  expect(await within(dialog).findByText(/enter a domain/i)).toBeInTheDocument();
+  expect(within(dialog).getByText(/enter a valid ipv4 address/i)).toBeInTheDocument();
+  expect(within(dialog).getByText(/ttl must be a whole number/i)).toBeInTheDocument();
+});
+
 test("a valid add posts /records (wildcard name included) and the new row appears", async () => {
   const user = userEvent.setup();
   let requestBody: unknown;

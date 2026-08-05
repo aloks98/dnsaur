@@ -11,6 +11,8 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 import { useForm, type Control } from "react-hook-form";
+import { zodResolver } from "@hookform/resolvers/zod";
+import { z } from "zod";
 import {
   Alert,
   AlertDescription,
@@ -42,14 +44,15 @@ import { ApiError } from "../api/client";
 import type { Settings } from "../api/types";
 import { useSettings, useUpdateSetting } from "../hooks/use-settings";
 import { StaleDataAlert } from "../components/stale-data-alert";
+import { requiredText } from "../lib/schemas";
 
 // --- field model -------------------------------------------------------
 // One row per key in internal/api/settings_handlers.go's editableSettings
 // map — 11 keys, no more, no less (see the exhaustiveness note by
-// SETTING_GROUPS below). Each field's `validate` mirrors that map's check
+// SETTING_GROUPS below). Each field's `schema` mirrors that map's check
 // function exactly, so a value accepted here is one PUT /settings will
 // also accept, and nothing rejected here would have been rejected there
-// either — see the validators just below for the key-by-key mapping.
+// either — see the schemas just below for the key-by-key mapping.
 
 interface SelectOption {
   value: string;
@@ -64,7 +67,9 @@ interface BaseField {
    * docs/configuration.md's "restart required" note — everything else
    * hot-reloads live. */
   restartRequired?: boolean;
-  validate: (value: string) => string | true;
+  /** Every field's value is a string on the wire and in the form, so each
+   * schema is string-in/string-out — it only ever trims and judges. */
+  schema: z.ZodType<string, string>;
 }
 
 interface TextField extends BaseField {
@@ -94,27 +99,32 @@ interface SettingGroup {
  * nothing more. The server does no host:port format checking, so this
  * must not invent stricter format rules and false-reject a legitimate
  * entry (the lesson from Tasks 9-11's own over-strict validators). */
-function validateNonEmpty(value: string): string | true {
-  return value !== "" ? true : "Can't be empty";
-}
+const nonEmptySchema = requiredText("Can't be empty");
 
 /** Mirrors editableSettings' oneOf(...) checks (upstream.strategy,
- * blocking.mode, qlog.privacy): membership in a fixed, exact-match set. */
-function validateOneOf(values: readonly string[]) {
-  return (value: string): string | true =>
-    values.includes(value) ? true : `Must be one of: ${values.join(", ")}`;
+ * blocking.mode, qlog.privacy): membership in a fixed, exact-match set.
+ * Not z.enum(): the message has to name the accepted values in the
+ * server's own order, and the form's value type stays a plain string. */
+function oneOfSchema(values: readonly string[]) {
+  return z
+    .string()
+    .trim()
+    .refine((value) => values.includes(value), `Must be one of: ${values.join(", ")}`);
 }
 
 /** Mirrors editableSettings' nonNegInt(...): Go's
  * strconv.ParseInt(v, 10, 64) succeeding with a non-negative result — an
  * optional leading sign then digits only, no surrounding whitespace
- * tolerated (the caller trims first, so this only rejects internal
+ * tolerated (the value is trimmed first, so this only rejects internal
  * whitespace/non-digits, matching ParseInt exactly on the trimmed form). */
-function validateNonNegInt(value: string): string | true {
-  if (!/^[+-]?\d+$/.test(value)) return "Enter a whole number";
-  const n = Number(value);
-  return Number.isSafeInteger(n) && n >= 0 ? true : "Must be zero or greater";
-}
+const nonNegIntSchema = z
+  .string()
+  .trim()
+  .regex(/^[+-]?\d+$/, "Enter a whole number")
+  .refine(
+    (value) => Number.isSafeInteger(Number(value)) && Number(value) >= 0,
+    "Must be zero or greater",
+  );
 
 // Fallback display defaults, matching docs/configuration.md's table —
 // used only if the server's GET /settings response is unexpectedly
@@ -149,7 +159,7 @@ const SETTING_GROUPS: SettingGroup[] = [
         label: "Upstream resolvers",
         description: "Comma-separated host:port pairs, tried in order.",
         placeholder: "1.1.1.1:53,1.0.0.1:53,9.9.9.9:53",
-        validate: validateNonEmpty,
+        schema: nonEmptySchema,
       },
       {
         key: "upstream.strategy",
@@ -169,7 +179,7 @@ const SETTING_GROUPS: SettingGroup[] = [
           { value: "failover", label: "Failover — try in order, fall back on failure" },
           { value: "fastest", label: "Fastest — prefer the historically quickest resolver" },
         ],
-        validate: validateOneOf(["failover", "fastest", "race"]),
+        schema: oneOfSchema(["failover", "fastest", "race"]),
       },
     ],
   },
@@ -187,14 +197,14 @@ const SETTING_GROUPS: SettingGroup[] = [
           { value: "null-ip", label: "Null IP (0.0.0.0)" },
           { value: "nxdomain", label: "NXDOMAIN" },
         ],
-        validate: validateOneOf(["null-ip", "nxdomain"]),
+        schema: oneOfSchema(["null-ip", "nxdomain"]),
       },
       {
         key: "blocking.ttl",
         kind: "int",
         label: "Blocked response TTL (seconds)",
         description: "How long resolvers may cache a blocked answer.",
-        validate: validateNonNegInt,
+        schema: nonNegIntSchema,
       },
     ],
   },
@@ -209,7 +219,7 @@ const SETTING_GROUPS: SettingGroup[] = [
         label: "Minimum cache TTL (seconds)",
         description: "Floor enforced on cached response TTLs.",
         restartRequired: true,
-        validate: validateNonNegInt,
+        schema: nonNegIntSchema,
       },
       {
         key: "cache.max_ttl",
@@ -217,7 +227,7 @@ const SETTING_GROUPS: SettingGroup[] = [
         label: "Maximum cache TTL (seconds)",
         description: "Ceiling clamp on cached response TTLs.",
         restartRequired: true,
-        validate: validateNonNegInt,
+        schema: nonNegIntSchema,
       },
       {
         key: "cache.max_entries",
@@ -225,7 +235,7 @@ const SETTING_GROUPS: SettingGroup[] = [
         label: "Maximum cache entries",
         description: "Upper bound on how many entries the in-memory cache holds.",
         restartRequired: true,
-        validate: validateNonNegInt,
+        schema: nonNegIntSchema,
       },
       {
         key: "cache.serve_stale_for",
@@ -233,7 +243,7 @@ const SETTING_GROUPS: SettingGroup[] = [
         label: "Serve stale for (seconds)",
         description: "How long a stale entry may still be served if upstream is unreachable.",
         restartRequired: true,
-        validate: validateNonNegInt,
+        schema: nonNegIntSchema,
       },
     ],
   },
@@ -252,14 +262,14 @@ const SETTING_GROUPS: SettingGroup[] = [
           { value: "anon", label: "Anonymized — client IPs redacted" },
           { value: "none", label: "None — don't log individual queries" },
         ],
-        validate: validateOneOf(["full", "anon", "none"]),
+        schema: oneOfSchema(["full", "anon", "none"]),
       },
       {
         key: "qlog.retention_days",
         kind: "int",
         label: "Retention (days)",
         description: "How long query log rows are kept before the pruner deletes them.",
-        validate: validateNonNegInt,
+        schema: nonNegIntSchema,
       },
     ],
   },
@@ -274,7 +284,7 @@ const SETTING_GROUPS: SettingGroup[] = [
         label: "Refresh interval (hours)",
         description: "How often blocklists and allowlists are re-downloaded and recompiled.",
         restartRequired: true,
-        validate: validateNonNegInt,
+        schema: nonNegIntSchema,
       },
     ],
   },
@@ -313,6 +323,15 @@ function buildDefaults(settings: Settings): SettingsFormValues {
   return values;
 }
 
+// One schema for the whole form, keyed the same way the form is (sanitized
+// names, not API keys) so the resolver's issue paths land on the right
+// fields. Assembled from the field definitions rather than written out
+// again, which keeps the "exactly editableSettings' 11 keys" guarantee
+// above the single thing to maintain.
+const SETTINGS_SCHEMA = z.object(
+  Object.fromEntries(ALL_FIELDS.map((field) => [rhfName(field.key), field.schema])),
+);
+
 // --- restart-required badge --------------------------------------------
 
 function RestartBadge() {
@@ -337,7 +356,6 @@ function SettingFieldControl({
     <FormField
       control={control}
       name={rhfName(field.key)}
-      rules={{ validate: (value: string) => field.validate(value.trim()) }}
       render={({ field: rhfField }) => (
         <FormItem>
           <div className="flex flex-wrap items-center gap-2">
@@ -443,7 +461,10 @@ function SettingsSkeleton() {
 function SettingsForm({ settings }: { settings: Settings }) {
   const updateSetting = useUpdateSetting();
   const defaultsRef = useRef(buildDefaults(settings));
-  const form = useForm<SettingsFormValues>({ defaultValues: defaultsRef.current });
+  const form = useForm<SettingsFormValues>({
+    resolver: zodResolver(SETTINGS_SCHEMA),
+    defaultValues: defaultsRef.current,
+  });
 
   async function onSubmit(values: SettingsFormValues) {
     const baseline = defaultsRef.current;

@@ -2,6 +2,8 @@ import { useEffect, useState } from "react";
 import { CircleAlert, KeyRound, ShieldCheck } from "lucide-react";
 import { toast } from "sonner";
 import { useForm } from "react-hook-form";
+import { zodResolver } from "@hookform/resolvers/zod";
+import { z } from "zod";
 import { useQueryClient } from "@tanstack/react-query";
 import {
   Alert,
@@ -29,14 +31,33 @@ import {
 import { ApiError } from "../api/client";
 import { AuthLayout } from "../components/auth-layout";
 import { authKeys, useLogin } from "../hooks/use-auth";
+import { totpCodeSchema } from "../lib/schemas";
 
 type Step = "credentials" | "totp";
 
-interface LoginFormValues {
-  username: string;
-  password: string;
-  totpCode: string;
-}
+/**
+ * One schema per step, rather than one for the form.
+ *
+ * The verification code field only exists — and only has to hold six
+ * digits — once the server has asked for it; on the credentials step it's
+ * an unmounted, empty string that must not block the first submit. A
+ * resolver validates the whole schema at once (unlike per-field `rules`,
+ * which only ran for mounted fields), so the step picks the schema and
+ * `useForm` is handed the matching resolver on every render.
+ *
+ * Neither username nor password is trimmed: whitespace can be part of a
+ * password, and this only has to reject the empty string exactly as the
+ * `required` rule it replaces did.
+ */
+const credentialsSchema = z.object({
+  username: z.string().min(1, "Username is required"),
+  password: z.string().min(1, "Password is required"),
+  totpCode: z.string(),
+});
+
+const totpChallengeSchema = credentialsSchema.extend({ totpCode: totpCodeSchema });
+
+type LoginFormValues = z.infer<typeof credentialsSchema>;
 
 interface FormError {
   /** True when the error should offer a way to jump to first-run setup. */
@@ -90,6 +111,7 @@ export function Login() {
   const settled = useStepTransition(step);
 
   const form = useForm<LoginFormValues>({
+    resolver: zodResolver(step === "totp" ? totpChallengeSchema : credentialsSchema),
     defaultValues: { username: "", password: "", totpCode: "" },
   });
 
@@ -201,7 +223,6 @@ export function Login() {
                   <FormField
                     control={form.control}
                     name="username"
-                    rules={{ required: "Username is required" }}
                     render={({ field }) => (
                       <FormItem>
                         <FormLabel>Username</FormLabel>
@@ -215,7 +236,6 @@ export function Login() {
                   <FormField
                     control={form.control}
                     name="password"
-                    rules={{ required: "Password is required" }}
                     render={({ field }) => (
                       <FormItem>
                         <FormLabel>Password</FormLabel>
@@ -242,9 +262,6 @@ export function Login() {
                   <FormField
                     control={form.control}
                     name="totpCode"
-                    rules={{
-                      validate: (value) => value.length === 6 || "Enter the 6-digit code",
-                    }}
                     render={({ field }) => (
                       <FormItem>
                         <FormLabel>Verification code</FormLabel>

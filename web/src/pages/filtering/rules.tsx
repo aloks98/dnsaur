@@ -2,6 +2,8 @@ import { useEffect, useState, type ReactNode } from "react";
 import { Plus, Regex, ShieldBan, ShieldCheck, Trash2, TriangleAlert } from "lucide-react";
 import { toast } from "sonner";
 import { useForm, useWatch } from "react-hook-form";
+import { zodResolver } from "@hookform/resolvers/zod";
+import { z } from "zod";
 import {
   Alert,
   AlertDescription,
@@ -86,33 +88,45 @@ const RULE_ACTION_ITEMS: Record<Rule["action"], string> = {
   allow: ACTION_META.allow.label,
 };
 
-function validatePattern(value: string, isRegex: boolean): string | true {
-  if (!value.trim()) return "Pattern is required";
-  if (!isRegex) return true;
-  if (value.length > MAX_REGEX_PATTERN_LENGTH) {
-    return `Regex pattern must be ${MAX_REGEX_PATTERN_LENGTH} characters or fewer`;
-  }
-  try {
-    // eslint-disable-next-line no-new -- constructed only to validate syntax
-    new RegExp(value);
-  } catch (err) {
-    return `Invalid regular expression: ${err instanceof Error ? err.message : "syntax error"}`;
-  }
-  return true;
-}
+/** The pattern's rules depend on the Regular expression switch sitting
+ * below it, so the check lives at the object level (with an explicit
+ * `path`) where the refinement can see both fields at once.
+ *
+ * Neither the length cap nor the compile check runs against a trimmed
+ * pattern, deliberately: leading/trailing whitespace is significant inside
+ * a regex, and the server measures and compiles the pattern it was sent. */
+const addRuleSchema = z
+  .object({
+    action: z.enum(["block", "allow"]),
+    pattern: z.string(),
+    is_regex: z.boolean(),
+  })
+  .superRefine(({ pattern, is_regex }, ctx) => {
+    const fail = (message: string) => ctx.addIssue({ code: "custom", message, path: ["pattern"] });
+    if (!pattern.trim()) return fail("Pattern is required");
+    if (!is_regex) return;
+    if (pattern.length > MAX_REGEX_PATTERN_LENGTH) {
+      return fail(`Regex pattern must be ${MAX_REGEX_PATTERN_LENGTH} characters or fewer`);
+    }
+    try {
+      // eslint-disable-next-line no-new -- constructed only to validate syntax
+      new RegExp(pattern);
+    } catch (err) {
+      fail(`Invalid regular expression: ${err instanceof Error ? err.message : "syntax error"}`);
+    }
+  });
 
-interface AddRuleValues {
-  action: Rule["action"];
-  pattern: string;
-  is_regex: boolean;
-}
+type AddRuleValues = z.infer<typeof addRuleSchema>;
 
 const ADD_RULE_DEFAULTS: AddRuleValues = { action: "block", pattern: "", is_regex: false };
 
 function AddRuleDialog({ groupId, groupName }: { groupId: number; groupName: string }) {
   const [open, setOpen] = useState(false);
   const addRule = useAddRule();
-  const form = useForm<AddRuleValues>({ defaultValues: ADD_RULE_DEFAULTS });
+  const form = useForm<AddRuleValues>({
+    resolver: zodResolver(addRuleSchema),
+    defaultValues: ADD_RULE_DEFAULTS,
+  });
   const isRegex = useWatch({ control: form.control, name: "is_regex" });
 
   function onOpenChange(next: boolean) {
@@ -178,10 +192,6 @@ function AddRuleDialog({ groupId, groupName }: { groupId: number; groupName: str
             <FormField
               control={form.control}
               name="pattern"
-              rules={{
-                validate: (value: string, formValues) =>
-                  validatePattern(value, formValues.is_regex),
-              }}
               render={({ field }) => (
                 <FormItem>
                   <FormLabel>Pattern</FormLabel>

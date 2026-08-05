@@ -2,6 +2,8 @@ import { useId, useState } from "react";
 import { CheckIcon, CircleAlert } from "lucide-react";
 import { toast } from "sonner";
 import { useForm } from "react-hook-form";
+import { zodResolver } from "@hookform/resolvers/zod";
+import { z } from "zod";
 import { useQueryClient } from "@tanstack/react-query";
 import {
   Alert,
@@ -57,11 +59,33 @@ const STARTER_LISTS = [
   },
 ] as const;
 
-interface AccountFormValues {
-  username: string;
-  password: string;
-  confirmPassword: string;
-}
+/**
+ * The account step's rules, mirroring POST /setup (internal/api's
+ * handleSetup rejects an empty username and a password under 8
+ * characters). Nothing is trimmed: whitespace can be part of a password,
+ * and both fields are sent exactly as typed.
+ *
+ * The confirmation check is a schema-level refinement with an explicit
+ * `path` — it's the one rule here that needs to see a second field — and
+ * the two checks on the password itself stay ordered so an empty one still
+ * reads "Password is required" rather than the length complaint.
+ */
+const accountFormSchema = z
+  .object({
+    username: z.string().min(1, "Username is required"),
+    password: z
+      .string()
+      .min(1, "Password is required")
+      .min(8, "Password must be at least 8 characters"),
+    confirmPassword: z.string().min(1, "Confirm your password"),
+  })
+  .superRefine((values, ctx) => {
+    if (values.confirmPassword !== values.password) {
+      ctx.addIssue({ code: "custom", message: "Passwords don't match", path: ["confirmPassword"] });
+    }
+  });
+
+type AccountFormValues = z.infer<typeof accountFormSchema>;
 
 function passwordStrengthHint(password: string): string {
   if (password.length === 0) return "Use at least 8 characters.";
@@ -97,6 +121,7 @@ export function Setup() {
   const updateSetting = useUpdateSetting();
 
   const accountForm = useForm<AccountFormValues>({
+    resolver: zodResolver(accountFormSchema),
     defaultValues: { username: "", password: "", confirmPassword: "" },
   });
 
@@ -285,7 +310,6 @@ export function Setup() {
                     <FormField
                       control={accountForm.control}
                       name="username"
-                      rules={{ required: "Username is required" }}
                       render={({ field }) => (
                         <FormItem>
                           <FormLabel>Username</FormLabel>
@@ -299,13 +323,6 @@ export function Setup() {
                     <FormField
                       control={accountForm.control}
                       name="password"
-                      rules={{
-                        required: "Password is required",
-                        minLength: {
-                          value: 8,
-                          message: "Password must be at least 8 characters",
-                        },
-                      }}
                       render={({ field }) => (
                         <FormItem>
                           <FormLabel>Password</FormLabel>
@@ -320,11 +337,6 @@ export function Setup() {
                     <FormField
                       control={accountForm.control}
                       name="confirmPassword"
-                      rules={{
-                        required: "Confirm your password",
-                        validate: (value, formValues) =>
-                          value === formValues.password || "Passwords don't match",
-                      }}
                       render={({ field }) => (
                         <FormItem>
                           <FormLabel>Confirm password</FormLabel>

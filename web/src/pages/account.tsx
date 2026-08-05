@@ -11,6 +11,8 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 import { useForm, type Control } from "react-hook-form";
+import { zodResolver } from "@hookform/resolvers/zod";
+import { z } from "zod";
 import * as QRCode from "qrcode";
 import {
   Alert,
@@ -74,6 +76,7 @@ import { useMe } from "../hooks/use-auth";
 import { useCreateToken, useRevokeToken, useTokens } from "../hooks/use-tokens";
 import { useTotpConfirm, useTotpDisable, useTotpStart } from "../hooks/use-totp";
 import { relativeTime } from "../lib/format";
+import { requiredText, totpCodeSchema } from "../lib/schemas";
 import { StaleDataAlert } from "../components/stale-data-alert";
 
 // --- shared: copyable secret/token block ------------------------------
@@ -130,9 +133,11 @@ function useQrDataUrl(text: string | null): string | null {
   return dataUrl;
 }
 
-interface CodeFormValues {
-  code: string;
-}
+// Both TOTP dialogs (enable and disable) ask for the same six digits, so
+// they share one schema as well as one field component.
+const codeFormSchema = z.object({ code: totpCodeSchema });
+
+type CodeFormValues = z.infer<typeof codeFormSchema>;
 
 function CodeField({
   control,
@@ -145,7 +150,6 @@ function CodeField({
     <FormField
       control={control}
       name="code"
-      rules={{ validate: (value) => value.length === 6 || "Enter the 6-digit code" }}
       render={({ field }) => (
         <FormItem>
           <FormLabel>Verification code</FormLabel>
@@ -206,7 +210,10 @@ function TotpEnableDialog({
   enrollment: { secret: string; otpauth_url: string } | null;
   totpConfirm: ReturnType<typeof useTotpConfirm>;
 }) {
-  const form = useForm<CodeFormValues>({ defaultValues: { code: "" } });
+  const form = useForm<CodeFormValues>({
+    resolver: zodResolver(codeFormSchema),
+    defaultValues: { code: "" },
+  });
   const qrDataUrl = useQrDataUrl(open ? (enrollment?.otpauth_url ?? null) : null);
 
   useEffect(() => {
@@ -322,7 +329,10 @@ function TotpDisableDialog({
   onOpenChange: (open: boolean) => void;
   totpDisable: ReturnType<typeof useTotpDisable>;
 }) {
-  const form = useForm<CodeFormValues>({ defaultValues: { code: "" } });
+  const form = useForm<CodeFormValues>({
+    resolver: zodResolver(codeFormSchema),
+    defaultValues: { code: "" },
+  });
 
   useEffect(() => {
     if (open) form.reset({ code: "" });
@@ -521,14 +531,12 @@ function TokenScopeBadge({ scope }: { scope: ApiToken["scope"] }) {
   );
 }
 
-interface TokenFormValues {
-  name: string;
-  scope: ApiToken["scope"];
-}
+const tokenFormSchema = z.object({
+  name: requiredText("Name is required"),
+  scope: z.enum(["read", "write"]),
+});
 
-function validateTokenName(value: string): string | true {
-  return value.trim() ? true : "Name is required";
-}
+type TokenFormValues = z.infer<typeof tokenFormSchema>;
 
 // Defaults to "read" — the server itself defaults an omitted scope to
 // "write" (see internal/api/tokens_handlers.go's handleTokenCreate), but
@@ -556,7 +564,10 @@ function NewTokenDialog({
   onOpenChange: (open: boolean) => void;
   onCreated: (result: { id: number; token: string }) => void;
 }) {
-  const form = useForm<TokenFormValues>({ defaultValues: tokenFormDefaults() });
+  const form = useForm<TokenFormValues>({
+    resolver: zodResolver(tokenFormSchema),
+    defaultValues: tokenFormDefaults(),
+  });
 
   useEffect(() => {
     if (open) form.reset(tokenFormDefaults());
@@ -595,7 +606,6 @@ function NewTokenDialog({
             <FormField
               control={form.control}
               name="name"
-              rules={{ validate: validateTokenName }}
               render={({ field }) => (
                 <FormItem>
                   <FormLabel>Name</FormLabel>
