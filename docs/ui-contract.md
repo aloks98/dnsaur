@@ -1111,12 +1111,16 @@ Go source. **The code is the source of truth.**
    hagezi `wildcard/*` file was skipped and the list blocked nothing while
    reporting a healthy "refreshed just now". A leading `*.` is now stripped
    and stored as a normal entry (§3.2).
-5. `openapi.yaml` does not document `name`, `last_status`, `last_error` or
+5. ~~`openapi.yaml` does not document `name`, `last_status`, `last_error` or
    `last_attempt` on the filter-list schema, nor the extended `PATCH
-   /filters/lists/{id}` body.
+   /filters/lists/{id}` body.~~ **Fixed.** The list shape now lives once in
+   `components/schemas/List` and is `$ref`'d from both `GET /filters/lists`
+   and `GET /groups/{id}/lists`, which previously carried separate inline
+   copies that had already drifted apart.
 6. `openapi.yaml` omits **503 `storage unavailable`** on most operations that
-   can return it, and omits it entirely from `POST /setup`. It also does not
-   document the new **409** duplicate responses.
+   can return it, and omits it entirely from `POST /setup`. It still omits
+   **409** on the duplicate responses other than `POST /filters/lists`, which
+   is now documented.
 7. `openapi.yaml` marks `group_id` **required** on `DELETE /blocking/pause`;
    the code makes it optional, defaulting to 0 (the global pause).
 8. `openapi.yaml` marks `group_id` required on `POST /blocking/pause`; only

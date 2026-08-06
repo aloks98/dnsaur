@@ -48,6 +48,61 @@ components:
       type: object
       properties:
         error: { type: string }
+    List:
+      type: object
+      description: >
+        A subscribed filter list. last_status is the field that says whether
+        the list is actually enforcing anything: entry_count alone cannot
+        tell "never fetched" from "fetched, but every line was rejected" —
+        both read as 0.
+      properties:
+        id: { type: integer, format: int64 }
+        url: { type: string }
+        name:
+          type: string
+          description: >
+            Readable label, shown wherever the UI would otherwise print the
+            raw URL (assignment menus, toasts, delete confirmations). Never
+            empty on read: a list stored with a blank name resolves to one
+            derived from its URL, which is also what labels rows written
+            before this field existed.
+        kind: { type: string, enum: [block, allow] }
+        enabled: { type: boolean }
+        last_refreshed:
+          type: integer
+          format: int64
+          description: unix ms of the last successful fetch-and-parse; 0 = never
+        entry_count:
+          type: integer
+          format: int64
+          description: unique domains currently compiled and enforcing
+        last_status:
+          type: string
+          enum: [pending, ok, stale, failed, empty]
+          description: >
+            pending — never attempted; the only case where 0 entries and a
+            "never" last_refreshed are expected.
+            ok — fetched (or 304'd) and parsed; entries are live.
+            stale — this attempt failed, but a previously cached copy is
+            still compiled and enforcing, so entries are real but ageing;
+            last_refreshed dates the copy being served.
+            failed — the attempt failed and there is no usable copy, so the
+            list is blocking nothing.
+            empty — fetched and parsed fine, but produced no usable entries
+            (every line rejected, or the file holds no domains). Also
+            blocking nothing, but for a parser reason rather than a fetch
+            one; last_error says which.
+        last_error:
+          type: string
+          description: >
+            Short human-readable reason; "" when last_status is pending or ok.
+        last_attempt:
+          type: integer
+          format: int64
+          description: >
+            unix ms of the last attempt, successful or not; 0 = never tried.
+            Differs from last_refreshed on a failing list, which is what lets
+            the UI say "tried 5m ago, still serving Tuesday's copy".
   responses:
     ReadOnlyToken:
       description: read-only token used for a write operation
@@ -625,15 +680,7 @@ paths:
             application/json:
               schema:
                 type: array
-                items:
-                  type: object
-                  properties:
-                    id: { type: integer, format: int64 }
-                    url: { type: string }
-                    kind: { type: string, enum: [block, allow] }
-                    enabled: { type: boolean }
-                    last_refreshed: { type: integer, format: int64 }
-                    entry_count: { type: integer, format: int64 }
+                items: { $ref: "#/components/schemas/List" }
         "400":
           description: bad id
           content:
@@ -882,15 +929,7 @@ paths:
             application/json:
               schema:
                 type: array
-                items:
-                  type: object
-                  properties:
-                    id: { type: integer, format: int64 }
-                    url: { type: string }
-                    kind: { type: string, enum: [block, allow] }
-                    enabled: { type: boolean }
-                    last_refreshed: { type: integer, format: int64 }
-                    entry_count: { type: integer, format: int64 }
+                items: { $ref: "#/components/schemas/List" }
         "401":
           description: authentication required
           content:
@@ -904,6 +943,12 @@ paths:
         (the same as POST /filters/refresh): the list row is created and
         its id returned immediately, and the potentially slow full-network
         refresh runs in the background.
+
+
+        The new list is also assigned to every existing group. A group's
+        ruleset compiles only from the lists assigned to it, so a list that
+        exists but is assigned nowhere filters nothing while still reporting
+        itself enabled with a full entry_count.
       requestBody:
         required: true
         content:
@@ -913,6 +958,12 @@ paths:
               required: [url, kind]
               properties:
                 url: { type: string, description: http(s) URL of the list }
+                name:
+                  type: string
+                  maxLength: 120
+                  description: >
+                    Optional label. Blank or omitted stores blank, which
+                    reads back as a name derived from the URL.
                 kind: { type: string, enum: [block, allow] }
       responses:
         "201":
@@ -924,7 +975,9 @@ paths:
                 properties:
                   id: { type: integer, format: int64 }
         "400":
-          description: url must be http(s), or kind must be block or allow
+          description: >
+            url must be http(s), kind must be block or allow, or name too
+            long (max 120)
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -935,6 +988,11 @@ paths:
               schema: { $ref: "#/components/schemas/Error" }
         "403":
           $ref: "#/components/responses/ReadOnlyToken"
+        "409":
+          description: that list URL is already subscribed
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
 
   /filters/lists/{id}:
     parameters:
@@ -944,21 +1002,37 @@ paths:
         schema: { type: integer, format: int64 }
     patch:
       tags: [Filters]
-      summary: Enable or disable a filter list
+      summary: Enable, disable, or rename a filter list
       requestBody:
         required: true
         content:
           application/json:
             schema:
               type: object
-              required: [enabled]
+              description: >
+                Either field alone is a valid patch, but at least one is
+                required. url and kind are deliberately immutable — changing
+                either would silently invalidate the on-disk cache and the
+                compiled ruleset — and sending one is rejected rather than
+                ignored.
+              minProperties: 1
+              anyOf:
+                - required: [enabled]
+                - required: [name]
               properties:
                 enabled: { type: boolean }
+                name:
+                  type: string
+                  maxLength: 120
+                  description: >
+                    Blank resets the list to its URL-derived default name
+                    rather than clearing it.
       responses:
         "204":
           description: No Content
         "400":
-          description: enabled required
+          description: >
+            enabled or name required, or name too long (max 120)
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
