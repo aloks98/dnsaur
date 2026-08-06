@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 )
@@ -104,6 +105,100 @@ func TestFilterAndRecordCRUD(t *testing.T) {
 		}
 		if err := s.Records().Delete(ctx, recID); !errors.Is(err, ErrNotFound) {
 			t.Fatalf("double delete: %v", err)
+		}
+	})
+}
+
+// TestListRefreshStatusRoundTrip pins the persistence half of "make
+// filter-list fetch failures visible": every outcome has to survive a write
+// and a read on both dialects, a recovery has to *clear* the previous error
+// (otherwise a healed list wears a permanent red badge and the signal gets
+// ignored), and a stale list has to keep last_refreshed pointing at the copy
+// it is still serving rather than at the attempt that just failed.
+func TestListRefreshStatusRoundTrip(t *testing.T) {
+	forEachDriver(t, func(t *testing.T, s Store) {
+		ctx := context.Background()
+		lid, err := s.Filters().AddList(ctx, List{URL: testGroupName("https://status.example/l"), Kind: "block", Enabled: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		get := func() List {
+			t.Helper()
+			ls, err := s.Filters().Lists(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, l := range ls {
+				if l.ID == lid {
+					return l
+				}
+			}
+			t.Fatalf("list %d vanished", lid)
+			return List{}
+		}
+
+		// A brand-new subscription has never been attempted. This is the
+		// only thing `0 entries / never refreshed` is allowed to mean.
+		if got := get(); got.LastStatus != ListStatusPending || got.LastError != "" || got.LastAttempt != 0 {
+			t.Fatalf("fresh list = %+v, want pending with no attempt", got)
+		}
+
+		// Failed: the attempt failed and nothing is being served.
+		if err := s.Filters().MarkListFailed(ctx, lid, 1000, 0, "404 Not Found"); err != nil {
+			t.Fatal(err)
+		}
+		got := get()
+		if got.LastStatus != ListStatusFailed || got.LastError != "404 Not Found" || got.LastAttempt != 1000 {
+			t.Fatalf("failed = %+v", got)
+		}
+		if got.LastRefreshed != 0 {
+			t.Fatalf("failed list claims a successful refresh: %+v", got)
+		}
+
+		// OK: a success stores entries and clears the error.
+		if err := s.Filters().TouchList(ctx, lid, 2000, 99277); err != nil {
+			t.Fatal(err)
+		}
+		if got := get(); got.LastStatus != ListStatusOK || got.LastError != "" ||
+			got.EntryCount != 99277 || got.LastRefreshed != 2000 || got.LastAttempt != 2000 {
+			t.Fatalf("ok = %+v, want the error cleared and both timestamps at 2000", got)
+		}
+
+		// Stale: a later failure that still serves the cached copy keeps
+		// last_refreshed at the copy's own date (2000), not the attempt's.
+		if err := s.Filters().MarkListFailed(ctx, lid, 3000, 99277, "404 Not Found"); err != nil {
+			t.Fatal(err)
+		}
+		if got := get(); got.LastStatus != ListStatusStale || got.LastRefreshed != 2000 ||
+			got.LastAttempt != 3000 || got.EntryCount != 99277 {
+			t.Fatalf("stale = %+v, want last_refreshed pinned to the served copy", got)
+		}
+
+		// Empty: the download worked, so last_refreshed advances; the
+		// entries are gone and the reason says why.
+		if err := s.Filters().MarkListEmpty(ctx, lid, 4000, "fetched 4.5 MB, no usable entries — 250,431 lines skipped"); err != nil {
+			t.Fatal(err)
+		}
+		if got := get(); got.LastStatus != ListStatusEmpty || got.EntryCount != 0 ||
+			got.LastRefreshed != 4000 || !strings.Contains(got.LastError, "250,431 lines skipped") {
+			t.Fatalf("empty = %+v", got)
+		}
+
+		// ListsForGroup serves the same columns as Lists — the Groups &
+		// Clients screen reads that one and must see the state too.
+		gid, err := s.Clients().AddGroup(ctx, testGroupName("status-group"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Filters().AssignList(ctx, gid, lid); err != nil {
+			t.Fatal(err)
+		}
+		gl, err := s.Filters().ListsForGroup(ctx, gid)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(gl) != 1 || gl[0].LastStatus != ListStatusEmpty || gl[0].LastAttempt != 4000 {
+			t.Fatalf("ListsForGroup dropped the status: %+v", gl)
 		}
 	})
 }

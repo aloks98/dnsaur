@@ -849,13 +849,15 @@ function rawRow(entry: QueryEntry): RawField[] {
 /** What matched, in one line. The group is named, not assumed: a rule that
  * governs this row lives in the row's *client's* group (see groupForEntry),
  * and "rule #1" means nothing without saying which group's rule #1. */
-function matchTitle(entry: QueryEntry, groupName?: string): string {
+function matchTitle(entry: QueryEntry, groupName?: string, list?: List): string {
   if (entry.rule_id > 0) {
     return groupName === undefined
       ? `Matched rule #${entry.rule_id}`
       : `Matched rule #${entry.rule_id} in group ${groupName}`;
   }
-  if (entry.list_id > 0) return `Matched list #${entry.list_id}`;
+  // The list is already resolved for the prose below, so name it here too:
+  // "#3" is an internal id the admin has no way to look up.
+  if (entry.list_id > 0) return list ? `Matched ${list.name}` : `Matched list #${entry.list_id}`;
   return "No rule or list matched";
 }
 
@@ -894,8 +896,8 @@ function MatchProse({
   if (entry.list_id > 0) {
     return list ? (
       <p>
-        From the {list.kind} list{" "}
-        <code className="font-mono break-all text-foreground">{list.url}</code>.
+        From the {list.kind} list <span className="font-medium text-foreground">{list.name}</span> (
+        <code className="font-mono break-all">{list.url}</code>).
       </p>
     ) : (
       <p>Matched list #{entry.list_id}, which isn&apos;t available right now.</p>
@@ -1045,7 +1047,7 @@ const Inspector = memo(function Inspector({
                     : "default"
                 }
               >
-                <AlertTitle>{matchTitle(entry, groupName)}</AlertTitle>
+                <AlertTitle>{matchTitle(entry, groupName, list)}</AlertTitle>
                 <AlertDescription>
                   <MatchProse entry={entry} rule={rule} ruleLoading={ruleLoading} list={list} />
                 </AlertDescription>

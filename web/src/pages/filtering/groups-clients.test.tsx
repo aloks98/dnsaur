@@ -20,10 +20,14 @@ function list(overrides: Partial<List> = {}): List {
   return {
     id: 1,
     url: "https://example.com/hosts",
+    name: "example.com hosts",
     kind: "block",
     enabled: true,
     last_refreshed: Date.now(),
     entry_count: 100,
+    last_status: "ok",
+    last_error: "",
+    last_attempt: Date.now(),
     ...overrides,
   };
 }
@@ -221,12 +225,14 @@ test("toggling a list in a group's Lists menu PUTs the full assigned-list id arr
   server.use(
     http.get("/api/v1/filters/lists", () =>
       HttpResponse.json([
-        list({ id: 1, url: "https://example.com/hosts" }),
-        list({ id: 2, url: "https://example.com/allow" }),
+        list({ id: 1, url: "https://example.com/hosts", name: "Household baseline" }),
+        list({ id: 2, url: "https://example.com/allow", name: "Work allowlist" }),
       ]),
     ),
     http.get("/api/v1/groups/1/lists", () =>
-      HttpResponse.json([list({ id: 1, url: "https://example.com/hosts" })]),
+      HttpResponse.json([
+        list({ id: 1, url: "https://example.com/hosts", name: "Household baseline" }),
+      ]),
     ),
     http.put("/api/v1/groups/1/lists", async ({ request }) => {
       requestBody = await request.json();
@@ -239,7 +245,8 @@ test("toggling a list in a group's Lists menu PUTs the full assigned-list id arr
 
   const listsButton = await screen.findByRole("button", { name: /^lists \(1\)$/i });
   const menu = openMenu(listsButton);
-  fireEvent.click(within(menu).getByText("https://example.com/allow"));
+  expect(within(menu).queryByText("https://example.com/allow")).not.toBeInTheDocument();
+  fireEvent.click(within(menu).getByText("Work allowlist"));
 
   await waitFor(() => expect(requestBody).toEqual({ list_ids: [1, 2] }));
 });

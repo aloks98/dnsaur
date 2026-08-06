@@ -199,7 +199,9 @@ export function Setup() {
 
     for (const list of chosen) {
       try {
-        const res = await addList.mutateAsync({ url: list.url, kind: "block" });
+        // The wizard already has human labels for these; pass them through
+        // as the list's name rather than letting the server re-derive one.
+        const res = await addList.mutateAsync({ url: list.url, kind: "block", name: list.name });
         created.push(res.id);
       } catch {
         failed = true;

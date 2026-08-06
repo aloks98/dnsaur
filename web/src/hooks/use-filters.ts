@@ -47,11 +47,24 @@ export function useLists() {
   });
 }
 
+/** `name` is optional — the server derives one from the URL when it's
+ * omitted or blank, so a list always has a label the UI can print. */
 export function useAddList() {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: (v: { url: string; kind: "block" | "allow" }) =>
+    mutationFn: (v: { url: string; kind: "block" | "allow"; name?: string }) =>
       api.post<{ id: number }>("/filters/lists", v),
+    onSuccess: () => invalidateListsEverywhere(qc),
+  });
+}
+
+/** Renames a list. A blank name resets it to the URL-derived default rather
+ * than clearing it. */
+export function useRenameList() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, name }: { id: number; name: string }) =>
+      api.patch<void>(`/filters/lists/${id}`, { name }),
     onSuccess: () => invalidateListsEverywhere(qc),
   });
 }

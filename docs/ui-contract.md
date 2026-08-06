@@ -249,8 +249,8 @@ Path ids must parse as int64 **and be > 0**, else 400 `bad id`. So `0`, `-1`,
 | Endpoint | Success | Notes |
 |---|---|---|
 | `GET /filters/lists` | 200 array | |
-| `POST /filters/lists` | **201** `{"id":1}` | kicks off a background refresh of *every* list |
-| `PATCH /filters/lists/{id}` | 204 | body `{"enabled": bool}` — **required** |
+| `POST /filters/lists` | **201** `{"id":1}` | body `{"url","kind"}` + **optional `name`**; kicks off a background refresh of *every* list |
+| `PATCH /filters/lists/{id}` | 204 | body `{"enabled": bool}` and/or `{"name": string}` — **at least one required**; `url`/`kind` are rejected |
 | `DELETE /filters/lists/{id}` | 204 | |
 | `GET /groups/{id}/lists` | 200 array | a **nonexistent group returns `[]` + 200**, not 404 |
 | `PUT /groups/{id}/lists` | 204 | body `{"list_ids":[...]}`; `null`/omitted unassigns everything |
@@ -262,8 +262,16 @@ Path ids must parse as int64 **and be > 0**, else 400 `bad id`. So `0`, `-1`,
 ```json
 [{"id":1,
   "url":"https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts",
+  "name":"StevenBlack hosts",
   "kind":"block","enabled":true,
-  "last_refreshed":1785946876638,"entry_count":99277}]
+  "last_refreshed":1785946876638,"entry_count":99277,
+  "last_status":"ok","last_error":"","last_attempt":1785946876638},
+ {"id":2,
+  "url":"https://raw.githubusercontent.com/hagezi/dns-blocklists/main/hosts/pro.txt",
+  "name":"hagezi hosts/pro.txt",
+  "kind":"block","enabled":true,
+  "last_refreshed":0,"entry_count":0,
+  "last_status":"failed","last_error":"404 Not Found","last_attempt":1785946876700}]
 ```
 ```json
 [{"id":1,"group_id":1,"action":"block","pattern":"ads.example.com","is_regex":false}]
@@ -274,17 +282,19 @@ Path ids must parse as int64 **and be > 0**, else 400 `bad id`. So `0`, `-1`,
 | 409 | `that list URL is already subscribed` |
 | 400 | `url must be http(s)` |
 | 400 | `kind must be block or allow` |
-| 400 | `enabled required` (also the decode-failure message for PATCH) |
+| 400 | `enabled or name required` (also the decode-failure message for PATCH — including an attempt to PATCH `url` or `kind`, which `DisallowUnknownFields` rejects) |
+| 400 | `name too long (max 120)` (create and PATCH) |
 | 400 | `action allow\|block and pattern required` (also decode failure) |
 | 400 | `regex pattern too long (max 512)` |
 | 400 | `invalid regex: <Go's compile error, verbatim>` — e.g. `invalid regex: error parsing regexp: missing closing ]: ` + `` `[unclosed` `` |
 
 **`POST /filters/refresh` is fire-and-forget.** The work runs detached; there is
 **no progress endpoint, no job id, and errors never reach the client** — they
-only hit the server log. Poll `GET /filters/lists` and watch `last_refreshed` /
-`entry_count`. `POST /filters/lists` does the same background refresh but
-answers **201**, so a freshly added list reads `entry_count: 0` until the fetch
-lands.
+only hit the server log. Poll `GET /filters/lists` and read `last_status` /
+`last_error`, which is where a refresh's outcome now lands (§3.2). `POST
+/filters/lists` does the same background refresh but answers **201**, so a
+freshly added list reads `entry_count: 0` with `last_status: "pending"` until
+the fetch lands.
 
 **`PUT /groups/{id}/lists` is not transactional** — it unassigns every current
 list one-by-one, then assigns the requested ids
@@ -524,22 +534,68 @@ another user's token *and* any underlying storage failure.
 | Field | Type | Notes |
 |---|---|---|
 | `id` | int64 | |
-| `url` | string | must be `http`/`https` with a non-empty host; **DB-unique** |
-| `kind` | string | **`block` \| `allow`** — not `hosts`/`abp`; the *format* is auto-detected at parse time |
-| `enabled` | bool | create always forces `true`; the only mutable field |
-| `last_refreshed` | int64 | **unix ms**; **`0` = never successfully fetched-and-parsed** |
-| `entry_count` | int64 | **unique domains in the compiled set**, after dedup and parse rejects — not lines |
+| `url` | string | must be `http`/`https` with a non-empty host; **DB-unique**; **immutable** |
+| `name` | string | readable label; **never empty on the way out** — derived from the URL when not supplied. Optional on `POST`, mutable via `PATCH`; max 120 chars |
+| `kind` | string | **`block` \| `allow`** — not `hosts`/`abp`; the *format* is auto-detected at parse time. **Immutable** |
+| `enabled` | bool | create always forces `true` |
+| `last_refreshed` | int64 | **unix ms of the last successful fetch-and-parse**; **`0` = never**. Does **not** move on a failed attempt, so a `stale` list keeps dating the copy it is still serving |
+| `entry_count` | int64 | **unique domains currently compiled and enforcing**, after dedup and parse rejects — not lines |
+| `last_status` | string | `pending` \| `ok` \| `stale` \| `failed` \| `empty` — see below |
+| `last_error` | string | short single-line reason, ≤160 bytes; `""` when `last_status` is `pending` or `ok` |
+| `last_attempt` | int64 | **unix ms of the last attempt, successful or not**; `0` = never tried |
+
+#### Refresh outcome (`last_status`)
+
+Four things used to be indistinguishable on the wire, all of them
+`entry_count: 0, last_refreshed: 0`. They are now separate values, and the UI
+renders each differently:
+
+| Value | Meaning | Enforcing? |
+|---|---|---|
+| `pending` | never attempted. **The only thing `0` / "never" is allowed to mean.** | no, not yet |
+| `ok` | fetched (or 304'd) and parsed; entries are live | yes |
+| `stale` | this attempt failed, but a previously cached copy is still compiled. `last_refreshed` dates that copy; `last_attempt` dates the failure | **yes** |
+| `failed` | the attempt failed and there is no usable copy | **no — blocking nothing** |
+| `empty` | fetched and parsed fine, and still produced no usable entries (a format the parser rejects, or a file with no domains) | **no — blocking nothing** |
+
+`last_error` carries the actual reason, not a generic string: `404 Not Found`
+(the status line's own phrase), `dial tcp 10.0.0.1:443: connect: connection
+refused` (the `*url.Error` wrapper stripped, since the URL is already on the
+row), `parse failed: …`, or for `empty`, `fetched 4.5 MB, no usable entries —
+250,431 lines skipped`.
+
+The cache fallback is unchanged: a failed download still falls back to
+`<data_dir>/lists/<id>.txt`, which is exactly why `stale` and `failed` are
+different states rather than one.
 
 Parser accepts hosts-style (`0.0.0.0 domain`, `127.0.0.1 domain`, `:: domain`),
-ABP-subset (`||domain^`, `@@||domain^`), and bare domains; `#`/`!` comments are
-stripped. ABP rules containing `/ ^ $ * |` after the prefix are skipped.
-Domains are lowercased, ≤253 chars, labels ≤63, charset `a-z 0-9 - _` — **no
-IDN/punycode handling**. `kind=allow` uses the file's allow entries **plus** its
-block entries, so a plain domain list works as an allowlist.
+ABP-subset (`||domain^`, `@@||domain^`), bare domains, and **`*.domain`
+wildcards** (hagezi's `wildcard/*` files); `#`/`!` comments are stripped. ABP
+rules containing `/ ^ $ * |` after the prefix are still skipped. Domains are
+lowercased, ≤253 chars, labels ≤63, charset `a-z 0-9 - _` — **no IDN/punycode
+handling**. `kind=allow` uses the file's allow entries **plus** its block
+entries, so a plain domain list works as an allowlist.
 
-Skipped-line counts are computed and **discarded** — not stored, not exposed.
+**`*.domain` is stored as `domain`.** The matcher (`DomainSet.Match`) walks
+whole labels from the TLD inward and hits on any stored ancestor, so
+`*.ads.example.com` and `ads.example.com` are the same entry — and it therefore
+**also blocks the apex**, which strict AdGuard `*.x` syntax would exclude. That
+is deliberate, and matches dnsmasq's `address=/x/`. Only a *leading* `*.` is
+accepted.
 
-**TODO** — there is no endpoint to edit a list's `url` or `kind` after creation.
+Skipped-line counts are still not stored as a field, but they are **no longer
+discarded**: they are folded into `last_error` for `last_status: "empty"`.
+
+**Name derivation** (`store.DeriveListName`, mirrored for the Add dialog's
+placeholder in `web/src/lib/list-name.ts`): GitHub raw/blob URLs
+(`/<owner>/<repo>/<ref>/<path…>`) become `<owner> <path-below-ref>` —
+`hagezi wildcard/pro.txt`, `StevenBlack hosts`; the branch is dropped.
+Everything else becomes `<host-without-www> <last-path-segment>` —
+`example.com hosts`. Capped at 60 chars with an ellipsis. A blank `name` on
+`PATCH` **resets to this default**, it does not clear the label.
+
+**TODO** — there is still no endpoint to edit a list's `url` or `kind` after
+creation; only `name` and `enabled` are mutable.
 
 ### 3.3 Rule
 
@@ -810,9 +866,10 @@ no `onMutate` and no `setQueryData` in the whole client.
 | Query log | Block / Allow | `POST /groups/{id}/rules` | `Couldn't ${verb} ${entry.q_name}` |
 | Query log | Block/Allow, client unresolvable | *no request made* | `Couldn't ${verb} ${q_name} — this client's group is unknown` |
 | Query log | Why this decision? | local only | — |
-| Lists | Toggle enabled | `PATCH /filters/lists/{id}` | `Couldn't ${enabled ? "enable" : "disable"} ${list.url}` |
-| Lists | Delete | `DELETE /filters/lists/{id}` | `Couldn't delete ${target.url}` |
+| Lists | Toggle enabled | `PATCH /filters/lists/{id}` | `Couldn't ${enabled ? "enable" : "disable"} ${list.name}` |
+| Lists | Delete | `DELETE /filters/lists/{id}` | `Couldn't delete ${target.name}` |
 | Lists | Add | `POST /filters/lists` | server message, else `Couldn't add the list` |
+| Lists | Rename | `PATCH /filters/lists/{id}` | server message, else `Couldn't rename ${target.name}` |
 | Lists | Refresh now | `POST /filters/refresh` | `Couldn't start a refresh — try again` |
 | Rules | Delete | `DELETE /filters/rules/{id}` | `Couldn't delete the rule for ${target.pattern}` |
 | Rules | Add | `POST /groups/{id}/rules` | server message, else `Couldn't add the rule` |
@@ -861,7 +918,7 @@ The client distinguishes two error cases, and the distinction is load-bearing:
 | Dashboard rail panels | 4 row skeletons | `Nothing blocked in this window yet` / `No clients have queried in this window yet` | plain text `Couldn't load this list.` | stale banner |
 | Dashboard live queries | n/a (the stream, not a query) | `Listening — queries appear here as dnsaur answers them` | n/a | n/a |
 | Query log | skeleton **only in filtered mode** | `Waiting for traffic` (live) / `No matching queries` (filtered) | `Couldn't load queries` | **nothing — no stale banner exists here** |
-| Lists | 4 skeletons | `No filter lists yet` | `Couldn't load filter lists` | stale banner |
+| Lists | 4 skeletons | `No filter lists yet` | `Couldn't load filter lists` | stale banner, plus a **per-list** destructive banner (`N filter lists are blocking nothing`) and a warning one (`… serving older copies`) driven by `last_status` |
 | Rules | 4 skeletons | `No rules for this group yet` | `Couldn't load rules` | stale banner |
 | Groups | 3 skeletons | `No groups yet` | `Couldn't load groups` | stale banner |
 | Clients | 4 skeletons | `No clients yet` | `Couldn't load clients` | stale banner |
@@ -927,6 +984,7 @@ typing in an input.
 | Screen | What's missing |
 |---|---|
 | **Filtering → Groups & Clients** | CRUD works, but the per-group "Lists (n)" menu has **no error state**: it's disabled only while `isPending`, not on `isError`, and its toggle rebuilds the assignment set from `groupLists.data ?? []`. If that read failed, clicking one list PUTs `[thatOne]` and **silently drops every other assignment**. |
+| **Filtering → Lists** | The table leads with the list's `name`; the URL is a muted second line and stays in the row's `title`. Actions (toggle, rename, delete) are labelled by name. The **Status** column replaces the old "Last refreshed" one and carries the badge plus a plain-language line per `last_status`. |
 | **Dashboard health** | Reduced to the shell's two row-1 readouts (blocking state, and `DNS OK`/`DNS down` from `GET /health`). Filter-list freshness moved off the dashboard with the redesign and now lives only on Filtering → Lists. The spec's "upstreams healthy" signal **has no code at all** — there is no upstream-health endpoint. |
 | **Settings** | 11 keys work. The spec's "storage (read-only info)" section is absent, with a code comment noting no endpoint exists to source it. |
 | **Account** | TOTP and tokens are complete. **Change password is not implemented**; the page says so: *"Password changes aren't available yet — that's planned for a future update."* |
@@ -1003,13 +1061,22 @@ Collected because each one has already caused, or would cause, a wrong UI.
 6. **`/stats/top` takes `n`, not `limit`.** `limit` is silently ignored.
 7. **`hours` is never validated.** Garbage silently means 24.
 8. **A freshly added list reads `entry_count: 0`** until the detached refresh
-   finishes. Treat 0 + `last_refreshed: 0` as "still loading", not "empty".
-9. **`POST /filters/refresh` never reports failure** to the client.
+   finishes. Read `last_status`, not the numbers: `pending` is "still
+   loading", `failed`/`empty` is "blocking nothing". `0` + `last_refreshed: 0`
+   no longer distinguishes them on its own.
+9. **`POST /filters/refresh` never reports failure** to the client — but the
+   *outcome* is now persisted per list, so poll `GET /filters/lists` and read
+   `last_status`/`last_error` instead of guessing from `entry_count`.
 10. **IPv6 zone-id client matchers are accepted but can never match.**
 11. **`PUT /groups/{id}/lists` can leave a partial set** on failure.
 12. **Query-log domain search is case-sensitive on Postgres**, insensitive on
     SQLite.
 13. **The token id in a create response is unreliable** — refetch instead.
+14. **A `stale` list is still enforcing.** Don't treat any non-`ok` status as
+    "broken": `stale` has real entries and `last_refreshed` points at the copy
+    serving them, not at the failed attempt.
+15. **A list's `name` is derived unless the admin set one**, so it is not a
+    stable identifier — key on `id`, and keep the `url` visible next to it.
 
 ---
 
@@ -1029,20 +1096,38 @@ Go source. **The code is the source of truth.**
 2. ~~The query-log decision filter advertises `allowed`.~~ **Fixed** — the
    placeholder no longer offers a value the resolver never writes. The
    `allowed` enum member itself still exists unused in the Go source; see §3.1.
-3. `openapi.yaml` omits **503 `storage unavailable`** on most operations that
+3. ~~A failed filter-list fetch is invisible: the UI shows `0 entries /
+   never refreshed`, exactly what an unrefreshed list looks like.~~
+   **Fixed.** `internal/filter/refresh.go` fell back to the on-disk cache on
+   every failure and, when no cache existed, logged `"list cache not
+   accessible"` and moved on — persisting nothing, so there was nothing to
+   render. Lists now carry `last_status`/`last_error`/`last_attempt` (§3.2),
+   the refresher records the real reason (HTTP status, transport cause, parse
+   failure, or a parsed-but-empty file with its skipped-line count), and the
+   Lists tab renders four distinct states plus a page-level banner for the
+   ones enforcing nothing.
+4. ~~`*.domain` wildcard lists silently parse to zero entries.~~ **Fixed.**
+   `validDomain`'s charset rejected the `*` label, so every line of a 4.5 MB
+   hagezi `wildcard/*` file was skipped and the list blocked nothing while
+   reporting a healthy "refreshed just now". A leading `*.` is now stripped
+   and stored as a normal entry (§3.2).
+5. `openapi.yaml` does not document `name`, `last_status`, `last_error` or
+   `last_attempt` on the filter-list schema, nor the extended `PATCH
+   /filters/lists/{id}` body.
+6. `openapi.yaml` omits **503 `storage unavailable`** on most operations that
    can return it, and omits it entirely from `POST /setup`. It also does not
    document the new **409** duplicate responses.
-4. `openapi.yaml` marks `group_id` **required** on `DELETE /blocking/pause`;
+7. `openapi.yaml` marks `group_id` **required** on `DELETE /blocking/pause`;
    the code makes it optional, defaulting to 0 (the global pause).
-5. `openapi.yaml` marks `group_id` required on `POST /blocking/pause`; only
+8. `openapi.yaml` marks `group_id` required on `POST /blocking/pause`; only
    `minutes` is actually validated.
-6. `openapi.yaml` documents neither `DisallowUnknownFields` nor the 1 MiB body
+9. `openapi.yaml` documents neither `DisallowUnknownFields` nor the 1 MiB body
    cap, and does not mention that method mismatches yield 404 rather than 405.
-7. `openapi.yaml` describes the SSE stream without noting the absent
-   `event:`/`id:` fields, the absent heartbeat, or the 64-entry
-   drop-on-slow-consumer behaviour.
-8. `openapi.yaml:6` calls the project a "DNS/DHCP server". No DHCP exists.
-9. The spec's "session expired" message on a mid-session 401 is **not
-   implemented** — no such string exists in the client.
-10. The spec's "keeps retrying" behaviour for the API-unreachable banner is
+10. `openapi.yaml` describes the SSE stream without noting the absent
+    `event:`/`id:` fields, the absent heartbeat, or the 64-entry
+    drop-on-slow-consumer behaviour.
+11. `openapi.yaml:6` calls the project a "DNS/DHCP server". No DHCP exists.
+12. The spec's "session expired" message on a mid-session 401 is **not
+    implemented** — no such string exists in the client.
+13. The spec's "keeps retrying" behaviour for the API-unreachable banner is
     **not implemented**: recovery requires the manual Retry button.

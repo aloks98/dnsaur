@@ -121,10 +121,14 @@ export const handlers = [
       {
         id: 1,
         url: "https://example.com/hosts",
+        name: "example.com hosts",
         kind: "block",
         enabled: true,
         last_refreshed: Date.now() - 15 * 60 * 1000,
         entry_count: 85000,
+        last_status: "ok",
+        last_error: "",
+        last_attempt: Date.now() - 15 * 60 * 1000,
       },
     ];
     return HttpResponse.json(lists);

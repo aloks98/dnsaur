@@ -42,7 +42,10 @@ func (s *Server) handleListsGet(w http.ResponseWriter, r *http.Request) {
 }
 
 type listCreate struct {
-	URL  string `json:"url"`
+	URL string `json:"url"`
+	// Name is optional; a blank one is derived from the URL by
+	// store.AddList so the UI always has a label to show.
+	Name string `json:"name"`
 	Kind string `json:"kind"`
 }
 
@@ -61,7 +64,11 @@ func (s *Server) handleListCreate(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusBadRequest, "kind must be block or allow")
 		return
 	}
-	id, err := s.deps.Store.Filters().AddList(r.Context(), store.List{URL: body.URL, Kind: body.Kind, Enabled: true})
+	if len(body.Name) > maxListNameLen {
+		errJSON(w, http.StatusBadRequest, "name too long (max 120)")
+		return
+	}
+	id, err := s.deps.Store.Filters().AddList(r.Context(), store.List{URL: body.URL, Name: body.Name, Kind: body.Kind, Enabled: true})
 	if err != nil {
 		storeErrDup(w, err, "that list URL is already subscribed")
 		return
@@ -101,8 +108,17 @@ func (s *Server) handleListCreate(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, map[string]int64{"id": id})
 }
 
+// maxListNameLen bounds a user-supplied list name. It is rendered in table
+// cells, dropdown items and toasts; the derived defaults are far shorter.
+const maxListNameLen = 120
+
+// listPatch is the mutable surface of a list: what it's called and whether
+// it's on. `url` and `kind` stay immutable — changing either would silently
+// invalidate the on-disk cache and the compiled ruleset — and `decode`'s
+// DisallowUnknownFields rejects them outright rather than ignoring them.
 type listPatch struct {
-	Enabled *bool `json:"enabled"`
+	Enabled *bool   `json:"enabled"`
+	Name    *string `json:"name"`
 }
 
 func (s *Server) handleListPatch(w http.ResponseWriter, r *http.Request) {
@@ -112,13 +128,29 @@ func (s *Server) handleListPatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	body, err := decode[listPatch](r)
-	if err != nil || body.Enabled == nil {
-		errJSON(w, http.StatusBadRequest, "enabled required")
+	// Either field alone is a valid patch. An `enabled`-only body — what
+	// the row's toggle sends — must keep behaving exactly as it did.
+	if err != nil || (body.Enabled == nil && body.Name == nil) {
+		errJSON(w, http.StatusBadRequest, "enabled or name required")
 		return
 	}
-	if err := s.deps.Store.Filters().SetListEnabled(r.Context(), id, *body.Enabled); err != nil {
-		storeErr(w, err)
-		return
+	if body.Name != nil {
+		if len(*body.Name) > maxListNameLen {
+			errJSON(w, http.StatusBadRequest, "name too long (max 120)")
+			return
+		}
+		// A blank name is not an error: RenameList trims it and reads
+		// blank as "go back to the URL-derived default".
+		if err := s.deps.Store.Filters().RenameList(r.Context(), id, *body.Name); err != nil {
+			storeErr(w, err)
+			return
+		}
+	}
+	if body.Enabled != nil {
+		if err := s.deps.Store.Filters().SetListEnabled(r.Context(), id, *body.Enabled); err != nil {
+			storeErr(w, err)
+			return
+		}
 	}
 	s.refreshFilters(r)
 	w.WriteHeader(http.StatusNoContent)

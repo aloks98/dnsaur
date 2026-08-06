@@ -309,7 +309,10 @@ function GroupListsMenu({ group, allLists }: { group: Group; allLists: List[] })
               disabled={setGroupLists.isPending || groupLists.isPending}
               onCheckedChange={(checked) => onToggle(list.id, checked)}
             >
-              {list.url}
+              {/* The name, not the URL. This menu is the worst offender:
+                  a column of 90-character raw.githubusercontent.com paths
+                  is unreadable, and every hagezi entry looked identical. */}
+              {list.name}
             </DropdownMenuCheckboxItem>
           ))
         )}
