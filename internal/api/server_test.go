@@ -24,7 +24,7 @@ import (
 // uniformity and because a future async reload there would silently start
 // racing otherwise.
 type fakeReloader struct {
-	mu                         sync.Mutex
+	mu                        sync.Mutex
 	clients, records, filters int
 }
 

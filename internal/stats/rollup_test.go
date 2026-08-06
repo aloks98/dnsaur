@@ -32,8 +32,8 @@ func (f *fakeStatsStore) Timeline(ctx context.Context, fromSec int64) (map[int64
 
 // fakeSettingsStore holds in-memory settings and records SetInternal calls.
 type fakeSettingsStore struct {
-	values          map[string]string
-	setInternalErr  error
+	values           map[string]string
+	setInternalErr   error
 	setInternalCalls []struct {
 		key   string
 		value string
