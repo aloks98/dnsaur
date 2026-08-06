@@ -36,6 +36,7 @@ import {
   type QuerySearchFilter,
 } from "../hooks/use-queries";
 import { useLiveTailPaused } from "../lib/live-tail";
+import { durationLabel, rowKey } from "../lib/query-rows";
 
 // The group a query is attributed to when its client matched no client entry
 // at all — internal/clients/registry.go's Lookup falls back to
@@ -68,39 +69,6 @@ const ROW_HEIGHT_ESTIMATE = 29;
  * pages/queries.test.tsx watches them stay flat while rows stream.
  */
 export const renderCounts = { filterBar: 0, inspector: 0 };
-
-// --- row identity ------------------------------------------------------------
-
-/**
- * A stable key per row — deliberately NOT `entry.id`.
- *
- * A live row's `id` is 0. internal/qlog/qlog.go publishes the entry to the
- * SSE hub in the same breath as it queues it for the batched database write,
- * so it goes out before the insert assigns a primary key: every row on the
- * stream carries the zero value. Keying on it (react-table's `getRowId`,
- * React's list keys, the virtualizer's item keys, the "which row is
- * selected" comparison, the per-row action status map) collapses the entire
- * live tail onto one identity.
- *
- * Paged rows come from the database and do have real ids, so they use them.
- * Live rows get a monotonic client-side key instead, remembered per entry
- * object in a WeakMap — each SSE message is its own JSON.parse result, so
- * the object identity is unique and the map costs nothing once the ring
- * buffer drops the row.
- */
-const LIVE_ROW_KEYS = new WeakMap<QueryEntry, string>();
-let liveRowSeq = 0;
-
-function rowKey(entry: QueryEntry): string {
-  if (entry.id > 0) return `q${entry.id}`;
-  let key = LIVE_ROW_KEYS.get(entry);
-  if (key === undefined) {
-    liveRowSeq += 1;
-    key = `live${liveRowSeq}`;
-    LIVE_ROW_KEYS.set(entry, key);
-  }
-  return key;
-}
 
 // --- group resolution --------------------------------------------------------
 
@@ -163,16 +131,6 @@ function clockTime(atMs: number): string {
     minute: "2-digit",
     second: "2-digit",
   });
-}
-
-/**
- * `duration_ms` is `time.Duration.Milliseconds()` — truncated whole
- * milliseconds (internal/qlog/qlog.go). A cache hit answered in 180µs is
- * therefore logged as 0, and printing "0 ms" claims an instantaneous
- * resolve; "<1" says what was actually measured.
- */
-function durationLabel(ms: number): string {
-  return ms > 0 ? String(ms) : "<1";
 }
 
 // --- shared chrome -----------------------------------------------------------

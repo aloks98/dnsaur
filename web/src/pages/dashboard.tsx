@@ -23,6 +23,7 @@ import { useGroups } from "../hooks/use-groups";
 import { useClients } from "../hooks/use-clients";
 import { useLiveTail } from "../hooks/use-queries";
 import { useStatsOverview, useStatsTimeline, useStatsTop } from "../hooks/use-stats";
+import { durationLabel, rowKey } from "../lib/query-rows";
 import { hoursFor, parseWindow, WINDOW_PARAM, windowPhrase } from "../lib/stats-window";
 import { useTheme, type Theme } from "../lib/theme";
 import { StaleDataAlert } from "../components/stale-data-alert";
@@ -707,10 +708,10 @@ function LiveQueries({
           <tbody>
             {rows.map((entry) => (
               <tr
-                key={entry.id}
+                key={rowKey(entry)}
                 className="group/row border-b border-border-muted text-xs last:border-b-0"
               >
-                <td className="px-4 py-2 text-muted-foreground tabular-nums">
+                <td className="px-4 py-2 whitespace-nowrap text-muted-foreground tabular-nums">
                   {clockTime(entry.at)}
                 </td>
                 <td className="truncate px-4 py-2">
@@ -736,7 +737,7 @@ function LiveQueries({
                   {entry.decision}
                 </td>
                 <td className="px-4 py-2 text-right text-muted-foreground tabular-nums">
-                  {entry.duration_ms}ms
+                  {durationLabel(entry.duration_ms)}ms
                 </td>
               </tr>
             ))}
