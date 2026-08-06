@@ -111,3 +111,48 @@ func TestRules(t *testing.T) {
 		t.Fatalf("delete rule: %d", w.Code)
 	}
 }
+
+// A list assigned to no group filters nothing: a group's ruleset is compiled
+// only from its assigned lists (internal/filter/refresh.go's ListsForGroup).
+// Subscribing to a blocklist and having it block zero queries — while the UI
+// reports it enabled with a six-figure entry count — is the failure this
+// guards, in both directions: a list added after a group, and a group added
+// after a list.
+func TestNewListsAndGroupsInheritEachOther(t *testing.T) {
+	srv, s, _ := testServer(t)
+	cookie := login(t, srv, s)
+	h := srv.Handler()
+
+	existing, _ := s.Clients().AddGroup(t.Context(), "before")
+
+	w := doReq(t, h, "POST", "/api/v1/filters/lists", `{"url":"https://x.example/block.txt","kind":"block"}`, cookie)
+	if w.Code != 201 {
+		t.Fatalf("create list: %d %s", w.Code, w.Body.String())
+	}
+	var created map[string]int64
+	_ = json.Unmarshal(w.Body.Bytes(), &created)
+	lid := created["id"]
+
+	assigned := func(gid int64) []store.List {
+		t.Helper()
+		r := doReq(t, h, "GET", fmt.Sprintf("/api/v1/groups/%d/lists", gid), "", cookie)
+		var ls []store.List
+		_ = json.Unmarshal(r.Body.Bytes(), &ls)
+		return ls
+	}
+
+	if ls := assigned(existing); len(ls) != 1 || ls[0].ID != lid {
+		t.Fatalf("a group that predates the list did not get it: %v", ls)
+	}
+
+	w = doReq(t, h, "POST", "/api/v1/groups", `{"name":"after"}`, cookie)
+	if w.Code != 201 {
+		t.Fatalf("create group: %d %s", w.Code, w.Body.String())
+	}
+	var g map[string]int64
+	_ = json.Unmarshal(w.Body.Bytes(), &g)
+
+	if ls := assigned(g["id"]); len(ls) != 1 || ls[0].ID != lid {
+		t.Fatalf("a group created after the list did not inherit it: %v", ls)
+	}
+}

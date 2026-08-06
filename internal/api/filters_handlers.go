@@ -66,6 +66,28 @@ func (s *Server) handleListCreate(w http.ResponseWriter, r *http.Request) {
 		storeErrDup(w, err, "that list URL is already subscribed")
 		return
 	}
+	// Apply it to every group straight away.
+	//
+	// A group's ruleset is compiled only from the lists assigned to it
+	// (internal/filter/refresh.go's ListsForGroup), so a list that exists
+	// but is assigned nowhere filters nothing — while the UI shows it
+	// enabled with a six-figure entry count, which reads as working. That
+	// gap is not theoretical: a 99,559-entry blocklist subscribed this way
+	// blocked zero queries until it was assigned by hand on another screen.
+	//
+	// Subscribing to a blocklist means "block these", so the useful default
+	// is on. Groups that shouldn't have it can unassign it — an explicit,
+	// visible act — and a group created later starts from the same default
+	// (see handleGroupCreate).
+	groups, gerr := s.deps.Store.Clients().Groups(r.Context())
+	if gerr != nil {
+		slog.Error("assigning new list to groups failed", "list", id, "err", gerr)
+	}
+	for _, g := range groups {
+		if err := s.deps.Store.Filters().AssignList(r.Context(), g.ID, id); err != nil {
+			slog.Error("assigning new list to group failed", "list", id, "group", g.ID, "err", err)
+		}
+	}
 	// Unlike the other list/rule mutations (cheap metadata ops refreshed
 	// synchronously), adding a list triggers a full network refresh of
 	// every list. Do that in the background so the request doesn't block
