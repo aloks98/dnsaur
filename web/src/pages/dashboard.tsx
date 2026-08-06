@@ -1257,7 +1257,12 @@ export function Dashboard() {
     // padding for this route — see components/app-shell.tsx), so the split
     // below can take every pixel left over and its vertical rule can run to
     // the bottom of the window however few rows there are.
-    <div className="flex flex-1 flex-col font-mono">
+    //
+    // It owns its own overflow: the shell is h-screen/overflow-hidden so the
+    // query log can size a table to the remaining height, which means a
+    // full-bleed page that outgrows the window has to scroll itself rather
+    // than being clipped.
+    <div className="flex min-h-0 flex-1 flex-col overflow-y-auto font-mono">
       {/* The design gives the page no visible title — the chrome's own tab
           already says Dashboard — but a page still needs one heading. */}
       <h1 className="sr-only">Dashboard</h1>

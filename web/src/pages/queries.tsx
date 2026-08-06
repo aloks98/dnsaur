@@ -740,7 +740,13 @@ function QueryTable({
           // view page past its first 100 matches instead of stopping dead
           // there, and a short final page swaps the loader for "All
           // matching queries loaded" so the end is stated, not implied.
-          <DataGridScrollArea className="h-136">
+          //
+          // The scroll area fills the split rather than carrying a fixed
+          // height: the shell is h-screen and every ancestor sets min-h-0,
+          // so "the rest of the window" is a real number here and the rows
+          // scroll inside it instead of the pane stopping short of the
+          // bottom of the page.
+          <DataGridScrollArea className="min-h-0 flex-1">
             <DataGridTableVirtual
               estimateSize={ROW_HEIGHT_ESTIMATE}
               overscan={12}
@@ -957,10 +963,10 @@ const Inspector = memo(function Inspector({
       aria-labelledby="why-title"
       className="flex shrink-0 flex-col max-lg:border-t max-lg:border-border lg:w-96 lg:border-l lg:border-border"
     >
-      {/* Same px-4 py-2 as the grid's header row: the rail's rule and the
-          table's have to meet at the same height or the split reads as two
-          misaligned panes. */}
-      <div className="flex h-9 items-center justify-between gap-2 border-b border-border px-4">
+      {/* h-8 to the pixel: the grid's own header row measures 32px, and a
+          4px difference here is enough for the two panes' rules to visibly
+          miss each other across the split. */}
+      <div className="flex h-8 items-center justify-between gap-2 border-b border-border px-4">
         <SectionTitle id="why-title">Why this decision</SectionTitle>
         {
           <button
@@ -980,14 +986,7 @@ const Inspector = memo(function Inspector({
         }
       </div>
 
-      {entry === null ? (
-        <Prose>
-          <p className="text-sm text-muted-foreground">
-            Pick a row to see which rule, list or default policy decided it — and the raw record
-            behind it.
-          </p>
-        </Prose>
-      ) : (
+      {entry !== null && (
         <>
           <div className="min-h-0 flex-1 overflow-y-auto">
             <div className="flex flex-col gap-2 border-b border-border px-4 py-3">
@@ -1116,8 +1115,14 @@ export function QueryLog() {
    * is still highlighted, and picking a row should bring the rail back
    * without the user hunting for a re-open control. Defaults open so the
    * screen explains itself on arrival.
+   *
+   * Tracks only whether the user dismissed it. Visibility is
+   * `selected !== null && !railDismissed`: the rail is the detail view of a
+   * row, so with nothing picked there is nothing for it to say, and on
+   * arrival — nothing selected — the table gets the full width. Closing
+   * hides it; picking another row brings it back.
    */
-  const [railOpen, setRailOpen] = useState(true);
+  const [railDismissed, setRailDismissed] = useState(false);
   const [resetToken, setResetToken] = useState(0);
   // The flag is shared with the chrome's own cell (components/top-nav.tsx),
   // so both toggles observe and write one value. See lib/live-tail.ts.
@@ -1242,11 +1247,11 @@ export function QueryLog() {
 
   const onSelect = useCallback((entry: QueryEntry) => {
     setSelected(entry);
-    setRailOpen(true);
+    setRailDismissed(false);
   }, []);
   const onClearSelection = useCallback(() => {
     setSelected(null);
-    setRailOpen(false);
+    setRailDismissed(true);
   }, []);
   const patchFilters = useCallback(
     (patch: Partial<FilterState>) => setFilters((f) => ({ ...f, ...patch })),
@@ -1338,7 +1343,7 @@ export function QueryLog() {
     // padding for this route — see components/app-shell.tsx), so the split
     // below can take every pixel left over and its vertical rule can run to
     // the bottom of the window.
-    <div className="flex flex-1 flex-col font-mono">
+    <div className="flex min-h-0 flex-1 flex-col font-mono">
       {/* The chrome's own tab already says Query Log, and the design gives
           the page no visible title — but a page still needs one heading. */}
       <h1 className="sr-only">Query log</h1>
@@ -1358,8 +1363,8 @@ export function QueryLog() {
         )}
       </div>
 
-      <div className="flex flex-1 flex-col lg:flex-row lg:items-stretch">
-        <div ref={tableRef} className="flex min-w-0 flex-1 flex-col">
+      <div className="flex min-h-0 flex-1 flex-col lg:flex-row lg:items-stretch">
+        <div ref={tableRef} className="flex min-h-0 min-w-0 flex-1 flex-col">
           {/* The one surface this page never had: a background or next-page
               fetch that fails with rows still in hand used to render
               nothing at all, leaving a stale table that looked live. Every
@@ -1384,7 +1389,7 @@ export function QueryLog() {
           />
         </div>
 
-        {railOpen && (
+        {selected !== null && !railDismissed && (
           <Inspector
             entry={selected}
             groupName={groupName}

@@ -1028,19 +1028,6 @@ test("picking another row replaces what the inspector shows", async () => {
   expect(within(inspector()).queryByText("first.example.com")).not.toBeInTheDocument();
 });
 
-test("with nothing selected the rail explains itself instead of rendering an empty shell", async () => {
-  renderQueryLog();
-  const source = await firstSource();
-  act(() => source.emitOpen());
-
-  expect(within(inspector()).getByText(/pick a row to see which rule/i)).toBeInTheDocument();
-  expect(
-    within(inspector()).queryByRole("button", { name: /copy row json/i }),
-  ).not.toBeInTheDocument();
-});
-
-// --- quick rules -------------------------------------------------------------
-
 test("the primary action blocks a resolved row and writes into that row's client group", async () => {
   const user = userEvent.setup();
   const posted: { groupId: string; body: unknown }[] = [];
@@ -1294,13 +1281,19 @@ test("the inspector rail closes, and picking a row brings it back", async () => 
   act(() => source.emitOpen());
   act(() => source.emit(entry({ q_name: "closable.example.com" })));
 
+  // Nothing is selected on arrival, so the rail isn't there: the table is
+  // the page's subject and an inspector with no row is 384px of nothing.
+  expect(screen.queryByRole("heading", { name: /why this decision/i })).not.toBeInTheDocument();
+
+  const user = userEvent.setup();
+  await user.click(await screen.findByText("closable.example.com"));
   expect(await screen.findByRole("heading", { name: /why this decision/i })).toBeInTheDocument();
 
-  await userEvent.setup().click(screen.getByRole("button", { name: /close the inspector/i }));
+  await user.click(screen.getByRole("button", { name: /close the inspector/i }));
   await waitFor(() =>
     expect(screen.queryByRole("heading", { name: /why this decision/i })).not.toBeInTheDocument(),
   );
 
-  await userEvent.setup().click(await screen.findByText("closable.example.com"));
+  await user.click(await screen.findByText("closable.example.com"));
   expect(await screen.findByRole("heading", { name: /why this decision/i })).toBeInTheDocument();
 });
