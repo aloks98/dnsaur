@@ -35,7 +35,6 @@ import {
   type DateSelectorValue,
 } from "@e412/rnui-react";
 import type { Client, List, QueryEntry, Rule } from "../api/types";
-import type { SseState } from "../api/sse";
 import { StaleDataAlert } from "../components/stale-data-alert";
 import { useClients } from "../hooks/use-clients";
 import { useGroups } from "../hooks/use-groups";
@@ -47,7 +46,7 @@ import {
   useQuerySearch,
   type QuerySearchFilter,
 } from "../hooks/use-queries";
-import { useLiveTailPaused } from "../lib/live-tail";
+import { useLiveTailPaused, usePublishLiveTailStatus } from "../lib/live-tail";
 import { durationLabel, rowKey } from "../lib/query-rows";
 
 // The group a query is attributed to when its client matched no client entry
@@ -203,7 +202,7 @@ function clockTime(atMs: number): string {
 
 function SectionTitle({ id, children }: { id?: string; children: ReactNode }) {
   return (
-    <h2 id={id} className="text-sm tracking-widest uppercase">
+    <h2 id={id} className="text-xs tracking-widest uppercase">
       {children}
     </h2>
   );
@@ -538,93 +537,6 @@ const FilterBar = memo(function FilterBar({
   );
 });
 
-// --- stream state ------------------------------------------------------------
-
-/**
- * Which of the page's two modes is running, and how healthy it is.
- *
- * These are the design's row-2 right-hand cells. They are rendered by the
- * page rather than by components/top-nav.tsx because only the page knows
- * whether a filter is active — the shell would need a second cross-component
- * store to find out, and the tail flag (lib/live-tail.ts) is deliberately
- * the only one of those. See the report accompanying this change.
- */
-function ModeReadout({ filtered }: { filtered: boolean }) {
-  return (
-    <output className="flex shrink-0 items-center gap-2 text-xs tracking-widest uppercase">
-      <span
-        aria-hidden="true"
-        className={cn("size-1.5 shrink-0", filtered ? "bg-muted-foreground" : "bg-primary")}
-      />
-      {filtered ? "Filtered · paged" : "Live tail"}
-    </output>
-  );
-}
-
-/**
- * The tail's own health, beside the mode readout.
- *
- * Only meaningful while the tail is the thing running: a filtered view reads
- * the database instead of the stream, and the mode readout already says so.
- * "failed" is not a state to render as a quieter shade of the same dot — it
- * means the subscription gave up after six consecutive attempts (api/sse.ts)
- * and nothing further will happen without a click, so it says so and puts the
- * click next to it.
- */
-function StreamState({
-  paused,
-  state,
-  onReconnect,
-}: {
-  paused: boolean;
-  state: SseState;
-  onReconnect: () => void;
-}) {
-  if (paused) return <Note>Paused</Note>;
-  if (state === "failed") {
-    return (
-      <div className="flex shrink-0 items-center gap-3">
-        <Note className="text-destructive">Live tail disconnected</Note>
-        <Button type="button" size="sm" variant="outline" onClick={onReconnect}>
-          Reconnect
-        </Button>
-      </div>
-    );
-  }
-  return (
-    <output>
-      <Note>{state === "open" ? "Streaming" : "Reconnecting…"}</Note>
-    </output>
-  );
-}
-
-/**
- * The design's one filled control on this screen, and the only one that isn't
- * an rnui Button: it wears the chrome's cell skin because it belongs to the
- * sub-nav strip, not to the filter row it currently sits at the end of.
- *
- * Labelled with what it will do rather than with the state it is in, so it
- * needs no `aria-pressed` to be understood — and so it can't collide with the
- * shell's own `role="switch"` cell while both exist.
- */
-function TailToggle({ paused, onToggle }: { paused: boolean; onToggle: (next: boolean) => void }) {
-  return (
-    <button
-      type="button"
-      onClick={() => onToggle(!paused)}
-      className={cn(
-        "shrink-0 px-3 py-1.5 text-xs font-semibold tracking-widest uppercase transition-colors",
-        "outline-none focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring",
-        paused
-          ? "bg-warn text-primary-foreground hover:bg-warn/90"
-          : "bg-primary text-primary-foreground hover:bg-primary/90",
-      )}
-    >
-      {paused ? "Resume tail" : "Pause tail"}
-    </button>
-  );
-}
-
 // --- table -------------------------------------------------------------------
 
 type RowStatus = "pending" | "blocked" | "allowed";
@@ -802,7 +714,7 @@ function QueryTable({
         headerSticky: true,
       }}
       tableClassNames={{
-        headerRow: "text-sm tracking-widest text-muted-foreground uppercase",
+        headerRow: "text-xs tracking-widest text-muted-foreground uppercase",
         headerSticky: "sticky top-0 z-10 bg-background",
         // `*:` reaches the row's own cells, which is where rowBorder puts
         // the hairline — the design separates rows in the muted tone and
@@ -1045,12 +957,17 @@ const Inspector = memo(function Inspector({
       aria-labelledby="why-title"
       className="flex shrink-0 flex-col max-lg:border-t max-lg:border-border lg:w-96 lg:border-l lg:border-border"
     >
-      <div className="flex items-center justify-between gap-2 border-b border-border px-4 py-3">
+      {/* Same px-4 py-2 as the grid's header row: the rail's rule and the
+          table's have to meet at the same height or the split reads as two
+          misaligned panes. */}
+      <div className="flex h-9 items-center justify-between gap-2 border-b border-border px-4">
         <SectionTitle id="why-title">Why this decision</SectionTitle>
-        {entry && (
+        {
           <button
             type="button"
-            aria-label="Clear the selected row"
+            aria-label={
+              entry ? "Close the inspector and clear the selected row" : "Close the inspector"
+            }
             onClick={onClose}
             className={cn(
               "shrink-0 text-xs tracking-widest text-muted-foreground uppercase",
@@ -1060,7 +977,7 @@ const Inspector = memo(function Inspector({
           >
             Close <span aria-hidden="true">×</span>
           </button>
-        )}
+        }
       </div>
 
       {entry === null ? (
@@ -1191,10 +1108,20 @@ export function QueryLog() {
   // The other four are discrete selections, so they apply immediately.
   const [debouncedQ, setDebouncedQ] = useState("");
   const [selected, setSelected] = useState<QueryEntry | null>(null);
+  /**
+   * Is the inspector rail showing?
+   *
+   * Separate from `selected` because the two answer different questions:
+   * closing the rail should give the table the full width even though a row
+   * is still highlighted, and picking a row should bring the rail back
+   * without the user hunting for a re-open control. Defaults open so the
+   * screen explains itself on arrival.
+   */
+  const [railOpen, setRailOpen] = useState(true);
   const [resetToken, setResetToken] = useState(0);
   // The flag is shared with the chrome's own cell (components/top-nav.tsx),
   // so both toggles observe and write one value. See lib/live-tail.ts.
-  const { paused, setPaused } = useLiveTailPaused();
+  const { paused } = useLiveTailPaused();
 
   useEffect(() => {
     const timer = setTimeout(() => setDebouncedQ(filters.q), 300);
@@ -1210,6 +1137,18 @@ export function QueryLog() {
   // active. Neither ever clears what's already rendered.
   const live = useLiveTail(!filtered && !paused);
   const paged = useQuerySearch(searchFilter, { enabled: filtered });
+
+  // The tail's mode and health are rendered by the chrome, not here. Row 2
+  // of the top bar owns that cell in the design, and having the page render
+  // its own copy beneath produced four readouts of one fact side by side
+  // (LIVE · PAUSE, LIVE TAIL, RECONNECTING…, PAUSE TAIL). `paused` flows
+  // down from the chrome; these three flow up, because only the routed page
+  // knows whether a filter is active or how the subscription is faring.
+  usePublishLiveTailStatus({
+    filtered,
+    streamState: live.state,
+    reconnect: live.reconnect,
+  });
 
   // Every quick rule and the inspector's rule lookup are scoped to the group
   // that actually governs the row's client (see groupForEntry) — a rule
@@ -1301,8 +1240,14 @@ export function QueryLog() {
     );
   }, []);
 
-  const onSelect = useCallback((entry: QueryEntry) => setSelected(entry), []);
-  const onClearSelection = useCallback(() => setSelected(null), []);
+  const onSelect = useCallback((entry: QueryEntry) => {
+    setSelected(entry);
+    setRailOpen(true);
+  }, []);
+  const onClearSelection = useCallback(() => {
+    setSelected(null);
+    setRailOpen(false);
+  }, []);
   const patchFilters = useCallback(
     (patch: Partial<FilterState>) => setFilters((f) => ({ ...f, ...patch })),
     [],
@@ -1411,13 +1356,6 @@ export function QueryLog() {
             Clear filters
           </Button>
         )}
-        <div className="ml-auto flex shrink-0 items-center gap-4">
-          <ModeReadout filtered={filtered} />
-          {!filtered && (
-            <StreamState paused={paused} state={live.state} onReconnect={live.reconnect} />
-          )}
-          <TailToggle paused={paused} onToggle={setPaused} />
-        </div>
       </div>
 
       <div className="flex flex-1 flex-col lg:flex-row lg:items-stretch">
@@ -1446,19 +1384,21 @@ export function QueryLog() {
           />
         </div>
 
-        <Inspector
-          entry={selected}
-          groupName={groupName}
-          rule={selected && selected.rule_id > 0 ? rulesById.get(selected.rule_id) : undefined}
-          ruleLoading={rules.isPending || rules.isFetching}
-          list={selected && selected.list_id > 0 ? listsById.get(selected.list_id) : undefined}
-          status={selectedKey === null ? undefined : rowStatus[selectedKey]}
-          actionsDisabled={clientsUnavailable}
-          actionsDisabledReason={actionsDisabledReason}
-          onClose={onClearSelection}
-          onQuickRule={quickRule}
-          onCopy={copyRow}
-        />
+        {railOpen && (
+          <Inspector
+            entry={selected}
+            groupName={groupName}
+            rule={selected && selected.rule_id > 0 ? rulesById.get(selected.rule_id) : undefined}
+            ruleLoading={rules.isPending || rules.isFetching}
+            list={selected && selected.list_id > 0 ? listsById.get(selected.list_id) : undefined}
+            status={selectedKey === null ? undefined : rowStatus[selectedKey]}
+            actionsDisabled={clientsUnavailable}
+            actionsDisabledReason={actionsDisabledReason}
+            onClose={onClearSelection}
+            onQuickRule={quickRule}
+            onCopy={copyRow}
+          />
+        )}
       </div>
 
       <Footer

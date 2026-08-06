@@ -47,6 +47,7 @@
      this alias means components can spell it the way the design spec does
      without a second source of truth. */
   --color-warn: var(--warning);
+  --color-warning-solid-foreground: var(--warning-solid-foreground);
 }
 
 /*

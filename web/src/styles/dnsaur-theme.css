@@ -105,6 +105,14 @@
   /* the design's "warn" */
   --warning: oklch(0.5957 0.1213 75.62); /* #a8730f locked */
   --warning-foreground: oklch(0.42 0.085 72);
+  /* Same job as --destructive-solid-foreground, for the one control that
+     fills itself with solid --warning: the query log's paused live-tail
+     toggle. rnui has no token for this — its own solid warning badge
+     hardcodes text-white, which measures 4.10:1 on the light warning and
+     2.18:1 on the dark one, both under AA. A hue-matched near-black is the
+     only value that clears AA against *both* modes' warning (4.60:1 light,
+     8.63:1 dark), so unlike the destructive pair this one does not flip. */
+  --warning-solid-foreground: oklch(0.1759 0.0253 156.26); /* #07140c */
 
   --invert: oklch(0.24 0.035 158);
   --invert-foreground: oklch(0.9705 0.0214 158.6);
@@ -201,6 +209,7 @@
   /* the design's "warn" */
   --warning: oklch(0.7596 0.1374 78.36); /* #e0a53a locked */
   --warning-foreground: oklch(0.86 0.11 78);
+  --warning-solid-foreground: oklch(0.1759 0.0253 156.26); /* #07140c — see the light block */
 
   --invert: oklch(0.9 0.008 150);
   --invert-foreground: oklch(0.1575 0.0027 145.45);

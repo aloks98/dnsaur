@@ -8,7 +8,7 @@ import { server } from "../test/msw-server";
 import { renderWithProviders } from "../test/render";
 import { FakeEventSource } from "../test/fake-event-source";
 import type { QueryEntry } from "../api/types";
-import { setLiveTailPaused } from "../lib/live-tail";
+import { getLiveTailStatus, setLiveTailPaused } from "../lib/live-tail";
 import { QueryLog, renderCounts } from "./queries";
 
 // The table is virtualized (@tanstack/react-virtual, via rnui's
@@ -177,8 +177,7 @@ test("live rows keep separate identities even though they all arrive with id 0",
   ).not.toBeNull();
 });
 
-test("the tail toggle holds the stream without dropping what's on screen, and resuming doesn't duplicate it", async () => {
-  const user = userEvent.setup();
+test("pausing holds the stream without dropping what's on screen, and resuming doesn't duplicate it", async () => {
   renderQueryLog();
 
   const source = await firstSource();
@@ -188,9 +187,9 @@ test("the tail toggle holds the stream without dropping what's on screen, and re
 
   // The design's one filled control on this screen, labelled with what it
   // will do rather than with the state it is in.
-  await user.click(screen.getByRole("button", { name: /pause tail/i }));
-  expect(await screen.findByRole("button", { name: /resume tail/i })).toBeInTheDocument();
-  expect(await screen.findByText(/^Paused$/)).toBeInTheDocument();
+  // The toggle itself is chrome (row 2); pausing is the store flip it performs.
+  act(() => setLiveTailPaused(true));
+  await waitFor(() => expect(getLiveTailStatus().paused).toBe(true));
 
   // The old stream is torn down on pause; emitting on it must not append.
   act(() => source.emit(entry({ q_name: "dropped.example.com" })));
@@ -200,7 +199,7 @@ test("the tail toggle holds the stream without dropping what's on screen, and re
 
   // Resuming reopens a *new* stream and prepends only what arrives next —
   // the buffered row is neither lost nor replayed.
-  await user.click(screen.getByRole("button", { name: /resume tail/i }));
+  act(() => setLiveTailPaused(false));
   await waitFor(() => expect(FakeEventSource.instances).toHaveLength(2));
   const resumed = FakeEventSource.instances[1]!;
   act(() => resumed.emitOpen());
@@ -224,8 +223,7 @@ test("a pause set from outside the page (the chrome's cell) stops the tail here 
 
   act(() => setLiveTailPaused(true));
 
-  expect(await screen.findByRole("button", { name: /resume tail/i })).toBeInTheDocument();
-  expect(screen.getByText(/^Paused$/)).toBeInTheDocument();
+  await waitFor(() => expect(getLiveTailStatus().paused).toBe(true));
   act(() => source.emit(entry({ q_name: "dropped.example.com" })));
   await new Promise((resolve) => setTimeout(resolve, 50));
   expect(screen.queryByText("dropped.example.com")).not.toBeInTheDocument();
@@ -236,10 +234,10 @@ test("a dropped stream is reported as reconnecting", async () => {
 
   const source = await firstSource();
   act(() => source.emitOpen());
-  expect(await screen.findByText(/streaming/i)).toBeInTheDocument();
+  await waitFor(() => expect(getLiveTailStatus().streamState).toBe("open"));
 
   act(() => source.emitError());
-  expect(await screen.findByText(/reconnecting/i)).toBeInTheDocument();
+  await waitFor(() => expect(getLiveTailStatus().streamState).toBe("reconnecting"));
 });
 
 // api/sse.ts gives up after MAX_CONSECUTIVE_FAILURES (6) errors with no
@@ -262,10 +260,12 @@ test("a stream that gives up says so and offers a manual reconnect", async () =>
     }
     act(() => FakeEventSource.instances.at(-1)!.emitError());
 
-    await vi.waitFor(() => expect(screen.getByText(/live tail disconnected/i)).toBeInTheDocument());
+    // The label and the button live in the chrome now; what this page owes
+    // it is the terminal state and a working reconnect callback.
+    await vi.waitFor(() => expect(getLiveTailStatus().streamState).toBe("failed"));
     const opened = FakeEventSource.instances.length;
 
-    act(() => void fireEvent.click(screen.getByRole("button", { name: /reconnect/i })));
+    act(() => getLiveTailStatus().reconnect());
     expect(FakeEventSource.instances.length).toBe(opened + 1);
   } finally {
     vi.useRealTimers();
@@ -302,19 +302,19 @@ test("a fresh install is told the tail is listening rather than shown an empty t
 // by id. Which one is running changes what the footer means, whether OLDER
 // does anything, and how far behind the table can be — so the page says
 // which it is rather than leaving it to be inferred from whether rows move.
-test("the readout names the mode, and switches when a filter takes over from the tail", async () => {
+// The readout itself lives in the chrome (components/top-nav.tsx) — row 2
+// owns that cell in the design. What this page is responsible for is
+// *publishing* which mode is running, since only it knows whether a filter
+// is active. That's what's asserted here.
+test("the page publishes which mode is running, and switches when a filter takes over", async () => {
   renderQueryLog();
   await firstSource();
 
-  expect(screen.getByText(/^Live tail$/)).toBeInTheDocument();
-  expect(screen.queryByText(/filtered · paged/i)).not.toBeInTheDocument();
+  await waitFor(() => expect(getLiveTailStatus().filtered).toBe(false));
 
   filterByType();
 
-  expect(await screen.findByText(/filtered · paged/i)).toBeInTheDocument();
-  expect(screen.queryByText(/^Live tail$/)).not.toBeInTheDocument();
-  // Nothing is streaming in paged mode, so there is no stream health to report.
-  expect(screen.queryByText(/streaming/i)).not.toBeInTheDocument();
+  await waitFor(() => expect(getLiveTailStatus().filtered).toBe(true));
 });
 
 // --- the table ---------------------------------------------------------------
@@ -643,7 +643,7 @@ test("picking a day filters on that whole day and switches the page to paged mod
   const [start, end] = dayRange(2026, 2, 15);
   await waitFor(() => expect(urls.at(-1) ?? "").toContain(`from=${start}`));
   expect(urls.at(-1)).toContain(`to=${end}`);
-  expect(await screen.findByText(/filtered · paged/i)).toBeInTheDocument();
+  await waitFor(() => expect(getLiveTailStatus().filtered).toBe(true));
 });
 
 // "after the 15th" is an open-ended bound. Sending a `to` as well would turn
@@ -705,7 +705,7 @@ test("clearing filters returns to the live tail and forgets the picked range", a
   const input = await openTimeRange(user);
   fireEvent.change(input, { target: { value: "2026-03-15" } });
   expect(await screen.findByText("paged-result.example.com")).toBeInTheDocument();
-  expect(screen.getByText(/filtered · paged/i)).toBeInTheDocument();
+  await waitFor(() => expect(getLiveTailStatus().filtered).toBe(true));
   // The trigger says what it's filtering on, operator included.
   expect(screen.getByRole("button", { name: /is 2026-03-15/i })).toBeInTheDocument();
 
@@ -720,7 +720,7 @@ test("clearing filters returns to the live tail and forgets the picked range", a
 
   await waitFor(() => expect(FakeEventSource.instances).toHaveLength(2));
   expect(screen.queryByText("paged-result.example.com")).not.toBeInTheDocument();
-  expect(screen.getByText(/^Live tail$/)).toBeInTheDocument();
+  await waitFor(() => expect(getLiveTailStatus().filtered).toBe(false));
 
   const resumed = FakeEventSource.instances[1]!;
   act(() => resumed.emitOpen());
@@ -1281,4 +1281,26 @@ test("changing a filter does re-render the filter bar", async () => {
   filterByType();
 
   await waitFor(() => expect(renderCounts.filterBar).toBeGreaterThan(before));
+});
+
+// The rail is a panel, not a detail view bolted to the selection: closing it
+// should give the table the full width even while a row stays highlighted,
+// and picking a row should bring it back without hunting for a re-open
+// control. Those are two pieces of state, and conflating them was the bug —
+// "Close" only cleared the selection and left a 384px empty panel behind.
+test("the inspector rail closes, and picking a row brings it back", async () => {
+  renderQueryLog();
+  const source = await firstSource();
+  act(() => source.emitOpen());
+  act(() => source.emit(entry({ q_name: "closable.example.com" })));
+
+  expect(await screen.findByRole("heading", { name: /why this decision/i })).toBeInTheDocument();
+
+  await userEvent.setup().click(screen.getByRole("button", { name: /close the inspector/i }));
+  await waitFor(() =>
+    expect(screen.queryByRole("heading", { name: /why this decision/i })).not.toBeInTheDocument(),
+  );
+
+  await userEvent.setup().click(await screen.findByText("closable.example.com"));
+  expect(await screen.findByRole("heading", { name: /why this decision/i })).toBeInTheDocument();
 });
