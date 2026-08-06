@@ -71,30 +71,3 @@
 .dnsaur-scroll-x::-webkit-scrollbar {
   display: none;
 }
-
-/*
- * Query log — live-tail row insertion (see pages/queries.tsx).
- *
- * Only ever the single newest row carries `data-row-new="true"` (on its
- * decision-rail cell) at any moment, so this stays cheap even under a
- * bursty stream: one short one-shot flash per arrival, never more than
- * one row animating at once, never a JS animation loop. `tr:has(...)`
- * lets a single per-row marker retint every cell in that row without
- * threading a class through each column's cell renderer individually.
- * Wrapped in `no-preference` (not a duration override) so it's fully
- * absent, not just faster, under prefers-reduced-motion.
- */
-@media (prefers-reduced-motion: no-preference) {
-  @keyframes dnsaur-query-row-in {
-    from {
-      background-color: color-mix(in oklch, var(--primary) 12%, transparent);
-    }
-    to {
-      background-color: transparent;
-    }
-  }
-
-  tr:has([data-row-new="true"]) > td {
-    animation: dnsaur-query-row-in 700ms cubic-bezier(0.16, 1, 0.3, 1);
-  }
-}

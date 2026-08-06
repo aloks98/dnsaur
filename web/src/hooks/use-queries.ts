@@ -4,8 +4,11 @@ import { api } from "../api/client";
 import { subscribeQueries, type SseState } from "../api/sse";
 import type { QueryEntry } from "../api/types";
 
-const LIVE_TAIL_CAP = 500;
-const DEFAULT_SEARCH_LIMIT = 100;
+/** Exported because the query log's footer states both numbers to the user
+ * ("500 row buffer", "limit 100") and they must not drift from the ones the
+ * hooks actually use. */
+export const LIVE_TAIL_CAP = 500;
+export const DEFAULT_SEARCH_LIMIT = 100;
 // Incoming SSE rows are coalesced into one state update per frame-ish
 // window. A busy resolver emits far more messages than the eye can follow,
 // and every single one used to rebuild all 500 @tanstack/react-table Row

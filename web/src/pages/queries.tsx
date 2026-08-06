@@ -1,74 +1,118 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { getCoreRowModel, useReactTable, type ColumnDef, type Table } from "@tanstack/react-table";
 import {
-  Activity,
-  ArrowUpRight,
-  CircleAlert,
-  Clock,
-  Filter as FilterIcon,
-  HelpCircle,
-  House,
-  Search,
-  ShieldBan,
-  ShieldCheck,
-  TriangleAlert,
-  Zap,
-  type LucideIcon,
-} from "lucide-react";
+  Fragment,
+  memo,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
+import { getCoreRowModel, useReactTable, type ColumnDef, type Table } from "@tanstack/react-table";
 import { toast } from "sonner";
 import {
-  Badge,
-  Button,
   cn,
   DataGrid,
   DataGridContainer,
   DataGridScrollArea,
   DataGridTableVirtual,
-  Drawer,
-  DrawerContent,
-  DrawerDescription,
-  DrawerHeader,
-  DrawerTitle,
-  EmptyState,
-  Filters,
-  InputGroup,
-  InputGroupAddon,
-  InputGroupInput,
-  Separator,
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
   Skeleton,
-  StatusIndicator,
-  Switch,
-  Tooltip,
-  TooltipContent,
-  TooltipTrigger,
-  type BadgeProps,
-  type Filter as RnuiFilter,
-  type FilterFieldConfig,
-  type StatusIndicatorProps,
 } from "@e412/rnui-react";
 import type { Client, List, QueryEntry, Rule } from "../api/types";
 import type { SseState } from "../api/sse";
+import { StaleDataAlert } from "../components/stale-data-alert";
 import { useClients } from "../hooks/use-clients";
 import { useAddRule, useRules, useLists } from "../hooks/use-filters";
-import { useLiveTail, useQuerySearch, type QuerySearchFilter } from "../hooks/use-queries";
+import {
+  DEFAULT_SEARCH_LIMIT,
+  LIVE_TAIL_CAP,
+  useLiveTail,
+  useQuerySearch,
+  type QuerySearchFilter,
+} from "../hooks/use-queries";
+import { useLiveTailPaused } from "../lib/live-tail";
 
-// The group a query is attributed to when its client matched no client
-// entry at all — internal/clients/registry.go's Lookup falls back to
+// The group a query is attributed to when its client matched no client entry
+// at all — internal/clients/registry.go's Lookup falls back to
 // ClientInfo{GroupID: 1} (with a zero ID) for those, so the query log must
-// use the same fallback or its rules would land somewhere the resolver
-// never consults for that client.
+// use the same fallback or its rules would land somewhere the resolver never
+// consults for that client.
 const DEFAULT_GROUP_ID = 1;
 
+/** Dense row: `py-1.5` twice plus a `text-xs` line box plus the hairline. Only
+ * an estimate — the virtualizer measures for real once a row is mounted. */
+const ROW_HEIGHT_ESTIMATE = 29;
+
 /**
- * The group whose rules actually govern this row, resolved through the
- * row's client — NOT a hardcoded group 1.
+ * Render counters, exported as a test seam rather than as telemetry.
  *
- * `QueryEntry.client_id` is the *client's* id (internal/qlog/qlog.go), so
- * the group comes from that client's `group_id`. Returns null when the row
- * names a client this instance can't resolve (deleted since, or the client
- * list hasn't loaded yet): writing a rule into a guessed group would be a
- * silent no-op for that client, so callers must refuse rather than claim
- * success.
+ * The live tail commits a batch up to ten times a second, and everything in
+ * this page's subtree re-renders with it unless a `memo` boundary stops it.
+ * That is not a theoretical cost: the identical problem on the dashboard ate
+ * the timeline chart's first-hover tooltip, because re-applying an ECharts
+ * option tears down its hover state. Here the two expensive, tail-irrelevant
+ * subtrees are the filter bar (six controls, one of them a popup menu) and
+ * the inspector rail.
+ *
+ * `memo` only pays off if every prop those two receive is referentially
+ * stable across a tail commit, which is easy to break by accident — one
+ * inline arrow, or a `useCallback` that closes over a react-query result
+ * object instead of its stable `mutate`, and the boundary silently stops
+ * working with nothing on screen to show for it. Counting renders is the
+ * only way to assert on that, so the counters live here and
+ * pages/queries.test.tsx watches them stay flat while rows stream.
+ */
+export const renderCounts = { filterBar: 0, inspector: 0 };
+
+// --- row identity ------------------------------------------------------------
+
+/**
+ * A stable key per row — deliberately NOT `entry.id`.
+ *
+ * A live row's `id` is 0. internal/qlog/qlog.go publishes the entry to the
+ * SSE hub in the same breath as it queues it for the batched database write,
+ * so it goes out before the insert assigns a primary key: every row on the
+ * stream carries the zero value. Keying on it (react-table's `getRowId`,
+ * React's list keys, the virtualizer's item keys, the "which row is
+ * selected" comparison, the per-row action status map) collapses the entire
+ * live tail onto one identity.
+ *
+ * Paged rows come from the database and do have real ids, so they use them.
+ * Live rows get a monotonic client-side key instead, remembered per entry
+ * object in a WeakMap — each SSE message is its own JSON.parse result, so
+ * the object identity is unique and the map costs nothing once the ring
+ * buffer drops the row.
+ */
+const LIVE_ROW_KEYS = new WeakMap<QueryEntry, string>();
+let liveRowSeq = 0;
+
+function rowKey(entry: QueryEntry): string {
+  if (entry.id > 0) return `q${entry.id}`;
+  let key = LIVE_ROW_KEYS.get(entry);
+  if (key === undefined) {
+    liveRowSeq += 1;
+    key = `live${liveRowSeq}`;
+    LIVE_ROW_KEYS.set(entry, key);
+  }
+  return key;
+}
+
+// --- group resolution --------------------------------------------------------
+
+/**
+ * The group whose rules actually govern this row, resolved through the row's
+ * client — NOT a hardcoded group 1.
+ *
+ * `QueryEntry.client_id` is the *client's* id (internal/qlog/qlog.go), so the
+ * group comes from that client's `group_id`. Returns null when the row names
+ * a client this instance can't resolve (deleted since, or the client list
+ * hasn't loaded yet): writing a rule into a guessed group would be a silent
+ * no-op for that client, so callers must refuse rather than claim success.
  */
 function groupForEntry(entry: QueryEntry, clientGroups: Map<number, number>): number | null {
   if (!entry.client_id) return DEFAULT_GROUP_ID;
@@ -79,123 +123,41 @@ function clientGroupMap(clients: Client[] | undefined): Map<number, number> {
   return new Map((clients ?? []).map((c) => [c.id, c.group_id]));
 }
 
-// --- decision badges ---------------------------------------------------
-// A seven-way vocabulary (see internal/dnssrv/pipeline.go for the decision
-// kinds a query can land on) built as a deliberate hierarchy, not a flat
-// rainbow — each decision gets a DIFFERENT icon silhouette (a second
-// channel beyond color/text, so it still reads correctly for colorblind
-// users or in a quick grayscale glance) and its color-weight signals how
-// much attention it deserves:
-//   - filled ("-light") badges are the two poles a sysadmin scans for
-//     first — blocked (red, a stop) and allowed (green, an explicit rule
-//     override) — plus error (amber), which must never share blocked's
-//     red: a failed resolve is a broken query, not a policy decision.
-//   - outline badges are the "expected, keep scrolling" cases: forwarded
-//     (the plain default path — bare, no tint at all, so it stays quiet
-//     against the two poles) and stale (amber outline — related to
-//     cached but flagged, without the visual weight of a true error).
-//   - cached reuses the dashboard's own cache convention (info/cyan +
-//     Zap, see dashboard.tsx's "Cache hit rate" tile) rather than
-//     inventing a new hue for the same concept.
-//   - local sits outside the policy axis entirely (self-answered, not
-//     forwarded or filtered) — neutral secondary/grey, not part of the
-//     red/green/amber thread at all.
-const DECISION_BADGE: Record<
-  string,
-  {
-    label: string;
-    variant: NonNullable<BadgeProps["variant"]>;
-    icon: LucideIcon;
-    rail: string;
-  }
-> = {
-  blocked: {
-    label: "Blocked",
-    variant: "destructive-light",
-    icon: ShieldBan,
-    rail: "bg-destructive",
-  },
-  allowed: {
-    label: "Allowed",
-    variant: "success-light",
-    icon: ShieldCheck,
-    rail: "bg-success",
-  },
-  error: {
-    label: "Error",
-    variant: "warning-light",
-    icon: TriangleAlert,
-    rail: "bg-warning",
-  },
-  stale: {
-    label: "Stale",
-    variant: "warning-outline",
-    icon: Clock,
-    rail: "bg-warning/50",
-  },
-  cached: {
-    label: "Cached",
-    variant: "info-light",
-    icon: Zap,
-    rail: "bg-info",
-  },
-  local: {
-    label: "Local",
-    variant: "secondary",
-    icon: House,
-    rail: "bg-muted-foreground/50",
-  },
-  forwarded: {
-    label: "Forwarded",
-    variant: "outline",
-    icon: ArrowUpRight,
-    rail: "bg-border",
-  },
+// --- decisions ---------------------------------------------------------------
+
+/**
+ * Per-decision tint. The resolver's decision vocabulary is in
+ * internal/dnssrv/pipeline.go; this is the design's flat, text-only reading
+ * of it — no badges, no icons, because a column of twelve tinted pills is the
+ * loudest thing on a page whose whole point is scanning a thousand rows.
+ *
+ * There is no `allowed` entry, here or in the filter below, on purpose:
+ * DecisionAllowed exists in the Go enum but is never assigned. An allow rule
+ * only *skips* blocking, so the row is logged with whatever the downstream
+ * stage produced. Offering it as a filter advertised a query that always
+ * returns zero rows.
+ */
+const DECISION_TONE: Record<string, string> = {
+  blocked: "text-destructive",
+  // A failed resolve is a broken query, not a policy decision — but on a
+  // one-line readout it needs the same "look at me" weight as a block.
+  error: "text-destructive",
+  stale: "text-warn",
+  cached: "text-muted-foreground",
+  forwarded: "text-foreground",
+  local: "text-primary",
 };
 
-function decisionBadge(decision: string) {
-  return (
-    DECISION_BADGE[decision] ?? {
-      label: decision || "Unknown",
-      variant: "outline" as const,
-      icon: HelpCircle,
-      rail: "bg-border",
-    }
-  );
+/** The decisions the resolver actually writes — the filter's whole vocabulary. */
+const DECISIONS = ["blocked", "forwarded", "cached", "stale", "local", "error"];
+
+function decisionTone(decision: string): string {
+  return DECISION_TONE[decision] ?? "text-muted-foreground";
 }
 
-function DecisionBadge({ decision }: { decision: string }) {
-  const { label, variant, icon: Icon } = decisionBadge(decision);
-  return (
-    <Badge variant={variant}>
-      <Icon />
-      {label}
-    </Badge>
-  );
-}
+// --- formatting --------------------------------------------------------------
 
-/** The log's signature scan aid: a decision-colored rail down the left
- * edge of every row, the same hue as that row's decision badge — so the
- * whole log reads top-to-bottom like a colored-priority log viewer
- * (journalctl -p, lnav) without needing to read every badge individually.
- * `isNew` marks the single most-recently-arrived live row (see
- * `data-row-new` / app.css's `dnsaur-query-row-in` keyframe) so a fresh
- * row gets one brief attention flash without any JS animation loop or
- * per-row timers — never more than one row animating at once, however
- * fast the stream is. */
-function DecisionRail({ decision, isNew }: { decision: string; isNew?: boolean }) {
-  const { rail } = decisionBadge(decision);
-  return (
-    <div
-      aria-hidden="true"
-      className={cn("h-5 w-1 rounded-full", rail)}
-      data-decision-rail={decision}
-      data-row-new={isNew ? "true" : undefined}
-    />
-  );
-}
-
-function formatTime(atMs: number): string {
+function clockTime(atMs: number): string {
   return new Date(atMs).toLocaleTimeString([], {
     hour: "2-digit",
     minute: "2-digit",
@@ -203,35 +165,357 @@ function formatTime(atMs: number): string {
   });
 }
 
-// --- table columns -------------------------------------------------------
+/**
+ * `duration_ms` is `time.Duration.Milliseconds()` — truncated whole
+ * milliseconds (internal/qlog/qlog.go). A cache hit answered in 180µs is
+ * therefore logged as 0, and printing "0 ms" claims an instantaneous
+ * resolve; "<1" says what was actually measured.
+ */
+function durationLabel(ms: number): string {
+  return ms > 0 ? String(ms) : "<1";
+}
+
+// --- shared chrome -----------------------------------------------------------
+// The same vocabulary the dashboard uses: hairline-bordered bands, never
+// cards. One rule between bands, one between cells, nothing else.
+
+function SectionTitle({ id, children }: { id?: string; children: ReactNode }) {
+  return (
+    <h2 id={id} className="text-sm tracking-widest uppercase">
+      {children}
+    </h2>
+  );
+}
+
+function Note({ className, children }: { className?: string; children: ReactNode }) {
+  return (
+    <span className={cn("text-xs tracking-widest text-muted-foreground uppercase", className)}>
+      {children}
+    </span>
+  );
+}
+
+/** Prose (alerts, empty sentences, explanations) is the one thing on this
+ * page that isn't mono. */
+function Prose({ className, children }: { className?: string; children: ReactNode }) {
+  return <div className={cn("px-4 py-3 font-sans", className)}>{children}</div>;
+}
+
+/**
+ * Every cell in the filter row: a hairline on the right, one gutter.
+ *
+ * `shrink-0` and `overflow-hidden` together are what keep the row honest.
+ * Six cells plus a status readout do not fit 1280px — the two native
+ * `datetime-local` controls alone are ~200px each — so the row scrolls
+ * (`dnsaur-scroll-x`, the same treatment both nav strips get) rather than
+ * squeezing cells to nothing. Without `shrink-0` the free-text cell
+ * collapsed to 53px and its content spilled straight over the DECISION and
+ * TYPE cells beside it.
+ */
+const FILTER_CELL =
+  "flex shrink-0 items-center gap-3 overflow-hidden border-r border-border px-4 py-2";
+
+/** The bare, cell-shaped skin every filter control wears — the row is a strip
+ * of divided cells, and a bordered input dropped into it looks like something
+ * that fell in from another screen. */
+const FILTER_INPUT =
+  "min-w-0 flex-1 bg-transparent text-xs text-foreground placeholder:text-muted-foreground " +
+  "outline-none focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-ring";
+
+// --- filter state ------------------------------------------------------------
+
+interface FilterState {
+  q: string;
+  decision: string;
+  type: string;
+  client: string;
+  /** `datetime-local` values — local wall-clock, converted to epoch ms below. */
+  from: string;
+  to: string;
+}
+
+const NO_FILTERS: FilterState = { q: "", decision: "", type: "", client: "", from: "", to: "" };
+
+/** A `datetime-local` value is local wall-clock with no zone; `new Date(v)`
+ * reads it as local time, which is what the user meant. An empty or
+ * half-typed value is simply no bound. */
+function toEpochMs(value: string): number | undefined {
+  if (value === "") return undefined;
+  const ms = new Date(value).getTime();
+  return Number.isNaN(ms) ? undefined : ms;
+}
+
+function toSearchFilter(filters: FilterState, q: string): QuerySearchFilter {
+  return {
+    q: q.trim() || undefined,
+    decision: filters.decision || undefined,
+    type: filters.type.trim() || undefined,
+    client: filters.client.trim() || undefined,
+    from: toEpochMs(filters.from),
+    to: toEpochMs(filters.to),
+  };
+}
+
+function isFiltered(filter: QuerySearchFilter): boolean {
+  return Object.values(filter).some((value) => value !== undefined);
+}
+
+// --- filter bar --------------------------------------------------------------
+
+function FilterTextCell({
+  label,
+  value,
+  placeholder,
+  onChange,
+  className,
+}: {
+  label: string;
+  value: string;
+  placeholder: string;
+  onChange: (value: string) => void;
+  className?: string;
+}) {
+  return (
+    <label className={cn(FILTER_CELL, className)}>
+      <span className="shrink-0 text-xs tracking-widest text-muted-foreground uppercase">
+        {label}
+      </span>
+      <input
+        type="text"
+        value={value}
+        placeholder={placeholder}
+        onChange={(event) => onChange(event.target.value)}
+        className={FILTER_INPUT}
+      />
+    </label>
+  );
+}
+
+/**
+ * The filter row, memoised.
+ *
+ * Nothing in here has anything to do with arriving rows — it re-renders when
+ * a filter changes and at no other time. See `renderCounts` for why that is
+ * asserted on rather than assumed.
+ */
+const FilterBar = memo(function FilterBar({
+  value,
+  onChange,
+}: {
+  value: FilterState;
+  onChange: (patch: Partial<FilterState>) => void;
+}) {
+  renderCounts.filterBar += 1;
+
+  return (
+    <div className="dnsaur-scroll-x flex min-w-0 flex-1 items-stretch">
+      {/* The widest cell, and the only one that grows — but never below a
+          usable box, since the row would rather scroll than crush it. */}
+      <div className={cn(FILTER_CELL, "min-w-64 flex-1")}>
+        <input
+          type="text"
+          aria-label="Search domains"
+          aria-describedby="query-search-hint"
+          value={value.q}
+          placeholder="Domain contains…"
+          onChange={(event) => onChange({ q: event.target.value })}
+          className={cn(FILTER_INPUT, "min-w-32")}
+        />
+        {/* Literally true, not a simplification: internal/store/search.go's
+            escapeLike *strips* % and _ rather than escaping them, because
+            the escape syntax isn't portable between the two dialects. A
+            hint that promised wildcards would be promising a feature the
+            server deletes on the way in. */}
+        {/* Only where there is genuinely room for it: at 1280 the row is
+            already scrolling, and this is the one cell that can afford to
+            drop content rather than push the rest off screen. It stays in
+            the DOM as the input's description either way. */}
+        <span
+          id="query-search-hint"
+          className="hidden shrink-0 text-xs text-muted-foreground 2xl:inline"
+        >
+          substring of q_name — % and _ are ignored
+        </span>
+      </div>
+
+      <div className={FILTER_CELL}>
+        <span className="shrink-0 text-xs tracking-widest text-muted-foreground uppercase">
+          Decision
+        </span>
+        {/* A fixed list, so a fixed control: the vocabulary is the
+            resolver's six, and "allowed" is not one of them (see
+            DECISION_TONE). A free-text box here let people ask for rows
+            that cannot exist. */}
+        <Select
+          items={Object.fromEntries([["any", "any"], ...DECISIONS.map((d) => [d, d])])}
+          value={value.decision || "any"}
+          onValueChange={(next) => onChange({ decision: next === "any" ? "" : String(next) })}
+        >
+          <SelectTrigger
+            aria-label="Decision"
+            className="h-auto w-24 border-0 bg-transparent px-0 py-0 text-xs uppercase shadow-none"
+          >
+            <SelectValue placeholder="any" />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="any">any</SelectItem>
+            {DECISIONS.map((decision) => (
+              <SelectItem key={decision} value={decision}>
+                {decision}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+      </div>
+
+      {/* Record types are open-ended (A, AAAA, HTTPS, SVCB, and whatever
+          the next RFC adds), so this one stays free text. */}
+      <FilterTextCell
+        label="Type"
+        value={value.type}
+        placeholder="any"
+        onChange={(type) => onChange({ type })}
+        className="w-32"
+      />
+      <FilterTextCell
+        label="Client"
+        value={value.client}
+        placeholder="any"
+        onChange={(client) => onChange({ client })}
+        className="w-48"
+      />
+
+      <label className={FILTER_CELL}>
+        <span className="shrink-0 text-xs tracking-widest text-muted-foreground uppercase">
+          From
+        </span>
+        <input
+          type="datetime-local"
+          value={value.from}
+          onChange={(event) => onChange({ from: event.target.value })}
+          className={cn(FILTER_INPUT, "w-36")}
+        />
+      </label>
+      <label className={FILTER_CELL}>
+        <span className="shrink-0 text-xs tracking-widest text-muted-foreground uppercase">To</span>
+        <input
+          type="datetime-local"
+          value={value.to}
+          onChange={(event) => onChange({ to: event.target.value })}
+          className={cn(FILTER_INPUT, "w-36")}
+        />
+      </label>
+    </div>
+  );
+});
+
+/**
+ * Reset, pinned outside the scrolling strip.
+ *
+ * Six cells is six things to empty by hand, and emptying all of them is the
+ * single most common thing anyone does here — it's how you get back to the
+ * live tail. Inside the strip it was the last cell, i.e. the one already
+ * scrolled off screen exactly when filters are active and it is needed. Only
+ * offered once there is something to clear, so the row never carries a
+ * permanently inert cell.
+ */
+function ClearFiltersCell({ onClear }: { onClear: () => void }) {
+  return (
+    <button
+      type="button"
+      onClick={onClear}
+      className={cn(
+        FILTER_CELL,
+        "border-r-0 border-l text-xs tracking-widest text-muted-foreground uppercase",
+        "transition-colors hover:text-foreground",
+        "outline-none focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-ring",
+      )}
+    >
+      Clear filters
+    </button>
+  );
+}
+
+// --- stream state ------------------------------------------------------------
+
+/**
+ * The tail's own health, at the end of the filter row — directly under the
+ * chrome's LIVE · PAUSE cell, which is the control it answers for.
+ *
+ * The toggle can't carry this itself: it lives in the shell and the stream
+ * lives in the page. And "failed" is not a state to render as a quieter
+ * shade of the same dot — it means the subscription gave up after six
+ * consecutive attempts (api/sse.ts) and nothing further will happen without
+ * a click, so it says so and puts the click next to it.
+ */
+function StreamState({
+  paused,
+  filtered,
+  state,
+  onReconnect,
+}: {
+  paused: boolean;
+  filtered: boolean;
+  state: SseState;
+  onReconnect: () => void;
+}) {
+  // A filtered view reads the database instead of the stream, so the stream
+  // is closed *because you asked for something else* — not a fault.
+  if (filtered) {
+    return (
+      <span className={cn(FILTER_CELL, "border-r-0 border-l")}>
+        <Note>Filtered · stream paused</Note>
+      </span>
+    );
+  }
+  if (paused) {
+    return (
+      <span className={cn(FILTER_CELL, "border-r-0 border-l")}>
+        <Note>Paused</Note>
+      </span>
+    );
+  }
+  if (state === "failed") {
+    return (
+      <div className={cn(FILTER_CELL, "border-r-0 border-l")}>
+        <Note className="text-destructive">Live tail disconnected</Note>
+        <button
+          type="button"
+          onClick={onReconnect}
+          className={cn(
+            "shrink-0 text-xs tracking-widest uppercase transition-colors hover:text-primary",
+            "outline-none focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring",
+          )}
+        >
+          Reconnect
+        </button>
+      </div>
+    );
+  }
+  return (
+    <output className={cn(FILTER_CELL, "border-r-0 border-l")}>
+      <Note>{state === "open" ? "Streaming" : "Reconnecting…"}</Note>
+    </output>
+  );
+}
+
+// --- table -------------------------------------------------------------------
 
 type RowStatus = "pending" | "blocked" | "allowed";
 
 /**
- * Everything a cell needs that changes while the table is mounted. It
- * travels through the table's `meta` rather than being closed over by the
- * column defs, because a column def array built per render is poison here:
- * `cell` functions are used as component *types*, so a fresh arrow function
- * per render makes React unmount and remount every visible row (losing focus
- * and restarting the row-flash animation), on top of rebuilding
- * getAllColumns/getHeaderGroups — and the live tail re-renders on every
- * batch of arrivals. With the defs constant, only the cells' output changes.
+ * Everything a cell needs that changes while the table is mounted. It travels
+ * through the table's `meta` rather than being closed over by the column
+ * defs, because a column def array rebuilt per render is poison here: `cell`
+ * functions are used as component *types*, so a fresh arrow function per
+ * render makes React unmount and remount every visible row, on top of
+ * rebuilding getAllColumns/getHeaderGroups — and this table re-renders on
+ * every batch of arrivals. With the defs constant, only the cells' output
+ * changes.
  */
 interface QueryTableMeta {
-  rowStatus: Record<number, RowStatus>;
-  newRowId: number | null;
-  onBlock: (entry: QueryEntry) => void;
-  onAllow: (entry: QueryEntry) => void;
-  onWhy: (entry: QueryEntry) => void;
-  /**
-   * Set while GET /clients hasn't landed. Every rule is scoped to the group
-   * that governs the row's client (see groupForEntry), so with no client list
-   * there is no group to write into — the actions would fail on click with
-   * "this client's group is unknown", which describes a deleted client, not a
-   * sibling request that is still in flight or has failed.
-   */
-  actionsDisabled: boolean;
-  actionsDisabledReason?: string;
+  selectedKey: string | null;
+  onSelect: (entry: QueryEntry) => void;
 }
 
 function tableMeta(table: Table<QueryEntry>): QueryTableMeta {
@@ -240,168 +524,107 @@ function tableMeta(table: Table<QueryEntry>): QueryTableMeta {
 
 const QUERY_COLUMNS: ColumnDef<QueryEntry>[] = [
   {
-    id: "rail",
-    header: "",
-    size: 10,
-    cell: ({ row, table }) => (
-      <DecisionRail
-        decision={row.original.decision}
-        isNew={row.original.id === tableMeta(table).newRowId}
-      />
-    ),
-  },
-  {
     accessorKey: "at",
     header: "Time",
-    size: 88,
-    cell: ({ row }) => (
-      <span className="font-mono text-xs tabular-nums text-muted-foreground">
-        {formatTime(row.original.at)}
-      </span>
-    ),
-  },
-  {
-    accessorKey: "client_ip",
-    header: "Client",
-    size: 118,
-    cell: ({ row }) => <span className="font-mono text-xs">{row.original.client_ip}</span>,
+    size: 112,
+    meta: {
+      headerClassName: "px-4",
+      // `relative` so the selection marker can hang off the row's leading
+      // edge without a spacer column to live in.
+      cellClassName: "relative px-4 whitespace-nowrap text-muted-foreground tabular-nums",
+    },
+    cell: ({ row, table }) => {
+      const selected = rowKey(row.original) === tableMeta(table).selectedKey;
+      return (
+        <>
+          {selected && (
+            // Also what tints the row: styles/app.css has no hand-written
+            // rule for this — `has-data-selected:bg-card` on the row picks
+            // this element up. One marker, both effects.
+            <span
+              data-selected=""
+              aria-hidden="true"
+              className="absolute inset-y-0 left-0 w-0.5 bg-primary"
+            />
+          )}
+          {clockTime(row.original.at)}
+        </>
+      );
+    },
   },
   {
     accessorKey: "q_name",
     header: "Domain",
-    cell: ({ row }) => (
-      <span className="font-mono text-xs" title={row.original.q_name}>
-        {row.original.q_name}
-      </span>
-    ),
+    size: 208,
+    meta: { headerClassName: "px-4", cellClassName: "px-4" },
+    cell: ({ row, table }) => {
+      const entry = row.original;
+      return (
+        // A real button, not just a click handler on the row: selecting a
+        // row is what opens the inspector, and that has to be reachable
+        // without a mouse. The row is clickable too (DataGrid's onRowClick),
+        // as a convenience on top of this rather than instead of it.
+        <button
+          type="button"
+          aria-label={`Why was ${entry.q_name} ${entry.decision}?`}
+          title={entry.q_name}
+          onClick={() => tableMeta(table).onSelect(entry)}
+          className={cn(
+            "block w-full truncate text-left transition-colors hover:text-primary",
+            "outline-none focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-ring",
+          )}
+        >
+          {entry.q_name}
+        </button>
+      );
+    },
   },
   {
     accessorKey: "q_type",
     header: "Type",
-    size: 60,
-    cell: ({ row }) => (
-      <span className="font-mono text-xs text-muted-foreground">{row.original.q_type}</span>
-    ),
+    size: 56,
+    meta: { headerClassName: "px-4", cellClassName: "px-4 text-muted-foreground" },
+    cell: ({ row }) => row.original.q_type,
+  },
+  {
+    accessorKey: "client_ip",
+    header: "Client",
+    size: 128,
+    meta: { headerClassName: "px-4", cellClassName: "truncate px-4 text-muted-foreground" },
+    cell: ({ row }) => row.original.client_ip,
   },
   {
     accessorKey: "decision",
     header: "Decision",
-    size: 108,
-    cell: ({ row }) => <DecisionBadge decision={row.original.decision} />,
+    size: 96,
+    meta: { headerClassName: "px-4", cellClassName: "px-4" },
+    cell: ({ row }) => (
+      <span className={decisionTone(row.original.decision)}>{row.original.decision}</span>
+    ),
   },
   {
     accessorKey: "upstream",
     header: "Upstream",
-    size: 124,
-    cell: ({ row }) => (
-      <span className="font-mono text-xs text-muted-foreground">
-        {row.original.upstream || "—"}
-      </span>
-    ),
+    size: 128,
+    meta: { headerClassName: "px-4", cellClassName: "truncate px-4 text-muted-foreground" },
+    cell: ({ row }) => row.original.upstream || "—",
   },
   {
     accessorKey: "duration_ms",
-    header: "Latency",
-    size: 76,
-    meta: { headerClassName: "text-right", cellClassName: "text-right" },
-    cell: ({ row }) => (
-      <span className="font-mono text-xs tabular-nums text-muted-foreground">
-        {row.original.duration_ms}ms
-      </span>
-    ),
-  },
-  {
-    id: "actions",
-    header: "",
-    size: 216,
-    cell: ({ row, table }) => {
-      const entry = row.original;
-      const { rowStatus, onBlock, onAllow, onWhy, actionsDisabled, actionsDisabledReason } =
-        tableMeta(table);
-      const status = rowStatus[entry.id];
-      const disabled = status === "pending" || actionsDisabled;
-      const title = actionsDisabled ? actionsDisabledReason : undefined;
-      return (
-        <div className="flex items-center justify-end gap-1">
-          {status === "blocked" ? (
-            <Badge variant="destructive-light">Blocked</Badge>
-          ) : status === "allowed" ? (
-            <Badge variant="success-light">Allowed</Badge>
-          ) : (
-            <>
-              <Button
-                type="button"
-                size="sm"
-                variant="outline"
-                disabled={disabled}
-                title={title}
-                onClick={() => onBlock(entry)}
-              >
-                <ShieldBan />
-                Block
-              </Button>
-              <Button
-                type="button"
-                size="sm"
-                variant="outline"
-                disabled={disabled}
-                title={title}
-                onClick={() => onAllow(entry)}
-              >
-                <ShieldCheck />
-                Allow
-              </Button>
-            </>
-          )}
-          <Tooltip>
-            <TooltipTrigger
-              render={
-                <Button
-                  type="button"
-                  size="icon-sm"
-                  variant="ghost"
-                  aria-label={`Why was ${entry.q_name} ${entry.decision}?`}
-                  onClick={() => onWhy(entry)}
-                />
-              }
-            >
-              <HelpCircle />
-            </TooltipTrigger>
-            <TooltipContent>Why this decision?</TooltipContent>
-          </Tooltip>
-        </div>
-      );
+    header: "ms",
+    size: 56,
+    meta: {
+      headerClassName: "px-4 text-right",
+      cellClassName: "px-4 text-right text-muted-foreground tabular-nums",
     },
+    cell: ({ row }) => durationLabel(row.original.duration_ms),
   },
 ];
 
-// --- shared grid -----------------------------------------------------------
-// Virtualized per the brief: every SSE message can replace the whole
-// 500-row live-tail array, and a plain (non-virtualized) table would
-// re-render every richly-celled row on every single message on a busy
-// resolver. DataGridTableVirtual only mounts the rows within (or near) the
-// visible scroll window, so a full-buffer replacement stays cheap
-// regardless of how many rows are logically in the array.
-//
-// DataGridTableVirtual has no built-in skeleton/isLoading handling (unlike
-// the plain DataGridTable) — its virtual body only branches on
-// isFetchingMore/hasMore for infinite-scroll status rows, not an initial
-// loading state. So the loading skeleton is rendered here explicitly,
-// swapped in for the grid entirely while paged search is still in flight,
-// rather than relying on DataGrid's (virtual-body-unaware) isLoading prop.
-//
-// Those same isFetchingMore/hasMore props are what makes filtered search
-// page: scrolling to the end asks useQuerySearch for the next offset
-// instead of stopping dead at the first 100 matches, and a short final page
-// swaps the loader for "All matching queries loaded" so the end of the
-// results is stated rather than implied.
-
-const ROW_HEIGHT_ESTIMATE = 34; // dense row: ~12px vertical padding + text-xs line height + 1px border
-
-function QueryDataGridPanel({
+function QueryTable({
   entries,
   isLoading,
-  emptyState,
+  emptyMessage,
   meta,
   onFetchMore,
   isFetchingMore,
@@ -409,7 +632,7 @@ function QueryDataGridPanel({
 }: {
   entries: QueryEntry[];
   isLoading: boolean;
-  emptyState: ReactNode;
+  emptyMessage: ReactNode;
   meta: QueryTableMeta;
   /** Paged mode only — omitted for the live tail, which has no "more". */
   onFetchMore?: () => void;
@@ -420,7 +643,7 @@ function QueryDataGridPanel({
     data: entries,
     columns: QUERY_COLUMNS,
     meta,
-    getRowId: (row) => String(row.id),
+    getRowId: rowKey,
     getCoreRowModel: getCoreRowModel(),
   });
 
@@ -429,20 +652,46 @@ function QueryDataGridPanel({
       table={table}
       recordCount={entries.length}
       isLoading={isLoading}
-      emptyMessage={emptyState}
+      emptyMessage={emptyMessage}
+      onRowClick={meta.onSelect}
       fetchingMoreMessage="Loading more matches…"
       allRowsLoadedMessage="All matching queries loaded"
-      tableLayout={{ dense: true, width: "auto" }}
+      tableLayout={{
+        dense: true,
+        width: "fixed",
+        rowBorder: true,
+        headerBorder: true,
+        headerBackground: false,
+        headerSticky: true,
+      }}
+      tableClassNames={{
+        headerRow: "text-sm tracking-widest text-muted-foreground uppercase",
+        headerSticky: "sticky top-0 z-10 bg-background",
+        // `*:` reaches the row's own cells, which is where rowBorder puts
+        // the hairline — the design separates rows in the muted tone and
+        // keeps full-strength --border for the bands around the table.
+        bodyRow: "text-xs *:border-border-muted hover:bg-card has-data-selected:bg-card",
+      }}
     >
-      <DataGridContainer>
+      <DataGridContainer border={false}>
         {isLoading ? (
-          <div className="flex flex-col gap-2 p-3" aria-hidden="true">
-            {Array.from({ length: 8 }).map((_, i) => (
-              <Skeleton key={i} className="h-8 w-full" />
+          <div className="flex flex-col gap-2 px-4 py-3" aria-hidden="true">
+            {Array.from({ length: 12 }).map((_, i) => (
+              <Skeleton key={i} className="h-5 w-full" />
             ))}
           </div>
         ) : (
-          <DataGridScrollArea className="h-[34rem]">
+          // Virtualized per the brief: an SSE batch can replace the whole
+          // 500-row array, and a plain table would re-render every mounted
+          // row on every batch. DataGridTableVirtual only mounts the rows
+          // in (or near) the scroll window, so a full-buffer replacement
+          // stays cheap however many rows are logically in the array.
+          //
+          // The same onFetchMore/hasMore props are what makes a filtered
+          // view page past its first 100 matches instead of stopping dead
+          // there, and a short final page swaps the loader for "All
+          // matching queries loaded" so the end is stated, not implied.
+          <DataGridScrollArea className="h-136">
             <DataGridTableVirtual
               estimateSize={ROW_HEIGHT_ESTIMATE}
               overscan={12}
@@ -457,9 +706,53 @@ function QueryDataGridPanel({
   );
 }
 
-// --- "why?" drawer -----------------------------------------------------------
+// --- inspector ---------------------------------------------------------------
 
-function WhyContent({
+interface RawField {
+  name: string;
+  value: string;
+  /** What a zero/empty value actually means. The contract's zero values are
+   * not "missing data" — each one says something specific — and an
+   * unannotated `list_id 0` reads as a bug in the log. */
+  note?: string;
+}
+
+function rawRow(entry: QueryEntry): RawField[] {
+  return [
+    { name: "at", value: String(entry.at), note: new Date(entry.at).toLocaleString() },
+    { name: "client_ip", value: entry.client_ip },
+    {
+      name: "client_id",
+      value: String(entry.client_id),
+      note: entry.client_id === 0 ? "no client entry matched" : undefined,
+    },
+    { name: "q_type", value: entry.q_type },
+    { name: "decision", value: entry.decision },
+    {
+      name: "rule_id",
+      value: String(entry.rule_id),
+      note: entry.rule_id === 0 ? "no rule matched" : undefined,
+    },
+    {
+      name: "list_id",
+      value: String(entry.list_id),
+      note: entry.list_id === 0 ? "not attributed" : undefined,
+    },
+    {
+      name: "upstream",
+      value: entry.upstream || "—",
+      note: entry.upstream ? undefined : "never left the box",
+    },
+    { name: "r_code", value: entry.r_code || "—", note: entry.r_code ? undefined : "no answer" },
+    {
+      name: "duration_ms",
+      value: String(entry.duration_ms),
+      note: entry.duration_ms === 0 ? "under 1 ms, truncated" : undefined,
+    },
+  ];
+}
+
+function MatchProse({
   entry,
   rule,
   ruleLoading,
@@ -467,194 +760,341 @@ function WhyContent({
 }: {
   entry: QueryEntry;
   rule?: Rule;
-  /** The row's group's rules are still being fetched — see whyGroupId. */
+  /** The row's group's rules are still in flight — see whyGroupId. */
   ruleLoading?: boolean;
   list?: List;
 }) {
-  const { label, variant, icon: Icon } = decisionBadge(entry.decision);
-
-  let matchBody: ReactNode;
   if (entry.rule_id > 0) {
-    matchBody = rule ? (
-      <p className="text-sm text-muted-foreground">
-        Matched a {rule.action === "block" ? "block" : "allow"} rule for{" "}
-        <code className="font-mono text-foreground">{rule.pattern}</code>
-        {rule.is_regex ? " (regex)" : ""}.
-      </p>
-    ) : ruleLoading ? (
-      // Never claim the rule is missing while its group's rules are still
-      // in flight — the drawer opens before that request comes back.
-      <p className="text-sm text-muted-foreground">Looking up the matching rule…</p>
-    ) : (
-      <p className="text-sm text-muted-foreground">
+    if (rule) {
+      return (
+        <p>
+          Matched a {rule.action === "block" ? "block" : "allow"} rule for{" "}
+          <code className="font-mono text-foreground">{rule.pattern}</code>
+          {rule.is_regex ? " (regex)" : ""}.
+        </p>
+      );
+    }
+    // Never claim the rule is missing while its group's rules are still in
+    // flight — the rail populates before that request comes back.
+    if (ruleLoading) return <p>Looking up the matching rule…</p>;
+    return (
+      <p>
         Matched rule #{entry.rule_id}, which isn&apos;t available right now (it may have been
         deleted).
       </p>
     );
-  } else if (entry.list_id > 0) {
-    matchBody = list ? (
-      <p className="text-sm text-muted-foreground">
+  }
+  if (entry.list_id > 0) {
+    return list ? (
+      <p>
         From the {list.kind} list{" "}
-        <code className="font-mono text-foreground break-all">{list.url}</code>.
+        <code className="font-mono break-all text-foreground">{list.url}</code>.
       </p>
     ) : (
-      <p className="text-sm text-muted-foreground">
-        Matched list #{entry.list_id}, which isn&apos;t available right now.
-      </p>
-    );
-  } else {
-    matchBody = (
-      <p className="text-sm text-muted-foreground">
-        No rule or list matched — resolved by the default policy.
-      </p>
+      <p>Matched list #{entry.list_id}, which isn&apos;t available right now.</p>
     );
   }
+  return <p>No rule or list matched — resolved by the default policy.</p>;
+}
+
+/** The inspector's two-cell action strip. The primary cell is the design's
+ * one filled control on this rail, and which rule it writes follows the row:
+ * a blocked row needs an allow, anything else needs a block. */
+function ActionStrip({
+  entry,
+  status,
+  disabled,
+  disabledReason,
+  onQuickRule,
+  onCopy,
+}: {
+  entry: QueryEntry;
+  status?: RowStatus;
+  disabled: boolean;
+  disabledReason: string;
+  onQuickRule: (action: "allow" | "block", entry: QueryEntry) => void;
+  onCopy: (entry: QueryEntry) => void;
+}) {
+  const action = entry.decision === "blocked" ? "allow" : "block";
+  const done = status === "blocked" || status === "allowed";
+  const cell =
+    "flex items-center justify-center px-4 py-3 text-xs tracking-widest uppercase transition-colors " +
+    "outline-none focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-ring";
 
   return (
-    <div className="flex flex-col gap-4">
-      <Badge variant={variant} className="w-fit">
-        <Icon />
-        {label}
-      </Badge>
-      <dl className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1.5 text-sm">
-        <dt className="text-muted-foreground">Time</dt>
-        <dd className="tabular-nums">{new Date(entry.at).toLocaleString()}</dd>
-        <dt className="text-muted-foreground">Client</dt>
-        <dd className="font-mono">{entry.client_ip}</dd>
-        <dt className="text-muted-foreground">Query type</dt>
-        <dd className="font-mono">{entry.q_type}</dd>
-        <dt className="text-muted-foreground">Upstream</dt>
-        <dd className="font-mono">{entry.upstream || "—"}</dd>
-        <dt className="text-muted-foreground">Response code</dt>
-        <dd className="font-mono">{entry.r_code || "—"}</dd>
-        <dt className="text-muted-foreground">Latency</dt>
-        <dd className="tabular-nums">{entry.duration_ms}ms</dd>
-      </dl>
-      <Separator />
-      <div className="flex flex-col gap-1.5">
-        <h4 className="text-sm font-medium text-foreground">Match</h4>
-        {matchBody}
+    <div className="grid grid-cols-2 border-t border-border">
+      {done ? (
+        <span className={cn(cell, "bg-primary font-semibold text-primary-foreground")}>
+          {status === "blocked" ? "Blocked" : "Allowed"}
+        </span>
+      ) : (
+        <button
+          type="button"
+          disabled={status === "pending" || disabled}
+          title={disabled ? disabledReason : undefined}
+          onClick={() => onQuickRule(action, entry)}
+          className={cn(
+            cell,
+            "bg-primary font-semibold text-primary-foreground hover:bg-primary/90",
+            // Still visible while unavailable, just visibly inert and
+            // carrying the reason — silently having no affordance is how
+            // "why can't I block from here?" starts.
+            "disabled:cursor-not-allowed disabled:opacity-60 disabled:hover:bg-primary",
+          )}
+        >
+          {action === "allow" ? "Allow domain" : "Block domain"}
+        </button>
+      )}
+      <button
+        type="button"
+        onClick={() => onCopy(entry)}
+        className={cn(cell, "border-l border-border hover:bg-card")}
+      >
+        Copy row JSON
+      </button>
+    </div>
+  );
+}
+
+/**
+ * The right-hand rail: why this row got the decision it did, and the raw
+ * record behind it.
+ *
+ * Memoised for the same reason the filter bar is — none of it is a function
+ * of arriving rows, and it is the most expensive subtree on the page.
+ * Replaced the slide-over drawer the log used to have: a drawer over a log
+ * hides the rows you are comparing against, and every "why?" needed a click
+ * to open and an Escape to get back. The rail is always there, so selecting
+ * a row *is* opening it.
+ */
+const Inspector = memo(function Inspector({
+  entry,
+  rule,
+  ruleLoading,
+  list,
+  status,
+  actionsDisabled,
+  actionsDisabledReason,
+  onClose,
+  onQuickRule,
+  onCopy,
+}: {
+  entry: QueryEntry | null;
+  rule?: Rule;
+  ruleLoading?: boolean;
+  list?: List;
+  status?: RowStatus;
+  actionsDisabled: boolean;
+  actionsDisabledReason: string;
+  onClose: () => void;
+  onQuickRule: (action: "allow" | "block", entry: QueryEntry) => void;
+  onCopy: (entry: QueryEntry) => void;
+}) {
+  renderCounts.inspector += 1;
+
+  return (
+    <aside
+      aria-labelledby="why-title"
+      className="flex shrink-0 flex-col max-lg:border-t max-lg:border-border lg:w-96 lg:border-l lg:border-border"
+    >
+      <div className="flex items-center justify-between gap-2 border-b border-border px-4 py-3">
+        <SectionTitle id="why-title">Why this decision</SectionTitle>
+        {entry && (
+          <button
+            type="button"
+            aria-label="Clear the selected row"
+            onClick={onClose}
+            className={cn(
+              "shrink-0 text-xs tracking-widest text-muted-foreground uppercase",
+              "transition-colors hover:text-foreground",
+              "outline-none focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring",
+            )}
+          >
+            Close <span aria-hidden="true">×</span>
+          </button>
+        )}
+      </div>
+
+      {entry === null ? (
+        <Prose>
+          <p className="text-sm text-muted-foreground">
+            Pick a row to see which rule, list or default policy decided it — and the raw record
+            behind it.
+          </p>
+        </Prose>
+      ) : (
+        <>
+          <div className="min-h-0 flex-1 overflow-y-auto">
+            <div className="flex flex-col gap-2 border-b border-border px-4 py-3">
+              <p className="text-base break-all">{entry.q_name}</p>
+              <div className="flex flex-wrap items-center gap-3">
+                <span
+                  className={cn(
+                    "border border-current px-2 py-0.5 text-xs tracking-widest uppercase",
+                    decisionTone(entry.decision),
+                  )}
+                >
+                  {entry.decision}
+                </span>
+                <Note>
+                  {entry.q_type} · {entry.r_code || "no answer"} ·{" "}
+                  {durationLabel(entry.duration_ms)} ms
+                </Note>
+              </div>
+            </div>
+
+            <Prose className="border-b border-border text-sm text-muted-foreground">
+              <MatchProse entry={entry} rule={rule} ruleLoading={ruleLoading} list={list} />
+            </Prose>
+
+            <div className="px-4 py-3">
+              <SectionTitle>Raw row</SectionTitle>
+              <dl className="mt-3 grid grid-cols-2 gap-x-4 gap-y-1.5 text-xs">
+                {rawRow(entry).map((field) => (
+                  <Fragment key={field.name}>
+                    <dt className="text-muted-foreground">{field.name}</dt>
+                    <dd className="break-all">
+                      {field.value}
+                      {field.note !== undefined && (
+                        <span className="text-muted-foreground"> {field.note}</span>
+                      )}
+                    </dd>
+                  </Fragment>
+                ))}
+              </dl>
+            </div>
+          </div>
+
+          <ActionStrip
+            entry={entry}
+            status={status}
+            disabled={actionsDisabled}
+            disabledReason={actionsDisabledReason}
+            onQuickRule={onQuickRule}
+            onCopy={onCopy}
+          />
+        </>
+      )}
+    </aside>
+  );
+});
+
+// --- footer ------------------------------------------------------------------
+
+function FooterButton({
+  children,
+  disabled,
+  onClick,
+}: {
+  children: ReactNode;
+  disabled?: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      disabled={disabled}
+      onClick={onClick}
+      className={cn(
+        "text-xs tracking-widest text-muted-foreground uppercase transition-colors",
+        "hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50",
+        "disabled:hover:text-muted-foreground",
+        "outline-none focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring",
+      )}
+    >
+      {children}
+    </button>
+  );
+}
+
+function Footer({
+  rows,
+  filtered,
+  offset,
+  hasMore,
+  isFetchingMore,
+  onOlder,
+  onNewer,
+}: {
+  rows: number;
+  filtered: boolean;
+  offset: number;
+  hasMore: boolean;
+  isFetchingMore: boolean;
+  onOlder: () => void;
+  onNewer: () => void;
+}) {
+  return (
+    <div className="flex flex-wrap items-center gap-x-4 gap-y-2 border-t border-border px-4 py-3">
+      <Note>
+        {rows} rows ·{" "}
+        {filtered
+          ? `limit ${DEFAULT_SEARCH_LIMIT} · offset ${offset}`
+          : `live tail · ${LIVE_TAIL_CAP} row buffer`}
+      </Note>
+      {/* The search endpoint is `ORDER BY id DESC` (internal/store/search.go),
+          and id order is insertion order — which is the logger's batched
+          flush order, not the order the queries were answered in. Close
+          enough to always look like time, wrong often enough to say so. */}
+      {filtered && <Note>ordered by id, not by time</Note>}
+      <div className="ml-auto flex items-center gap-4">
+        <FooterButton onClick={onNewer}>
+          <span aria-hidden="true">←</span> Newer
+        </FooterButton>
+        <FooterButton disabled={!filtered || !hasMore || isFetchingMore} onClick={onOlder}>
+          Older <span aria-hidden="true">→</span>
+        </FooterButton>
       </div>
     </div>
   );
 }
 
-// --- filters -----------------------------------------------------------
-
-const FILTER_FIELDS: FilterFieldConfig<string>[] = [
-  // Deliberately not "allowed": DecisionAllowed exists in the Go enum
-  // (internal/dnssrv/pipeline.go) but is never assigned — an allow rule only
-  // *skips* blocking, so the row is logged with whatever the downstream stage
-  // produced. Offering it here advertised a filter that always returns zero
-  // rows. These four are the decisions the resolver actually writes, plus
-  // "local" and "error".
-  { key: "decision", label: "Decision", type: "text", placeholder: "blocked, forwarded, cached…" },
-  { key: "type", label: "Record type", type: "text", placeholder: "A, AAAA, CNAME…" },
-  { key: "client", label: "Client IP", type: "text", placeholder: "192.168.1.10" },
-];
-
-function toSearchFilter(rnuiFilters: RnuiFilter<string>[], search: string): QuerySearchFilter {
-  const byField = new Map(rnuiFilters.map((f) => [f.field, f.values[0]]));
-  const decision = byField.get("decision")?.trim();
-  const type = byField.get("type")?.trim();
-  const client = byField.get("client")?.trim();
-  return {
-    decision: decision || undefined,
-    type: type || undefined,
-    client: client || undefined,
-    q: search.trim() || undefined,
-  };
-}
-
-// --- live state indicator -----------------------------------------------
-
-function liveStateBadge(
-  paused: boolean,
-  state: SseState,
-): { dotState: NonNullable<StatusIndicatorProps["state"]>; label: string } {
-  if (paused) return { dotState: "idle", label: "Paused" };
-  if (state === "open") return { dotState: "active", label: "Streaming" };
-  if (state === "reconnecting") return { dotState: "fixing", label: "Reconnecting…" };
-  // "failed" = the stream gave up retrying (see api/sse.ts). Said plainly,
-  // with a manual retry beside it, rather than pretending a reconnect is
-  // still coming — the usual cause is a session that no longer exists.
-  if (state === "failed") return { dotState: "down", label: "Live tail disconnected" };
-  return { dotState: "down", label: "Disconnected" };
-}
-
-// --- page ------------------------------------------------------------------
+// --- page --------------------------------------------------------------------
 
 export function QueryLog() {
-  const [rnuiFilters, setRnuiFilters] = useState<RnuiFilter<string>[]>([]);
-  const [searchDraft, setSearchDraft] = useState("");
-  const [search, setSearch] = useState("");
-  const [paused, setPaused] = useState(false);
-  // Open state is deliberately separate from the target rather than derived
-  // from `whyEntry !== null`: the drawer stays mounted through vaul's exit
-  // transition, so nulling the entry on close would blank the still-visible
-  // panel and slide an empty sheet off screen. The entry is replaced on the
-  // next open instead of cleared on close (same treatment as dns.tsx's edit
-  // sheet and groups-clients.tsx's client dialog).
-  const [whyEntry, setWhyEntry] = useState<QueryEntry | null>(null);
-  const [whyOpen, setWhyOpen] = useState(false);
+  const [filters, setFilters] = useState<FilterState>(NO_FILTERS);
+  // Light debounce so the domain box doesn't fire a LIKE query per keystroke.
+  // The other five are discrete selections, so they apply immediately.
+  const [debouncedQ, setDebouncedQ] = useState("");
+  const [selected, setSelected] = useState<QueryEntry | null>(null);
+  // The toggle itself is the chrome's one filled cell (components/top-nav.tsx);
+  // this page is only ever a reader of the flag. See lib/live-tail.ts.
+  const { paused } = useLiveTailPaused();
 
-  const openWhy = useCallback((entry: QueryEntry) => {
-    setWhyEntry(entry);
-    setWhyOpen(true);
-  }, []);
-
-  // Light debounce so the domain search doesn't fire a LIKE query per
-  // keystroke — the rnui Filters chips (decision/type/client) are
-  // discrete selections, not per-keystroke, so they're left undebounced.
   useEffect(() => {
-    const t = setTimeout(() => setSearch(searchDraft), 300);
-    return () => clearTimeout(t);
-  }, [searchDraft]);
+    const timer = setTimeout(() => setDebouncedQ(filters.q), 300);
+    return () => clearTimeout(timer);
+  }, [filters.q]);
 
-  const hasActiveFilters = rnuiFilters.length > 0 || search.trim() !== "";
-  const searchFilter = useMemo(() => toSearchFilter(rnuiFilters, search), [rnuiFilters, search]);
+  const searchFilter = useMemo(() => toSearchFilter(filters, debouncedQ), [filters, debouncedQ]);
+  const filtered = isFiltered(searchFilter);
 
-  // Live tail and paged search share one `enabled` toggle each: the live
-  // tail stops consuming the stream (see use-queries.ts) the moment either
-  // a filter is applied OR the user pauses; the paged search only ever
-  // runs while filters are active.
-  const live = useLiveTail(!hasActiveFilters && !paused);
-  const paged = useQuerySearch(searchFilter, { enabled: hasActiveFilters });
+  // Live tail and paged search share one `enabled` each: the tail stops
+  // consuming the stream (see use-queries.ts) the moment either a filter is
+  // applied or the user pauses; the paged search only runs while filters are
+  // active. Neither ever clears what's already rendered.
+  const live = useLiveTail(!filtered && !paused);
+  const paged = useQuerySearch(searchFilter, { enabled: filtered });
 
-  // Row-insertion flash (see DecisionRail / app.css's dnsaur-query-row-in
-  // keyframe): track only the single newest live row at a time, so a
-  // bursty stream never has more than one row animating at once. A ref
-  // (not state) tracks "have we already flashed this id" across renders
-  // without re-triggering the effect on every unrelated re-render.
-  const [newRowId, setNewRowId] = useState<number | null>(null);
-  const latestFlashedId = useRef<number | undefined>(undefined);
-  const latestLiveId = live.entries[0]?.id;
-  useEffect(() => {
-    if (hasActiveFilters || paused) return;
-    if (latestLiveId === undefined || latestLiveId === latestFlashedId.current) return;
-    latestFlashedId.current = latestLiveId;
-    setNewRowId(latestLiveId);
-    const t = setTimeout(() => {
-      setNewRowId((id) => (id === latestLiveId ? null : id));
-    }, 700);
-    return () => clearTimeout(t);
-  }, [latestLiveId, hasActiveFilters, paused]);
-
-  // Every quick rule and the "why?" drawer are scoped to the group that
-  // actually governs the row's client (see groupForEntry) — a rule written
-  // into group 1 for a client that lives in group 3 is a no-op the UI would
-  // otherwise report as a success.
+  // Every quick rule and the inspector's rule lookup are scoped to the group
+  // that actually governs the row's client (see groupForEntry) — a rule
+  // written into group 1 for a client that lives in group 3 is a no-op the
+  // UI would otherwise report as a success.
   const clients = useClients();
   const clientGroups = useMemo(() => clientGroupMap(clients.data), [clients.data]);
-  const whyGroupId = whyEntry ? groupForEntry(whyEntry, clientGroups) : null;
+  const selectedGroupId = selected ? groupForEntry(selected, clientGroups) : null;
 
-  const rules = useRules(whyGroupId ?? DEFAULT_GROUP_ID);
+  const rules = useRules(selectedGroupId ?? DEFAULT_GROUP_ID);
   const lists = useLists();
   const rulesById = useMemo(() => new Map((rules.data ?? []).map((r) => [r.id, r])), [rules.data]);
   const listsById = useMemo(() => new Map((lists.data ?? []).map((l) => [l.id, l])), [lists.data]);
 
-  const addRule = useAddRule();
-  const [rowStatus, setRowStatus] = useState<Record<number, RowStatus>>({});
+  // `mutate`, not the mutation object: useMutation hands back a fresh result
+  // object on every render, so closing over it would give `quickRule` a new
+  // identity ten times a second and quietly defeat the inspector's memo.
+  // `mutate` itself is stable for the life of the component.
+  const { mutate: addRule } = useAddRule();
+  const [rowStatus, setRowStatus] = useState<Record<string, RowStatus>>({});
 
   const quickRule = useCallback(
     (action: "allow" | "block", entry: QueryEntry) => {
@@ -664,12 +1104,13 @@ export function QueryLog() {
         toast.error(`Couldn't ${verb} ${entry.q_name} — this client's group is unknown`);
         return;
       }
-      setRowStatus((s) => ({ ...s, [entry.id]: "pending" }));
-      addRule.mutate(
+      const key = rowKey(entry);
+      setRowStatus((s) => ({ ...s, [key]: "pending" }));
+      addRule(
         { groupId, action, pattern: entry.q_name },
         {
           onSuccess: () => {
-            setRowStatus((s) => ({ ...s, [entry.id]: action === "block" ? "blocked" : "allowed" }));
+            setRowStatus((s) => ({ ...s, [key]: action === "block" ? "blocked" : "allowed" }));
             toast.success(
               action === "block" ? `Blocked ${entry.q_name}` : `Allowed ${entry.q_name}`,
             );
@@ -677,7 +1118,7 @@ export function QueryLog() {
           onError: () => {
             setRowStatus((s) => {
               const next = { ...s };
-              delete next[entry.id];
+              delete next[key];
               return next;
             });
             toast.error(`Couldn't ${verb} ${entry.q_name}`);
@@ -688,174 +1129,159 @@ export function QueryLog() {
     [addRule, clientGroups],
   );
 
-  const onBlock = useCallback((e: QueryEntry) => quickRule("block", e), [quickRule]);
-  const onAllow = useCallback((e: QueryEntry) => quickRule("allow", e), [quickRule]);
+  const copyRow = useCallback((entry: QueryEntry) => {
+    // Optional-chaining the call would `await undefined` and then toast a
+    // success for a copy that never happened — the clipboard API is absent
+    // outside secure contexts, which is exactly where a homelab instance
+    // reached over plain HTTP lives.
+    if (!navigator.clipboard) {
+      toast.error("Couldn't copy — this browser won't allow clipboard access here");
+      return;
+    }
+    navigator.clipboard.writeText(JSON.stringify(entry, null, 2)).then(
+      () => toast.success("Row JSON copied"),
+      () => toast.error("Couldn't copy the row JSON"),
+    );
+  }, []);
+
+  const onSelect = useCallback((entry: QueryEntry) => setSelected(entry), []);
+  const onClearSelection = useCallback(() => setSelected(null), []);
+  const patchFilters = useCallback(
+    (patch: Partial<FilterState>) => setFilters((f) => ({ ...f, ...patch })),
+    [],
+  );
+  const clearFilters = useCallback(() => setFilters(NO_FILTERS), []);
+  // The debounced `q` lags the box by 300ms, so "anything typed at all"
+  // isn't the same question as "anything is being searched for": the Clear
+  // cell has to appear the moment there is something to clear.
+  const anyFilterSet = filtered || filters.q.trim() !== "";
+
   // Without the client list, groupForEntry can only answer null for any row
-  // that names a client — which the quick rules report as "this client's group
-  // is unknown", a message about a *deleted* client. When the real cause is a
-  // /clients request that is still in flight or has failed, that's both wrong
-  // and unactionable, so the actions are held closed and say why instead.
+  // that names a client — which the quick rule reports as "this client's
+  // group is unknown", a message about a *deleted* client. When the real
+  // cause is a /clients request still in flight or failed, that's both wrong
+  // and unactionable, so the action is held closed and says why instead.
   const clientsUnavailable = clients.isPending || clients.isError;
+  const actionsDisabledReason = clients.isError
+    ? "Couldn't load clients — reload to write rules from here"
+    : "Loading clients…";
+
+  const selectedKey = selected ? rowKey(selected) : null;
   const gridMeta: QueryTableMeta = useMemo(
-    () => ({
-      rowStatus,
-      newRowId,
-      onBlock,
-      onAllow,
-      onWhy: openWhy,
-      actionsDisabled: clientsUnavailable,
-      actionsDisabledReason: clients.isError
-        ? "Couldn't load clients — reload to write rules from here"
-        : "Loading clients…",
-    }),
-    [rowStatus, newRowId, onBlock, onAllow, openWhy, clientsUnavailable, clients.isError],
+    () => ({ selectedKey, onSelect }),
+    [selectedKey, onSelect],
   );
 
   // Deduplicated by id, not a bare flat(): the search endpoint pages by
   // `ORDER BY id DESC LIMIT ? OFFSET ?` (internal/store/search.go) with the
   // running row count as the next offset, so any query logged between the
-  // page-1 and page-2 fetches shifts every row down one and page 2 re-returns
-  // the tail of page 1. getRowId is String(row.id), so those duplicates reach
-  // react-table and the virtualizer as duplicate keys — React logs a
-  // duplicate-key warning and the same domain renders twice around the page
-  // boundary. Deduping here rather than in the pageParam keeps hasNextPage
-  // correct: termination still reads the *raw* page length, so a page that is
-  // short only because it overlapped isn't mistaken for the end of results.
+  // page-1 and page-2 fetches shifts every row down one and page 2
+  // re-returns the tail of page 1. Those duplicates reach react-table and
+  // the virtualizer as duplicate keys: React logs a duplicate-key warning
+  // and the same domain renders twice around the boundary. Deduping here
+  // rather than in the pageParam keeps hasNextPage correct — termination
+  // still reads the *raw* page length, so a page that is short only because
+  // it overlapped isn't mistaken for the end of the results.
+  const pages = paged.data?.pages;
   const pagedEntries = useMemo(
-    () => Array.from(new Map((paged.data?.pages.flat() ?? []).map((e) => [e.id, e])).values()),
-    [paged.data],
+    () => Array.from(new Map((pages?.flat() ?? []).map((e) => [e.id, e])).values()),
+    [pages],
   );
-  const entries = hasActiveFilters ? pagedEntries : live.entries;
-  const isLoading = hasActiveFilters && paged.isPending;
-  const liveState = liveStateBadge(paused, live.state);
+  const entries = filtered ? pagedEntries : live.entries;
+  const isLoading = filtered && paged.isPending;
+  // The offset the last page was actually asked for: the sum of every page
+  // before it, which is exactly what getNextPageParam handed the fetch.
+  const offset = (pages ?? []).slice(0, -1).reduce((n, page) => n + page.length, 0);
 
-  let emptyState: ReactNode;
-  if (hasActiveFilters && paged.isError) {
-    emptyState = (
-      <EmptyState
-        icon={<CircleAlert />}
-        title="Couldn't load queries"
-        description="Try adjusting filters or refreshing the page."
-      />
-    );
-  } else if (hasActiveFilters) {
-    emptyState = (
-      <EmptyState
-        icon={<Search />}
-        title="No matching queries"
-        description="Try a different domain, decision, or clearing filters."
-      />
-    );
+  const tableRef = useRef<HTMLDivElement>(null);
+  const scrollToNewest = useCallback(() => {
+    const viewport = tableRef.current?.querySelector('[data-slot="scroll-area-viewport"]');
+    if (viewport) viewport.scrollTop = 0;
+  }, []);
+
+  let emptyMessage: ReactNode;
+  if (filtered && paged.isError) {
+    emptyMessage = "Couldn't load queries. Try adjusting the filters, or reload the page.";
+  } else if (filtered) {
+    emptyMessage = "No queries match these filters.";
+  } else if (paused) {
+    emptyMessage = "Paused. Resume the live tail to start appending rows.";
   } else {
-    emptyState = (
-      <EmptyState
-        icon={<Activity />}
-        title="Waiting for traffic"
-        description="Live queries will appear here as dnsaur resolves them."
-      />
-    );
+    emptyMessage = "Listening — queries appear here as dnsaur answers them.";
   }
 
   return (
-    <div className="flex flex-col gap-8">
-      <div className="flex flex-col gap-3">
-        <div>
-          <h1 className="text-2xl font-heading font-semibold text-foreground">Query Log</h1>
-          <p className="mt-1 text-sm text-muted-foreground">
-            Live and historical DNS queries, newest first.
-          </p>
-        </div>
+    // A column that claims the whole content area (the shell drops its
+    // padding for this route — see components/app-shell.tsx), so the split
+    // below can take every pixel left over and its vertical rule can run to
+    // the bottom of the window.
+    <div className="flex flex-1 flex-col font-mono">
+      {/* The chrome's own tab already says Query Log, and the design gives
+          the page no visible title — but a page still needs one heading. */}
+      <h1 className="sr-only">Query log</h1>
 
-        <div className="flex flex-wrap items-center justify-between gap-3">
-          <div className="flex flex-wrap items-center gap-2">
-            <InputGroup className="w-56">
-              <InputGroupAddon>
-                <Search className="size-4" />
-              </InputGroupAddon>
-              <InputGroupInput
-                aria-label="Search domains"
-                placeholder="Search domains…"
-                value={searchDraft}
-                onChange={(e) => setSearchDraft(e.target.value)}
-              />
-            </InputGroup>
-            <Filters
-              filters={rnuiFilters}
-              fields={FILTER_FIELDS}
-              onChange={setRnuiFilters}
-              size="sm"
-              trigger={
-                <Button type="button" variant="outline" size="sm">
-                  <FilterIcon />
-                  Filter
-                </Button>
-              }
-            />
-          </div>
-
-          {hasActiveFilters ? (
-            <Button
-              type="button"
-              variant="ghost"
-              size="sm"
-              onClick={() => {
-                setRnuiFilters([]);
-                setSearchDraft("");
-                setSearch("");
-              }}
-            >
-              Clear filters
-            </Button>
-          ) : (
-            <div className="flex items-center gap-3">
-              <StatusIndicator state={liveState.dotState} label={liveState.label} size="sm" />
-              {!paused && live.state === "failed" && (
-                <Button type="button" variant="outline" size="sm" onClick={live.reconnect}>
-                  Reconnect
-                </Button>
-              )}
-              <Switch
-                checked={!paused}
-                onCheckedChange={(checked) => setPaused(!checked)}
-                aria-label="Live tail"
-              />
-            </div>
-          )}
+      <div className="flex items-stretch border-b border-border">
+        <FilterBar value={filters} onChange={patchFilters} />
+        <div className="flex shrink-0 items-stretch">
+          {anyFilterSet && <ClearFiltersCell onClear={clearFilters} />}
+          <StreamState
+            paused={paused}
+            filtered={filtered}
+            state={live.state}
+            onReconnect={live.reconnect}
+          />
         </div>
       </div>
 
-      <Separator />
-
-      <QueryDataGridPanel
-        entries={entries}
-        isLoading={isLoading}
-        emptyState={emptyState}
-        meta={gridMeta}
-        onFetchMore={hasActiveFilters ? () => void paged.fetchNextPage() : undefined}
-        isFetchingMore={paged.isFetchingNextPage}
-        hasMore={hasActiveFilters ? paged.hasNextPage : undefined}
-      />
-
-      <Drawer open={whyOpen} onOpenChange={setWhyOpen} direction="right">
-        <DrawerContent>
-          {whyEntry && (
-            <>
-              <DrawerHeader>
-                <DrawerTitle>Why this decision?</DrawerTitle>
-                <DrawerDescription className="font-mono">{whyEntry.q_name}</DrawerDescription>
-              </DrawerHeader>
-              <div className="flex flex-col gap-4 overflow-y-auto px-4 pb-4">
-                <WhyContent
-                  entry={whyEntry}
-                  rule={whyEntry.rule_id > 0 ? rulesById.get(whyEntry.rule_id) : undefined}
-                  ruleLoading={rules.isPending || rules.isFetching}
-                  list={whyEntry.list_id > 0 ? listsById.get(whyEntry.list_id) : undefined}
-                />
-              </div>
-            </>
+      <div className="flex flex-1 flex-col lg:flex-row lg:items-stretch">
+        <div ref={tableRef} className="flex min-w-0 flex-1 flex-col">
+          {/* The one surface this page never had: a background or next-page
+              fetch that fails with rows still in hand used to render
+              nothing at all, leaving a stale table that looked live. Every
+              other screen shows this over still-valid data. */}
+          {paged.isError && pagedEntries.length > 0 && (
+            <Prose className="border-b border-border">
+              <StaleDataAlert
+                what="the query log"
+                onRetry={() => void paged.refetch()}
+                isRetrying={paged.isFetching}
+              />
+            </Prose>
           )}
-        </DrawerContent>
-      </Drawer>
+          <QueryTable
+            entries={entries}
+            isLoading={isLoading}
+            emptyMessage={emptyMessage}
+            meta={gridMeta}
+            onFetchMore={filtered ? () => void paged.fetchNextPage() : undefined}
+            isFetchingMore={paged.isFetchingNextPage}
+            hasMore={filtered ? paged.hasNextPage : undefined}
+          />
+        </div>
+
+        <Inspector
+          entry={selected}
+          rule={selected && selected.rule_id > 0 ? rulesById.get(selected.rule_id) : undefined}
+          ruleLoading={rules.isPending || rules.isFetching}
+          list={selected && selected.list_id > 0 ? listsById.get(selected.list_id) : undefined}
+          status={selectedKey === null ? undefined : rowStatus[selectedKey]}
+          actionsDisabled={clientsUnavailable}
+          actionsDisabledReason={actionsDisabledReason}
+          onClose={onClearSelection}
+          onQuickRule={quickRule}
+          onCopy={copyRow}
+        />
+      </div>
+
+      <Footer
+        rows={entries.length}
+        filtered={filtered}
+        offset={offset}
+        hasMore={paged.hasNextPage}
+        isFetchingMore={paged.isFetchingNextPage}
+        onOlder={() => void paged.fetchNextPage()}
+        onNewer={scrollToNewest}
+      />
     </div>
   );
 }

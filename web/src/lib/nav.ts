@@ -19,6 +19,23 @@ import {
  */
 export const DASHBOARD_PATH = "/";
 
+/**
+ * The query log. Recognised for the same two reasons the dashboard is: the
+ * chrome hangs that screen's own cells off it (components/top-nav.tsx), and
+ * the shell drops its page padding for it (components/app-shell.tsx).
+ */
+export const QUERY_LOG_PATH = "/queries";
+
+/**
+ * Screens that own the whole content area rather than sitting inside the
+ * shell's gutter: both are full-bleed grids of hairline-separated bands, and
+ * their rules have to meet the viewport edges instead of floating in a 24px
+ * frame.
+ */
+export function isFullBleedRoute(pathname: string): boolean {
+  return pathname === DASHBOARD_PATH || pathname === QUERY_LOG_PATH;
+}
+
 export interface NavItem {
   to: string;
   label: string;

@@ -12,7 +12,7 @@ import { renderWithProviders } from "../test/render";
 import { FakeEventSource } from "../test/fake-event-source";
 import { makeQueryClient } from "../lib/query-client";
 import { useTheme } from "../lib/theme";
-import type { QueryEntry } from "../api/types";
+import type { QueryEntry, TimelineBucket } from "../api/types";
 import { Dashboard } from "./dashboard";
 
 // ECharts (which rnui's BarChart wraps) needs a real 2D canvas context,
@@ -871,4 +871,62 @@ test("a new timeline still re-renders the chart", async () => {
 
   await waitFor(() => expect(seriesEl("Resolved").textContent).toContain("99"));
   expect(chartRenders.count).toBeGreaterThan(before);
+});
+
+// --- reserved height ---------------------------------------------------------
+
+// A fresh instance sits with no traffic in the window for its first hour, and
+// the hourly stats tables lag the query log by up to a minute — so the
+// loading → empty → populated sequence is *guaranteed* to be watched. Letting
+// the empty message collapse to one line of text shunted LIVE QUERIES, the
+// whole right rail and the bottom rule ~200px up the page and dropped them
+// back the moment the first bucket landed. jsdom has no layout to measure, so
+// what's asserted is the mechanism: every state renders into the same box.
+function plotFrame(): HTMLElement {
+  const box = document.querySelector('[data-slot="query-volume-plot"]');
+  if (!box) throw new Error("the query volume section rendered no plot frame");
+  return box as HTMLElement;
+}
+
+test("the query volume section reserves its height while loading, when empty, and when drawn", async () => {
+  let buckets: TimelineBucket[] = [];
+  server.use(http.get("/api/v1/stats/timeline", () => HttpResponse.json(buckets)));
+
+  const client = makeQueryClient();
+  render(
+    <QueryClientProvider client={client}>
+      <MemoryRouter>
+        <Dashboard />
+      </MemoryRouter>
+    </QueryClientProvider>,
+  );
+
+  // 1. loading — the skeleton is inside the box, not instead of it.
+  expect(plotFrame().className).toContain("h-64");
+
+  // 2. empty — the message is inside the same box.
+  await screen.findByText(/no query activity yet/i);
+  expect(plotFrame().className).toContain("h-64");
+  expect(plotFrame()).toContainElement(screen.getByText(/no query activity yet/i));
+
+  // 3. populated — so is the chart.
+  buckets = [{ bucket: hourStart(0), decisions: { forwarded: 9, blocked: 1 } }];
+  await act(async () => {
+    await client.invalidateQueries({ queryKey: ["stats", "timeline"] });
+  });
+  await screen.findByTestId("timeline-chart");
+  expect(plotFrame().className).toContain("h-64");
+  expect(plotFrame()).toContainElement(screen.getByTestId("timeline-chart"));
+});
+
+test("an empty rail panel keeps the height its rows would have taken", async () => {
+  server.use(http.get("/api/v1/stats/top", () => HttpResponse.json([])));
+
+  renderWithProviders(<Dashboard />);
+
+  await screen.findByText(/nothing blocked in this window yet/i);
+  const bodies = [...document.querySelectorAll('[data-slot="rail-body"]')];
+  // TOP BLOCKED holds 6 rows, TOP CLIENTS 5 — 32px each, so 48 and 40
+  // spacing units. Empty must not collapse either of them.
+  expect(bodies.map((b) => b.className)).toEqual(["min-h-48", "min-h-40"]);
 });

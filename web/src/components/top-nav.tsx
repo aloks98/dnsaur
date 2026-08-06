@@ -20,8 +20,10 @@ import {
   findActiveGroup,
   isNavItemActive,
   NAV_GROUPS,
+  QUERY_LOG_PATH,
   type NavGroup,
 } from "../lib/nav";
+import { useLiveTailPaused } from "../lib/live-tail";
 import { parseWindow, WINDOW_PARAM, WINDOWS } from "../lib/stats-window";
 import { DnsaurLogo } from "./dnsaur-logo";
 import { PauseControl } from "./pause-control";
@@ -77,10 +79,11 @@ const CELL_QUIET = "text-muted-foreground hover:text-foreground";
 export function TopNav({ onOpenCommandPalette }: TopNavProps) {
   const { pathname } = useLocation();
   const activeGroup = findActiveGroup(pathname);
-  // Row 2's right-hand cells are contextual, and both of these are about the
-  // dashboard: a stats window has nothing to govern on Settings, and a
-  // "view query log" CTA is noise on the query log itself.
+  // Row 2's right-hand cells are contextual. The dashboard's pair (a stats
+  // window and the "view query log" CTA) govern nothing on Settings, and the
+  // CTA is noise on the query log itself — which gets its own pair instead.
   const onDashboard = pathname === DASHBOARD_PATH;
+  const onQueryLog = pathname === QUERY_LOG_PATH;
 
   return (
     <header
@@ -164,8 +167,67 @@ export function TopNav({ onOpenCommandPalette }: TopNavProps) {
             </NavLink>
           </div>
         )}
+
+        {onQueryLog && (
+          <div className="ml-auto flex shrink-0 items-stretch">
+            {/* Why the log can lag what you just watched scroll past: the
+                table's *filtered* mode reads the database, and rows reach
+                it only after the logger's batched flush. Said once, here,
+                rather than left for someone to discover as a bug. */}
+            <span
+              className={cn(CELL, "border-l border-l-border text-muted-foreground max-md:sr-only")}
+            >
+              Table trails the tail by ~1s
+            </span>
+            <LiveTailCell />
+          </div>
+        )}
       </div>
     </header>
+  );
+}
+
+/**
+ * The query log's CTA cell: the design's single filled cell, spent here on
+ * the one control this screen is actually about.
+ *
+ * A `switch` rather than two buttons or a link — it has exactly two states,
+ * and the cell shows both of them (`LIVE · PAUSE`) with the one you're not
+ * in dimmed, so the control says what it will do without needing a tooltip.
+ * The flag itself lives in lib/live-tail.ts; see there for why it isn't
+ * state in the shell or in the URL.
+ */
+function LiveTailCell() {
+  const { paused, setPaused } = useLiveTailPaused();
+
+  return (
+    <button
+      type="button"
+      role="switch"
+      aria-checked={!paused}
+      // The visible text is the pair of states; the accessible name still
+      // has to say what the pair is *of*.
+      aria-label="Live tail"
+      onClick={() => setPaused(!paused)}
+      className={cn(
+        CELL,
+        "gap-2 border-l border-l-border bg-primary font-semibold text-primary-foreground",
+        "hover:bg-primary/90",
+      )}
+    >
+      <span
+        aria-hidden="true"
+        className={cn(
+          "size-2 shrink-0 border border-primary-foreground",
+          !paused && "bg-primary-foreground",
+        )}
+      />
+      <span className={cn(paused && "opacity-60")}>Live</span>
+      <span aria-hidden="true" className="opacity-60">
+        ·
+      </span>
+      <span className={cn(!paused && "opacity-60")}>Pause</span>
+    </button>
   );
 }
 

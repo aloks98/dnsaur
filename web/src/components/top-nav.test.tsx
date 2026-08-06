@@ -360,4 +360,31 @@ test("no other screen gets the window selector or the CTA", async () => {
 
   expect(screen.queryByRole("group", { name: "Time window" })).not.toBeInTheDocument();
   expect(screen.queryByRole("link", { name: /view query log/i })).not.toBeInTheDocument();
+  expect(screen.queryByRole("switch", { name: /live tail/i })).not.toBeInTheDocument();
+});
+
+// The query log spends the same filled cell on its own CTA — the one control
+// that screen is actually about. The flag it toggles lives in
+// lib/live-tail.ts, because the stream it governs is consumed by the routed
+// page below rather than by the chrome.
+test("the query log's chrome carries the trailing note and the live/pause cell", async () => {
+  renderTopNav({ route: "/queries" });
+
+  expect(screen.getByText(/table trails the tail by ~1s/i)).toBeInTheDocument();
+  // Not on the dashboard, which has its own pair.
+  expect(screen.queryByRole("link", { name: /view query log/i })).not.toBeInTheDocument();
+
+  const toggle = screen.getByRole("switch", { name: /live tail/i });
+  expect(toggle.className).toContain("bg-primary");
+  // The cell shows both states so it says what it will do; the accessible
+  // name says what the pair is *of*.
+  // Flex `gap-2` does the spacing, so the text nodes sit flush.
+  expect(toggle.textContent).toBe("Live·Pause");
+  expect(toggle).toHaveAttribute("aria-checked", "true");
+
+  fireEvent.click(toggle);
+  await waitFor(() => expect(toggle).toHaveAttribute("aria-checked", "false"));
+
+  fireEvent.click(toggle);
+  await waitFor(() => expect(toggle).toHaveAttribute("aria-checked", "true"));
 });

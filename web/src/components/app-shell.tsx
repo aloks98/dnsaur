@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { Outlet, useLocation } from "react-router";
 import { cn } from "@e412/rnui-react";
-import { DASHBOARD_PATH } from "../lib/nav";
+import { isFullBleedRoute } from "../lib/nav";
 import { CommandPalette } from "./command-palette";
 import { ErrorBoundary } from "./error-boundary";
 import { TopNav } from "./top-nav";
@@ -16,13 +16,13 @@ export function AppShell() {
   return (
     <div className="flex min-h-screen flex-col bg-background">
       <TopNav onOpenCommandPalette={() => setPaletteOpen(true)} />
-      {/* Every page gets the shell's gutter except the dashboard, which is a
-          full-bleed grid of hairline-separated bands — its rules have to
-          meet the viewport edges, not float inside a 24px frame. `flex
-          flex-col` is what lets that page claim the remaining height, so
-          its vertical rule runs to the bottom of the window however few
-          rows it has. */}
-      <main className={cn("flex flex-1 flex-col", pathname !== DASHBOARD_PATH && "p-6")}>
+      {/* Every page gets the shell's gutter except the dashboard and the
+          query log, which are full-bleed grids of hairline-separated bands —
+          their rules have to meet the viewport edges, not float inside a
+          24px frame. `flex flex-col` is what lets those pages claim the
+          remaining height, so their vertical rules run to the bottom of the
+          window however few rows they have. */}
+      <main className={cn("flex flex-1 flex-col", !isFullBleedRoute(pathname) && "p-6")}>
         {/* Keyed on the path: this shell is the persistent layout element,
             so one instance of the boundary outlives every sibling route
             change. Without the key, a page that throws once leaves

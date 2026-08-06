@@ -205,10 +205,10 @@ function StatStrip({
         </Prose>
       )}
       <div className="grid grid-cols-2 sm:grid-cols-4">
-        <StatCell label="Total queries" value={total.toLocaleString()} />
+        <StatCell label="Queries" value={total.toLocaleString()} />
         <StatCell label="Blocked" value={pct(blocked, total)} tone="text-chart-blocked" />
-        <StatCell label="Cache hit rate" value={pct(cached, total)} />
-        <StatCell label="Active clients" value={clients.toLocaleString()} />
+        <StatCell label="Cache" value={pct(cached, total)} />
+        <StatCell label="Clients" value={clients.toLocaleString()} />
       </div>
     </section>
   );
@@ -437,8 +437,8 @@ const VolumeChart = memo(function VolumeChart({
 
   return (
     // The plot needs a real pixel height — ECharts measures its container —
-    // and `h-64` is where that height is decided, so the chart fills it.
-    <div className="h-64">
+    // and PlotFrame is where that height is decided, so the chart fills it.
+    <div className="h-full">
       <BarChart
         // `categories` + `series` supersede it; BarChart's prop type still
         // requires the field.
@@ -453,6 +453,31 @@ const VolumeChart = memo(function VolumeChart({
   );
 });
 
+/**
+ * The box every state of this section renders into.
+ *
+ * A fresh instance sits with no traffic in the window for its first hour,
+ * and the stats tables lag the query log by up to a minute — so the
+ * loading → empty → populated sequence is *guaranteed* to be watched, not a
+ * corner case. Letting the empty message collapse to one line of text
+ * shunted LIVE QUERIES, the whole right rail and the bottom rule ~200px up
+ * the page and then dropped them back the moment the first bucket landed.
+ * So the height is the section's, not the chart's: skeleton, error, empty
+ * and plot all fill the same 16rem.
+ */
+function PlotFrame({ children }: { children: ReactNode }) {
+  return (
+    <div className="px-4 pb-3">
+      {/* Named so the height reservation is assertable: under jsdom there is
+          no layout to measure, so the test asserts that every state really
+          does render into this one box. */}
+      <div data-slot="query-volume-plot" className="h-64">
+        {children}
+      </div>
+    </div>
+  );
+}
+
 /** Turns buckets into series once, and wraps the plot in its text
  * alternative. Split out so the memoised chart's array props are computed
  * in a hook rather than inline in a branch. */
@@ -466,18 +491,12 @@ function VolumeBody({ buckets, hours }: { buckets: TimelineBucket[]; hours: numb
   const totalBlocked = blocked.reduce((s, n) => s + n, 0);
 
   return (
-    <div className="px-4 pb-3">
-      <figure
-        aria-label={`Query volume over ${categories.length} hourly buckets: ${(totalResolved + totalBlocked).toLocaleString()} queries — ${totalResolved.toLocaleString()} resolved, ${totalBlocked.toLocaleString()} blocked`}
-      >
-        <VolumeChart
-          categories={categories}
-          resolved={resolved}
-          blocked={blocked}
-          colors={colors}
-        />
-      </figure>
-    </div>
+    <figure
+      className="h-full"
+      aria-label={`Query volume over ${categories.length} hourly buckets: ${(totalResolved + totalBlocked).toLocaleString()} queries — ${totalResolved.toLocaleString()} resolved, ${totalBlocked.toLocaleString()} blocked`}
+    >
+      <VolumeChart categories={categories} resolved={resolved} blocked={blocked} colors={colors} />
+    </figure>
   );
 }
 
@@ -490,33 +509,29 @@ function QueryVolume({
 }) {
   let body: ReactNode;
   if (timeline.isPending) {
-    body = (
-      <div className="px-4 pb-3">
-        <Skeleton className="h-64 w-full" />
-      </div>
-    );
+    body = <Skeleton className="h-full w-full" />;
   } else if (timeline.data === undefined) {
     // isPending is already ruled out, so no data means the *first* load
     // failed — there is genuinely nothing to draw. A background poll that
     // fails with buckets still cached takes the StaleDataAlert path below.
     body = (
-      <Prose>
+      <div className="flex h-full flex-col justify-center font-sans">
         <Alert variant="destructive">
           <CircleAlert />
           <AlertTitle>Couldn&apos;t load the timeline</AlertTitle>
         </Alert>
-      </Prose>
+      </div>
     );
   } else if (timeline.data.length === 0) {
     // Deliberately not a zero-filled flat chart: an axis of empty hours
     // claims dnsaur was up and quiet, which on a fresh instance is a guess.
     body = (
-      <Prose>
+      <div className="flex h-full items-center justify-center font-sans">
         <p className="text-sm text-muted-foreground">
           No query activity yet. Once dnsaur resolves queries in this window, blocked and resolved
           volume shows up here.
         </p>
-      </Prose>
+      </div>
     );
   } else {
     body = <VolumeBody buckets={timeline.data} hours={hours} />;
@@ -543,7 +558,7 @@ function QueryVolume({
           />
         </Prose>
       )}
-      {body}
+      <PlotFrame>{body}</PlotFrame>
     </section>
   );
 }
@@ -862,18 +877,32 @@ function RailBody({
   query,
   emptyText,
   what,
+  rows,
+  reserve,
   children,
 }: {
   query: UseQueryResult<TopEntry[], Error>;
   emptyText: string;
   what: string;
+  /** How many rows this panel can hold — the skeleton draws that many. */
+  rows: number;
+  /**
+   * The height that many rows occupy, so loading → empty → populated never
+   * moves the panel below (or the rule under the rail). A RailRow is exactly
+   * `py-2` plus a `text-xs` line box = 32px, i.e. 8 spacing units per row;
+   * the class has to be a literal for Tailwind to see it, so the caller
+   * spells it out next to its row count.
+   */
+  reserve: string;
   children: (entries: TopEntry[]) => ReactNode;
 }) {
   if (query.isPending) {
     return (
-      <div className="flex flex-col gap-2 px-3.5 py-3">
-        {[0, 1, 2, 3].map((i) => (
-          <Skeleton key={i} className="h-4 w-full" />
+      <div data-slot="rail-body" className={reserve} aria-hidden="true">
+        {Array.from({ length: rows }).map((_, i) => (
+          <div key={i} className="px-3.5 py-2">
+            <Skeleton className="h-4 w-full" />
+          </div>
         ))}
       </div>
     );
@@ -882,7 +911,10 @@ function RailBody({
     // First load failed outright. A poll that fails with rows still cached
     // keeps them on screen under the StaleDataAlert below instead.
     return (
-      <div className="px-3.5 py-3 font-sans text-sm text-muted-foreground">
+      <div
+        data-slot="rail-body"
+        className={cn(reserve, "px-3.5 py-3 font-sans text-sm text-muted-foreground")}
+      >
         Couldn&apos;t load this list.
       </div>
     );
@@ -898,11 +930,13 @@ function RailBody({
           />
         </div>
       )}
-      {query.data.length === 0 ? (
-        <p className="px-3.5 py-3 font-sans text-sm text-muted-foreground">{emptyText}</p>
-      ) : (
-        <ul>{children(query.data)}</ul>
-      )}
+      <div data-slot="rail-body" className={reserve}>
+        {query.data.length === 0 ? (
+          <p className="px-3.5 py-3 font-sans text-sm text-muted-foreground">{emptyText}</p>
+        ) : (
+          <ul>{children(query.data)}</ul>
+        )}
+      </div>
     </>
   );
 }
@@ -1055,6 +1089,8 @@ export function Dashboard() {
               query={topBlocked}
               what="top blocked"
               emptyText="Nothing blocked in this window yet."
+              rows={TOP_BLOCKED_N}
+              reserve="min-h-48"
             >
               {(entries) => {
                 const max = maxCount(entries);
@@ -1090,6 +1126,8 @@ export function Dashboard() {
               query={topClients}
               what="top clients"
               emptyText="No clients have queried in this window yet."
+              rows={TOP_CLIENTS_N}
+              reserve="min-h-40"
             >
               {(entries) => {
                 const max = maxCount(entries);
