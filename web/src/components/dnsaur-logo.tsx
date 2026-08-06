@@ -4,8 +4,22 @@ import { type Theme, useTheme } from "../lib/theme";
 // Palette + geometry are locked by docs/superpowers/specs/2026-08-05-logo-design.md.
 // Keep in sync with web/public/favicon.svg and docs/assets/logo*.svg.
 const PALETTES = {
-  light: { tile: "#2FE26F", body: "#101010", spike: "#0A5B2C", shade: "#000000", eye: "#F2FBF5", pupil: "#101010" },
-  dark: { tile: "#0F2B1C", body: "#2FE26F", spike: "#A9F5C7", shade: "#1FA84F", eye: "#F2FBF5", pupil: "#07140C" },
+  light: {
+    tile: "#2FE26F",
+    body: "#101010",
+    spike: "#0A5B2C",
+    shade: "#000000",
+    eye: "#F2FBF5",
+    pupil: "#101010",
+  },
+  dark: {
+    tile: "#0F2B1C",
+    body: "#2FE26F",
+    spike: "#A9F5C7",
+    shade: "#1FA84F",
+    eye: "#F2FBF5",
+    pupil: "#07140C",
+  },
 } as const satisfies Record<Theme, Record<string, string>>;
 
 const SPIKE = "M -4.4 3.6 Q 0 -8 4.4 3.6 Q 0 6.4 -4.4 3.6 Z";
@@ -37,6 +51,12 @@ export function DnsaurLogo({
       viewBox="0 0 64 64"
       width={size}
       height={size}
+      // prefer-tag-over-role wants an <img> here, which this cannot be: the
+      // mark is inline SVG so it can read the live theme palette and scope a
+      // clipPath to a useId. role="img" + aria-label is the pattern that
+      // makes an inline SVG announce as a single graphic; dropping the role
+      // would leave the aria-label unreliably exposed, so suppress instead.
+      // oxlint-disable-next-line jsx-a11y/prefer-tag-over-role
       role="img"
       aria-label="dnsaur logo"
       className={className}

@@ -161,9 +161,9 @@ type QueryLogEntry struct {
 // QueryLogFilter specifies optional filters for query log search.
 // Zero values mean no constraint. Limit 0 defaults to 100, capped at 1000.
 type QueryLogFilter struct {
-	FromMs, ToMs                          int64
+	FromMs, ToMs                             int64
 	ClientIP, QNameContains, Decision, QType string
-	Limit, Offset                         int
+	Limit, Offset                            int
 }
 
 // ClientStore manages client groups and clients.
