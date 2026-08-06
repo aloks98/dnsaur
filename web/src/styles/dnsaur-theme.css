@@ -125,7 +125,13 @@
      rnui's default single-series chart lands on the design's hero colour;
      2..5 fill out a distinguishable ramp for anything multi-series. */
   --chart-blocked: oklch(0.2622 0.0446 157.77); /* #0f2b1c locked */
-  --chart-resolved: oklch(0.9082 0.0983 157.22); /* #a9f5c7 locked */
+  /* Deepened from the locked #a9f5c7. As a bar fill that mint reads 1.21:1
+     against the #f7faf8 plot — effectively invisible, so a stacked bar
+     looked like its blocked cap floating in mid-air. This keeps the hue
+     and stays far lighter than blocked (6.07:1 apart) at 2.38:1 on the
+     background. The locked mint is still used verbatim for the list
+     magnitude fills, where it sits under text rather than alone. */
+  --chart-resolved: oklch(0.7167 0.1382 157.34); /* #43b87d */
   --chart-1: var(--chart-blocked);
   --chart-2: oklch(0.45 0.1 158);
   --chart-3: oklch(0.6 0.1 200);
@@ -209,7 +215,11 @@
   --ring: oklch(0.6 0.12 156);
 
   --chart-blocked: oklch(0.8014 0.1844 155.96); /* #2ce08a locked */
-  --chart-resolved: oklch(0.2826 0.0101 151.46); /* #262b27 locked */
+  /* Deepened from the locked #262b27, which is 1.35:1 against the
+     #0c0d0c plot — the resolved half of every stacked bar was invisible.
+     3.09:1 clears WCAG 1.4.11's bar for a graphical object, and 3.65:1
+     from the emerald blocked cap keeps the two readable apart. */
+  --chart-resolved: oklch(0.4436 0.0243 158.35); /* #52645a */
   --chart-1: var(--chart-blocked);
   --chart-2: oklch(0.72 0.13 178);
   --chart-3: oklch(0.7 0.11 240);
