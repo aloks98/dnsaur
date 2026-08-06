@@ -11,22 +11,34 @@ import {
 import { getCoreRowModel, useReactTable, type ColumnDef, type Table } from "@tanstack/react-table";
 import { toast } from "sonner";
 import {
+  Alert,
+  AlertDescription,
+  AlertTitle,
+  Badge,
+  Button,
   cn,
   DataGrid,
   DataGridContainer,
   DataGridScrollArea,
   DataGridTableVirtual,
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
+  DateSelector,
+  formatDateValue,
+  Input,
+  NativeSelect,
+  NativeSelectOption,
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
   Skeleton,
+  type BadgeProps,
+  type DateSelectorPeriodType,
+  type DateSelectorValue,
 } from "@e412/rnui-react";
 import type { Client, List, QueryEntry, Rule } from "../api/types";
 import type { SseState } from "../api/sse";
 import { StaleDataAlert } from "../components/stale-data-alert";
 import { useClients } from "../hooks/use-clients";
+import { useGroups } from "../hooks/use-groups";
 import { useAddRule, useRules, useLists } from "../hooks/use-filters";
 import {
   DEFAULT_SEARCH_LIMIT,
@@ -49,6 +61,10 @@ const DEFAULT_GROUP_ID = 1;
  * an estimate — the virtualizer measures for real once a row is mounted. */
 const ROW_HEIGHT_ESTIMATE = 29;
 
+/** What the log renders where a value genuinely isn't knowable. Never a
+ * guess, and never a blank cell that reads as a rendering bug. */
+const UNKNOWN = "—";
+
 /**
  * Render counters, exported as a test seam rather than as telemetry.
  *
@@ -57,7 +73,7 @@ const ROW_HEIGHT_ESTIMATE = 29;
  * That is not a theoretical cost: the identical problem on the dashboard ate
  * the timeline chart's first-hover tooltip, because re-applying an ECharts
  * option tears down its hover state. Here the two expensive, tail-irrelevant
- * subtrees are the filter bar (six controls, one of them a popup menu) and
+ * subtrees are the filter bar (four controls plus a date-picker popover) and
  * the inspector rail.
  *
  * `memo` only pays off if every prop those two receive is referentially
@@ -91,13 +107,28 @@ function clientGroupMap(clients: Client[] | undefined): Map<number, number> {
   return new Map((clients ?? []).map((c) => [c.id, c.group_id]));
 }
 
+/**
+ * `client_id` → that client's name, for the table's HOSTNAME column.
+ *
+ * Keyed on the id rather than on the IP: `client_id` is a real foreign key
+ * (internal/qlog/qlog.go writes whatever the registry matched), so it
+ * resolves a name even for a client whose matcher is a CIDR and therefore
+ * never equals any single `client_ip`. Rows whose `client_id` is 0, or names
+ * a client deleted since the query was logged, are simply absent from the
+ * map — the column renders UNKNOWN for those rather than inventing a name.
+ */
+function clientNameMap(clients: Client[] | undefined): Map<number, string> {
+  return new Map((clients ?? []).map((c) => [c.id, c.name]));
+}
+
 // --- decisions ---------------------------------------------------------------
 
 /**
- * Per-decision tint. The resolver's decision vocabulary is in
+ * Per-decision tint for the *table*. The resolver's decision vocabulary is in
  * internal/dnssrv/pipeline.go; this is the design's flat, text-only reading
- * of it — no badges, no icons, because a column of twelve tinted pills is the
- * loudest thing on a page whose whole point is scanning a thousand rows.
+ * of it — no badges, no icons, because a column of a thousand tinted pills is
+ * the loudest thing on a page whose whole point is scanning a thousand rows.
+ * The one badge on this screen is the inspector's chip, below.
  *
  * There is no `allowed` entry, here or in the filter below, on purpose:
  * DecisionAllowed exists in the Go enum but is never assigned. An allow rule
@@ -116,11 +147,44 @@ const DECISION_TONE: Record<string, string> = {
   local: "text-primary",
 };
 
+/**
+ * The inspector chip's tone, as an rnui Badge variant.
+ *
+ * The rail shows one row at a time, so a chip here costs nothing and reads
+ * far faster than a word in a tint. The "-light" variants are the ones whose
+ * foreground tokens are tuned for a 10% wash of their own colour (see
+ * styles/dnsaur-theme.css) — the solid ones hardcode `text-white`, which
+ * this theme's dark mode can't carry.
+ */
+const DECISION_BADGE: Record<string, NonNullable<BadgeProps["variant"]>> = {
+  blocked: "destructive-light",
+  error: "destructive-light",
+  stale: "warning-light",
+  local: "primary-light",
+  cached: "secondary",
+  forwarded: "outline",
+};
+
 /** The decisions the resolver actually writes — the filter's whole vocabulary. */
 const DECISIONS = ["blocked", "forwarded", "cached", "stale", "local", "error"];
 
+/**
+ * The record types worth offering as a fixed list.
+ *
+ * `q_type` is open-ended in the contract (whatever miekg/dns names), but a
+ * free-text box here was a licence to type `a` and get nothing back — the
+ * server matches exactly, uppercase as stored. These five are what a home
+ * resolver actually answers in bulk; anything rarer is still reachable
+ * through the domain search.
+ */
+const QUERY_TYPES = ["A", "AAAA", "HTTPS", "PTR", "TXT"];
+
 function decisionTone(decision: string): string {
   return DECISION_TONE[decision] ?? "text-muted-foreground";
+}
+
+function decisionBadge(decision: string): NonNullable<BadgeProps["variant"]> {
+  return DECISION_BADGE[decision] ?? "outline";
 }
 
 // --- formatting --------------------------------------------------------------
@@ -159,26 +223,8 @@ function Prose({ className, children }: { className?: string; children: ReactNod
   return <div className={cn("px-4 py-3 font-sans", className)}>{children}</div>;
 }
 
-/**
- * Every cell in the filter row: a hairline on the right, one gutter.
- *
- * `shrink-0` and `overflow-hidden` together are what keep the row honest.
- * Six cells plus a status readout do not fit 1280px — the two native
- * `datetime-local` controls alone are ~200px each — so the row scrolls
- * (`dnsaur-scroll-x`, the same treatment both nav strips get) rather than
- * squeezing cells to nothing. Without `shrink-0` the free-text cell
- * collapsed to 53px and its content spilled straight over the DECISION and
- * TYPE cells beside it.
- */
-const FILTER_CELL =
-  "flex shrink-0 items-center gap-3 overflow-hidden border-r border-border px-4 py-2";
-
-/** The bare, cell-shaped skin every filter control wears — the row is a strip
- * of divided cells, and a bordered input dropped into it looks like something
- * that fell in from another screen. */
-const FILTER_INPUT =
-  "min-w-0 flex-1 bg-transparent text-xs text-foreground placeholder:text-muted-foreground " +
-  "outline-none focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-ring";
+/** The label beside each filter control. */
+const FILTER_LABEL = "shrink-0 text-xs tracking-widest text-muted-foreground uppercase";
 
 // --- filter state ------------------------------------------------------------
 
@@ -187,30 +233,22 @@ interface FilterState {
   decision: string;
   type: string;
   client: string;
-  /** `datetime-local` values — local wall-clock, converted to epoch ms below. */
-  from: string;
-  to: string;
+  /** Inclusive epoch-ms bounds, straight from the DateSelector — the shape
+   * `GET /queries` wants, applied only when set (internal/store/search.go). */
+  from?: number;
+  to?: number;
 }
 
-const NO_FILTERS: FilterState = { q: "", decision: "", type: "", client: "", from: "", to: "" };
-
-/** A `datetime-local` value is local wall-clock with no zone; `new Date(v)`
- * reads it as local time, which is what the user meant. An empty or
- * half-typed value is simply no bound. */
-function toEpochMs(value: string): number | undefined {
-  if (value === "") return undefined;
-  const ms = new Date(value).getTime();
-  return Number.isNaN(ms) ? undefined : ms;
-}
+const NO_FILTERS: FilterState = { q: "", decision: "", type: "", client: "" };
 
 function toSearchFilter(filters: FilterState, q: string): QuerySearchFilter {
   return {
     q: q.trim() || undefined,
     decision: filters.decision || undefined,
-    type: filters.type.trim() || undefined,
-    client: filters.client.trim() || undefined,
-    from: toEpochMs(filters.from),
-    to: toEpochMs(filters.to),
+    type: filters.type || undefined,
+    client: filters.client || undefined,
+    from: filters.from,
+    to: filters.to,
   };
 }
 
@@ -218,35 +256,154 @@ function isFiltered(filter: QuerySearchFilter): boolean {
   return Object.values(filter).some((value) => value !== undefined);
 }
 
+// --- the time range ----------------------------------------------------------
+
+/**
+ * Only day and month.
+ *
+ * `qlog.retention_days` defaults to 90 (docs/ui-contract.md §5), so a
+ * quarter is already at the edge of what can still be in the table and a
+ * half-year or year selects a window whose rows the pruner deleted. Offering
+ * those would be the `allowed`-filter mistake again: a control that looks
+ * like it narrows the search and can only ever return nothing.
+ */
+const RANGE_PERIODS: DateSelectorPeriodType[] = ["day", "month"];
+
+/**
+ * And only two years, for the same reason: 90 days of retention can straddle
+ * a new year but nothing further back, so a year picker offering 2015 offers
+ * a decade of guaranteed-empty results.
+ */
+const THIS_YEAR = new Date().getFullYear();
+
+/**
+ * ISO, not the component's `MM/dd/yyyy` default.
+ *
+ * Every other date and number on this page is mono and unambiguous, and
+ * `03/04` means two different days either side of the Atlantic — which is a
+ * coin flip this screen has no way to resolve for a homelab that could be
+ * anywhere. `inputHint` alongside it is what makes the box typeable at all
+ * (the component leaves it readonly without one), so a date can be entered
+ * rather than clicked to.
+ */
+const DAY_FORMAT = "yyyy-MM-dd";
+const DAY_HINT = "YYYY-MM-DD";
+
+/** Midnight local on `d`, and the last millisecond of that same day. */
+function dayBounds(d: Date): [number, number] {
+  const start = new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+  return [start, new Date(d.getFullYear(), d.getMonth(), d.getDate() + 1).getTime() - 1];
+}
+
+/** Midnight local on the 1st, and the last millisecond of that month. */
+function monthBounds(year: number, month: number): [number, number] {
+  return [new Date(year, month, 1).getTime(), new Date(year, month + 1, 1).getTime() - 1];
+}
+
+/**
+ * The bounds of the single period a DateSelectorValue names — the day it
+ * points at, or the month. Null while nothing has been picked yet, which is
+ * also the value the component emits on mount.
+ */
+function periodBounds(value: DateSelectorValue): [number, number] | null {
+  if (value.period === "month") {
+    if (value.year === undefined || value.month === undefined) return null;
+    return monthBounds(value.year, value.month);
+  }
+  return value.startDate ? dayBounds(value.startDate) : null;
+}
+
+/** The bounds of the *end* of a `between` selection, which is a second day or
+ * a second month rather than a second copy of the first. */
+function rangeEndBounds(value: DateSelectorValue): [number, number] | null {
+  if (value.period === "month") {
+    return value.rangeEnd ? monthBounds(value.rangeEnd.year, value.rangeEnd.value) : null;
+  }
+  return value.endDate ? dayBounds(value.endDate) : null;
+}
+
+/** The start of a `between` selection — the range anchor for months, the
+ * start date for days. */
+function rangeStartBounds(value: DateSelectorValue): [number, number] | null {
+  if (value.period === "month") {
+    return value.rangeStart ? monthBounds(value.rangeStart.year, value.rangeStart.value) : null;
+  }
+  return value.startDate ? dayBounds(value.startDate) : null;
+}
+
+/**
+ * A DateSelectorValue as the two inclusive epoch-ms bounds `GET /queries`
+ * takes. The operator is what decides which end of the picked period each
+ * bound comes from:
+ *
+ *   is       whole period          from = period start, to = period end
+ *   after    that period onwards   from = period start, to unset
+ *   before   up to that period     from unset,          to = period end
+ *   between  two periods           from = first start,  to = second end
+ *
+ * `between` is emitted mid-selection too, with only the first end picked;
+ * that reads as "from there onwards" (an open `to`) rather than silently
+ * collapsing to a single day the user never asked for.
+ */
+function toEpochRange(value: DateSelectorValue): { from?: number; to?: number } {
+  if (value.operator === "between") {
+    const start = rangeStartBounds(value);
+    const end = rangeEndBounds(value);
+    if (start === null) return {};
+    return { from: start[0], to: end?.[1] };
+  }
+  const bounds = periodBounds(value);
+  if (bounds === null) return {};
+  if (value.operator === "after") return { from: bounds[0] };
+  if (value.operator === "before") return { to: bounds[1] };
+  return { from: bounds[0], to: bounds[1] };
+}
+
+/** What the trigger says once something is picked: the operator plus the
+ * period, because "08/06/2026" alone doesn't say whether it means that day,
+ * everything before it, or everything after. */
+function rangeSummary(value: DateSelectorValue | null): string {
+  if (value === null) return "";
+  const formatted = formatDateValue(value, undefined, DAY_FORMAT);
+  return formatted === "" ? "" : `${value.operator} ${formatted}`;
+}
+
 // --- filter bar --------------------------------------------------------------
 
-function FilterTextCell({
+/** One labelled select in the filter strip. The `<label>` wraps the control,
+ * so the visible label *is* the accessible name — no aria-label to drift. */
+function FilterSelect({
   label,
   value,
-  placeholder,
   onChange,
   className,
+  children,
 }: {
   label: string;
   value: string;
-  placeholder: string;
   onChange: (value: string) => void;
   className?: string;
+  children: ReactNode;
 }) {
   return (
-    <label className={cn(FILTER_CELL, className)}>
-      <span className="shrink-0 text-xs tracking-widest text-muted-foreground uppercase">
-        {label}
-      </span>
-      <input
-        type="text"
+    <label className="flex shrink-0 items-center gap-2">
+      <span className={FILTER_LABEL}>{label}</span>
+      <NativeSelect
+        size="sm"
         value={value}
-        placeholder={placeholder}
         onChange={(event) => onChange(event.target.value)}
-        className={FILTER_INPUT}
-      />
+        className={cn("text-xs", className)}
+      >
+        {children}
+      </NativeSelect>
     </label>
   );
+}
+
+/** An option per known client, `<ip> <name>`. */
+interface ClientOption {
+  ip: string;
+  name: string;
 }
 
 /**
@@ -258,202 +415,213 @@ function FilterTextCell({
  */
 const FilterBar = memo(function FilterBar({
   value,
+  clients,
+  resetToken,
   onChange,
+  onTimeRange,
 }: {
   value: FilterState;
+  clients: ClientOption[];
+  /** Bumped when the filters are cleared, so the DateSelector — which keeps
+   * its own selection internally — is remounted empty rather than left
+   * showing a range the page is no longer filtering on. */
+  resetToken: number;
   onChange: (patch: Partial<FilterState>) => void;
+  onTimeRange: (value: DateSelectorValue) => void;
 }) {
   renderCounts.filterBar += 1;
 
+  // The picked value, kept here purely to label the trigger. The page only
+  // ever wants the two epoch bounds, and DateSelector is left uncontrolled:
+  // it syncs from a `value` prop inside an effect, so feeding it back a
+  // freshly-built object every render would loop.
+  const [range, setRange] = useState<DateSelectorValue | null>(null);
+  const handleRange = useCallback(
+    (next: DateSelectorValue) => {
+      setRange(next);
+      onTimeRange(next);
+    },
+    [onTimeRange],
+  );
+
+  const summary = rangeSummary(range);
+
   return (
-    <div className="dnsaur-scroll-x flex min-w-0 flex-1 items-stretch">
-      {/* The widest cell, and the only one that grows — but never below a
-          usable box, since the row would rather scroll than crush it. */}
-      <div className={cn(FILTER_CELL, "min-w-64 flex-1")}>
-        <input
-          type="text"
-          aria-label="Search domains"
-          aria-describedby="query-search-hint"
-          value={value.q}
-          placeholder="Domain contains…"
-          onChange={(event) => onChange({ q: event.target.value })}
-          className={cn(FILTER_INPUT, "min-w-32")}
-        />
-        {/* Literally true, not a simplification: internal/store/search.go's
-            escapeLike *strips* % and _ rather than escaping them, because
-            the escape syntax isn't portable between the two dialects. A
-            hint that promised wildcards would be promising a feature the
-            server deletes on the way in. */}
-        {/* Only where there is genuinely room for it: at 1280 the row is
-            already scrolling, and this is the one cell that can afford to
-            drop content rather than push the rest off screen. It stays in
-            the DOM as the input's description either way. */}
-        <span
-          id="query-search-hint"
-          className="hidden shrink-0 text-xs text-muted-foreground 2xl:inline"
-        >
-          substring of q_name — % and _ are ignored
-        </span>
-      </div>
-
-      <div className={FILTER_CELL}>
-        <span className="shrink-0 text-xs tracking-widest text-muted-foreground uppercase">
-          Decision
-        </span>
-        {/* A fixed list, so a fixed control: the vocabulary is the
-            resolver's six, and "allowed" is not one of them (see
-            DECISION_TONE). A free-text box here let people ask for rows
-            that cannot exist. */}
-        <Select
-          items={Object.fromEntries([["any", "any"], ...DECISIONS.map((d) => [d, d])])}
-          value={value.decision || "any"}
-          onValueChange={(next) => onChange({ decision: next === "any" ? "" : String(next) })}
-        >
-          <SelectTrigger
-            aria-label="Decision"
-            className="h-auto w-24 border-0 bg-transparent px-0 py-0 text-xs uppercase shadow-none"
-          >
-            <SelectValue placeholder="any" />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem value="any">any</SelectItem>
-            {DECISIONS.map((decision) => (
-              <SelectItem key={decision} value={decision}>
-                {decision}
-              </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
-      </div>
-
-      {/* Record types are open-ended (A, AAAA, HTTPS, SVCB, and whatever
-          the next RFC adds), so this one stays free text. */}
-      <FilterTextCell
-        label="Type"
-        value={value.type}
-        placeholder="any"
-        onChange={(type) => onChange({ type })}
-        className="w-32"
+    <div className="flex min-w-0 flex-1 flex-wrap items-center gap-x-4 gap-y-2">
+      <Input
+        aria-label="Search domains"
+        aria-describedby="query-search-hint"
+        value={value.q}
+        placeholder="search q_name…"
+        onChange={(event) => onChange({ q: event.target.value })}
+        className="h-7 min-w-48 flex-1 text-xs md:text-xs"
       />
-      <FilterTextCell
+      {/* Literally true, not a simplification: internal/store/search.go's
+          escapeLike *strips* % and _ rather than escaping them, because the
+          escape syntax isn't portable between the two dialects. A hint that
+          promised wildcards would be promising a feature the server deletes
+          on the way in. Only shown where there is genuinely room for it; it
+          stays in the DOM as the input's description either way. */}
+      <span
+        id="query-search-hint"
+        className="hidden shrink-0 text-xs text-muted-foreground 2xl:inline"
+      >
+        substring of q_name — % and _ are ignored
+      </span>
+
+      {/* A fixed list, so a fixed control: the vocabulary is the resolver's
+          six, and "allowed" is not one of them (see DECISION_TONE). A
+          free-text box here let people ask for rows that cannot exist. */}
+      <FilterSelect
+        label="Decision"
+        value={value.decision}
+        onChange={(decision) => onChange({ decision })}
+      >
+        <NativeSelectOption value="">All decisions</NativeSelectOption>
+        {DECISIONS.map((decision) => (
+          <NativeSelectOption key={decision} value={decision}>
+            {decision}
+          </NativeSelectOption>
+        ))}
+      </FilterSelect>
+
+      <FilterSelect label="Type" value={value.type} onChange={(type) => onChange({ type })}>
+        <NativeSelectOption value="">All types</NativeSelectOption>
+        {QUERY_TYPES.map((type) => (
+          <NativeSelectOption key={type} value={type}>
+            {type}
+          </NativeSelectOption>
+        ))}
+      </FilterSelect>
+
+      <FilterSelect
         label="Client"
         value={value.client}
-        placeholder="any"
         onChange={(client) => onChange({ client })}
-        className="w-48"
-      />
+        className="max-w-56"
+      >
+        <NativeSelectOption value="">Any client IP</NativeSelectOption>
+        {clients.map((client) => (
+          <NativeSelectOption key={client.ip} value={client.ip}>
+            {client.ip} {client.name}
+          </NativeSelectOption>
+        ))}
+      </FilterSelect>
 
-      <label className={FILTER_CELL}>
-        <span className="shrink-0 text-xs tracking-widest text-muted-foreground uppercase">
-          From
-        </span>
-        <input
-          type="datetime-local"
-          value={value.from}
-          onChange={(event) => onChange({ from: event.target.value })}
-          className={cn(FILTER_INPUT, "w-36")}
-        />
-      </label>
-      <label className={FILTER_CELL}>
-        <span className="shrink-0 text-xs tracking-widest text-muted-foreground uppercase">To</span>
-        <input
-          type="datetime-local"
-          value={value.to}
-          onChange={(event) => onChange({ to: event.target.value })}
-          className={cn(FILTER_INPUT, "w-36")}
-        />
-      </label>
+      {/* The two `datetime-local` boxes this replaced were ~170px each and
+          still couldn't express "everything before Tuesday". Behind a
+          trigger, the whole vocabulary (is / before / after / between, by
+          day or by month) costs one button's worth of row. */}
+      <Popover>
+        <PopoverTrigger render={<Button type="button" size="sm" variant="outline" />}>
+          Time range
+          {summary !== "" && <span className="text-muted-foreground">· {summary}</span>}
+        </PopoverTrigger>
+        <PopoverContent align="end" className="w-auto">
+          <DateSelector
+            key={resetToken}
+            label="Time range"
+            periodTypes={RANGE_PERIODS}
+            defaultPeriodType="day"
+            defaultFilterType="is"
+            minYear={THIS_YEAR - 1}
+            maxYear={THIS_YEAR}
+            showTwoMonths={false}
+            dayDateFormat={DAY_FORMAT}
+            inputHint={DAY_HINT}
+            onChange={handleRange}
+            className="sm:w-80"
+          />
+        </PopoverContent>
+      </Popover>
     </div>
   );
 });
 
-/**
- * Reset, pinned outside the scrolling strip.
- *
- * Six cells is six things to empty by hand, and emptying all of them is the
- * single most common thing anyone does here — it's how you get back to the
- * live tail. Inside the strip it was the last cell, i.e. the one already
- * scrolled off screen exactly when filters are active and it is needed. Only
- * offered once there is something to clear, so the row never carries a
- * permanently inert cell.
- */
-function ClearFiltersCell({ onClear }: { onClear: () => void }) {
-  return (
-    <button
-      type="button"
-      onClick={onClear}
-      className={cn(
-        FILTER_CELL,
-        "border-r-0 border-l text-xs tracking-widest text-muted-foreground uppercase",
-        "transition-colors hover:text-foreground",
-        "outline-none focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-ring",
-      )}
-    >
-      Clear filters
-    </button>
-  );
-}
-
 // --- stream state ------------------------------------------------------------
 
 /**
- * The tail's own health, at the end of the filter row — directly under the
- * chrome's LIVE · PAUSE cell, which is the control it answers for.
+ * Which of the page's two modes is running, and how healthy it is.
  *
- * The toggle can't carry this itself: it lives in the shell and the stream
- * lives in the page. And "failed" is not a state to render as a quieter
- * shade of the same dot — it means the subscription gave up after six
- * consecutive attempts (api/sse.ts) and nothing further will happen without
- * a click, so it says so and puts the click next to it.
+ * These are the design's row-2 right-hand cells. They are rendered by the
+ * page rather than by components/top-nav.tsx because only the page knows
+ * whether a filter is active — the shell would need a second cross-component
+ * store to find out, and the tail flag (lib/live-tail.ts) is deliberately
+ * the only one of those. See the report accompanying this change.
+ */
+function ModeReadout({ filtered }: { filtered: boolean }) {
+  return (
+    <output className="flex shrink-0 items-center gap-2 text-xs tracking-widest uppercase">
+      <span
+        aria-hidden="true"
+        className={cn("size-1.5 shrink-0", filtered ? "bg-muted-foreground" : "bg-primary")}
+      />
+      {filtered ? "Filtered · paged" : "Live tail"}
+    </output>
+  );
+}
+
+/**
+ * The tail's own health, beside the mode readout.
+ *
+ * Only meaningful while the tail is the thing running: a filtered view reads
+ * the database instead of the stream, and the mode readout already says so.
+ * "failed" is not a state to render as a quieter shade of the same dot — it
+ * means the subscription gave up after six consecutive attempts (api/sse.ts)
+ * and nothing further will happen without a click, so it says so and puts the
+ * click next to it.
  */
 function StreamState({
   paused,
-  filtered,
   state,
   onReconnect,
 }: {
   paused: boolean;
-  filtered: boolean;
   state: SseState;
   onReconnect: () => void;
 }) {
-  // A filtered view reads the database instead of the stream, so the stream
-  // is closed *because you asked for something else* — not a fault.
-  if (filtered) {
-    return (
-      <span className={cn(FILTER_CELL, "border-r-0 border-l")}>
-        <Note>Filtered · stream paused</Note>
-      </span>
-    );
-  }
-  if (paused) {
-    return (
-      <span className={cn(FILTER_CELL, "border-r-0 border-l")}>
-        <Note>Paused</Note>
-      </span>
-    );
-  }
+  if (paused) return <Note>Paused</Note>;
   if (state === "failed") {
     return (
-      <div className={cn(FILTER_CELL, "border-r-0 border-l")}>
+      <div className="flex shrink-0 items-center gap-3">
         <Note className="text-destructive">Live tail disconnected</Note>
-        <button
-          type="button"
-          onClick={onReconnect}
-          className={cn(
-            "shrink-0 text-xs tracking-widest uppercase transition-colors hover:text-primary",
-            "outline-none focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring",
-          )}
-        >
+        <Button type="button" size="sm" variant="outline" onClick={onReconnect}>
           Reconnect
-        </button>
+        </Button>
       </div>
     );
   }
   return (
-    <output className={cn(FILTER_CELL, "border-r-0 border-l")}>
+    <output>
       <Note>{state === "open" ? "Streaming" : "Reconnecting…"}</Note>
     </output>
+  );
+}
+
+/**
+ * The design's one filled control on this screen, and the only one that isn't
+ * an rnui Button: it wears the chrome's cell skin because it belongs to the
+ * sub-nav strip, not to the filter row it currently sits at the end of.
+ *
+ * Labelled with what it will do rather than with the state it is in, so it
+ * needs no `aria-pressed` to be understood — and so it can't collide with the
+ * shell's own `role="switch"` cell while both exist.
+ */
+function TailToggle({ paused, onToggle }: { paused: boolean; onToggle: (next: boolean) => void }) {
+  return (
+    <button
+      type="button"
+      onClick={() => onToggle(!paused)}
+      className={cn(
+        "shrink-0 px-3 py-1.5 text-xs font-semibold tracking-widest uppercase transition-colors",
+        "outline-none focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring",
+        paused
+          ? "bg-warn text-primary-foreground hover:bg-warn/90"
+          : "bg-primary text-primary-foreground hover:bg-primary/90",
+      )}
+    >
+      {paused ? "Resume tail" : "Pause tail"}
+    </button>
   );
 }
 
@@ -473,6 +641,8 @@ type RowStatus = "pending" | "blocked" | "allowed";
  */
 interface QueryTableMeta {
   selectedKey: string | null;
+  /** `client_id` → hostname, for the HOSTNAME column. See clientNameMap. */
+  hostnames: Map<number, string>;
   onSelect: (entry: QueryEntry) => void;
 }
 
@@ -484,7 +654,7 @@ const QUERY_COLUMNS: ColumnDef<QueryEntry>[] = [
   {
     accessorKey: "at",
     header: "Time",
-    size: 112,
+    size: 104,
     meta: {
       headerClassName: "px-4",
       // `relative` so the selection marker can hang off the row's leading
@@ -546,10 +716,19 @@ const QUERY_COLUMNS: ColumnDef<QueryEntry>[] = [
   },
   {
     accessorKey: "client_ip",
-    header: "Client",
-    size: 128,
+    header: "Client IP",
+    size: 120,
     meta: { headerClassName: "px-4", cellClassName: "truncate px-4 text-muted-foreground" },
     cell: ({ row }) => row.original.client_ip,
+  },
+  {
+    // A display column: the value isn't on the row at all, it's the row's
+    // `client_id` looked up in GET /clients.
+    id: "hostname",
+    header: "Hostname",
+    size: 128,
+    meta: { headerClassName: "px-4", cellClassName: "truncate px-4 text-muted-foreground" },
+    cell: ({ row, table }) => tableMeta(table).hostnames.get(row.original.client_id) ?? UNKNOWN,
   },
   {
     accessorKey: "decision",
@@ -565,7 +744,7 @@ const QUERY_COLUMNS: ColumnDef<QueryEntry>[] = [
     header: "Upstream",
     size: 128,
     meta: { headerClassName: "px-4", cellClassName: "truncate px-4 text-muted-foreground" },
-    cell: ({ row }) => row.original.upstream || "—",
+    cell: ({ row }) => row.original.upstream || UNKNOWN,
   },
   {
     accessorKey: "duration_ms",
@@ -698,16 +877,33 @@ function rawRow(entry: QueryEntry): RawField[] {
     },
     {
       name: "upstream",
-      value: entry.upstream || "—",
+      value: entry.upstream || UNKNOWN,
       note: entry.upstream ? undefined : "never left the box",
     },
-    { name: "r_code", value: entry.r_code || "—", note: entry.r_code ? undefined : "no answer" },
+    {
+      name: "r_code",
+      value: entry.r_code || UNKNOWN,
+      note: entry.r_code ? undefined : "no answer",
+    },
     {
       name: "duration_ms",
       value: String(entry.duration_ms),
       note: entry.duration_ms === 0 ? "under 1 ms, truncated" : undefined,
     },
   ];
+}
+
+/** What matched, in one line. The group is named, not assumed: a rule that
+ * governs this row lives in the row's *client's* group (see groupForEntry),
+ * and "rule #1" means nothing without saying which group's rule #1. */
+function matchTitle(entry: QueryEntry, groupName?: string): string {
+  if (entry.rule_id > 0) {
+    return groupName === undefined
+      ? `Matched rule #${entry.rule_id}`
+      : `Matched rule #${entry.rule_id} in group ${groupName}`;
+  }
+  if (entry.list_id > 0) return `Matched list #${entry.list_id}`;
+  return "No rule or list matched";
 }
 
 function MatchProse({
@@ -718,7 +914,7 @@ function MatchProse({
 }: {
   entry: QueryEntry;
   rule?: Rule;
-  /** The row's group's rules are still in flight — see whyGroupId. */
+  /** The row's group's rules are still in flight — see the page's `rules`. */
   ruleLoading?: boolean;
   list?: List;
 }) {
@@ -755,9 +951,8 @@ function MatchProse({
   return <p>No rule or list matched — resolved by the default policy.</p>;
 }
 
-/** The inspector's two-cell action strip. The primary cell is the design's
- * one filled control on this rail, and which rule it writes follows the row:
- * a blocked row needs an allow, anything else needs a block. */
+/** The inspector's action pair. Which rule the primary button writes follows
+ * the row: a blocked row needs an allow, anything else needs a block. */
 function ActionStrip({
   entry,
   status,
@@ -775,41 +970,30 @@ function ActionStrip({
 }) {
   const action = entry.decision === "blocked" ? "allow" : "block";
   const done = status === "blocked" || status === "allowed";
-  const cell =
-    "flex items-center justify-center px-4 py-3 text-xs tracking-widest uppercase transition-colors " +
-    "outline-none focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-ring";
 
   return (
-    <div className="grid grid-cols-2 border-t border-border">
+    <div className="flex flex-wrap items-center gap-3 border-t border-border px-4 py-3">
       {done ? (
-        <span className={cn(cell, "bg-primary font-semibold text-primary-foreground")}>
+        <Button type="button" size="sm" disabled>
           {status === "blocked" ? "Blocked" : "Allowed"}
-        </span>
+        </Button>
       ) : (
-        <button
+        <Button
           type="button"
+          size="sm"
           disabled={status === "pending" || disabled}
+          // Still visible while unavailable, just visibly inert and carrying
+          // the reason — silently having no affordance is how "why can't I
+          // block from here?" starts.
           title={disabled ? disabledReason : undefined}
           onClick={() => onQuickRule(action, entry)}
-          className={cn(
-            cell,
-            "bg-primary font-semibold text-primary-foreground hover:bg-primary/90",
-            // Still visible while unavailable, just visibly inert and
-            // carrying the reason — silently having no affordance is how
-            // "why can't I block from here?" starts.
-            "disabled:cursor-not-allowed disabled:opacity-60 disabled:hover:bg-primary",
-          )}
         >
           {action === "allow" ? "Allow domain" : "Block domain"}
-        </button>
+        </Button>
       )}
-      <button
-        type="button"
-        onClick={() => onCopy(entry)}
-        className={cn(cell, "border-l border-border hover:bg-card")}
-      >
+      <Button type="button" size="sm" variant="outline" onClick={() => onCopy(entry)}>
         Copy row JSON
-      </button>
+      </Button>
     </div>
   );
 }
@@ -824,9 +1008,14 @@ function ActionStrip({
  * hides the rows you are comparing against, and every "why?" needed a click
  * to open and an Escape to get back. The rail is always there, so selecting
  * a row *is* opening it.
+ *
+ * Note `groupName` is a plain string, not the group object: a react-query
+ * result (or anything derived per render from one) as a prop here would give
+ * this a fresh identity ten times a second and quietly defeat the memo.
  */
 const Inspector = memo(function Inspector({
   entry,
+  groupName,
   rule,
   ruleLoading,
   list,
@@ -838,6 +1027,7 @@ const Inspector = memo(function Inspector({
   onCopy,
 }: {
   entry: QueryEntry | null;
+  groupName?: string;
   rule?: Rule;
   ruleLoading?: boolean;
   list?: List;
@@ -886,14 +1076,9 @@ const Inspector = memo(function Inspector({
             <div className="flex flex-col gap-2 border-b border-border px-4 py-3">
               <p className="text-base break-all">{entry.q_name}</p>
               <div className="flex flex-wrap items-center gap-3">
-                <span
-                  className={cn(
-                    "border border-current px-2 py-0.5 text-xs tracking-widest uppercase",
-                    decisionTone(entry.decision),
-                  )}
-                >
+                <Badge variant={decisionBadge(entry.decision)} size="sm" className="uppercase">
                   {entry.decision}
-                </span>
+                </Badge>
                 <Note>
                   {entry.q_type} · {entry.r_code || "no answer"} ·{" "}
                   {durationLabel(entry.duration_ms)} ms
@@ -901,8 +1086,19 @@ const Inspector = memo(function Inspector({
               </div>
             </div>
 
-            <Prose className="border-b border-border text-sm text-muted-foreground">
-              <MatchProse entry={entry} rule={rule} ruleLoading={ruleLoading} list={list} />
+            <Prose className="border-b border-border">
+              <Alert
+                variant={
+                  entry.decision === "blocked" || entry.decision === "error"
+                    ? "destructive"
+                    : "default"
+                }
+              >
+                <AlertTitle>{matchTitle(entry, groupName)}</AlertTitle>
+                <AlertDescription>
+                  <MatchProse entry={entry} rule={rule} ruleLoading={ruleLoading} list={list} />
+                </AlertDescription>
+              </Alert>
             </Prose>
 
             <div className="px-4 py-3">
@@ -939,32 +1135,6 @@ const Inspector = memo(function Inspector({
 
 // --- footer ------------------------------------------------------------------
 
-function FooterButton({
-  children,
-  disabled,
-  onClick,
-}: {
-  children: ReactNode;
-  disabled?: boolean;
-  onClick: () => void;
-}) {
-  return (
-    <button
-      type="button"
-      disabled={disabled}
-      onClick={onClick}
-      className={cn(
-        "text-xs tracking-widest text-muted-foreground uppercase transition-colors",
-        "hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50",
-        "disabled:hover:text-muted-foreground",
-        "outline-none focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring",
-      )}
-    >
-      {children}
-    </button>
-  );
-}
-
 function Footer({
   rows,
   filtered,
@@ -993,15 +1163,21 @@ function Footer({
       {/* The search endpoint is `ORDER BY id DESC` (internal/store/search.go),
           and id order is insertion order — which is the logger's batched
           flush order, not the order the queries were answered in. Close
-          enough to always look like time, wrong often enough to say so. */}
-      {filtered && <Note>ordered by id, not by time</Note>}
-      <div className="ml-auto flex items-center gap-4">
-        <FooterButton onClick={onNewer}>
-          <span aria-hidden="true">←</span> Newer
-        </FooterButton>
-        <FooterButton disabled={!filtered || !hasMore || isFetchingMore} onClick={onOlder}>
-          Older <span aria-hidden="true">→</span>
-        </FooterButton>
+          enough to always look like `at`, wrong often enough to say so. */}
+      {filtered && <Note>ordered by id, not by at</Note>}
+      <div className="ml-auto flex items-center gap-3">
+        <Button type="button" size="sm" variant="outline" onClick={onNewer}>
+          Newer
+        </Button>
+        <Button
+          type="button"
+          size="sm"
+          variant="outline"
+          disabled={!filtered || !hasMore || isFetchingMore}
+          onClick={onOlder}
+        >
+          Older
+        </Button>
       </div>
     </div>
   );
@@ -1012,12 +1188,13 @@ function Footer({
 export function QueryLog() {
   const [filters, setFilters] = useState<FilterState>(NO_FILTERS);
   // Light debounce so the domain box doesn't fire a LIKE query per keystroke.
-  // The other five are discrete selections, so they apply immediately.
+  // The other four are discrete selections, so they apply immediately.
   const [debouncedQ, setDebouncedQ] = useState("");
   const [selected, setSelected] = useState<QueryEntry | null>(null);
-  // The toggle itself is the chrome's one filled cell (components/top-nav.tsx);
-  // this page is only ever a reader of the flag. See lib/live-tail.ts.
-  const { paused } = useLiveTailPaused();
+  const [resetToken, setResetToken] = useState(0);
+  // The flag is shared with the chrome's own cell (components/top-nav.tsx),
+  // so both toggles observe and write one value. See lib/live-tail.ts.
+  const { paused, setPaused } = useLiveTailPaused();
 
   useEffect(() => {
     const timer = setTimeout(() => setDebouncedQ(filters.q), 300);
@@ -1037,10 +1214,32 @@ export function QueryLog() {
   // Every quick rule and the inspector's rule lookup are scoped to the group
   // that actually governs the row's client (see groupForEntry) — a rule
   // written into group 1 for a client that lives in group 3 is a no-op the
-  // UI would otherwise report as a success.
+  // UI would otherwise report as a success. The same request feeds the
+  // CLIENT filter's options and the table's HOSTNAME column.
   const clients = useClients();
   const clientGroups = useMemo(() => clientGroupMap(clients.data), [clients.data]);
+  const hostnames = useMemo(() => clientNameMap(clients.data), [clients.data]);
   const selectedGroupId = selected ? groupForEntry(selected, clientGroups) : null;
+
+  // Only exact-IP matchers become options. `client` is an exact match on
+  // `client_ip` (docs/ui-contract.md §2.7), so a client matched by CIDR —
+  // which the API accepts — can never equal any single logged address:
+  // offering it would be advertising a filter that always returns nothing,
+  // the same mistake the `allowed` decision used to be. Those clients still
+  // resolve a HOSTNAME, which goes through `client_id`, not the matcher.
+  const clientOptions = useMemo<ClientOption[]>(
+    () =>
+      (clients.data ?? [])
+        .filter((c) => !c.matcher.includes("/"))
+        .map((c) => ({ ip: c.matcher, name: c.name })),
+    [clients.data],
+  );
+
+  const groups = useGroups();
+  const groupName = useMemo(
+    () => groups.data?.find((g) => g.id === selectedGroupId)?.name,
+    [groups.data, selectedGroupId],
+  );
 
   const rules = useRules(selectedGroupId ?? DEFAULT_GROUP_ID);
   const lists = useLists();
@@ -1108,10 +1307,31 @@ export function QueryLog() {
     (patch: Partial<FilterState>) => setFilters((f) => ({ ...f, ...patch })),
     [],
   );
-  const clearFilters = useCallback(() => setFilters(NO_FILTERS), []);
+
+  /**
+   * The DateSelector's value, as the API's two bounds.
+   *
+   * Stable identity (no deps) because it is a prop of the memoised filter
+   * bar — and it bails out when the bounds haven't actually moved, because
+   * the component emits its value once on mount and again on every internal
+   * state change, and a new `filters` object per emission would restart the
+   * debounce and rebuild the search filter for nothing.
+   */
+  const applyTimeRange = useCallback((value: DateSelectorValue) => {
+    const range = toEpochRange(value);
+    setFilters((f) => (f.from === range.from && f.to === range.to ? f : { ...f, ...range }));
+  }, []);
+
+  const clearFilters = useCallback(() => {
+    setFilters(NO_FILTERS);
+    // The DateSelector keeps its own selection; remount it so the trigger
+    // stops claiming a range the page is no longer filtering on.
+    setResetToken((n) => n + 1);
+  }, []);
+
   // The debounced `q` lags the box by 300ms, so "anything typed at all"
   // isn't the same question as "anything is being searched for": the Clear
-  // cell has to appear the moment there is something to clear.
+  // control has to appear the moment there is something to clear.
   const anyFilterSet = filtered || filters.q.trim() !== "";
 
   // Without the client list, groupForEntry can only answer null for any row
@@ -1126,8 +1346,8 @@ export function QueryLog() {
 
   const selectedKey = selected ? rowKey(selected) : null;
   const gridMeta: QueryTableMeta = useMemo(
-    () => ({ selectedKey, onSelect }),
-    [selectedKey, onSelect],
+    () => ({ selectedKey, hostnames, onSelect }),
+    [selectedKey, hostnames, onSelect],
   );
 
   // Deduplicated by id, not a bare flat(): the search endpoint pages by
@@ -1178,16 +1398,25 @@ export function QueryLog() {
           the page no visible title — but a page still needs one heading. */}
       <h1 className="sr-only">Query log</h1>
 
-      <div className="flex items-stretch border-b border-border">
-        <FilterBar value={filters} onChange={patchFilters} />
-        <div className="flex shrink-0 items-stretch">
-          {anyFilterSet && <ClearFiltersCell onClear={clearFilters} />}
-          <StreamState
-            paused={paused}
-            filtered={filtered}
-            state={live.state}
-            onReconnect={live.reconnect}
-          />
+      <div className="flex flex-wrap items-center gap-x-4 gap-y-2 border-b border-border px-4 py-2">
+        <FilterBar
+          value={filters}
+          clients={clientOptions}
+          resetToken={resetToken}
+          onChange={patchFilters}
+          onTimeRange={applyTimeRange}
+        />
+        {anyFilterSet && (
+          <Button type="button" size="sm" variant="ghost" onClick={clearFilters}>
+            Clear filters
+          </Button>
+        )}
+        <div className="ml-auto flex shrink-0 items-center gap-4">
+          <ModeReadout filtered={filtered} />
+          {!filtered && (
+            <StreamState paused={paused} state={live.state} onReconnect={live.reconnect} />
+          )}
+          <TailToggle paused={paused} onToggle={setPaused} />
         </div>
       </div>
 
@@ -1219,6 +1448,7 @@ export function QueryLog() {
 
         <Inspector
           entry={selected}
+          groupName={groupName}
           rule={selected && selected.rule_id > 0 ? rulesById.get(selected.rule_id) : undefined}
           ruleLoading={rules.isPending || rules.isFetching}
           list={selected && selected.list_id > 0 ? listsById.get(selected.list_id) : undefined}

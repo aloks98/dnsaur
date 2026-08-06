@@ -9,7 +9,6 @@ import { renderWithProviders } from "../test/render";
 import { FakeEventSource } from "../test/fake-event-source";
 import type { QueryEntry } from "../api/types";
 import { setLiveTailPaused } from "../lib/live-tail";
-import { TopNav } from "../components/top-nav";
 import { QueryLog, renderCounts } from "./queries";
 
 // The table is virtualized (@tanstack/react-virtual, via rnui's
@@ -18,7 +17,7 @@ import { QueryLog, renderCounts } from "./queries";
 // `getRect`), not from getBoundingClientRect. jsdom has no layout engine and
 // always reports 0 for both, which makes the virtualizer compute an empty
 // visible range and render no rows at all. Stub a generous fixed viewport
-// (and getBoundingClientRect too, since the filter row's Select popup also
+// (and getBoundingClientRect too, since the filter row's date popover also
 // reads it) so every test in this file gets a real, non-empty set of
 // rendered rows to assert against — scoped to this file, not global setup.
 beforeAll(() => {
@@ -62,19 +61,17 @@ beforeEach(() => {
 afterEach(() => vi.restoreAllMocks());
 
 /**
- * The live/pause toggle is the chrome's cell, not the page's, so the shell
- * row that carries it is rendered alongside the page — which is also the
- * only way the cross-component wiring in lib/live-tail.ts gets exercised at
- * all. Route matters: the chrome only hangs those cells off `/queries`.
+ * The page alone — deliberately not mounted alongside components/top-nav.tsx.
+ *
+ * The tail's pause flag is shared module state (lib/live-tail.ts), and the
+ * page now carries its own mode readout and PAUSE/RESUME TAIL toggle, so
+ * nothing here needs the shell rendered to be exercised. The cross-component
+ * half of that contract — "a pause set anywhere is observed here" — is
+ * asserted directly against the store instead, which is both stronger and
+ * doesn't tie this file to the chrome's markup.
  */
 function renderQueryLog() {
-  return renderWithProviders(
-    <>
-      <TopNav onOpenCommandPalette={() => {}} />
-      <QueryLog />
-    </>,
-    { route: "/queries" },
-  );
+  return renderWithProviders(<QueryLog />, { route: "/queries" });
 }
 
 /**
@@ -125,9 +122,20 @@ async function searchDomains(text: string) {
   });
 }
 
-/** Put a value in one of the free-text filter cells. */
-function setFilterCell(label: RegExp, value: string) {
-  fireEvent.change(screen.getByRole("textbox", { name: label }), { target: { value } });
+/** Pick a value in one of the three filter selects. */
+function selectFilter(label: RegExp, value: string) {
+  fireEvent.change(screen.getByRole("combobox", { name: label }), { target: { value } });
+}
+
+/** The default filter used by tests that only need *some* filter active:
+ * the type select, because it needs nothing else to have loaded first. */
+function filterByType(type = "AAAA") {
+  selectFilter(/type/i, type);
+}
+
+/** The row the given domain is rendered in. */
+function rowFor(domain: string): HTMLElement {
+  return screen.getByText(domain).closest("tr")!;
 }
 
 // --- the live tail -----------------------------------------------------------
@@ -169,7 +177,7 @@ test("live rows keep separate identities even though they all arrive with id 0",
   ).not.toBeNull();
 });
 
-test("pausing from the chrome holds the tail without dropping what's on screen, and resuming doesn't duplicate it", async () => {
+test("the tail toggle holds the stream without dropping what's on screen, and resuming doesn't duplicate it", async () => {
   const user = userEvent.setup();
   renderQueryLog();
 
@@ -178,10 +186,10 @@ test("pausing from the chrome holds the tail without dropping what's on screen, 
   act(() => source.emit(entry({ q_name: "kept.example.com" })));
   expect(await screen.findByText("kept.example.com")).toBeInTheDocument();
 
-  const toggle = screen.getByRole("switch", { name: /live tail/i });
-  expect(toggle).toHaveAttribute("aria-checked", "true");
-  await user.click(toggle);
-  await waitFor(() => expect(toggle).toHaveAttribute("aria-checked", "false"));
+  // The design's one filled control on this screen, labelled with what it
+  // will do rather than with the state it is in.
+  await user.click(screen.getByRole("button", { name: /pause tail/i }));
+  expect(await screen.findByRole("button", { name: /resume tail/i })).toBeInTheDocument();
   expect(await screen.findByText(/^Paused$/)).toBeInTheDocument();
 
   // The old stream is torn down on pause; emitting on it must not append.
@@ -192,7 +200,7 @@ test("pausing from the chrome holds the tail without dropping what's on screen, 
 
   // Resuming reopens a *new* stream and prepends only what arrives next —
   // the buffered row is neither lost nor replayed.
-  await user.click(toggle);
+  await user.click(screen.getByRole("button", { name: /resume tail/i }));
   await waitFor(() => expect(FakeEventSource.instances).toHaveLength(2));
   const resumed = FakeEventSource.instances[1]!;
   act(() => resumed.emitOpen());
@@ -200,6 +208,27 @@ test("pausing from the chrome holds the tail without dropping what's on screen, 
 
   expect(await screen.findByText("after.example.com")).toBeInTheDocument();
   expect(screen.getAllByText("kept.example.com")).toHaveLength(1);
+});
+
+// The flag lives in a module-level store precisely so the chrome's own cell
+// and this page observe one value (lib/live-tail.ts). Setting it from
+// outside React is what the chrome's toggle ultimately does, so this covers
+// the wiring without depending on the shell's markup.
+test("a pause set from outside the page (the chrome's cell) stops the tail here too", async () => {
+  renderQueryLog();
+
+  const source = await firstSource();
+  act(() => source.emitOpen());
+  act(() => source.emit(entry({ q_name: "kept.example.com" })));
+  expect(await screen.findByText("kept.example.com")).toBeInTheDocument();
+
+  act(() => setLiveTailPaused(true));
+
+  expect(await screen.findByRole("button", { name: /resume tail/i })).toBeInTheDocument();
+  expect(screen.getByText(/^Paused$/)).toBeInTheDocument();
+  act(() => source.emit(entry({ q_name: "dropped.example.com" })));
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  expect(screen.queryByText("dropped.example.com")).not.toBeInTheDocument();
 });
 
 test("a dropped stream is reported as reconnecting", async () => {
@@ -266,7 +295,87 @@ test("a fresh install is told the tail is listening rather than shown an empty t
   expect(await screen.findByText(/listening — queries appear here/i)).toBeInTheDocument();
 });
 
+// --- the mode readout --------------------------------------------------------
+
+// The two modes are not interchangeable: the live tail is the SSE stream and
+// carries rows with no id at all, the filtered view is `GET /queries` paged
+// by id. Which one is running changes what the footer means, whether OLDER
+// does anything, and how far behind the table can be — so the page says
+// which it is rather than leaving it to be inferred from whether rows move.
+test("the readout names the mode, and switches when a filter takes over from the tail", async () => {
+  renderQueryLog();
+  await firstSource();
+
+  expect(screen.getByText(/^Live tail$/)).toBeInTheDocument();
+  expect(screen.queryByText(/filtered · paged/i)).not.toBeInTheDocument();
+
+  filterByType();
+
+  expect(await screen.findByText(/filtered · paged/i)).toBeInTheDocument();
+  expect(screen.queryByText(/^Live tail$/)).not.toBeInTheDocument();
+  // Nothing is streaming in paged mode, so there is no stream health to report.
+  expect(screen.queryByText(/streaming/i)).not.toBeInTheDocument();
+});
+
 // --- the table ---------------------------------------------------------------
+
+test("the table carries the eight columns the log is read by", async () => {
+  renderQueryLog();
+  const source = await firstSource();
+  act(() => source.emitOpen());
+  act(() => source.emit(entry()));
+
+  await screen.findByText("example.com");
+  expect(screen.getAllByRole("columnheader").map((h) => h.textContent)).toEqual([
+    "Time",
+    "Domain",
+    "Type",
+    "Client IP",
+    "Hostname",
+    "Decision",
+    "Upstream",
+    "ms",
+  ]);
+});
+
+// CLIENT IP and HOSTNAME are separate columns because they answer different
+// questions and come from different places: the IP is on the row, the
+// hostname is `client_id` looked up in GET /clients. A row whose client was
+// deleted since (or which matched no client at all, `client_id` 0) has no
+// hostname to show — and inventing one, or reusing the IP, would claim the
+// log knows something it doesn't.
+test("hostname resolves through client_id, and says nothing rather than guessing when it can't", async () => {
+  server.use(
+    http.get("/api/v1/clients", () =>
+      HttpResponse.json([{ id: 7, name: "kids-ipad", matcher: "192.168.1.42", group_id: 1 }]),
+    ),
+  );
+
+  renderQueryLog();
+  const source = await firstSource();
+  act(() => source.emitOpen());
+  act(() =>
+    source.emit(entry({ q_name: "known.example.com", client_id: 7, client_ip: "192.168.1.42" })),
+  );
+  // client_id 99 belongs to no client this instance knows about; client_id 0
+  // means the query matched no client entry at all.
+  act(() =>
+    source.emit(entry({ q_name: "gone.example.com", client_id: 99, client_ip: "192.168.11.63" })),
+  );
+  act(() =>
+    source.emit(entry({ q_name: "anon.example.com", client_id: 0, client_ip: "192.168.11.64" })),
+  );
+
+  await screen.findByText("anon.example.com");
+  await waitFor(() =>
+    expect(within(rowFor("known.example.com")).getByText("kids-ipad")).toBeInTheDocument(),
+  );
+  // The row still shows its IP — only the *name* is unknown. (upstream is
+  // non-empty on these fixtures, so the em dash can only be the hostname.)
+  expect(within(rowFor("gone.example.com")).getByText("192.168.11.63")).toBeInTheDocument();
+  expect(within(rowFor("gone.example.com")).getByText("—")).toBeInTheDocument();
+  expect(within(rowFor("anon.example.com")).getByText("—")).toBeInTheDocument();
+});
 
 // duration_ms is time.Duration.Milliseconds() — truncated whole
 // milliseconds — so a sub-millisecond cache hit is logged as 0. Rendering
@@ -312,18 +421,18 @@ test("the selected row is marked, and clearing the selection unmarks it", async 
 
 test("the table is virtualized: rows far past the scroll window aren't mounted until scrolled into view", async () => {
   const many = Array.from({ length: 50 }, (_, i) =>
-    entry({ id: i + 1, q_name: `host-${i}.example.com`, client_ip: "10.0.0.1" }),
+    entry({ id: i + 1, q_name: `host-${i}.example.com`, q_type: "AAAA" }),
   );
   server.use(
     http.get("/api/v1/queries", ({ request }) => {
       const url = new URL(request.url);
-      return HttpResponse.json(url.searchParams.get("client") === "10.0.0.1" ? many : []);
+      return HttpResponse.json(url.searchParams.get("type") === "AAAA" ? many : []);
     }),
   );
 
   renderQueryLog();
   await firstSource();
-  setFilterCell(/client/i, "10.0.0.1");
+  filterByType();
 
   expect(await screen.findByText("host-0.example.com")).toBeInTheDocument();
   // With an ~800px stubbed viewport and ~29px rows (plus overscan), only
@@ -365,11 +474,12 @@ test("typing a domain substring searches on q and renders the matches", async ()
 // The hint is literally true, and has to stay that way: escapeLike in
 // internal/store/search.go *strips* % and _ rather than escaping them,
 // because the escape syntax isn't portable across the two SQL dialects.
-test("the search cell says what the server actually does with % and _", async () => {
+test("the search box says what the server actually does with % and _", async () => {
   renderQueryLog();
   await firstSource();
 
   const box = screen.getByRole("textbox", { name: /search domains/i });
+  expect(box).toHaveAttribute("placeholder", "search q_name…");
   const hint = screen.getByText(/% and _ are ignored/i);
   expect(box).toHaveAttribute("aria-describedby", hint.id);
   expect(hint).toHaveTextContent("substring of q_name — % and _ are ignored");
@@ -383,18 +493,12 @@ test("the decision filter offers the six decisions the resolver writes, and neve
   renderQueryLog();
   await firstSource();
 
-  fireEvent.click(screen.getByRole("combobox", { name: /decision/i }));
-  const options = await screen.findAllByRole("option");
-
-  expect(options.map((o) => o.textContent)).toEqual([
-    "any",
-    "blocked",
-    "forwarded",
-    "cached",
-    "stale",
-    "local",
-    "error",
-  ]);
+  const select = screen.getByRole("combobox", { name: /decision/i });
+  expect(
+    within(select)
+      .getAllByRole("option")
+      .map((o) => o.textContent),
+  ).toEqual(["All decisions", "blocked", "forwarded", "cached", "stale", "local", "error"]);
 });
 
 test("picking a decision calls GET /queries?decision=… and renders the results", async () => {
@@ -416,16 +520,177 @@ test("picking a decision calls GET /queries?decision=… and renders the results
   renderQueryLog();
   await firstSource();
 
-  // base-ui's Select commits on the full pointer sequence, not on a bare
-  // synthetic click — userEvent replays that sequence, fireEvent doesn't.
-  await user.click(screen.getByRole("combobox", { name: /decision/i }));
-  await user.click(await screen.findByRole("option", { name: "blocked" }));
+  await user.selectOptions(screen.getByRole("combobox", { name: /decision/i }), "blocked");
 
   await waitFor(() => expect(urls.at(-1) ?? "").toContain("decision=blocked"));
   expect(await screen.findByText("blocked-domain.example")).toBeInTheDocument();
 });
 
-test("clearing filters returns to the live tail: the stream reopens and live rows resume", async () => {
+// `type` is an exact, uppercase match server-side (docs/ui-contract.md §2.7),
+// so a free-text box here was a licence to type "a" and be told, truthfully
+// but uselessly, that there are no matches.
+test("the type filter offers the record types the resolver answers in bulk", async () => {
+  const urls: string[] = [];
+  server.use(
+    http.get("/api/v1/queries", ({ request }) => {
+      urls.push(request.url);
+      const url = new URL(request.url);
+      return HttpResponse.json(
+        url.searchParams.get("type") === "HTTPS"
+          ? [entry({ id: 3, q_name: "svc.example", q_type: "HTTPS" })]
+          : [],
+      );
+    }),
+  );
+
+  renderQueryLog();
+  await firstSource();
+
+  const select = screen.getByRole("combobox", { name: /type/i });
+  expect(
+    within(select)
+      .getAllByRole("option")
+      .map((o) => o.textContent),
+  ).toEqual(["All types", "A", "AAAA", "HTTPS", "PTR", "TXT"]);
+
+  selectFilter(/type/i, "HTTPS");
+  await waitFor(() => expect(urls.at(-1) ?? "").toContain("type=HTTPS"));
+  expect(await screen.findByText("svc.example")).toBeInTheDocument();
+});
+
+// `client` is an *exact* match on client_ip, so the options can only be IPs
+// — and a client whose matcher is a CIDR (which the API accepts) can never
+// equal a single logged address. Offering it would be the `allowed` mistake
+// again: a filter that looks like it narrows the search and returns nothing,
+// forever. Those clients still name their rows, because HOSTNAME resolves
+// through client_id rather than through the matcher.
+test("the client filter lists exact-IP clients as '<ip> <name>' and filters on the IP", async () => {
+  const urls: string[] = [];
+  server.use(
+    http.get("/api/v1/clients", () =>
+      HttpResponse.json([
+        { id: 7, name: "kids-ipad", matcher: "192.168.1.42", group_id: 1 },
+        { id: 8, name: "iot-vlan", matcher: "192.168.30.0/24", group_id: 1 },
+      ]),
+    ),
+    http.get("/api/v1/queries", ({ request }) => {
+      urls.push(request.url);
+      const url = new URL(request.url);
+      return HttpResponse.json(
+        url.searchParams.get("client") === "192.168.1.42"
+          ? [entry({ id: 4, q_name: "tablet.example", client_id: 7 })]
+          : [],
+      );
+    }),
+  );
+
+  renderQueryLog();
+  await firstSource();
+
+  const select = screen.getByRole("combobox", { name: /client/i });
+  await waitFor(() =>
+    expect(
+      within(select)
+        .getAllByRole("option")
+        .map((o) => o.textContent),
+    ).toEqual(["Any client IP", "192.168.1.42 kids-ipad"]),
+  );
+
+  selectFilter(/client/i, "192.168.1.42");
+  await waitFor(() => expect(urls.at(-1) ?? "").toContain("client=192.168.1.42"));
+  expect(await screen.findByText("tablet.example")).toBeInTheDocument();
+});
+
+// --- the time range ----------------------------------------------------------
+
+/** Local-midnight bounds of a day, the way the page computes them. */
+function dayRange(year: number, monthIndex: number, day: number): [number, number] {
+  return [
+    new Date(year, monthIndex, day).getTime(),
+    new Date(year, monthIndex, day + 1).getTime() - 1,
+  ];
+}
+
+/** Open the range popover and hand back its date box — typeable, and ISO,
+ * because `03/04` names two different days depending on where you are. */
+async function openTimeRange(user: ReturnType<typeof userEvent.setup>) {
+  await user.click(screen.getByRole("button", { name: /time range/i }));
+  const input = await screen.findByPlaceholderText(/select date/i);
+  expect(input).not.toHaveAttribute("readonly");
+  return input;
+}
+
+// `from`/`to` are inclusive unix-millisecond bounds applied only when > 0
+// (internal/store/search.go). A picked *day* is a whole day, not an instant:
+// sending the day's midnight as both bounds would return only queries logged
+// in the first millisecond of it.
+test("picking a day filters on that whole day and switches the page to paged mode", async () => {
+  const user = userEvent.setup();
+  const urls: string[] = [];
+  server.use(
+    http.get("/api/v1/queries", ({ request }) => {
+      urls.push(request.url);
+      return HttpResponse.json([entry({ id: 5, q_name: "dated.example" })]);
+    }),
+  );
+
+  renderQueryLog();
+  await firstSource();
+
+  const input = await openTimeRange(user);
+  fireEvent.change(input, { target: { value: "2026-03-15" } });
+
+  const [start, end] = dayRange(2026, 2, 15);
+  await waitFor(() => expect(urls.at(-1) ?? "").toContain(`from=${start}`));
+  expect(urls.at(-1)).toContain(`to=${end}`);
+  expect(await screen.findByText(/filtered · paged/i)).toBeInTheDocument();
+});
+
+// "after the 15th" is an open-ended bound. Sending a `to` as well would turn
+// it into "on the 15th" — the operator would be decoration.
+test("the 'after' operator sends only a lower bound", async () => {
+  const user = userEvent.setup();
+  const urls: string[] = [];
+  server.use(
+    http.get("/api/v1/queries", ({ request }) => {
+      urls.push(request.url);
+      return HttpResponse.json([]);
+    }),
+  );
+
+  renderQueryLog();
+  await firstSource();
+
+  const input = await openTimeRange(user);
+  await user.click(screen.getByRole("tab", { name: "after" }));
+  fireEvent.change(input, { target: { value: "2026-03-15" } });
+
+  const [start] = dayRange(2026, 2, 15);
+  await waitFor(() => expect(urls.at(-1) ?? "").toContain(`from=${start}`));
+  expect(urls.at(-1)).not.toContain("to=");
+});
+
+// `qlog.retention_days` defaults to 90 (docs/ui-contract.md §5), so a period
+// longer than a month selects a window the pruner has already emptied, and a
+// year picker offering 2015 offers a decade of guaranteed-empty results.
+test("the period and year choices stay inside what retention can actually hold", async () => {
+  const user = userEvent.setup();
+  renderQueryLog();
+  await firstSource();
+
+  await openTimeRange(user);
+  const periods = screen
+    .getAllByRole("tab")
+    .map((t) => t.textContent)
+    .filter((t) => t !== null);
+  expect(periods).toContain("Day");
+  expect(periods).toContain("Month");
+  expect(periods).not.toContain("Quarter");
+  expect(periods).not.toContain("Half-year");
+  expect(periods).not.toContain("Year");
+});
+
+test("clearing filters returns to the live tail and forgets the picked range", async () => {
   const user = userEvent.setup();
   server.use(
     http.get("/api/v1/queries", () =>
@@ -437,15 +702,25 @@ test("clearing filters returns to the live tail: the stream reopens and live row
   await firstSource();
   expect(FakeEventSource.instances).toHaveLength(1);
 
-  // A filter switches to paged mode, tearing down the live stream.
-  setFilterCell(/client/i, "10.0.0.1");
+  const input = await openTimeRange(user);
+  fireEvent.change(input, { target: { value: "2026-03-15" } });
   expect(await screen.findByText("paged-result.example.com")).toBeInTheDocument();
-  expect(screen.getByText(/filtered · stream paused/i)).toBeInTheDocument();
+  expect(screen.getByText(/filtered · paged/i)).toBeInTheDocument();
+  // The trigger says what it's filtering on, operator included.
+  expect(screen.getByRole("button", { name: /is 2026-03-15/i })).toBeInTheDocument();
 
   await user.click(screen.getByRole("button", { name: /clear filters/i }));
 
+  // A cleared range must not be left showing on the trigger — the picker
+  // keeps its own selection, so it is remounted rather than trusted.
+  await waitFor(() =>
+    expect(screen.queryByRole("button", { name: /is 2026-03-15/i })).not.toBeInTheDocument(),
+  );
+  expect(screen.getByRole("button", { name: /time range/i })).toBeInTheDocument();
+
   await waitFor(() => expect(FakeEventSource.instances).toHaveLength(2));
   expect(screen.queryByText("paged-result.example.com")).not.toBeInTheDocument();
+  expect(screen.getByText(/^Live tail$/)).toBeInTheDocument();
 
   const resumed = FakeEventSource.instances[1]!;
   act(() => resumed.emitOpen());
@@ -460,14 +735,14 @@ function pagedHandler(pageFor: (offset: number) => QueryEntry[], urls: string[])
   return http.get("/api/v1/queries", ({ request }) => {
     const url = new URL(request.url);
     urls.push(request.url);
-    if (url.searchParams.get("client") !== "10.0.0.1") return HttpResponse.json([]);
+    if (url.searchParams.get("type") !== "AAAA") return HttpResponse.json([]);
     return HttpResponse.json(pageFor(Number(url.searchParams.get("offset") ?? 0)));
   });
 }
 
 function page(start: number, count: number): QueryEntry[] {
   return Array.from({ length: count }, (_, i) =>
-    entry({ id: start + i, q_name: `hit-${start + i}.example.com`, client_ip: "10.0.0.1" }),
+    entry({ id: start + i, q_name: `hit-${start + i}.example.com`, q_type: "AAAA" }),
   );
 }
 
@@ -479,7 +754,7 @@ test("filtered results page past the first 100 matches instead of stopping there
 
   renderQueryLog();
   await firstSource();
-  setFilterCell(/client/i, "10.0.0.1");
+  filterByType();
 
   expect(await screen.findByText("hit-0.example.com")).toBeInTheDocument();
   // A full first page must not be presented as the whole result set.
@@ -494,19 +769,19 @@ test("filtered results page past the first 100 matches instead of stopping there
   expect(await screen.findByText(/all matching queries loaded/i)).toBeInTheDocument();
 });
 
-test("the footer's OLDER cell fetches the next page and the footer states the real offset", async () => {
+test("the footer's OLDER button fetches the next page and the footer states the real offset", async () => {
   const urls: string[] = [];
   server.use(pagedHandler((offset) => (offset === 0 ? page(0, 100) : page(100, 12)), urls));
 
   renderQueryLog();
   await firstSource();
-  setFilterCell(/client/i, "10.0.0.1");
+  filterByType();
 
   expect(await screen.findByText("hit-0.example.com")).toBeInTheDocument();
   expect(screen.getByText(/100 rows · limit 100 · offset 0/i)).toBeInTheDocument();
   // The endpoint orders by id, and id order is the logger's batched flush
-  // order — close enough to look like time, wrong often enough to say so.
-  expect(screen.getByText(/ordered by id, not by time/i)).toBeInTheDocument();
+  // order — close enough to look like `at`, wrong often enough to say so.
+  expect(screen.getByText(/ordered by id, not by at/i)).toBeInTheDocument();
 
   fireEvent.click(screen.getByRole("button", { name: /older/i }));
 
@@ -544,7 +819,7 @@ test("rows re-returned by an offset shift render once, not twice", async () => {
 
   renderQueryLog();
   await firstSource();
-  setFilterCell(/client/i, "10.0.0.1");
+  filterByType();
 
   expect(await screen.findByText("hit-0.example.com")).toBeInTheDocument();
 
@@ -574,7 +849,7 @@ test("a failed next-page fetch keeps the rows already in hand and says they may 
   server.use(
     http.get("/api/v1/queries", ({ request }) => {
       const url = new URL(request.url);
-      if (url.searchParams.get("client") !== "10.0.0.1") return HttpResponse.json([]);
+      if (url.searchParams.get("type") !== "AAAA") return HttpResponse.json([]);
       // A full first page, so there is a second one to ask for — and asking
       // for it is what fails.
       if (Number(url.searchParams.get("offset") ?? 0) === 0) return HttpResponse.json(page(0, 100));
@@ -585,7 +860,7 @@ test("a failed next-page fetch keeps the rows already in hand and says they may 
 
   renderQueryLog();
   await firstSource();
-  setFilterCell(/client/i, "10.0.0.1");
+  filterByType();
   expect(await screen.findByText("hit-0.example.com")).toBeInTheDocument();
 
   fireEvent.click(screen.getByRole("button", { name: /older/i }));
@@ -636,8 +911,18 @@ test("selecting a row explains the decision and shows the raw record", async () 
   await selectRow(user, "ads.example");
 
   const rail = inspector();
-  await waitFor(() => expect(within(rail).getByText(/matched a block rule for/i)).toBeVisible());
-  expect(within(rail).getByText("ads.example", { selector: "code" })).toBeInTheDocument();
+  // The decision is a chip beside the one-line summary, not a word in a tint
+  // — the rail shows one row at a time, so it can afford the weight.
+  const chip = rail.querySelector('[data-slot="badge"]');
+  expect(chip).toHaveTextContent("blocked");
+  expect(within(rail).getByText(/A · NOERROR · <1 ms/)).toBeInTheDocument();
+
+  // The alert names *which* rule, in which group — "rule #5" alone says
+  // nothing, because rules are per-group (see groupForEntry).
+  const alert = within(rail).getByRole("alert");
+  expect(alert).toHaveTextContent("Matched rule #5 in group default");
+  await waitFor(() => expect(within(alert).getByText(/matched a block rule for/i)).toBeVisible());
+  expect(within(alert).getByText("ads.example", { selector: "code" })).toBeInTheDocument();
 
   // The raw row is the contract, annotated where its zero values mean
   // something other than "missing".
@@ -651,10 +936,39 @@ test("selecting a row explains the decision and shows the raw record", async () 
   expect(within(rail).getByText("rule_id").nextElementSibling).toHaveTextContent(/^5$/);
 });
 
+// A rule can be deleted between the query being logged and the row being
+// inspected, and the rail must say so rather than rendering a blank
+// explanation under a title that promises one.
+test("a rule that no longer exists is reported as such, not silently omitted", async () => {
+  const user = userEvent.setup();
+  server.use(http.get("/api/v1/groups/:id/rules", () => HttpResponse.json([])));
+
+  renderQueryLog();
+  const source = await firstSource();
+  act(() => source.emitOpen());
+  act(() => source.emit(entry({ q_name: "orphaned.example", decision: "blocked", rule_id: 42 })));
+
+  await screen.findByText("orphaned.example");
+  await selectRow(user, "orphaned.example");
+
+  const alert = within(inspector()).getByRole("alert");
+  await waitFor(() =>
+    expect(alert).toHaveTextContent(
+      /Matched rule #42, which isn't available right now \(it may have been deleted\)\./i,
+    ),
+  );
+});
+
 test("the inspector resolves rules from the row's own group, not group 1", async () => {
   const user = userEvent.setup();
   const ruleRequests: string[] = [];
   server.use(
+    http.get("/api/v1/groups", () =>
+      HttpResponse.json([
+        { id: 1, name: "default", enabled: true },
+        { id: 3, name: "kids", enabled: true },
+      ]),
+    ),
     http.get("/api/v1/clients", () =>
       HttpResponse.json([{ id: 7, name: "Kids tablet", matcher: "192.168.1.40", group_id: 3 }]),
     ),
@@ -682,9 +996,11 @@ test("the inspector resolves rules from the row's own group, not group 1", async
 
   // Resolved out of group 3 — group 1's rules would have rendered the
   // "isn't available right now" fallback for every non-default group.
+  const alert = within(inspector()).getByRole("alert");
   await waitFor(() =>
-    expect(within(inspector()).getByText(/matched a block rule for/i)).toBeInTheDocument(),
+    expect(within(alert).getByText(/matched a block rule for/i)).toBeInTheDocument(),
   );
+  expect(alert).toHaveTextContent("Matched rule #5 in group kids");
   expect(ruleRequests).toContain("3");
 });
 
@@ -725,7 +1041,7 @@ test("with nothing selected the rail explains itself instead of rendering an emp
 
 // --- quick rules -------------------------------------------------------------
 
-test("the primary cell blocks a resolved row and writes into that row's client group", async () => {
+test("the primary action blocks a resolved row and writes into that row's client group", async () => {
   const user = userEvent.setup();
   const posted: { groupId: string; body: unknown }[] = [];
   server.use(
@@ -760,10 +1076,10 @@ test("the primary cell blocks a resolved row and writes into that row's client g
   expect(await within(inspector()).findByText("Blocked")).toBeInTheDocument();
 });
 
-// A blocked row needs the opposite rule, so the one primary cell follows the
-// row rather than making the user pick between two buttons that are never
-// both useful.
-test("the primary cell offers an allow for a blocked row", async () => {
+// A blocked row needs the opposite rule, so the one primary action follows
+// the row rather than making the user pick between two buttons that are
+// never both useful.
+test("the primary action offers an allow for a blocked row", async () => {
   const user = userEvent.setup();
   let body: unknown;
   server.use(
@@ -922,11 +1238,12 @@ test("copy row json puts the whole record on the clipboard", async () => {
 
 // The tail commits a batch up to ten times a second. `memo` on the filter bar
 // and the inspector only holds if every prop they get is referentially stable
-// across those commits — one inline arrow in the page, or a `useCallback`
-// closing over a react-query result object instead of its stable `mutate`,
-// and the boundary silently stops working. Nothing on screen changes when it
-// breaks, so the render counters (see pages/queries.tsx) are the only thing
-// that can catch it.
+// across those commits — one inline arrow in the page, a `useCallback`
+// closing over a react-query result object instead of its stable `mutate`, or
+// a freshly-built list of client options per render, and the boundary
+// silently stops working. Nothing on screen changes when it breaks, so the
+// render counters (see pages/queries.tsx) are the only thing that can catch
+// it.
 test("live tail traffic re-renders neither the filter bar nor the inspector", async () => {
   const user = userEvent.setup();
   renderQueryLog();
@@ -941,7 +1258,8 @@ test("live tail traffic re-renders neither the filter bar nor the inspector", as
   await waitFor(() =>
     expect(within(inspector()).getByText("watched.example.com")).toBeInTheDocument(),
   );
-  // Let anything else still settling (clients, rules, lists) land first.
+  // Let anything else still settling (clients, groups, rules, lists) land
+  // first — including the date picker's own on-mount value emission.
   await new Promise((resolve) => setTimeout(resolve, 150));
 
   const before = { ...renderCounts };
@@ -957,10 +1275,10 @@ test("live tail traffic re-renders neither the filter bar nor the inspector", as
 test("changing a filter does re-render the filter bar", async () => {
   renderQueryLog();
   await firstSource();
-  await new Promise((resolve) => setTimeout(resolve, 50));
+  await new Promise((resolve) => setTimeout(resolve, 150));
 
   const before = renderCounts.filterBar;
-  setFilterCell(/client/i, "10.0.0.1");
+  filterByType();
 
   await waitFor(() => expect(renderCounts.filterBar).toBeGreaterThan(before));
 });
