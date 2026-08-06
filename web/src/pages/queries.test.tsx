@@ -295,6 +295,130 @@ test("a fresh install is told the tail is listening rather than shown an empty t
   expect(await screen.findByText(/listening — queries appear here/i)).toBeInTheDocument();
 });
 
+// --- seeding the tail with real history --------------------------------------
+
+// The stream only carries queries answered *after* it was subscribed, so a
+// server with a million logged queries used to open on "Listening — queries
+// appear here…" and stay there until the next lookup. On a busy resolver
+// that is a second or two; on a quiet one it is minutes, and it reads as a
+// broken or empty install rather than as a tail.
+test("opening in live mode shows the recent history instead of an empty tail", async () => {
+  const urls: string[] = [];
+  server.use(
+    http.get("/api/v1/queries", ({ request }) => {
+      urls.push(request.url);
+      return HttpResponse.json([
+        entry({ id: 900, q_name: "history-newest.example.com" }),
+        entry({ id: 899, q_name: "history-older.example.com" }),
+      ]);
+    }),
+  );
+
+  renderQueryLog();
+  const source = await firstSource();
+  act(() => source.emitOpen());
+
+  expect(await screen.findByText("history-newest.example.com")).toBeInTheDocument();
+  expect(screen.getByText("history-older.example.com")).toBeInTheDocument();
+  // Seeded, not filtered: one page of the tail's own size, and the footer
+  // still describes the live tail rather than a paged search.
+  expect(urls.at(-1)).toContain("limit=100");
+  expect(screen.getByText(/live tail · 500 row buffer/i)).toBeInTheDocument();
+  await waitFor(() => expect(getLiveTailStatus().filtered).toBe(false));
+
+  // And the stream still prepends on top of the seeded history.
+  act(() => source.emit(entry({ q_name: "arrived-live.example.com" })));
+  expect(await screen.findByText("arrived-live.example.com")).toBeInTheDocument();
+  expect(screen.getByText("history-newest.example.com")).toBeInTheDocument();
+});
+
+// The seed request and the subscription start together, so a query answered
+// in between goes out on the stream (id 0, because internal/qlog/qlog.go
+// publishes before the batched insert assigns a key) *and* comes back in the
+// seed page with a real id once the logger's batch lands. lib/query-rows.ts's
+// rowKey cannot catch that — it hands live rows a synthetic `live<n>` key and
+// database rows a `q<id>` one, two namespaces that never collide — so the
+// same query would render twice, once per source.
+test("a query the stream already delivered is not repeated by the seed", async () => {
+  const overlapping = entry({ q_name: "overlap.example.com", at: 1_700_000_000_000 });
+  let release: () => void = () => {};
+  const seedArrived = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+
+  server.use(
+    http.get("/api/v1/queries", async () => {
+      // Hold the seed open until the stream has delivered the row, so the
+      // two genuinely race the way they do against a real server.
+      await seedArrived;
+      return HttpResponse.json([
+        // The database's copy of the very same query: same everything, but
+        // with the primary key the stream's copy could not have had.
+        { ...overlapping, id: 4242 },
+        entry({ id: 4241, q_name: "only-in-history.example.com" }),
+      ]);
+    }),
+  );
+
+  renderQueryLog();
+  const source = await firstSource();
+  act(() => source.emitOpen());
+  act(() => source.emit(overlapping));
+  expect(await screen.findByText("overlap.example.com")).toBeInTheDocument();
+
+  release();
+
+  expect(await screen.findByText("only-in-history.example.com")).toBeInTheDocument();
+  // One row for the overlapping query, not one per source.
+  expect(screen.getAllByText("overlap.example.com")).toHaveLength(1);
+});
+
+// Seeding is once per mount, not once per `enabled` edge. Pausing and
+// resuming flips `enabled`, and re-running the seed there would append a
+// second copy of history underneath rows that are already on screen.
+test("resuming after a pause does not seed a second copy of the history", async () => {
+  let seedRequests = 0;
+  server.use(
+    http.get("/api/v1/queries", () => {
+      seedRequests += 1;
+      return HttpResponse.json([entry({ id: 700, q_name: "seeded-once.example.com" })]);
+    }),
+  );
+
+  renderQueryLog();
+  const source = await firstSource();
+  act(() => source.emitOpen());
+  expect(await screen.findByText("seeded-once.example.com")).toBeInTheDocument();
+
+  act(() => setLiveTailPaused(true));
+  await waitFor(() => expect(getLiveTailStatus().paused).toBe(true));
+  // Pausing keeps what's on screen.
+  expect(screen.getByText("seeded-once.example.com")).toBeInTheDocument();
+
+  act(() => setLiveTailPaused(false));
+  await waitFor(() => expect(FakeEventSource.instances).toHaveLength(2));
+  await new Promise((resolve) => setTimeout(resolve, 100));
+
+  expect(seedRequests).toBe(1);
+  expect(screen.getAllByText("seeded-once.example.com")).toHaveLength(1);
+});
+
+// A homelab instance reached over a flaky link shouldn't lose its live tail
+// because one history request failed — the stream is unaffected, so the page
+// falls back to exactly the behaviour it had before seeding existed.
+test("a failed seed leaves the live tail working", async () => {
+  server.use(
+    http.get("/api/v1/queries", () => HttpResponse.json({ error: "boom" }, { status: 500 })),
+  );
+
+  renderQueryLog();
+  const source = await firstSource();
+  act(() => source.emitOpen());
+  act(() => source.emit(entry({ q_name: "still-streaming.example.com" })));
+
+  expect(await screen.findByText("still-streaming.example.com")).toBeInTheDocument();
+});
+
 // --- the mode readout --------------------------------------------------------
 
 // The two modes are not interchangeable: the live tail is the SSE stream and
@@ -446,6 +570,105 @@ test("the table is virtualized: rows far past the scroll window aren't mounted u
   fireEvent.scroll(viewport, { target: { scrollTop: 5000 } });
 
   await waitFor(() => expect(screen.getByText("host-49.example.com")).toBeInTheDocument());
+});
+
+// --- the bounded scroll box --------------------------------------------------
+
+// This one is a class-name assertion on purpose, and it is the only kind
+// available: the bug it guards is pure layout, and jsdom computes none.
+//
+// What went wrong in a real browser: rnui's DataGridScrollArea puts the
+// className it is given on base-ui's ScrollArea.Root and wraps that in its
+// own bare `<div class="relative">`, while DataGridContainer is a plain block
+// `div`. So a `flex-1` handed to the scroll area landed on the child of a
+// non-flex parent and did nothing — the Root sized to its content, its
+// `size-full` viewport resolved 100% of an auto height to that same content
+// height, and clientHeight came out equal to scrollHeight (measured: 26132 vs
+// 26132, 1001 rows mounted, nothing scrollable). The virtualizer's window was
+// therefore the entire list, DataGridTableVirtual saw its last row mounted and
+// called onFetchMore on a loop, and the log paged itself to OFFSET 2300 with
+// nobody touching it. After: 718 vs 2932, 38 rows mounted, offsets stop at 0.
+//
+// The three classes below are the whole fix, so assert they are still there.
+test("the rows scroll inside a bounded box rather than growing the box to fit them", async () => {
+  renderQueryLog();
+  const source = await firstSource();
+  act(() => source.emitOpen());
+  act(() => source.emit(entry({ q_name: "bounded.example.com" })));
+  await screen.findByText("bounded.example.com");
+
+  // The container rnui renders as a plain block div has to be made to take
+  // the height its parent chain resolves...
+  const container = document.querySelector('[data-slot="data-grid"]');
+  expect(container).not.toBeNull();
+  expect(container!.className).toContain("flex-1");
+  expect(container!.className).toContain("min-h-0");
+
+  // ...and the scroll Root has to resolve a *definite* height, which means a
+  // box we own in between: `flex min-h-0 flex-1` (so it has one) with the
+  // Root at `h-full` (so it takes it). `h-full` against an auto-height
+  // ancestor is what silently produced the content-sized box before.
+  const root = document.querySelector('[data-slot="data-grid-scroll-area"]');
+  expect(root).not.toBeNull();
+  expect(root!.className).toContain("h-full");
+
+  const bounding = root!.parentElement!.parentElement!;
+  expect(bounding.className).toContain("flex");
+  expect(bounding.className).toContain("min-h-0");
+  expect(bounding.className).toContain("flex-1");
+});
+
+// The runaway's second half. DataGridTableVirtual asks for the next page from
+// an effect whose deps include both its virtual-item array (a fresh array
+// every render) and the onFetchMore callback, and its own isFetchingMore /
+// hasMore guards are react-query flags that are a render behind the call. On
+// top of that, query-core's fetchNextPage defaults to cancelRefetch, so a
+// second call while the first is in flight *cancels and re-issues* rather
+// than being dropped. Several pages could therefore go out for one gesture.
+test("asking for more repeatedly while a page is in flight fetches it once", async () => {
+  const urls: string[] = [];
+  server.use(pagedHandler((offset) => (offset === 0 ? page(0, 100) : page(100, 12)), urls));
+
+  renderQueryLog();
+  await firstSource();
+  filterByType();
+  expect(await screen.findByText("hit-0.example.com")).toBeInTheDocument();
+
+  const older = screen.getByRole("button", { name: /older/i });
+  // Synchronously, in one tick — exactly the window react-query's own flags
+  // cannot close, because none of them have re-rendered yet.
+  for (let i = 0; i < 6; i += 1) fireEvent.click(older);
+
+  await waitFor(() => expect(urls.some((u) => u.includes("offset=100"))).toBe(true));
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  expect(urls.filter((u) => u.includes("offset=100"))).toHaveLength(1);
+  // And it stops at the end of the results rather than asking past them.
+  expect(urls.some((u) => u.includes("offset=112"))).toBe(false);
+});
+
+// hasMore === false is the end of the results, and the page must not ask
+// again — the footer's own control is disabled there, but the grid's
+// infinite-scroll effect still fires on every render, so the callback itself
+// has to refuse.
+test("no further pages are requested once the results are exhausted", async () => {
+  const urls: string[] = [];
+  // A short first page is the end of the results straight away.
+  server.use(pagedHandler(() => page(0, 12), urls));
+
+  renderQueryLog();
+  await firstSource();
+  filterByType();
+  expect(await screen.findByText("hit-0.example.com")).toBeInTheDocument();
+  expect(await screen.findByText(/all matching queries loaded/i)).toBeInTheDocument();
+
+  const viewport = document.querySelector('[data-slot="scroll-area-viewport"]');
+  if (!viewport) throw new Error("scroll viewport not found");
+  for (const top of [500, 1_000, 2_000, 4_000]) {
+    fireEvent.scroll(viewport, { target: { scrollTop: top } });
+  }
+  await new Promise((resolve) => setTimeout(resolve, 300));
+
+  expect(urls.filter((u) => u.includes("type=AAAA"))).toHaveLength(1);
 });
 
 // --- filters -----------------------------------------------------------------
@@ -670,6 +893,185 @@ test("the 'after' operator sends only a lower bound", async () => {
   expect(urls.at(-1)).not.toContain("to=");
 });
 
+/** Run a body with the process in a known zone, so millisecond bounds can be
+ * asserted as literals. Node re-reads process.env.TZ per Date construction,
+ * and every Date in this page's range arithmetic is built after this runs. */
+async function inTimeZone(tz: string, body: () => Promise<void>) {
+  const original = process.env.TZ;
+  process.env.TZ = tz;
+  try {
+    await body();
+  } finally {
+    process.env.TZ = original;
+  }
+}
+
+/** The `from`/`to` of the most recent search that actually carried a range. */
+function lastRange(urls: string[]): URLSearchParams | null {
+  const url = urls.filter((u) => u.includes("from=") || u.includes("to=")).at(-1);
+  return url === undefined ? null : new URL(url).searchParams;
+}
+
+function collectQueryUrls(urls: string[], rows: QueryEntry[] = []) {
+  server.use(
+    http.get("/api/v1/queries", ({ request }) => {
+      urls.push(request.url);
+      return HttpResponse.json(rows);
+    }),
+  );
+}
+
+// The exact arithmetic, pinned to the millisecond in a named zone — a day is
+// local midnight to local 23:59:59.999, and `from`/`to` are inclusive
+// (internal/store/search.go applies `at >= from AND at <= to`). A UTC/local
+// mix or an off-by-one-day would show up here and nowhere else: on this date
+// UTC midnight is 1773532800000, a full 19_800_000 ms away from the correct
+// answer, and either mistake returns a nearly-empty page for a day that
+// certainly had traffic.
+test("a picked day is exactly local midnight to the last millisecond of that day", async () => {
+  await inTimeZone("Asia/Kolkata", async () => {
+    const user = userEvent.setup();
+    const urls: string[] = [];
+    collectQueryUrls(urls);
+
+    renderQueryLog();
+    await firstSource();
+    const input = await openTimeRange(user);
+    fireEvent.change(input, { target: { value: "2026-03-15" } });
+
+    await waitFor(() => expect(lastRange(urls)).not.toBeNull());
+    const params = lastRange(urls)!;
+    // 2026-03-15T00:00:00.000+05:30 and 2026-03-15T23:59:59.999+05:30.
+    expect(params.get("from")).toBe("1773513000000");
+    expect(params.get("to")).toBe("1773599399999");
+    // Inclusive bounds over exactly one day, with no millisecond of the day
+    // outside them and no millisecond of the next day inside them.
+    expect(Number(params.get("to")) - Number(params.get("from")) + 1).toBe(86_400_000);
+    expect(new Date(Number(params.get("from"))).getDate()).toBe(15);
+    expect(new Date(Number(params.get("to"))).getDate()).toBe(15);
+    expect(new Date(Number(params.get("to")) + 1).getDate()).toBe(16);
+  });
+});
+
+// The same day in a zone west of UTC. Different absolute milliseconds for the
+// same calendar date is the whole point: the bounds follow the *browser's*
+// local day, which is the day the user picked off the calendar.
+test("the day bounds follow the browser's own zone, not UTC", async () => {
+  await inTimeZone("America/New_York", async () => {
+    const user = userEvent.setup();
+    const urls: string[] = [];
+    collectQueryUrls(urls);
+
+    renderQueryLog();
+    await firstSource();
+    const input = await openTimeRange(user);
+    fireEvent.change(input, { target: { value: "2026-03-15" } });
+
+    await waitFor(() => expect(lastRange(urls)).not.toBeNull());
+    const params = lastRange(urls)!;
+    // 2026-03-15T00:00:00.000-04:00 — four hours later than IST's answer is
+    // early, and nine and a half hours from it in total.
+    expect(params.get("from")).toBe("1773547200000");
+    expect(params.get("to")).toBe("1773633599999");
+    expect(Number(params.get("to")) - Number(params.get("from")) + 1).toBe(86_400_000);
+  });
+});
+
+// "before Tuesday" is an open-ended lower bound, the mirror of the `after`
+// case above. Sending a `from` as well would silently turn it into "on
+// Tuesday".
+test("the 'before' operator sends only an upper bound", async () => {
+  const user = userEvent.setup();
+  const urls: string[] = [];
+  collectQueryUrls(urls);
+
+  renderQueryLog();
+  await firstSource();
+
+  const input = await openTimeRange(user);
+  await user.click(screen.getByRole("tab", { name: "before" }));
+  fireEvent.change(input, { target: { value: "2026-03-15" } });
+
+  const [, end] = dayRange(2026, 2, 15);
+  await waitFor(() => expect(lastRange(urls)?.get("to")).toBe(String(end)));
+  expect(lastRange(urls)?.has("from")).toBe(false);
+});
+
+// `between` is emitted mid-selection too, with only the first end picked.
+// That has to read as "from there onwards" — and in particular must not be
+// completed with an upper bound left over from a previous selection.
+test("a half-finished 'between' is an open-ended range, not the previous one", async () => {
+  const user = userEvent.setup();
+  const urls: string[] = [];
+  collectQueryUrls(urls);
+
+  renderQueryLog();
+  await firstSource();
+
+  const input = await openTimeRange(user);
+  // Pick a whole day first, so there is a `to` in the page's state to leak.
+  fireEvent.change(input, { target: { value: "2026-03-20" } });
+  const [, march20End] = dayRange(2026, 2, 20);
+  await waitFor(() => expect(lastRange(urls)?.get("to")).toBe(String(march20End)));
+
+  await user.click(screen.getByRole("tab", { name: "between" }));
+  urls.length = 0;
+  fireEvent.change(screen.getByPlaceholderText(/select date/i), {
+    target: { value: "2026-03-15" },
+  });
+
+  const [start] = dayRange(2026, 2, 15);
+  await waitFor(() => expect(lastRange(urls)?.get("from")).toBe(String(start)));
+  expect(lastRange(urls)?.has("to")).toBe(false);
+});
+
+// The defect behind "if I select the time filter, I see only few rows".
+//
+// rnui's useDateSelector calls clearSelection() from setFilterType, so
+// changing the operator tells this page "nothing is picked". The page used to
+// answer that by spreading a *partial* patch over its filters — and a key that
+// is merely absent cannot remove one that is already there. So the previous
+// day's `from`/`to` stayed applied while the trigger stopped naming them: the
+// log went on returning one day's worth of rows with nothing on screen saying
+// why, and the only way out was Clear filters. The same hole capped "after the
+// 15th" at the end of the 15th, and floored "before the 15th" at its start.
+test("changing the operator releases the bounds instead of applying them invisibly", async () => {
+  const user = userEvent.setup();
+  const urls: string[] = [];
+  collectQueryUrls(urls, [entry({ id: 5, q_name: "dated.example" })]);
+
+  renderQueryLog();
+  await firstSource();
+
+  const input = await openTimeRange(user);
+  fireEvent.change(input, { target: { value: "2026-03-15" } });
+
+  const [, end] = dayRange(2026, 2, 15);
+  await waitFor(() => expect(lastRange(urls)?.get("to")).toBe(String(end)));
+  await waitFor(() => expect(getLiveTailStatus().filtered).toBe(true));
+
+  await user.click(screen.getByRole("tab", { name: "after" }));
+
+  // Nothing is picked any more, so nothing is filtered — the page is back on
+  // the live tail rather than quietly still showing one day.
+  await waitFor(() => expect(getLiveTailStatus().filtered).toBe(false));
+  expect(screen.queryByRole("button", { name: /is 2026-03-15/i })).not.toBeInTheDocument();
+
+  // And picking a day under `after` is genuinely open-ended: the `to` from
+  // the earlier `is` must not come back with it.
+  // A different day, because base-ui autofocuses the box when the popover
+  // opens and the picker only rewrites its text while unfocused — re-typing
+  // the identical string would fire no change event at all.
+  urls.length = 0;
+  fireEvent.change(screen.getByPlaceholderText(/select date/i), {
+    target: { value: "2026-03-16" },
+  });
+
+  const [afterStart] = dayRange(2026, 2, 16);
+  await waitFor(() => expect(lastRange(urls)?.get("from")).toBe(String(afterStart)));
+  expect(lastRange(urls)?.has("to")).toBe(false);
+});
+
 // `qlog.retention_days` defaults to 90 (docs/ui-contract.md §5), so a period
 // longer than a month selects a window the pruner has already emptied, and a
 // year picker offering 2015 offers a decade of guaranteed-empty results.
@@ -693,9 +1095,17 @@ test("the period and year choices stay inside what retention can actually hold",
 test("clearing filters returns to the live tail and forgets the picked range", async () => {
   const user = userEvent.setup();
   server.use(
-    http.get("/api/v1/queries", () =>
-      HttpResponse.json([entry({ id: 99, q_name: "paged-result.example.com" })]),
-    ),
+    // Only the *filtered* search answers with the paged row. The live tail
+    // seeds itself from this same endpoint (see LIVE_TAIL_SEED), so a handler
+    // that answered every call identically could no longer tell "the paged
+    // result is still on screen" from "the tail seeded its history" — which
+    // is the whole assertion below.
+    http.get("/api/v1/queries", ({ request }) => {
+      const url = new URL(request.url);
+      return HttpResponse.json(
+        url.searchParams.has("from") ? [entry({ id: 99, q_name: "paged-result.example.com" })] : [],
+      );
+    }),
   );
 
   renderQueryLog();

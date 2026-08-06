@@ -343,18 +343,33 @@ function rangeStartBounds(value: DateSelectorValue): [number, number] | null {
  * `between` is emitted mid-selection too, with only the first end picked;
  * that reads as "from there onwards" (an open `to`) rather than silently
  * collapsing to a single day the user never asked for.
+ *
+ * Both keys are ALWAYS present, `undefined` where the operator leaves that
+ * end open. That is load-bearing, not tidiness: the caller applies this over
+ * the existing filters, and a key that is merely absent cannot clear a bound
+ * a previous selection set. Returning `{ from }` for `after` left the `to`
+ * from an earlier `is` in place, so "after the 5th" was silently still
+ * capped at the end of the 5th — a filter the user could no longer see (the
+ * picker clears its own selection when the operator changes, so the trigger
+ * had stopped naming the range it was still applying) and could only get out
+ * of via Clear filters. Same for `before` and a stale `from`, and for the
+ * emitted-on-mount empty value, which used to leave the whole range applied.
  */
-function toEpochRange(value: DateSelectorValue): { from?: number; to?: number } {
+function toEpochRange(value: DateSelectorValue): {
+  from: number | undefined;
+  to: number | undefined;
+} {
+  const none = { from: undefined, to: undefined };
   if (value.operator === "between") {
     const start = rangeStartBounds(value);
     const end = rangeEndBounds(value);
-    if (start === null) return {};
+    if (start === null) return none;
     return { from: start[0], to: end?.[1] };
   }
   const bounds = periodBounds(value);
-  if (bounds === null) return {};
-  if (value.operator === "after") return { from: bounds[0] };
-  if (value.operator === "before") return { to: bounds[1] };
+  if (bounds === null) return none;
+  if (value.operator === "after") return { from: bounds[0], to: undefined };
+  if (value.operator === "before") return { from: undefined, to: bounds[1] };
   return { from: bounds[0], to: bounds[1] };
 }
 
@@ -722,7 +737,11 @@ function QueryTable({
         bodyRow: "text-xs *:border-border-muted hover:bg-card has-data-selected:bg-card",
       }}
     >
-      <DataGridContainer border={false}>
+      {/* `flex min-h-0 flex-1 flex-col` on the container, not just on the
+          panes above it: DataGridContainer is a plain block `div`
+          (`w-full overflow-hidden`), so a height chain that stops at its
+          parent leaves everything below it sized by content. */}
+      <DataGridContainer border={false} className="flex min-h-0 flex-1 flex-col">
         {isLoading ? (
           <div className="flex flex-col gap-2 px-4 py-3" aria-hidden="true">
             {Array.from({ length: 12 }).map((_, i) => (
@@ -742,19 +761,35 @@ function QueryTable({
           // matching queries loaded" so the end is stated, not implied.
           //
           // The scroll area fills the split rather than carrying a fixed
-          // height: the shell is h-screen and every ancestor sets min-h-0,
-          // so "the rest of the window" is a real number here and the rows
-          // scroll inside it instead of the pane stopping short of the
-          // bottom of the page.
-          <DataGridScrollArea className="min-h-0 flex-1">
-            <DataGridTableVirtual
-              estimateSize={ROW_HEIGHT_ESTIMATE}
-              overscan={12}
-              onFetchMore={onFetchMore}
-              isFetchingMore={isFetchingMore}
-              hasMore={hasMore}
-            />
-          </DataGridScrollArea>
+          // height — but "fills" has to be spelled out at both ends,
+          // because DataGridScrollArea puts our className on base-ui's
+          // ScrollArea.Root and wraps *that* in its own bare
+          // `<div class="relative">`. A `flex-1` handed to the component
+          // therefore lands on the child of a plain block div and does
+          // nothing: the Root sizes to its content, its `size-full`
+          // viewport resolves 100% of an auto height to that same content
+          // height, and clientHeight ends up equal to scrollHeight. That
+          // one fact is three bugs at once — nothing scrolls (the box grew
+          // instead), every row mounts (the virtualizer's window is the
+          // whole list), and DataGridTableVirtual sees its last row
+          // mounted and calls onFetchMore forever, which is where OFFSET
+          // 2300 came from with nobody touching the page.
+          //
+          // So: a row-flex box we own takes the height (flex-1 against a
+          // column parent that has one), which stretches rnui's wrapper
+          // div to match, and `h-full` gives the Root a percentage of a
+          // now-definite height.
+          <div className="flex min-h-0 flex-1">
+            <DataGridScrollArea className="h-full min-w-0 flex-1">
+              <DataGridTableVirtual
+                estimateSize={ROW_HEIGHT_ESTIMATE}
+                overscan={12}
+                onFetchMore={onFetchMore}
+                isFetchingMore={isFetchingMore}
+                hasMore={hasMore}
+              />
+            </DataGridScrollArea>
+          </div>
         )}
       </DataGridContainer>
     </DataGrid>
@@ -1269,7 +1304,12 @@ export function QueryLog() {
    */
   const applyTimeRange = useCallback((value: DateSelectorValue) => {
     const range = toEpochRange(value);
-    setFilters((f) => (f.from === range.from && f.to === range.to ? f : { ...f, ...range }));
+    setFilters((f) =>
+      // Assigning both bounds, never spreading a partial: `range` carries an
+      // explicit `undefined` for whichever end this operator leaves open, and
+      // that has to overwrite whatever the last selection put there.
+      f.from === range.from && f.to === range.to ? f : { ...f, from: range.from, to: range.to },
+    );
   }, []);
 
   const clearFilters = useCallback(() => {
@@ -1320,6 +1360,33 @@ export function QueryLog() {
   // The offset the last page was actually asked for: the sum of every page
   // before it, which is exactly what getNextPageParam handed the fetch.
   const offset = (pages ?? []).slice(0, -1).reduce((n, page) => n + page.length, 0);
+
+  /**
+   * The next-page fetch, guarded and referentially stable.
+   *
+   * rnui's DataGridTableVirtual asks for more from an effect whose deps
+   * include both the virtual-item array (a fresh array every render) and
+   * this callback, so an inline arrow here re-armed it on every commit. Its
+   * own `isFetchingMore`/`hasMore` guards are the react-query flags, which
+   * are a render behind the call — several requests could be issued before
+   * the first one flipped `isFetchingNextPage`. A ref closes that window
+   * synchronously, and the same ref means the page can never out-run the
+   * end of the results even if the grid asks again.
+   *
+   * `pagedRef` is only ever written during render and read from callbacks —
+   * never read during render — so it stays out of the rendered output.
+   */
+  const pagedRef = useRef(paged);
+  pagedRef.current = paged;
+  const fetchMoreInFlight = useRef(false);
+  const fetchMore = useCallback(() => {
+    const p = pagedRef.current;
+    if (fetchMoreInFlight.current || p.isFetchingNextPage || !p.hasNextPage) return;
+    fetchMoreInFlight.current = true;
+    void p.fetchNextPage().finally(() => {
+      fetchMoreInFlight.current = false;
+    });
+  }, []);
 
   const tableRef = useRef<HTMLDivElement>(null);
   const scrollToNewest = useCallback(() => {
@@ -1383,7 +1450,7 @@ export function QueryLog() {
             isLoading={isLoading}
             emptyMessage={emptyMessage}
             meta={gridMeta}
-            onFetchMore={filtered ? () => void paged.fetchNextPage() : undefined}
+            onFetchMore={filtered ? fetchMore : undefined}
             isFetchingMore={paged.isFetchingNextPage}
             hasMore={filtered ? paged.hasNextPage : undefined}
           />
@@ -1412,7 +1479,7 @@ export function QueryLog() {
         offset={offset}
         hasMore={paged.hasNextPage}
         isFetchingMore={paged.isFetchingNextPage}
-        onOlder={() => void paged.fetchNextPage()}
+        onOlder={fetchMore}
         onNewer={scrollToNewest}
       />
     </div>
