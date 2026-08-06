@@ -12,6 +12,7 @@ import { renderWithProviders } from "../test/render";
 import { FakeEventSource } from "../test/fake-event-source";
 import { makeQueryClient } from "../lib/query-client";
 import { useTheme } from "../lib/theme";
+import { LIVE_TAIL_CAP } from "../hooks/use-queries";
 import type { QueryEntry, TimelineBucket } from "../api/types";
 import { Dashboard } from "./dashboard";
 
@@ -88,10 +89,24 @@ function chart(): HTMLElement {
   return screen.getByTestId("timeline-chart");
 }
 
+/**
+ * The three bands, named as the page names them. Sentence case in the DOM,
+ * uppercased by CSS in the legend — the same rule the chrome follows, and
+ * the reason ECharts' own tooltip (which `text-transform` can't reach) is
+ * still readable.
+ */
+const SERVED = "Forwarded + cached";
+const BLOCKED = "Blocked";
+const OTHER = "Local + error";
+
 function seriesEl(name: string): HTMLElement {
   const el = chart().querySelector(`[data-series="${name}"]`);
   if (!el) throw new Error(`no "${name}" series on the chart`);
   return el as HTMLElement;
+}
+
+function seriesNames(): (string | null)[] {
+  return [...chart().querySelectorAll("[data-series]")].map((el) => el.getAttribute("data-series"));
 }
 
 /** The ECharts `option` the page merged into BarChart, as JSON. */
@@ -144,7 +159,19 @@ function liveRow(domain: string): HTMLElement {
 
 // --- 1. stat strip -----------------------------------------------------------
 
-test("the stat strip shows total, blocked %, cache hit rate and clients", async () => {
+/**
+ * The StatCard whose title reads `title`, as its outermost Card element.
+ * Scoped to the strip's own region: "Blocked" is a stat title *and* a chart
+ * legend label, and the two are different things.
+ */
+function statCard(title: string): HTMLElement {
+  const strip = screen.getByRole("region", { name: /^query stats/i });
+  const card = within(strip).getByText(title).closest('[data-slot="card"]');
+  if (!card) throw new Error(`no stat card titled ${title}`);
+  return card as HTMLElement;
+}
+
+test("the stat strip shows total, blocked %, cache hit rate and client IPs", async () => {
   renderWithProviders(<Dashboard />);
 
   expect(await screen.findByText("1,000")).toBeInTheDocument(); // total
@@ -152,9 +179,45 @@ test("the stat strip shows total, blocked %, cache hit rate and clients", async 
   expect(screen.getByText("40%")).toBeInTheDocument(); // cached: 400/1000
   expect(screen.getByText("12")).toBeInTheDocument(); // clients
 
-  // Only the blocked numeral is tinted — the design's one coloured stat.
-  expect(screen.getByText("25%").className).toContain("text-chart-blocked");
-  expect(screen.getByText("1,000").className).not.toContain("text-chart-blocked");
+  // Each number is inside the card that names it, not merely somewhere on
+  // the page — the four are otherwise indistinguishable.
+  expect(statCard("Queries")).toHaveTextContent("1,000");
+  expect(statCard("Blocked")).toHaveTextContent("25%");
+  expect(statCard("Cached")).toHaveTextContent("40%");
+  expect(statCard("Client IPs seen")).toHaveTextContent("12");
+});
+
+// Every one of these is a question the strip has been asked, and every
+// answer is a real property of the API rather than a caption: `total` sums
+// *every* decision (so it exceeds blocked + cached + forwarded), `cached`
+// is cached + stale in the same handler, and `clients` counts distinct
+// client_ip values — an unregistered device still counts.
+test("each stat says what it actually counts", async () => {
+  renderWithProviders(<Dashboard />);
+
+  await screen.findByText("1,000");
+  expect(statCard("Queries")).toHaveTextContent("every decision, incl. local + error");
+  expect(statCard("Blocked")).toHaveTextContent("250 blocked");
+  expect(statCard("Cached")).toHaveTextContent("400 cached + stale");
+  expect(statCard("Client IPs seen")).toHaveTextContent("distinct client_ip, not client rows");
+});
+
+// rnui's StatCard is built on Card, and Card brings a card's chrome. In a
+// page made of nothing but hairlines that chrome is the one thing that must
+// not appear — a ring around every cell turns the strip into four floating
+// tiles, and `bg-card` is a visibly different surface from the page.
+test("the stat cells keep the grid's hairlines and none of Card's own chrome", async () => {
+  renderWithProviders(<Dashboard />);
+  await screen.findByText("1,000");
+
+  for (const title of ["Queries", "Blocked", "Cached", "Client IPs seen"]) {
+    const cell = statCard(title);
+    expect(cell.className).toContain("ring-0");
+    expect(cell.className).toContain("bg-transparent");
+    // The divider between cells is the thing the strip actually is.
+    expect(cell.className).toContain("border-r");
+    expect(cell.className).toContain("last:border-r-0");
+  }
 });
 
 // `total` sums *every* decision the resolver writes — local and error
@@ -224,7 +287,7 @@ test("an unrecognised window falls back to 24h rather than putting it on the wir
 
 // --- 3. query volume ---------------------------------------------------------
 
-test("the chart stacks resolved under blocked, in square bars, in resolved colours", async () => {
+test("the chart stacks three bands bottom-up, in square bars", async () => {
   server.use(
     http.get("/api/v1/stats/timeline", () =>
       HttpResponse.json([
@@ -237,45 +300,68 @@ test("the chart stacks resolved under blocked, in square bars, in resolved colou
   await screen.findByTestId("timeline-chart");
 
   expect(chart().getAttribute("data-stacked")).toBe("true");
-  // Both series share one stack, and "Resolved" is declared first so it
-  // sits underneath.
-  const names = [...chart().querySelectorAll("[data-series]")].map((el) =>
-    el.getAttribute("data-series"),
+  // Declaration order is stacking order: what dnsaur served, then what it
+  // blocked, then what was neither.
+  expect(seriesNames()).toEqual([SERVED, BLOCKED, OTHER]);
+  // ...and all three share one stack, or they'd be three charts.
+  const stacks = new Set(
+    [...chart().querySelectorAll("[data-series]")].map((el) => el.getAttribute("data-stack")),
   );
-  expect(names).toEqual(["Resolved", "Blocked"]);
-  expect(seriesEl("Resolved").getAttribute("data-stack")).toBe(
-    seriesEl("Blocked").getAttribute("data-stack"),
-  );
+  expect(stacks.size).toBe(1);
 
   // BarChart's own default is itemStyle.borderRadius [4,4,0,0]; --radius is
   // 0 app-wide and a rounded cap inside a stack notches the band above it.
-  for (const name of ["Resolved", "Blocked"]) {
+  for (const name of [SERVED, BLOCKED, OTHER]) {
     expect(seriesEl(name).getAttribute("data-radius")).toBe("0");
   }
 });
 
-// "Resolved" is every non-blocked decision, errors included: a failed
-// resolve isn't a query dnsaur let through, but it *is* one it didn't
-// block, and the two bands have to add up to the same total the strip
-// above reports.
-test("resolved counts every non-blocked decision, so the bands total the strip", async () => {
+// The third band is why this changed: `error` used to be buried under the
+// same colour as a cache hit, so an upstream outage looked like traffic.
+// The three bands still have to partition `total` exactly — the strip above
+// sums every decision, and a chart that doesn't add up to it is lying.
+test("errors and local answers get their own band, and the three still total the strip", async () => {
   server.use(
     http.get("/api/v1/stats/overview", () =>
-      HttpResponse.json({ total: 20, blocked: 5, cached: 2, forwarded: 10, clients: 3 }),
+      HttpResponse.json({ total: 24, blocked: 5, cached: 4, forwarded: 10, clients: 3 }),
     ),
     http.get("/api/v1/stats/timeline", () =>
       HttpResponse.json([
-        { bucket: hourStart(0), decisions: { forwarded: 10, blocked: 5, error: 3, cached: 2 } },
+        {
+          bucket: hourStart(0),
+          decisions: { forwarded: 10, blocked: 5, error: 3, cached: 2, stale: 2, local: 2 },
+        },
       ]),
     ),
   );
 
   renderWithProviders(<Dashboard />, { route: "/?window=1h" });
 
-  // 10 forwarded + 3 error + 2 cached = 15 resolved, 5 blocked, 20 total.
-  expect(await screen.findByText("Resolved: 0,15")).toBeInTheDocument();
-  expect(screen.getByText("Blocked: 0,5")).toBeInTheDocument();
-  expect(screen.getByRole("figure", { name: /20 queries/ })).toBeInTheDocument();
+  // 10 forwarded + 2 cached + 2 stale = 14 served; 5 blocked; 3 error + 2
+  // local = 5 other. 14 + 5 + 5 = 24, the total the strip reports.
+  expect(await screen.findByText(`${SERVED}: 0,14`)).toBeInTheDocument();
+  expect(screen.getByText(`${BLOCKED}: 0,5`)).toBeInTheDocument();
+  expect(screen.getByText(`${OTHER}: 0,5`)).toBeInTheDocument();
+  expect(screen.getByRole("figure", { name: /24 queries/ })).toBeInTheDocument();
+});
+
+// The remainder band is deliberately "everything the bucket contained that
+// the other two didn't claim", not a hardcoded {local, error}: a decision
+// the resolver grows later must show up somewhere rather than being
+// silently dropped out of a chart that claims to total the strip.
+test("a decision the page has never heard of still lands in a band", async () => {
+  server.use(
+    http.get("/api/v1/stats/timeline", () =>
+      HttpResponse.json([
+        { bucket: hourStart(0), decisions: { forwarded: 4, blocked: 1, teleported: 7 } },
+      ]),
+    ),
+  );
+
+  renderWithProviders(<Dashboard />, { route: "/?window=1h" });
+
+  expect(await screen.findByText(`${OTHER}: 0,7`)).toBeInTheDocument();
+  expect(screen.getByText(`${SERVED}: 0,4`)).toBeInTheDocument();
 });
 
 // /stats/timeline emits a row only for hours that had traffic and never
@@ -298,32 +384,42 @@ test("hours with no traffic are synthesised as zeroes so the axis stays continuo
 
   // The window is 1h, but the data reaches 3h back — the axis grows to
   // cover it rather than dropping buckets it was handed.
-  expect(seriesEl("Resolved").textContent).toBe("Resolved: 4,0,0,8");
-  expect(seriesEl("Blocked").textContent).toBe("Blocked: 1,0,0,2");
+  expect(seriesEl(SERVED).textContent).toBe(`${SERVED}: 4,0,0,8`);
+  expect(seriesEl(BLOCKED).textContent).toBe(`${BLOCKED}: 1,0,0,2`);
   expect(chart().getAttribute("data-buckets")).toBe("4");
 });
 
-test("the header names the real granularity and legends both bands", async () => {
+test("the header names the real granularity, admits the lag, and legends all three bands", async () => {
   renderWithProviders(<Dashboard />);
   await screen.findByTestId("timeline-chart");
 
   // The design says "15-min"; the endpoint only ever produces hour buckets.
-  expect(screen.getByText("hourly buckets")).toBeInTheDocument();
+  // And these bars are written from the log's batched flush, so the newest
+  // minute is on the live feed below before it is up here.
+  expect(screen.getByText("hourly buckets · stats lag the log by up to 60s")).toBeInTheDocument();
   expect(screen.queryByText(/15-min/i)).not.toBeInTheDocument();
 
   const header = screen.getByText("Query volume").closest("div");
   expect(header).not.toBeNull();
-  expect(within(header!).getByText("Blocked")).toBeInTheDocument();
-  expect(within(header!).getByText("Resolved")).toBeInTheDocument();
+  // The legend reads bottom-up, in the order the bands stack.
+  expect(
+    [...header!.querySelectorAll("span > span:last-child")]
+      .map((el) => el.textContent)
+      .filter((t) => [SERVED, BLOCKED, OTHER].includes(t ?? "")),
+  ).toEqual([SERVED, BLOCKED, OTHER]);
 });
 
-test("the chart carries a text alternative naming both totals", async () => {
+test("the chart carries a text alternative naming all three totals", async () => {
   renderWithProviders(<Dashboard />);
 
-  // Default fixture: 5 buckets × (120+90+40+5 resolved, 30 blocked).
+  // Default fixture: 5 buckets × {allowed:120, blocked:30, cached:90,
+  // forwarded:40, stale:5} — 135 served, 30 blocked and 120 unrecognised
+  // per bucket.
   const figure = await screen.findByRole("figure");
-  expect(figure).toHaveAccessibleName(/1,275 resolved/);
+  expect(figure).toHaveAccessibleName(/675 forwarded or cached/);
   expect(figure).toHaveAccessibleName(/150 blocked/);
+  expect(figure).toHaveAccessibleName(/600 local or error/);
+  expect(figure).toHaveAccessibleName(/1,425 queries/);
   expect(figure).toHaveAccessibleName(/hourly buckets/);
 });
 
@@ -348,11 +444,15 @@ test("every colour the chart is given is resolved, never a raw var() reference",
   renderWithProviders(<Dashboard />);
   await screen.findByTestId("timeline-chart");
 
-  for (const name of ["Resolved", "Blocked"]) {
-    const color = seriesEl(name).getAttribute("data-color") ?? "";
+  const colors = [SERVED, BLOCKED, OTHER].map(
+    (name) => seriesEl(name).getAttribute("data-color") ?? "",
+  );
+  for (const color of colors) {
     expect(color).not.toContain("var(");
     expect(color).not.toBe("");
   }
+  // Three bands in one stack are only three bands if they're three colours.
+  expect(new Set(colors).size).toBe(3);
 
   // The axis/gridline colours ride in `option` and reach the same painter.
   expect(chart().getAttribute("data-option")).not.toContain("var(");
@@ -392,14 +492,17 @@ test("chart colours are re-read when the theme changes", async () => {
     </>,
   );
   await screen.findByTestId("timeline-chart");
-  const lightBlocked = seriesEl("Blocked").getAttribute("data-color");
+  const before = [SERVED, BLOCKED, OTHER].map((n) => seriesEl(n).getAttribute("data-color"));
 
   await user.click(screen.getByRole("button", { name: /go dark/i }));
 
-  await waitFor(() =>
-    expect(seriesEl("Blocked").getAttribute("data-color")).not.toBe(lightBlocked),
-  );
-  expect(seriesEl("Blocked").getAttribute("data-color")).not.toContain("var(");
+  await waitFor(() => expect(seriesEl(BLOCKED).getAttribute("data-color")).not.toBe(before[1]));
+  // All three tokens are redefined in dark, the newest one included.
+  for (const [i, name] of [SERVED, BLOCKED, OTHER].entries()) {
+    const color = seriesEl(name).getAttribute("data-color");
+    expect(color).not.toBe(before[i]);
+    expect(color).not.toContain("var(");
+  }
 });
 
 // --- 4. live queries ---------------------------------------------------------
@@ -424,23 +527,101 @@ test("live rows render from the shared tail, newest first, capped at twelve", as
   expect(FakeEventSource.instances[0]!.url).toBe("/api/v1/queries/tail");
 });
 
-test("each row shows time, domain, client, decision and duration", async () => {
+test("the panel header says where the rows come from and which end is new", async () => {
+  renderWithProviders(<Dashboard />);
+  await emitAll(await firstSource(), [entry({ id: 1, q_name: "one.example" })]);
+
+  const header = screen.getByText("Live queries").closest("div")!;
+  // rnui's StatusIndicator, live, rather than a second hand-rolled dot.
+  const dot = header.querySelector('[data-slot="status-indicator"]');
+  expect(dot).not.toBeNull();
+  expect(dot).toHaveAttribute("data-state", "active");
+  // The buffer size is the hook's, not a number typed twice.
+  expect(within(header).getByText(`SSE · ${LIVE_TAIL_CAP}-row buffer`)).toBeInTheDocument();
+  expect(within(header).getByText("newest first")).toBeInTheDocument();
+});
+
+test("the table carries all eight columns, in the design's order", async () => {
+  renderWithProviders(<Dashboard />);
+  await emitAll(await firstSource(), [entry({ id: 1, q_name: "one.example" })]);
+
+  expect(screen.getAllByRole("columnheader").map((th) => th.textContent)).toEqual([
+    "Time",
+    "Domain",
+    "Type",
+    "Client IP",
+    "Hostname",
+    "Decision",
+    "Upstream",
+    "ms",
+  ]);
+});
+
+test("each row shows time, domain, type, client, decision, upstream and duration", async () => {
   renderWithProviders(<Dashboard />);
   const source = await firstSource();
   await emitAll(source, [
     entry({
       id: 1,
       q_name: "one.example",
+      q_type: "AAAA",
       client_ip: "10.0.0.4",
       decision: "cached",
+      upstream: "9.9.9.9",
       duration_ms: 3,
     }),
   ]);
 
   const row = liveRow("one.example");
+  expect(within(row).getByText("AAAA")).toBeInTheDocument();
   expect(within(row).getByText("10.0.0.4")).toBeInTheDocument();
   expect(within(row).getByText("cached")).toBeInTheDocument();
-  expect(within(row).getByText("3ms")).toBeInTheDocument();
+  expect(within(row).getByText("9.9.9.9")).toBeInTheDocument();
+  // The column is headed MS, so the unit is in the header and not repeated
+  // on every one of twelve rows.
+  expect(within(row).getByText("3")).toBeInTheDocument();
+});
+
+// duration_ms is truncated whole milliseconds, so a cache hit answered in
+// 180µs is logged as 0 — and "0" in a column headed MS claims an
+// instantaneous resolve. lib/query-rows.ts owns that rule for both screens.
+test("a sub-millisecond answer reads <1, never 0", async () => {
+  renderWithProviders(<Dashboard />);
+  await emitAll(await firstSource(), [
+    entry({ id: 1, q_name: "fast.example", decision: "cached", duration_ms: 0 }),
+  ]);
+
+  const row = liveRow("fast.example");
+  expect(within(row).getByText("<1")).toBeInTheDocument();
+  expect(within(row).queryByText("0")).not.toBeInTheDocument();
+});
+
+// A query row carries `client_id` — the registry entry whose matcher the
+// address hit, or 0 when nothing matched — so a hostname exists only if
+// GET /clients can be asked for it. Anything unresolvable renders an em
+// dash; reverse-DNS or falling back to the IP would be inventing a name.
+test("HOSTNAME resolves through the client registry, and shows an em dash when it can't", async () => {
+  server.use(
+    http.get("/api/v1/clients", () =>
+      HttpResponse.json([{ id: 7, name: "Laptop", matcher: "192.168.1.10", group_id: 1 }]),
+    ),
+  );
+
+  renderWithProviders(<Dashboard />);
+  const source = await firstSource();
+  await emitAll(source, [
+    entry({ id: 1, q_name: "known.example", client_ip: "192.168.1.10", client_id: 7 }),
+    // Nothing in the registry matched this address at query time.
+    entry({ id: 2, q_name: "unknown.example", client_ip: "192.168.11.63", client_id: 0 }),
+    // Registered once, deleted since — the id no longer resolves.
+    entry({ id: 3, q_name: "stale-id.example", client_ip: "192.168.1.99", client_id: 42 }),
+  ]);
+
+  expect(within(liveRow("known.example")).getByText("Laptop")).toBeInTheDocument();
+  expect(within(liveRow("unknown.example")).getByText("—")).toBeInTheDocument();
+  expect(within(liveRow("stale-id.example")).getByText("—")).toBeInTheDocument();
+  // Never the address as a stand-in for a name.
+  expect(within(liveRow("unknown.example")).getAllByText("192.168.11.63")).toHaveLength(1);
 });
 
 // The decision vocabulary is the resolver's (internal/dnssrv/pipeline.go).
@@ -566,6 +747,33 @@ test("each rail panel offers a way through to the full list", async () => {
     "href",
     "/filtering/clients",
   );
+});
+
+// The two panels look identical and count different things:
+// /stats/top?metric=blocked_domain counts blocks only, while metric=client
+// counts every decision that client made. Without the notes the obvious
+// reading — "these are the clients doing the blocked lookups" — is wrong.
+test("each rail panel says which decisions its numbers count", async () => {
+  renderWithProviders(<Dashboard />);
+  await screen.findByText("ads.tracker.example");
+
+  const blocked = screen.getByRole("region", { name: "Top blocked" });
+  expect(within(blocked).getByText("blocked only")).toBeInTheDocument();
+
+  // "Client IPs", not "Clients": the metric groups by address, so one
+  // registered device with two addresses is two rows.
+  const clients = screen.getByRole("region", { name: "Top client IPs" });
+  expect(within(clients).getByText("all decisions")).toBeInTheDocument();
+});
+
+// The fill is a ranking you can read without reading a number, so it has to
+// sit under the label without swallowing it — `--accent` is the theme's own
+// tint surface and half strength keeps the text legible in both modes.
+test("the magnitude fills are the accent wash, not a solid bar", async () => {
+  renderWithProviders(<Dashboard />);
+  const top = (await screen.findByText("ads.tracker.example")).closest("li")!;
+
+  expect(top.querySelector("[aria-hidden]")!.className).toContain("bg-accent/50");
 });
 
 // --- 6. quick block / allow --------------------------------------------------
@@ -869,7 +1077,7 @@ test("a new timeline still re-renders the chart", async () => {
     await client.invalidateQueries({ queryKey: ["stats", "timeline"] });
   });
 
-  await waitFor(() => expect(seriesEl("Resolved").textContent).toContain("99"));
+  await waitFor(() => expect(seriesEl(SERVED).textContent).toContain("99"));
   expect(chartRenders.count).toBeGreaterThan(before);
 });
 
@@ -902,11 +1110,11 @@ test("the query volume section reserves its height while loading, when empty, an
   );
 
   // 1. loading — the skeleton is inside the box, not instead of it.
-  expect(plotFrame().className).toContain("h-64");
+  expect(plotFrame().className).toContain("h-52");
 
   // 2. empty — the message is inside the same box.
   await screen.findByText(/no query activity yet/i);
-  expect(plotFrame().className).toContain("h-64");
+  expect(plotFrame().className).toContain("h-52");
   expect(plotFrame()).toContainElement(screen.getByText(/no query activity yet/i));
 
   // 3. populated — so is the chart.
@@ -915,7 +1123,7 @@ test("the query volume section reserves its height while loading, when empty, an
     await client.invalidateQueries({ queryKey: ["stats", "timeline"] });
   });
   await screen.findByTestId("timeline-chart");
-  expect(plotFrame().className).toContain("h-64");
+  expect(plotFrame().className).toContain("h-52");
   expect(plotFrame()).toContainElement(screen.getByTestId("timeline-chart"));
 });
 

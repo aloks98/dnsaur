@@ -1,10 +1,18 @@
+import { act } from "react";
 import { http, HttpResponse } from "msw";
 import { toast } from "sonner";
 import { afterEach, expect, test, vi } from "vitest";
 import { fireEvent, screen, waitFor, within } from "@testing-library/react";
 import { useLocation, useNavigationType } from "react-router";
 import { server } from "../test/msw-server";
+import { blockingHandler } from "../test/msw-handlers";
 import { renderWithProviders } from "../test/render";
+import {
+  resetLiveTailReport,
+  setLiveTailPaused,
+  setLiveTailReport,
+  useLiveTailPaused,
+} from "../lib/live-tail";
 import { TopNav } from "./top-nav";
 
 // rnui's DropdownMenu is base-ui Menu-driven — under jsdom, opening it via
@@ -24,6 +32,22 @@ function tabs(groupLabel: string): HTMLElement {
   return screen.getByRole("navigation", { name: groupLabel });
 }
 
+/**
+ * Stands in for the routed page below the chrome: the tail flag is shared
+ * module state (lib/live-tail.ts), and the whole point of it is that the
+ * shell's toggle moves what the *page* reads. Observing it through the same
+ * hook the page uses is how this file asserts that, rather than reaching
+ * into the module.
+ */
+function TailProbe() {
+  const { paused } = useLiveTailPaused();
+  return <span data-testid="tail-paused">{String(paused)}</span>;
+}
+
+function readLiveTailPaused(): boolean {
+  return screen.getByTestId("tail-paused").textContent === "true";
+}
+
 function renderTopNav({ route = "/", onOpen = () => {} } = {}) {
   function Harness() {
     const location = useLocation();
@@ -34,6 +58,7 @@ function renderTopNav({ route = "/", onOpen = () => {} } = {}) {
         {/* "PUSH" vs "REPLACE" is how the router itself reports whether the
             last navigation added a back-stack entry. */}
         <span data-testid="nav-type">{useNavigationType()}</span>
+        <TailProbe />
         <TopNav onOpenCommandPalette={onOpen} />
       </>
     );
@@ -66,6 +91,9 @@ function stubNavigation() {
 afterEach(() => {
   restoreLocation?.();
   restoreLocation = null;
+  // lib/live-tail.ts is a module-level store, so it outlives any one test.
+  setLiveTailPaused(false);
+  resetLiveTailReport();
   vi.restoreAllMocks();
 });
 
@@ -96,7 +124,30 @@ test("row 1 carries the mark, the wordmark and the four nav groups", async () =>
     within(primary)
       .getAllByRole("button")
       .map((button) => button.textContent),
-  ).toEqual(["Monitor", "Filtering", "Network", "System"]);
+  ).toEqual(["Monitor", "Filtering", "Local DNS", "System"]);
+});
+
+// Four disclosure chevrons in a row said nothing the marked group and the
+// row of pages under it don't already say, and cost a column of noise at
+// the top of every screen. The bar keeps exactly one, on the blocking cell,
+// where the menu is the only route to the actions.
+test("the group cells carry no disclosure chevron", async () => {
+  renderTopNav();
+
+  const primary = screen.getByRole("navigation", { name: "Primary" });
+  const groups = within(primary).getAllByRole("button");
+  // Nothing in a group cell but its name — no icon, and no "▾" typed as
+  // text either.
+  expect(groups.map((g) => g.textContent)).toEqual(["Monitor", "Filtering", "Local DNS", "System"]);
+  for (const group of groups) {
+    expect(group.querySelector("svg")).toBeNull();
+    // Still a real menu button — the affordance moved to semantics, not away.
+    expect(group).toHaveAttribute("aria-haspopup", "menu");
+  }
+  // The blocking cell keeps its glyph and its chevron: its menu is the only
+  // way to reach pause/resume.
+  const blocking = screen.getByRole("button", { name: /open blocking controls/i });
+  expect(blocking.querySelectorAll("svg")).toHaveLength(2);
 });
 
 test("the active group is marked and row 2 shows its pages as links", async () => {
@@ -151,11 +202,14 @@ test("the redirecting /filtering index still lights the Filtering group", async 
   expect(screen.getByRole("button", { name: "Filtering" })).toHaveAttribute("data-active", "true");
 });
 
+// The group is named for the one thing behind it. "Network" promised DHCP,
+// interfaces and encrypted DNS, none of which exist.
 test("a group with a single page still gets its row-2 tab", async () => {
   renderTopNav({ route: "/dns" });
 
-  expect(screen.getByRole("button", { name: "Network" })).toHaveAttribute("data-active", "true");
-  expect(within(tabs("Network")).getByRole("link", { name: "Local DNS" })).toHaveAttribute(
+  expect(screen.getByRole("button", { name: "Local DNS" })).toHaveAttribute("data-active", "true");
+  expect(screen.queryByRole("button", { name: "Network" })).not.toBeInTheDocument();
+  expect(within(tabs("Local DNS")).getByRole("link", { name: "Local DNS" })).toHaveAttribute(
     "aria-current",
     "page",
   );
@@ -164,7 +218,7 @@ test("a group with a single page still gets its row-2 tab", async () => {
 test("a group menu lists its pages as menu items and navigates to them", async () => {
   renderTopNav({ route: "/" });
 
-  const menu = openGroup("Network");
+  const menu = openGroup("Local DNS");
   const item = within(menu).getByRole("menuitem", { name: /local dns/i });
   fireEvent.click(item);
 
@@ -178,6 +232,22 @@ test("the search cell opens the command palette", async () => {
   fireEvent.click(screen.getByRole("button", { name: /search/i }));
 
   expect(onOpen).toHaveBeenCalledTimes(1);
+});
+
+// The shortcut is a key, so it's a <kbd> — rnui's Kbd, not two more
+// characters of label text. The word stays in the accessible name even
+// where the viewport hides it, so the cell never announces as just "⌘K".
+test("the search cell names itself and shows the shortcut as a Kbd", async () => {
+  renderTopNav();
+
+  const search = screen.getByRole("button", { name: /search/i });
+  expect(search).toHaveAccessibleName("search ⌘K");
+
+  const kbd = search.querySelector("kbd");
+  expect(kbd).not.toBeNull();
+  expect(kbd).toHaveTextContent("⌘K");
+  // The old cell spelled the affordance out in the label instead.
+  expect(search.textContent).not.toMatch(/\//);
 });
 
 test("the System menu carries Settings, Account, the signed-in user, theme and log out", async () => {
@@ -274,11 +344,11 @@ test("an unreachable resolver says so rather than staying green", async () => {
   expect(screen.getByRole("status")).not.toHaveTextContent(/dns ok/i);
 });
 
-// Stage 2 parked resolver health in row 2's one filled cell for want of a
-// home. Row 2 is the *contextual* row and that cell is the design's only
-// call to action, so health moved up beside blocking — the shell's two "is
-// this thing working" readouts, in one place and in one visual language.
-test("the two health readouts sit together in row 1, neither of them filled", async () => {
+// Stage 2 parked resolver health in row 2's filled cell for want of a
+// home. Row 2 is the *contextual* row and that cell is its call to action,
+// so health moved up beside blocking — the shell's two "is this thing
+// working" readouts, in one place.
+test("the two health readouts sit together in row 1, and only blocking is filled", async () => {
   renderTopNav();
 
   const blocking = screen.getByRole("button", { name: /open blocking controls/i });
@@ -294,12 +364,55 @@ test("the two health readouts sit together in row 1, neither of them filled", as
     Node.DOCUMENT_POSITION_FOLLOWING,
   );
 
-  // Neither shouts over the other: the one solid fill belongs to the CTA.
+  // Blocking is row 1's filled cell — it's the control that changes what
+  // dnsaur does. Health beside it is a readout and stays flat text, so the
+  // bar doesn't shout twice.
+  expect(blocking.className).toContain("bg-primary");
+  expect(blocking.className).toContain("text-primary-foreground");
   expect(resolver.className).not.toContain("bg-primary");
   expect(resolver.className).toContain("text-primary");
   // The strings stay sentence case (accessible names, assertions); the cell
   // is what uppercases them.
   expect(blocking.className).toContain("uppercase");
+});
+
+// The fill is a claim, so only the states we've actually read from
+// GET /blocking may make it. A paused instance wears the warning tone; a
+// failed read gets no fill at all, which is what stops "I couldn't tell"
+// from looking like the confident "BLOCKING ACTIVE".
+/** The cell's classes as tokens, so `bg-warning` can't be satisfied by the
+ * 10%-opacity wash `bg-warning/10` that this cell used to wear. */
+function classes(el: HTMLElement): string[] {
+  return el.className.split(/\s+/);
+}
+
+test("a paused instance fills warning; an unreadable status fills nothing", async () => {
+  server.use(blockingHandler({ 0: Date.now() + 5 * 60_000 }));
+  const { unmount } = renderTopNav();
+
+  const paused = screen.getByRole("button", { name: /open blocking controls/i });
+  await waitFor(() => expect(paused).toHaveTextContent(/^paused · \d+:[0-5]\d/i));
+  // A real fill, not a tint.
+  expect(classes(paused)).toContain("bg-warning");
+  expect(paused.className).not.toContain("bg-primary");
+  // --warning-foreground is rnui's amber *text* tone, not ink for an amber
+  // fill: it measures 2.10:1 on --warning in light and 1.41:1 in dark. The
+  // app's own on-solid-amber token is what clears AA in both modes.
+  expect(paused.className).not.toContain("text-warning-foreground");
+  expect(classes(paused)).toContain("text-warning-solid-foreground");
+  unmount();
+
+  server.use(
+    http.get("/api/v1/blocking", () => HttpResponse.json({ error: "boom" }, { status: 500 })),
+  );
+  renderTopNav();
+
+  const unknown = screen.getByRole("button", { name: /open blocking controls/i });
+  await waitFor(() => expect(unknown).toHaveTextContent(/status unavailable/i), { timeout: 4000 });
+  expect(unknown).not.toHaveTextContent(/blocking active/i);
+  expect(unknown.className).not.toContain("bg-primary");
+  expect(unknown.className).not.toContain("bg-warning");
+  expect(classes(unknown)).toContain("text-destructive");
 });
 
 // --- row 2's contextual cells ------------------------------------------------
@@ -360,31 +473,113 @@ test("no other screen gets the window selector or the CTA", async () => {
 
   expect(screen.queryByRole("group", { name: "Time window" })).not.toBeInTheDocument();
   expect(screen.queryByRole("link", { name: /view query log/i })).not.toBeInTheDocument();
-  expect(screen.queryByRole("switch", { name: /live tail/i })).not.toBeInTheDocument();
 });
 
-// The query log spends the same filled cell on its own CTA — the one control
-// that screen is actually about. The flag it toggles lives in
-// lib/live-tail.ts, because the stream it governs is consumed by the routed
-// page below rather than by the chrome.
-test("the query log's chrome carries the trailing note and the live/pause cell", async () => {
+// --- the query log's contextual cells ----------------------------------------
+
+/** The one cell that reports what the table is doing. */
+function modeCell(): HTMLElement {
+  return screen.getByRole("status", { name: "Query log" });
+}
+
+function tailToggle(): HTMLElement {
+  return screen.getByRole("button", { name: /(pause|resume) tail/i });
+}
+
+/** The dot's tone — the readout's other half, and the half a screen reader
+ * never gets, so it has to agree with the word beside it. */
+function modeDot(): HTMLElement {
+  return modeCell().querySelector("[aria-hidden]") as HTMLElement;
+}
+
+test("the query log's chrome carries one mode readout and the filled tail toggle", async () => {
   renderTopNav({ route: "/queries" });
 
-  expect(screen.getByText(/table trails the tail by ~1s/i)).toBeInTheDocument();
-  // Not on the dashboard, which has its own pair.
+  // Its own tabs, still marking the page you're on.
+  expect(within(tabs("Monitor")).getByRole("link", { name: "Query Log" })).toHaveAttribute(
+    "aria-current",
+    "page",
+  );
+  // Not the dashboard's pair — each screen gets its own.
   expect(screen.queryByRole("link", { name: /view query log/i })).not.toBeInTheDocument();
+  expect(screen.queryByRole("group", { name: "Time window" })).not.toBeInTheDocument();
 
-  const toggle = screen.getByRole("switch", { name: /live tail/i });
-  expect(toggle.className).toContain("bg-primary");
-  // The cell shows both states so it says what it will do; the accessible
-  // name says what the pair is *of*.
-  // Flex `gap-2` does the spacing, so the text nodes sit flush.
-  expect(toggle.textContent).toBe("Live·Pause");
-  expect(toggle).toHaveAttribute("aria-checked", "true");
+  // The design's filled cell on this screen, labelled with what it does
+  // rather than with the state it's in — the readout beside it owns that.
+  expect(tailToggle()).toHaveTextContent("Pause tail");
+  expect(classes(tailToggle())).toContain("bg-primary");
 
-  fireEvent.click(toggle);
-  await waitFor(() => expect(toggle).toHaveAttribute("aria-checked", "false"));
+  // An earlier revision carried this note up here; it's gone from the
+  // design, and the mode readout says the useful half of it.
+  expect(screen.queryByText(/table trails the tail/i)).not.toBeInTheDocument();
+});
 
-  fireEvent.click(toggle);
-  await waitFor(() => expect(toggle).toHaveAttribute("aria-checked", "true"));
+// One cell, four states. The previous revision had the shell and the page
+// each rendering their own version of this, so /queries showed four
+// readouts of one piece of state across two rows.
+test("the mode readout collapses filter, pause and stream health into one cell", async () => {
+  renderTopNav({ route: "/queries" });
+
+  // Default: nothing filtered, not paused, stream still coming up.
+  expect(modeCell()).toHaveTextContent(/reconnecting/i);
+  expect(classes(modeDot())).toContain("bg-warn");
+
+  act(() => setLiveTailReport({ filtered: false, streamState: "open", reconnect: () => {} }));
+  expect(modeCell()).toHaveTextContent(/live tail/i);
+  expect(classes(modeDot())).toContain("bg-primary");
+
+  // A pause outranks the stream's own state — a paused tail isn't
+  // connecting to anything.
+  act(() => setLiveTailPaused(true));
+  expect(modeCell()).toHaveTextContent(/^paused$/i);
+  expect(classes(modeDot())).toContain("bg-muted-foreground");
+  act(() => setLiveTailPaused(false));
+
+  // ...and a filter outranks both: the page has swapped the stream for
+  // paged search, so the stream's health is not a thing to report.
+  act(() => setLiveTailReport({ filtered: true, streamState: "failed", reconnect: () => {} }));
+  expect(modeCell()).toHaveTextContent(/filtered · paged/i);
+  expect(classes(modeDot())).toContain("bg-muted-foreground");
+  expect(screen.queryByRole("button", { name: "Reconnect" })).not.toBeInTheDocument();
+});
+
+// "failed" is not a quieter shade of "reconnecting": api/sse.ts has given up
+// after six attempts and nothing further happens without a click.
+test("a dead stream says so and offers the click that revives it", async () => {
+  const reconnect = vi.fn<() => void>();
+  renderTopNav({ route: "/queries" });
+  act(() => setLiveTailReport({ filtered: false, streamState: "failed", reconnect }));
+
+  expect(modeCell()).toHaveTextContent(/disconnected/i);
+  expect(classes(modeDot())).toContain("bg-destructive");
+
+  fireEvent.click(screen.getByRole("button", { name: "Reconnect" }));
+  expect(reconnect).toHaveBeenCalledTimes(1);
+});
+
+test("the toggle pauses and resumes the shared tail flag, and wears the warning fill while paused", async () => {
+  renderTopNav({ route: "/queries" });
+  act(() => setLiveTailReport({ filtered: false, streamState: "open", reconnect: () => {} }));
+
+  fireEvent.click(tailToggle());
+  await waitFor(() => expect(tailToggle()).toHaveTextContent("Resume tail"));
+  // The flag the routed page below reads (lib/live-tail.ts) really moved.
+  expect(readLiveTailPaused()).toBe(true);
+  expect(classes(tailToggle())).toContain("bg-warn");
+  // White on solid --warning is 4.10:1 in light and 2.18:1 in dark; the
+  // app's on-solid-amber token is what clears AA in both.
+  expect(classes(tailToggle())).toContain("text-warning-solid-foreground");
+  expect(tailToggle().className).not.toContain("text-primary-foreground");
+
+  fireEvent.click(tailToggle());
+  await waitFor(() => expect(tailToggle()).toHaveTextContent("Pause tail"));
+  expect(readLiveTailPaused()).toBe(false);
+});
+
+// Everything above is contextual to /queries and governs nothing elsewhere.
+test("no other screen gets the tail cells", async () => {
+  renderTopNav({ route: "/settings" });
+
+  expect(screen.queryByRole("button", { name: /(pause|resume) tail/i })).not.toBeInTheDocument();
+  expect(screen.queryByRole("status", { name: "Query log" })).not.toBeInTheDocument();
 });

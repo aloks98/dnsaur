@@ -1,4 +1,4 @@
-import { ChevronDown, LogOut } from "lucide-react";
+import { LogOut } from "lucide-react";
 import { NavLink, useLocation, useSearchParams } from "react-router";
 import { toast } from "sonner";
 import {
@@ -12,7 +12,9 @@ import {
   DropdownMenuLabel,
   DropdownMenuSeparator,
   DropdownMenuTrigger,
+  Kbd,
 } from "@e412/rnui-react";
+import type { SseState } from "../api/sse";
 import { isAlreadyLoggedOut, useLogout, useMe, useMeInitials } from "../hooks/use-auth";
 import { useHealth } from "../hooks/use-stats";
 import {
@@ -23,7 +25,7 @@ import {
   QUERY_LOG_PATH,
   type NavGroup,
 } from "../lib/nav";
-import { useLiveTailPaused } from "../lib/live-tail";
+import { useLiveTailStatus } from "../lib/live-tail";
 import { parseWindow, WINDOW_PARAM, WINDOWS } from "../lib/stats-window";
 import { DnsaurLogo } from "./dnsaur-logo";
 import { PauseControl } from "./pause-control";
@@ -60,8 +62,14 @@ const CELL_QUIET = "text-muted-foreground hover:text-foreground";
  * sidebar. Row 1 is identity + the four nav *groups* + the global right-hand
  * readouts (search, blocking, resolver health); row 2 is the active group's
  * pages as tabs, plus the contextual right-hand cells — on the dashboard,
- * the stats window selector and the one filled primary cell in the whole
- * shell, which the design spends on that screen's CTA.
+ * the stats window selector and that screen's CTA.
+ *
+ * The bar carries at most two filled cells and they are the two the design
+ * fills: the blocking readout in row 1 (see pause-control.tsx — it is the
+ * one control that changes what dnsaur *does*, so it wears the state as a
+ * fill rather than as a tint) and row 2's per-screen call to action — the
+ * dashboard's "view query log", the query log's tail toggle. Everything
+ * else is text on the bar's own surface.
  *
  * Semantics are deliberately real, not divs-with-onClick: the groups are
  * menu buttons (base-ui Menu — arrow keys, Escape, typeahead, focus return),
@@ -79,9 +87,10 @@ const CELL_QUIET = "text-muted-foreground hover:text-foreground";
 export function TopNav({ onOpenCommandPalette }: TopNavProps) {
   const { pathname } = useLocation();
   const activeGroup = findActiveGroup(pathname);
-  // Row 2's right-hand cells are contextual. The dashboard's pair (a stats
-  // window and the "view query log" CTA) govern nothing on Settings, and the
-  // CTA is noise on the query log itself — which gets its own pair instead.
+  // Row 2's right-hand cells are contextual: a stats window governs nothing
+  // on Settings, "view query log" is noise on the query log itself, and a
+  // tail toggle is noise everywhere else. Each screen gets its own pair, or
+  // none.
   const onDashboard = pathname === DASHBOARD_PATH;
   const onQueryLog = pathname === QUERY_LOG_PATH;
 
@@ -115,21 +124,29 @@ export function TopNav({ onOpenCommandPalette }: TopNavProps) {
             className={cn(CELL, "border-l border-l-border", CELL_QUIET)}
           >
             {/* Same trick as the wordmark, below desktop: at tablet
-                width those ~75px are the difference between all four groups
+                width those ~55px are the difference between all four groups
                 fitting and System being the one you have to scroll for. The
-                shortcut alone is affordance enough, and the words stay in
+                shortcut alone is affordance enough, and the word stays in
                 the accessible name rather than being dropped from it. */}
-            <span className="max-lg:sr-only">/ search · </span>⌘K
+            <span className="max-lg:sr-only">search</span>
+            {/* A real space rather than flex `gap`: name computation
+                concatenates inline children without inserting one, so a gap
+                would leave this cell announcing as "search⌘K". */}{" "}
+            {/* rnui's Kbd rather than a bare "⌘K": a keyboard shortcut is a
+                <kbd>, and the component is what makes it look like a key
+                instead of two more characters of label. */}
+            <Kbd>⌘K</Kbd>
           </button>
           {/* Global blocking (group 0). Still the same control — state
-              readout and pause/resume menu in one — just wearing the
-              chrome's cell skin. See components/pause-control.tsx. */}
+              readout and pause/resume menu in one — now the filled cell the
+              design gives row 1. See components/pause-control.tsx. */}
           <PauseControl variant="chrome" />
           {/* Resolver liveness sits next to blocking rather than in row 2:
               they are the shell's two "is this thing working" readouts and
-              read as a pair, and row 2's terminal cell is the design's one
-              filled cell — spent below on the dashboard's CTA, not on a
-              status that is green nearly all the time. */}
+              read as a pair. It stays flat text while blocking is filled —
+              one of them governs what dnsaur does and the other reports a
+              status that is green nearly all the time, and filling both
+              would make the bar shout twice. */}
           <ResolverStatusCell />
         </div>
       </div>
@@ -152,9 +169,9 @@ export function TopNav({ onOpenCommandPalette }: TopNavProps) {
         {onDashboard && (
           <div className="ml-auto flex shrink-0 items-stretch">
             <WindowCells />
-            {/* The design's single filled cell, and the dashboard's one
-                call to action: the numbers above are a summary, the log is
-                where you actually go to look. */}
+            {/* Row 2's filled cell, and the dashboard's one call to action:
+                the numbers above are a summary, the log is where you
+                actually go to look. */}
             <NavLink
               to="/queries"
               className={cn(
@@ -168,65 +185,139 @@ export function TopNav({ onOpenCommandPalette }: TopNavProps) {
           </div>
         )}
 
-        {onQueryLog && (
-          <div className="ml-auto flex shrink-0 items-stretch">
-            {/* Why the log can lag what you just watched scroll past: the
-                table's *filtered* mode reads the database, and rows reach
-                it only after the logger's batched flush. Said once, here,
-                rather than left for someone to discover as a bug. */}
-            <span
-              className={cn(CELL, "border-l border-l-border text-muted-foreground max-md:sr-only")}
-            >
-              Table trails the tail by ~1s
-            </span>
-            <LiveTailCell />
-          </div>
-        )}
+        {onQueryLog && <QueryLogCells />}
       </div>
     </header>
   );
 }
 
 /**
- * The query log's CTA cell: the design's single filled cell, spent here on
- * the one control this screen is actually about.
+ * The query log's row-2 cells: one readout of what the table is doing, and
+ * the filled cell that changes it.
  *
- * A `switch` rather than two buttons or a link — it has exactly two states,
- * and the cell shows both of them (`LIVE · PAUSE`) with the one you're not
- * in dimmed, so the control says what it will do without needing a tooltip.
- * The flag itself lives in lib/live-tail.ts; see there for why it isn't
- * state in the shell or in the URL.
+ * These live in the chrome, not on the page, because they belong to the
+ * sub-nav strip — and because the alternative was worse. For one revision
+ * the page owned an equivalent pair while the shell still rendered its own,
+ * and `/queries` carried *four* readouts of one piece of state across two
+ * rows. The fix is not to move them down; it's to have one of each, up
+ * here, where every other screen's contextual cells already are.
+ *
+ * What the shell can't know on its own — whether a filter is active, and
+ * how the subscription is faring — the page publishes through
+ * lib/live-tail.ts, which already existed to carry `paused` between these
+ * two siblings. One store, one live value, four states in one cell.
  */
-function LiveTailCell() {
-  const { paused, setPaused } = useLiveTailPaused();
+function QueryLogCells() {
+  const { paused, setPaused, filtered, streamState, reconnect } = useLiveTailStatus();
+  const failed = !filtered && !paused && streamState === "failed";
 
+  return (
+    <div className="ml-auto flex shrink-0 items-stretch">
+      <TailModeCell filtered={filtered} paused={paused} streamState={streamState} />
+      {/* Only offered when there is something to retry. A failed stream is
+          not a quieter shade of "reconnecting": api/sse.ts has given up
+          after six attempts and nothing further happens without a click, so
+          the click sits next to the word that says so. */}
+      {failed && (
+        <button
+          type="button"
+          onClick={reconnect}
+          className={cn(CELL, "border-l border-l-border", CELL_QUIET)}
+        >
+          Reconnect
+        </button>
+      )}
+      <TailToggleCell paused={paused} onToggle={setPaused} />
+    </div>
+  );
+}
+
+/**
+ * All four states of the tail in one cell.
+ *
+ * The order is a precedence, not a preference: a filtered view has swapped
+ * the stream for paged search, so its health is not a thing to report; a
+ * paused tail likewise isn't connecting to anything. Only once neither is
+ * true does the subscription's own state get to speak.
+ *
+ * `<output>` rather than a div with role="status": same implicit role, same
+ * polite live region, and this genuinely is one — "Disconnected" arriving
+ * while you're reading the table is worth being told about. The Reconnect
+ * button stays *outside* it for the same reason: a control inside a live
+ * region gets re-announced every time the region updates.
+ */
+function TailModeCell({
+  filtered,
+  paused,
+  streamState,
+}: {
+  filtered: boolean;
+  paused: boolean;
+  streamState: SseState;
+}) {
+  const { tone, label } = tailMode(filtered, paused, streamState);
+
+  return (
+    // `aria-label` rather than an sr-only prefix inside the cell: `status`
+    // is not a name-from-content role, so the subject has to be the name or
+    // the readout announces its state with nothing to attach it to — and
+    // the resolver cell beside it in row 1 is also a `status`.
+    <output
+      aria-label="Query log"
+      className={cn(CELL, "gap-2 border-l border-l-border text-muted-foreground")}
+    >
+      <span aria-hidden="true" className={cn("size-1.5 shrink-0", tone)} />
+      {label}
+    </output>
+  );
+}
+
+function tailMode(
+  filtered: boolean,
+  paused: boolean,
+  streamState: SseState,
+): { tone: string; label: string } {
+  if (filtered) return { tone: "bg-muted-foreground", label: "Filtered · paged" };
+  if (paused) return { tone: "bg-muted-foreground", label: "Paused" };
+  if (streamState === "failed") return { tone: "bg-destructive", label: "Disconnected" };
+  if (streamState === "open") return { tone: "bg-primary", label: "Live tail" };
+  return { tone: "bg-warn", label: "Reconnecting…" };
+}
+
+/**
+ * Row 2's filled cell on this screen, and the one control the query log is
+ * actually about.
+ *
+ * Labelled with what it will do rather than with the state it is in, so it
+ * needs no `aria-pressed` and no second half of the label to be understood
+ * — the cell beside it already says which state you're in. The flag lives
+ * in lib/live-tail.ts; see there for why it isn't state in the shell or in
+ * the URL.
+ */
+function TailToggleCell({
+  paused,
+  onToggle,
+}: {
+  paused: boolean;
+  onToggle: (next: boolean) => void;
+}) {
   return (
     <button
       type="button"
-      role="switch"
-      aria-checked={!paused}
-      // The visible text is the pair of states; the accessible name still
-      // has to say what the pair is *of*.
-      aria-label="Live tail"
-      onClick={() => setPaused(!paused)}
+      onClick={() => onToggle(!paused)}
       className={cn(
         CELL,
-        "gap-2 border-l border-l-border bg-primary font-semibold text-primary-foreground",
-        "hover:bg-primary/90",
+        "border-l border-l-border font-semibold",
+        paused
+          ? // Not `text-primary-foreground`: white on solid --warning is
+            // 4.10:1 in light and 2.18:1 in dark, both under AA.
+            // --warning-solid-foreground is the near-black that clears it
+            // in both (see styles/dnsaur-theme.css).
+            "bg-warn text-warning-solid-foreground hover:bg-warn/90"
+          : "bg-primary text-primary-foreground hover:bg-primary/90",
       )}
     >
-      <span
-        aria-hidden="true"
-        className={cn(
-          "size-2 shrink-0 border border-primary-foreground",
-          !paused && "bg-primary-foreground",
-        )}
-      />
-      <span className={cn(paused && "opacity-60")}>Live</span>
-      <span aria-hidden="true" className="opacity-60">
-        ·
-      </span>
-      <span className={cn(!paused && "opacity-60")}>Pause</span>
+      {paused ? "Resume tail" : "Pause tail"}
     </button>
   );
 }
@@ -291,12 +382,16 @@ function NavGroupMenu({ group, active }: { group: NavGroup; active: boolean }) {
 
   return (
     <DropdownMenu>
+      {/* No disclosure chevron. Four of them in a row, at 12px and 60%
+          opacity, added a column of visual noise to say something the row
+          below already answers — whichever group is marked, its pages are
+          on screen. The one chevron the bar keeps is on the blocking cell,
+          where the menu is the only way to reach the actions. */}
       <DropdownMenuTrigger
         data-active={active}
-        className={cn(CELL, "gap-1.5 border-r border-r-border", CELL_QUIET, active && CELL_ACTIVE)}
+        className={cn(CELL, "border-r border-r-border", CELL_QUIET, active && CELL_ACTIVE)}
       >
         {group.label}
-        <ChevronDown className="size-3 opacity-60" />
       </DropdownMenuTrigger>
       <DropdownMenuContent align="start" sideOffset={0}>
         {isSystem && <AccountIdentity />}

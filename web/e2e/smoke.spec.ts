@@ -30,6 +30,19 @@ test("first-run setup, login, add a DNS record, dark mode persists across reload
   await page.getByRole("button", { name: /go to dashboard/i }).click();
   await expect(page.getByRole("heading", { name: "Dashboard" })).toBeVisible();
 
+  // The dashboard is composed from rnui: four StatCards in the hairline
+  // grid, each naming what it actually counts, and the chart's three bands
+  // legended below them. A fresh instance has served nothing, so the
+  // numbers are zeroes — the labels are the part that has to be there.
+  const statStrip = page.getByRole("region", { name: /^Query stats/ });
+  for (const stat of ["Queries", "Blocked", "Cached", "Client IPs seen"]) {
+    // `exact` because each title is also a substring of its own
+    // description ("Blocked" / "0 blocked").
+    await expect(statStrip.getByText(stat, { exact: true })).toBeVisible();
+  }
+  await expect(page.getByText("distinct client_ip, not client rows")).toBeVisible();
+  await expect(page.getByText("hourly buckets · stats lag the log by up to 60s")).toBeVisible();
+
   // The shell is two chrome rows, not a sidebar (see
   // src/components/top-nav.tsx): row 1 holds the four nav *group* menus,
   // row 2 the active group's pages as tabs. Account, theme and log out all
@@ -53,18 +66,36 @@ test("first-run setup, login, add a DNS record, dark mode persists across reload
   await expect(page.getByRole("heading", { name: "Dashboard" })).toBeVisible();
 
   // --- the row-1 search cell opens the ⌘K palette -----------------------
-  await topNav.getByRole("button", { name: /search/i }).click();
+  // The shortcut is a real <kbd>, not two more characters of label.
+  const search = topNav.getByRole("button", { name: /search/i });
+  await expect(search.locator("kbd")).toHaveText("⌘K");
+  await search.click();
   await expect(page.getByPlaceholder("Jump to a page…")).toBeVisible();
   await page.keyboard.press("Escape");
 
+  // --- the query log's row-2 cells belong to the shell ------------------
+  // One readout of what the table is doing and one filled toggle, both in
+  // row 2 (an earlier revision had the page render its own pair as well,
+  // which put four readouts of one flag on this screen).
+  await topNav.getByRole("navigation", { name: "Monitor" }).getByText("Query Log").click();
+  const modeCell = topNav.getByRole("status", { name: "Query log" });
+  await expect(modeCell).toHaveText(/live tail|reconnecting/i);
+  const tailToggle = topNav.getByRole("button", { name: /pause tail/i });
+  await tailToggle.click();
+  await expect(modeCell).toHaveText(/paused/i);
+  await expect(topNav.getByRole("button", { name: /resume tail/i })).toBeVisible();
+  await topNav.getByRole("button", { name: /resume tail/i }).click();
+  await expect(topNav.getByRole("button", { name: /pause tail/i })).toBeVisible();
+
   // --- add a local DNS record, see it listed ----------------------------
-  // Local DNS is Network's only page, so it's reached through that group's
-  // menu — and once there, row 2 must still give it a tab of its own.
-  await topNav.getByRole("button", { name: "Network" }).click();
+  // Local DNS is the group's only page and now its name too, so it's
+  // reached through that group's menu — and once there, row 2 must still
+  // give it a tab of its own.
+  await topNav.getByRole("button", { name: "Local DNS", exact: true }).click();
   await page.getByRole("menuitem", { name: "Local DNS" }).click();
   await expect(page.getByRole("heading", { name: "Local DNS", exact: true })).toBeVisible();
   await expect(
-    topNav.getByRole("navigation", { name: "Network" }).getByRole("link", { name: "Local DNS" }),
+    topNav.getByRole("navigation", { name: "Local DNS" }).getByRole("link", { name: "Local DNS" }),
   ).toHaveAttribute("aria-current", "page");
 
   await page.getByRole("button", { name: "Add record" }).click();

@@ -67,7 +67,7 @@ export interface NavGroup {
  * renders the active group's items as tabs. Grouping is fixed by the locked
  * design; the *contents* are only ever routes that actually exist — there are
  * no entries for DHCP, encrypted DNS or anything else unbuilt, and a group
- * with a single child (Network) still gets its row-2 tab.
+ * with a single child (Local DNS) still gets its row-2 tab.
  */
 export const NAV_GROUPS: NavGroup[] = [
   {
@@ -90,7 +90,13 @@ export const NAV_GROUPS: NavGroup[] = [
   },
   {
     id: "network",
-    label: "Network",
+    // The group is named for what it actually holds. "Network" promised
+    // DHCP, interfaces and encrypted DNS — none of which exist — so the
+    // one thing behind it (Local DNS) is what the chrome now says. The id
+    // stays `network` because it's a stable handle for keys and tests, not
+    // a user-facing string, and the group is still where those routes will
+    // land when they're built.
+    label: "Local DNS",
     items: [{ to: "/dns", label: "Local DNS", icon: Globe }],
   },
   {

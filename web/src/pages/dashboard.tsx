@@ -16,12 +16,14 @@ import {
   SelectTrigger,
   SelectValue,
   Skeleton,
+  StatCard,
+  StatusIndicator,
 } from "@e412/rnui-react";
 import type { Group, QueryEntry, StatsOverview, TimelineBucket, TopEntry } from "../api/types";
 import { useAddRule } from "../hooks/use-filters";
 import { useGroups } from "../hooks/use-groups";
 import { useClients } from "../hooks/use-clients";
-import { useLiveTail } from "../hooks/use-queries";
+import { LIVE_TAIL_CAP, useLiveTail } from "../hooks/use-queries";
 import { useStatsOverview, useStatsTimeline, useStatsTop } from "../hooks/use-stats";
 import { durationLabel, rowKey } from "../lib/query-rows";
 import { hoursFor, parseWindow, WINDOW_PARAM, windowPhrase } from "../lib/stats-window";
@@ -43,10 +45,14 @@ const TOP_CLIENTS_N = 5;
 
 // --- small formatting helpers ----------------------------------------------
 
-/** blocked/total as a whole-number percent string; "—" (never NaN) when
- * there's no data yet. */
+/** What every cell with nothing honest to put in it renders. Never a blank
+ * cell (which reads as a rendering bug) and never a guess. */
+const EM_DASH = "—";
+
+/** blocked/total as a whole-number percent string; an em dash (never NaN)
+ * when there's no data yet. */
 function pct(numerator: number, denominator: number): string {
-  if (denominator <= 0) return "—";
+  if (denominator <= 0) return EM_DASH;
   return `${Math.round((numerator / denominator) * 100)}%`;
 }
 
@@ -84,6 +90,19 @@ function decisionTone(decision: string): string {
   return DECISION_TONE[decision] ?? "text-muted-foreground";
 }
 
+/**
+ * The live table's cell padding, and its header cells' full skin.
+ *
+ * Eight columns at `px-4` spend 256px on gutters alone, which is a lot for
+ * a preview panel — but the gutter is what lines the TIME column up with
+ * the section heading above it and the rail rows beside it, and a table
+ * that starts 4px left of its own title is the kind of thing this design
+ * is made of noticing. `truncate` on the headers means a narrow viewport
+ * clips them rather than letting them spill into their neighbours.
+ */
+const CELL_PAD = "px-4 py-2";
+const HEAD_CELL = `${CELL_PAD} truncate text-left font-normal`;
+
 // --- section chrome ----------------------------------------------------------
 // Every section is a hairline-bordered band, never a card: one 1px rule
 // between bands, one between cells, and nothing else. These three keep that
@@ -107,12 +126,13 @@ function Note({ className, children }: { className?: string; children: ReactNode
 }
 
 /** The `ALL →` affordance on each rail panel. */
-function AllLink({ to, label }: { to: string; label: string }) {
+function AllLink({ to, label, className }: { to: string; label: string; className?: string }) {
   return (
     <Link
       to={to}
       aria-label={label}
       className={cn(
+        className,
         "text-xs tracking-widest text-muted-foreground uppercase transition-colors",
         "hover:text-foreground",
         "outline-none focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring",
@@ -132,23 +152,30 @@ function Prose({ children }: { children: ReactNode }) {
 
 // --- 1. stat strip -----------------------------------------------------------
 
-function StatCell({
-  label,
-  value,
-  tone,
-}: {
-  label: string;
-  value: string;
-  /** Only BLOCKED is tinted — the design's one coloured numeral. */
-  tone?: string;
-}) {
-  return (
-    <div className="flex flex-col gap-2 border-r border-border px-4 py-3 last:border-r-0">
-      <span className="text-sm tracking-widest text-muted-foreground uppercase">{label}</span>
-      <span className={cn("text-3xl font-semibold tabular-nums", tone)}>{value}</span>
-    </div>
-  );
-}
+/**
+ * rnui's StatCard, undressed back down to a grid cell.
+ *
+ * The component is the right one — title / value / description in one
+ * place, one type ramp for all four — but it is built on `Card`, and Card
+ * brings a card's chrome with it. In a page made of nothing but hairlines
+ * that chrome is exactly the thing that must not appear:
+ *
+ *   - `ring-1 ring-foreground/10` → `ring-0`. The ring drew a full box
+ *     around every cell, so the strip read as four floating tiles instead
+ *     of one divided band.
+ *   - `bg-card` → `bg-transparent`. `--card` is a distinctly different
+ *     surface from `--background` in this theme (#edf4ef vs #f7faf8), and
+ *     a tinted strip is a card by another name.
+ *   - `py-4` → `py-3`, the band rhythm every other section on the page uses.
+ *
+ * Radius needs no undoing: Card asks for `rounded-xl`, and rnui derives
+ * `--radius-xl` from `--radius`, which this theme pins to 0.
+ *
+ * The `border-r` divider is the thing the strip actually *is*, so it comes
+ * back on here rather than on a wrapper — one hairline between cells, none
+ * after the last.
+ */
+const STAT_CELL = "border-r border-border bg-transparent py-3 ring-0 last:border-r-0";
 
 function StatStrip({
   overview,
@@ -161,12 +188,15 @@ function StatStrip({
     return (
       <div className="grid grid-cols-2 border-b border-border sm:grid-cols-4">
         {[0, 1, 2, 3].map((i) => (
+          // Three bars for StatCard's three lines, at their heights, so the
+          // strip doesn't change height when the numbers land.
           <div
             key={i}
-            className="flex flex-col gap-2 border-r border-border px-4 py-3 last:border-r-0"
+            className="flex flex-col gap-1 border-r border-border px-4 py-3 last:border-r-0"
           >
-            <Skeleton className="h-3 w-24" />
-            <Skeleton className="h-9 w-20" />
+            <Skeleton className="h-5 w-24" />
+            <Skeleton className="h-8 w-20" />
+            <Skeleton className="h-4 w-36" />
           </div>
         ))}
       </div>
@@ -205,11 +235,39 @@ function StatStrip({
           />
         </Prose>
       )}
+      {/* The descriptions are not decoration: each one names what its
+          number actually counts, and every one of them is a question this
+          strip has been asked. `total` sums *every* decision the resolver
+          writes (internal/api/queries_handlers.go), so it is legitimately
+          larger than blocked + cached + forwarded; `cached` is
+          cached + stale in the same handler; and `clients` is the number of
+          distinct `client_ip` values seen, not the number of rows in the
+          client registry — an unregistered device still counts. */}
       <div className="grid grid-cols-2 sm:grid-cols-4">
-        <StatCell label="Queries" value={total.toLocaleString()} />
-        <StatCell label="Blocked" value={pct(blocked, total)} tone="text-chart-blocked" />
-        <StatCell label="Cache" value={pct(cached, total)} />
-        <StatCell label="Clients" value={clients.toLocaleString()} />
+        <StatCard
+          className={STAT_CELL}
+          title="Queries"
+          value={total.toLocaleString()}
+          description="every decision, incl. local + error"
+        />
+        <StatCard
+          className={STAT_CELL}
+          title="Blocked"
+          value={pct(blocked, total)}
+          description={`${blocked.toLocaleString()} blocked`}
+        />
+        <StatCard
+          className={STAT_CELL}
+          title="Cached"
+          value={pct(cached, total)}
+          description={`${cached.toLocaleString()} cached + stale`}
+        />
+        <StatCard
+          className={STAT_CELL}
+          title="Client IPs seen"
+          value={clients.toLocaleString()}
+          description="distinct client_ip, not client rows"
+        />
       </div>
     </section>
   );
@@ -231,6 +289,10 @@ function StatStrip({
 const CHART_TOKENS = {
   blocked: "--chart-blocked",
   resolved: "--chart-resolved",
+  // The third band. `--chart-5` is the one slot in the theme's ramp that is
+  // off the green axis entirely (violet/blue), which is what "this is
+  // neither a resolve nor a block" needs to say at a glance.
+  other: "--chart-5",
   gridline: "--border-muted",
   axis: "--muted-foreground",
 } as const;
@@ -243,12 +305,14 @@ const CHART_FALLBACKS: Record<Theme, Record<keyof typeof CHART_TOKENS, string>> 
   light: {
     blocked: "oklch(0.2622 0.0446 157.77)",
     resolved: "oklch(0.9082 0.0983 157.22)",
+    other: "oklch(0.55 0.11 265)",
     gridline: "oklch(0.9507 0.0108 158.84)",
     axis: "oklch(0.511 0.0259 155.36)",
   },
   dark: {
     blocked: "oklch(0.8014 0.1844 155.96)",
     resolved: "oklch(0.2826 0.0101 151.46)",
+    other: "oklch(0.68 0.13 300)",
     gridline: "oklch(0.2138 0.006 156.68)",
     axis: "oklch(0.6441 0.0137 156.83)",
   },
@@ -279,6 +343,7 @@ function useChartColors(): ChartColors {
     return {
       blocked: readColorToken(CHART_TOKENS.blocked, fallback.blocked),
       resolved: readColorToken(CHART_TOKENS.resolved, fallback.resolved),
+      other: readColorToken(CHART_TOKENS.other, fallback.other),
       gridline: readColorToken(CHART_TOKENS.gridline, fallback.gridline),
       axis: readColorToken(CHART_TOKENS.axis, fallback.axis),
     };
@@ -302,7 +367,30 @@ function bucketLabel(bucketSec: number, hours: number): string {
 }
 
 /**
- * Timeline buckets → two continuous stacked series.
+ * The decisions that make up the bottom band. `forwarded` is a real
+ * upstream answer; `cached` and `stale` are the same answer served from
+ * memory — the overview endpoint itself reports `cached + stale` as one
+ * number (internal/api/queries_handlers.go), and the strip's "cached"
+ * description says so.
+ */
+const SERVED_DECISIONS = ["forwarded", "cached", "stale"] as const;
+
+/**
+ * The three bands, named once for the legend, the ECharts series and the
+ * figure's text alternative alike.
+ *
+ * Sentence case in the source, uppercased by CSS in the legend — the same
+ * rule the chrome follows (see components/pause-control.tsx): a screen
+ * reader spelling out "L-O-C-A-L" helps nobody, and ECharts' tooltip is
+ * outside the reach of the legend's `text-transform` anyway, so the strings
+ * have to read as words on their own.
+ */
+const SERIES_SERVED = "Forwarded + cached";
+const SERIES_BLOCKED = "Blocked";
+const SERIES_OTHER = "Local + error";
+
+/**
+ * Timeline buckets → three continuous stacked series.
  *
  * `GET /stats/timeline` returns one entry per hour that had traffic, keyed by
  * a unix-**seconds** hour start, with only the non-zero decisions present —
@@ -313,10 +401,14 @@ function bucketLabel(bucketSec: number, hours: number): string {
  * synthesised here as real zeroes across the whole window, and the section
  * says so in as many words under the chart.
  *
- * "Resolved" is every non-`blocked` decision — including `error`. A failed
- * resolve isn't a query dnsaur let through, but it is one it *didn't block*,
- * and the two bands have to add up to the same `total` the strip above
- * reports (internal/api/queries_handlers.go sums every decision into it).
+ * The three bands partition `total` exactly, because they have to add up to
+ * the same number the strip above reports. Two are named sets of decisions
+ * (served, blocked); the third is *everything else the bucket contained* —
+ * local answers and errors today, and whatever decision the resolver grows
+ * next without this chart quietly dropping it on the floor. Splitting local
+ * and error out of the old "Resolved" band is the point of the third
+ * series: a failed resolve is not a query dnsaur served, and burying it
+ * under the same colour as a cache hit hid every upstream outage.
  */
 function timelineSeries(buckets: TimelineBucket[], hours: number) {
   const byBucket = new Map<number, Record<string, number>>();
@@ -334,17 +426,22 @@ function timelineSeries(buckets: TimelineBucket[], hours: number) {
   const start = Math.max(Math.min(firstHour, ...present), end - (MAX_BUCKETS - 1) * HOUR_SEC);
 
   const categories: string[] = [];
-  const resolved: number[] = [];
+  const served: number[] = [];
   const blocked: number[] = [];
+  const other: number[] = [];
   for (let t = start; t <= end; t += HOUR_SEC) {
     const decisions = byBucket.get(t);
     const total = decisions ? Object.values(decisions).reduce((sum, n) => sum + n, 0) : 0;
     const blockedCount = decisions?.blocked ?? 0;
+    const servedCount = decisions
+      ? SERVED_DECISIONS.reduce((sum, key) => sum + (decisions[key] ?? 0), 0)
+      : 0;
     categories.push(bucketLabel(t, hours));
+    served.push(servedCount);
     blocked.push(blockedCount);
-    resolved.push(total - blockedCount);
+    other.push(total - servedCount - blockedCount);
   }
-  return { categories, resolved, blocked };
+  return { categories, served, blocked, other };
 }
 
 function Swatch({ tone, label }: { tone: string; label: string }) {
@@ -376,39 +473,52 @@ function Swatch({ tone, label }: { tone: string; label: string }) {
  */
 const VolumeChart = memo(function VolumeChart({
   categories,
-  resolved,
+  served,
   blocked,
+  other,
   colors,
 }: {
   categories: string[];
-  resolved: number[];
+  served: number[];
   blocked: number[];
+  other: number[];
   colors: ChartColors;
 }) {
   // Passed explicitly rather than left to BarChart's default series, which
   // sets itemStyle.borderRadius to [4,4,0,0]. The design has no rounded
   // anything (--radius is 0 app-wide), and a rounded bar cap is especially
   // wrong on the *lower* half of a stack, where it notches the segment above.
+  //
+  // Declaration order is stacking order, bottom-up: served, then blocked,
+  // then the remainder — the same order the legend lists them in.
   const series = useMemo(
     () => [
       {
-        name: "Resolved",
+        name: SERIES_SERVED,
         type: "bar" as const,
         stack: "volume",
-        data: resolved,
+        data: served,
         barMaxWidth: 28,
         itemStyle: { borderRadius: 0, color: colors.resolved },
       },
       {
-        name: "Blocked",
+        name: SERIES_BLOCKED,
         type: "bar" as const,
         stack: "volume",
         data: blocked,
         barMaxWidth: 28,
         itemStyle: { borderRadius: 0, color: colors.blocked },
       },
+      {
+        name: SERIES_OTHER,
+        type: "bar" as const,
+        stack: "volume",
+        data: other,
+        barMaxWidth: 28,
+        itemStyle: { borderRadius: 0, color: colors.other },
+      },
     ],
-    [resolved, blocked, colors],
+    [served, blocked, other, colors],
   );
 
   const option = useMemo(
@@ -464,15 +574,17 @@ const VolumeChart = memo(function VolumeChart({
  * shunted LIVE QUERIES, the whole right rail and the bottom rule ~200px up
  * the page and then dropped them back the moment the first bucket landed.
  * So the height is the section's, not the chart's: skeleton, error, empty
- * and plot all fill the same 16rem.
+ * and plot all fill the same 13rem.
  */
 function PlotFrame({ children }: { children: ReactNode }) {
   return (
     <div className="px-4 pb-3">
       {/* Named so the height reservation is assertable: under jsdom there is
           no layout to measure, so the test asserts that every state really
-          does render into this one box. */}
-      <div data-slot="query-volume-plot" className="h-64">
+          does render into this one box. `h-52` is 208px — the nearest step
+          on Tailwind's own scale to the design's 210, and worth more than
+          an exact match is. */}
+      <div data-slot="query-volume-plot" className="h-52">
         {children}
       </div>
     </div>
@@ -484,19 +596,28 @@ function PlotFrame({ children }: { children: ReactNode }) {
  * in a hook rather than inline in a branch. */
 function VolumeBody({ buckets, hours }: { buckets: TimelineBucket[]; hours: number }) {
   const colors = useChartColors();
-  const { categories, resolved, blocked } = useMemo(
+  const { categories, served, blocked, other } = useMemo(
     () => timelineSeries(buckets, hours),
     [buckets, hours],
   );
-  const totalResolved = resolved.reduce((s, n) => s + n, 0);
-  const totalBlocked = blocked.reduce((s, n) => s + n, 0);
+  const sum = (ns: number[]) => ns.reduce((s, n) => s + n, 0);
+  const totalServed = sum(served);
+  const totalBlocked = sum(blocked);
+  const totalOther = sum(other);
+  const grand = totalServed + totalBlocked + totalOther;
 
   return (
     <figure
       className="h-full"
-      aria-label={`Query volume over ${categories.length} hourly buckets: ${(totalResolved + totalBlocked).toLocaleString()} queries — ${totalResolved.toLocaleString()} resolved, ${totalBlocked.toLocaleString()} blocked`}
+      aria-label={`Query volume over ${categories.length} hourly buckets: ${grand.toLocaleString()} queries — ${totalServed.toLocaleString()} forwarded or cached, ${totalBlocked.toLocaleString()} blocked, ${totalOther.toLocaleString()} local or error`}
     >
-      <VolumeChart categories={categories} resolved={resolved} blocked={blocked} colors={colors} />
+      <VolumeChart
+        categories={categories}
+        served={served}
+        blocked={blocked}
+        other={other}
+        colors={colors}
+      />
     </figure>
   );
 }
@@ -529,8 +650,8 @@ function QueryVolume({
     body = (
       <div className="flex h-full items-center justify-center font-sans">
         <p className="text-sm text-muted-foreground">
-          No query activity yet. Once dnsaur resolves queries in this window, blocked and resolved
-          volume shows up here.
+          No query activity yet. Once dnsaur answers queries in this window, what it forwarded,
+          cached, blocked and answered locally shows up here.
         </p>
       </div>
     );
@@ -542,12 +663,18 @@ function QueryVolume({
     <section aria-labelledby="query-volume-title" className="border-b border-border">
       <div className="flex flex-wrap items-center gap-x-4 gap-y-2 px-4 py-3">
         <SectionTitle id="query-volume-title">Query volume</SectionTitle>
-        {/* The design says "15-min"; /stats/timeline only ever produces hour
-            buckets, so the label says what the data actually is. */}
-        <Note>hourly buckets</Note>
+        {/* Two facts, one line. The design said "15-min"; /stats/timeline
+            only ever produces hour buckets, so the label says what the data
+            actually is. And the stats tables are written from the query
+            log's batched flush, so the newest minute of traffic is on the
+            live feed below before it is in these bars — said here rather
+            than left for someone to file as a bug. */}
+        <Note>hourly buckets · stats lag the log by up to 60s</Note>
         <div className="ml-auto flex items-center gap-4">
-          <Swatch tone="bg-chart-blocked" label="Blocked" />
-          <Swatch tone="bg-chart-resolved" label="Resolved" />
+          {/* Listed bottom-up, in stacking order. */}
+          <Swatch tone="bg-chart-resolved" label={SERIES_SERVED} />
+          <Swatch tone="bg-chart-blocked" label={SERIES_BLOCKED} />
+          <Swatch tone="bg-chart-5" label={SERIES_OTHER} />
         </div>
       </div>
       {timeline.isError && timeline.data !== undefined && (
@@ -651,6 +778,7 @@ function LiveQueries({
   const { entries, state } = useLiveTail(true);
   const isStreaming = state === "open" || state === "reconnecting";
   const rows = entries.slice(0, LIVE_ROWS);
+  const hostnames = useClientHostnames();
 
   return (
     <section
@@ -658,19 +786,20 @@ function LiveQueries({
       className="min-w-0 flex-1 lg:border-r lg:border-border"
     >
       <div className="flex flex-wrap items-center gap-x-4 gap-y-2 border-b border-border px-4 py-3">
-        <span
-          aria-hidden="true"
-          className={cn(
-            "size-1.5 shrink-0 rounded-full",
-            isStreaming ? "bg-primary" : "bg-muted-foreground",
-          )}
-        />
+        {/* rnui's StatusIndicator rather than a hand-rolled dot: it already
+            carries the state vocabulary (active/idle) and the halo that
+            says "this is live", and the shell has no business owning a
+            second implementation of a status dot. */}
+        <StatusIndicator size="sm" state={isStreaming ? "active" : "idle"} />
         <SectionTitle id="live-queries-title">Live queries</SectionTitle>
+        {/* Measured, not fetched — see useArrivalRate. Absent until it has
+            watched long enough to mean it. */}
         <RateReadout entries={entries} />
         {/* No filters exist on this panel — that's what the query log is
-            for — so the summary says what the stream actually is rather
-            than pretending to be a control. */}
-        <Note className="ml-auto">All clients · all decisions</Note>
+            for — so the notes say what the stream *is*: where the rows come
+            from, how many are held, and which end is new. */}
+        <Note>SSE · {LIVE_TAIL_CAP}-row buffer</Note>
+        <Note className="ml-auto">newest first</Note>
       </div>
 
       {rows.length === 0 ? (
@@ -688,20 +817,29 @@ function LiveQueries({
           </caption>
           <thead>
             <tr className="border-b border-border text-sm tracking-widest text-muted-foreground uppercase">
-              <th scope="col" className="w-24 px-4 py-2 text-left font-normal">
+              <th scope="col" className={cn(HEAD_CELL, "w-24")}>
                 Time
               </th>
-              <th scope="col" className="px-4 py-2 text-left font-normal">
+              <th scope="col" className={HEAD_CELL}>
                 Domain
               </th>
-              <th scope="col" className="w-36 px-4 py-2 text-left font-normal">
-                Client
+              <th scope="col" className={cn(HEAD_CELL, "w-20")}>
+                Type
               </th>
-              <th scope="col" className="w-28 px-4 py-2 text-left font-normal">
+              <th scope="col" className={cn(HEAD_CELL, "w-32")}>
+                Client IP
+              </th>
+              <th scope="col" className={cn(HEAD_CELL, "w-32")}>
+                Hostname
+              </th>
+              <th scope="col" className={cn(HEAD_CELL, "w-28")}>
                 Decision
               </th>
-              <th scope="col" className="w-24 px-4 py-2 text-right font-normal">
-                Duration
+              <th scope="col" className={cn(HEAD_CELL, "w-32")}>
+                Upstream
+              </th>
+              <th scope="col" className={cn(HEAD_CELL, "w-16 text-right")}>
+                ms
               </th>
             </tr>
           </thead>
@@ -711,10 +849,12 @@ function LiveQueries({
                 key={rowKey(entry)}
                 className="group/row border-b border-border-muted text-xs last:border-b-0"
               >
-                <td className="px-4 py-2 whitespace-nowrap text-muted-foreground tabular-nums">
+                <td
+                  className={cn(CELL_PAD, "whitespace-nowrap text-muted-foreground tabular-nums")}
+                >
                   {clockTime(entry.at)}
                 </td>
-                <td className="truncate px-4 py-2">
+                <td className={cn(CELL_PAD, "truncate")}>
                   <span className="flex items-center gap-2">
                     <span className="truncate">{entry.q_name}</span>
                     {/* The design has no per-row buttons; the capability
@@ -732,12 +872,25 @@ function LiveQueries({
                     />
                   </span>
                 </td>
-                <td className="truncate px-4 py-2 text-muted-foreground">{entry.client_ip}</td>
-                <td className={cn("truncate px-4 py-2", decisionTone(entry.decision))}>
+                <td className={cn(CELL_PAD, "truncate text-muted-foreground")}>{entry.q_type}</td>
+                <td className={cn(CELL_PAD, "truncate text-muted-foreground")}>
+                  {entry.client_ip}
+                </td>
+                <td className={cn(CELL_PAD, "truncate text-muted-foreground")}>
+                  {hostnames.get(entry.client_id) ?? EM_DASH}
+                </td>
+                <td className={cn(CELL_PAD, "truncate", decisionTone(entry.decision))}>
                   {entry.decision}
                 </td>
-                <td className="px-4 py-2 text-right text-muted-foreground tabular-nums">
-                  {durationLabel(entry.duration_ms)}ms
+                {/* Empty for anything the resolver answered itself — a
+                    blocked, local or cached query never went upstream, and
+                    an em dash says that rather than leaving a gap that
+                    reads as missing data. */}
+                <td className={cn(CELL_PAD, "truncate text-muted-foreground")}>
+                  {entry.upstream === "" ? EM_DASH : entry.upstream}
+                </td>
+                <td className={cn(CELL_PAD, "text-right text-muted-foreground tabular-nums")}>
+                  {durationLabel(entry.duration_ms)}
                 </td>
               </tr>
             ))}
@@ -806,12 +959,22 @@ function QuickRuleAction({
 
 function RailPanel({
   title,
+  note,
   allTo,
   allLabel,
   children,
   className,
 }: {
   title: string;
+  /**
+   * Which decisions this panel's numbers actually count. The two panels
+   * look identical and are not: TOP BLOCKED comes from
+   * `/stats/top?metric=blocked_domain` and counts blocks only, while TOP
+   * CLIENT IPS comes from `metric=client` and counts every decision that
+   * client made. Without the note the obvious reading — "these are the
+   * clients doing the blocked lookups" — is wrong.
+   */
+  note: string;
   allTo: string;
   allLabel: string;
   children: ReactNode;
@@ -820,9 +983,10 @@ function RailPanel({
   const titleId = `rail-${title.toLowerCase().replaceAll(" ", "-")}`;
   return (
     <section aria-labelledby={titleId} className={className}>
-      <div className="flex items-center justify-between gap-2 border-b border-border px-3.5 py-3">
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-1 border-b border-border px-3.5 py-3">
         <SectionTitle id={titleId}>{title}</SectionTitle>
-        <AllLink to={allTo} label={allLabel} />
+        <Note>{note}</Note>
+        <AllLink className="ml-auto" to={allTo} label={allLabel} />
       </div>
       {children}
     </section>
@@ -853,9 +1017,12 @@ function RailRow({
 }) {
   return (
     <li className="group/row relative flex items-center gap-2 px-3.5 py-2 text-xs">
+      {/* `--accent` is the theme's own tint surface — the mint the design
+          uses for exactly this, a wash under text. Half strength keeps the
+          row's label at full contrast over it in both modes. */}
       <span
         aria-hidden="true"
-        className="absolute inset-y-0 left-0 bg-muted/55"
+        className="absolute inset-y-0 left-0 bg-accent/50"
         style={{ width: `${share}%` }}
       />
       <span className="relative min-w-0 flex-1 truncate">{label}</span>
@@ -949,6 +1116,33 @@ function RailBody({
  * the address but does not identify the device, and labelling one host with
  * a subnet's name is worse than showing the address it really was.
  */
+/**
+ * The live table's HOSTNAME column, and the one column on this page with a
+ * caveat worth spelling out.
+ *
+ * A query row does not carry a hostname. It carries `client_id` — the id of
+ * the registry entry whose matcher the client's address hit, or 0 when
+ * nothing matched (internal/qlog/qlog.go) — so a name exists only if
+ * `GET /clients` can be asked for it. This is therefore a straight id
+ * lookup, deliberately *not* the address-matching the rail below has to do:
+ * there, `/stats/top?metric=client` hands over an IP and nothing else, so
+ * the matcher is all there is to go on. Here the resolver already did the
+ * matching and told us the answer.
+ *
+ * Anything that doesn't resolve — an unregistered client, a registry that
+ * hasn't loaded, an entry deleted since the row was logged — renders an em
+ * dash. Reverse-DNS, "guess from the IP", or falling back to the address in
+ * a column headed HOSTNAME would all be inventing a name for a device
+ * dnsaur cannot actually name.
+ */
+function useClientHostnames(): Map<number, string> {
+  const clients = useClients();
+  return useMemo(
+    () => new Map((clients.data ?? []).map((client) => [client.id, client.name])),
+    [clients.data],
+  );
+}
+
 function useClientNames(): Map<string, string> {
   const clients = useClients();
   return useMemo(() => {
@@ -1082,6 +1276,7 @@ export function Dashboard() {
         <div className="shrink-0 max-lg:border-t max-lg:border-border lg:w-80">
           <RailPanel
             title="Top blocked"
+            note="blocked only"
             allTo="/queries"
             allLabel="All blocked domains in the query log"
             className="border-b border-border"
@@ -1118,8 +1313,12 @@ export function Dashboard() {
             </RailBody>
           </RailPanel>
 
+          {/* "Client IPs", not "Clients", for the same reason the strip
+              above says "Client IPs seen": the metric groups by address, so
+              a registered client with two addresses is two rows here. */}
           <RailPanel
-            title="Top clients"
+            title="Top client IPs"
+            note="all decisions"
             allTo="/filtering/clients"
             allLabel="All clients in Groups & Clients"
           >

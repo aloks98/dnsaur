@@ -38,10 +38,16 @@ test("opening the palette lists every page, grouped by nav section", async () =>
   ]) {
     expect(screen.getByRole("option", { name: label })).toBeInTheDocument();
   }
-  // ...under the same four headings the top bar's first row shows.
-  for (const heading of ["Monitor", "Filtering", "Network", "System"]) {
-    expect(screen.getByText(heading)).toBeInTheDocument();
-  }
+  // ...under the same four headings the top bar's first row shows, in the
+  // same order. Read off cmdk's own heading elements rather than by text:
+  // the Local DNS group and its single page are deliberately named the
+  // same thing, so a plain text query can't tell a heading from an option.
+  expect([...document.querySelectorAll("[cmdk-group-heading]")].map((h) => h.textContent)).toEqual([
+    "Monitor",
+    "Filtering",
+    "Local DNS",
+    "System",
+  ]);
 });
 
 test("filtering narrows the list and falls back to the empty state", async () => {

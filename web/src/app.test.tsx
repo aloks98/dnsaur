@@ -27,7 +27,7 @@ test("authenticated user gets the two-row shell: nav groups above, the active gr
     within(primary)
       .getAllByRole("button")
       .map((button) => button.textContent),
-  ).toEqual(["Monitor", "Filtering", "Network", "System"]);
+  ).toEqual(["Monitor", "Filtering", "Local DNS", "System"]);
 
   // Row 2 is the active group's pages, and "/" makes that Monitor.
   const monitorTabs = screen.getByRole("navigation", { name: "Monitor" });
@@ -52,7 +52,7 @@ test("the dashboard route gets no page gutter; every other page keeps it", async
   unmount();
 
   renderWithProviders(<App />, { route: "/dns" });
-  await screen.findByRole("navigation", { name: "Network" });
+  await screen.findByRole("navigation", { name: "Local DNS" });
   expect(screen.getByRole("main").className).toContain("p-6");
 });
 

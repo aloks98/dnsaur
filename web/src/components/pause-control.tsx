@@ -47,6 +47,11 @@ interface PauseControlProps {
  * is genuinely ambiguous about what stopped.
  *
  *     [⏸ BLOCKING ACTIVE ▾]  [▶ PAUSED · 4:32 ▾]  [⚠ STATUS UNAVAILABLE ▾]
+ *        filled, primary          filled, warning        flat, destructive
+ *
+ * In the chrome the two states we've actually read from GET /blocking fill
+ * the cell; the two we haven't (checking, unreachable) stay flat text. That
+ * asymmetry is the point — see `triggerView` below.
  *
  * Uppercase is CSS, not the strings: `text-transform` keeps the accessible
  * name and the DOM text as sentence case, which is what screen readers and
@@ -159,11 +164,14 @@ export function PauseControl({ groupId = 0, variant = "button" }: PauseControlPr
  * a whole phrase ("Status unavailable") still fits the row. Not a Button:
  * the chrome is a strip of divided cells, and a rounded outlined control
  * dropped into it looks like something that fell in from another screen.
+ *
+ * The surface is left to `chromeTone`, because the *known* states fill this
+ * cell (see below) and the unknown ones deliberately don't.
  */
 const CHROME_CELL =
   "flex h-full shrink-0 items-center gap-1.5 whitespace-nowrap border-l border-border " +
   "px-4 font-mono text-xs font-medium tracking-wider uppercase transition-colors " +
-  "hover:bg-accent/60 disabled:opacity-60 " +
+  "disabled:opacity-60 " +
   "outline-none focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-ring";
 
 interface TriggerView {
@@ -173,9 +181,28 @@ interface TriggerView {
    * pause is temporary and about to end (the tone the old StatusIndicator's
    * "fixing" carried). */
   buttonTone?: string;
-  /** The same four states in the chrome cell's flat, text-only vocabulary. */
+  /**
+   * The same four states in the chrome cell's vocabulary. The two states we
+   * have actually read fill the cell; the two we haven't don't — which is
+   * what keeps "I couldn't reach GET /blocking" from ever looking like the
+   * confident, filled "BLOCKING ACTIVE".
+   */
   chromeTone: string;
 }
+
+/**
+ * The paused fill's ink.
+ *
+ * The design asks for `var(--on-warning)`, which doesn't exist. rnui's
+ * nearest token is `--warning-foreground`, but that is amber *text for a
+ * normal surface*, not ink for an amber fill: on `--warning` it measures
+ * 2.10:1 in light and 1.41:1 in dark. `--warning-solid-foreground` is the
+ * app token for exactly this — a near-black that clears AA on the solid
+ * amber in both modes (see styles/dnsaur-theme.css) — and it's the same
+ * ink the query log's RESUME TAIL cell wears, so the two amber fills in
+ * the shell agree.
+ */
+const ON_WARNING = "text-warning-solid-foreground";
 
 function triggerView(
   status: ReturnType<typeof useBlockingStatus>,
@@ -187,16 +214,18 @@ function triggerView(
       icon: Pause,
       label: "Checking…",
       buttonTone: "text-muted-foreground",
-      chromeTone: "text-muted-foreground",
+      // Unfilled: there is nothing to be confident about yet.
+      chromeTone: "text-muted-foreground hover:bg-accent/60",
     };
   if (status.isError)
     return {
       icon: CircleAlert,
       label: "Status unavailable",
       buttonTone: "text-muted-foreground",
-      // Loud enough not to be skimmed past in a one-row bar, and impossible to
-      // read as a confident "blocking is on".
-      chromeTone: "text-destructive",
+      // Loud enough not to be skimmed past in a one-row bar, and — by not
+      // being a fill at all — impossible to mistake for the filled cell
+      // that means "blocking is on".
+      chromeTone: "text-destructive hover:bg-accent/60",
     };
   if (isPaused)
     return {
@@ -204,7 +233,11 @@ function triggerView(
       label: `Paused · ${formatCountdown(remainingMs)}`,
       buttonTone:
         "border-warning/40 bg-warning/10 text-warning-foreground hover:bg-warning/20 dark:bg-warning/20",
-      chromeTone: "bg-warning/10 text-warning-foreground dark:bg-warning/20",
+      chromeTone: `bg-warning ${ON_WARNING} hover:bg-warning/90`,
     };
-  return { icon: Pause, label: "Blocking active", chromeTone: "text-primary" };
+  return {
+    icon: Pause,
+    label: "Blocking active",
+    chromeTone: "bg-primary text-primary-foreground hover:bg-primary/90",
+  };
 }
