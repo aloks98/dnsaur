@@ -7,8 +7,8 @@
  * comment is derived from the locked set to complete rnui's token contract
  * (see ~/projects/rnui/packages/themes/src/ocean.css for the shape).
  *
- * Fonts: IBM Plex Sans (body) / IBM Plex Mono (all data, labels, numerals)
- * / Archivo (wordmark + display headings). Self-hosted via @fontsource —
+ * Fonts: Space Grotesk (body, wordmark, headings) / IBM Plex Mono (all
+ * data, labels, numerals). Self-hosted via @fontsource —
  * see styles/app.css. Never a CDN: internal/api/static.go serves a CSP with
  * no external hosts, and dnsaur ships as one offline-capable binary.
  *
@@ -32,9 +32,11 @@
  */
 
 [data-theme="dnsaur"] {
-  --font-sans: "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
+  --font-sans: "Space Grotesk", ui-sans-serif, system-ui, sans-serif;
   --font-mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, "Liberation Mono", Menlo, monospace;
-  --font-heading: "Archivo", "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
+  /* The wordmark and headings are the same face as the UI now — the design
+     dropped Archivo when it moved to Space Grotesk. */
+  --font-heading: "Space Grotesk", ui-sans-serif, system-ui, sans-serif;
   /* Squared, everywhere. The design is built out of 1px rules meeting at
      hard corners; a radius anywhere reads as a card, which is the thing
      this layout deliberately isn't. rnui derives --radius-sm/md/lg/xl/2xl
