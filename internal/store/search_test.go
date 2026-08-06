@@ -23,6 +23,18 @@ func TestQueryLogSearch(t *testing.T) {
 		// Clean up any pre-existing query_log and stats data
 		cleanupStats(t, s)
 
+		// Regression coverage for Task 14's finding — Search used to
+		// declare `var out []QueryLogEntry`, which marshals to JSON `null`
+		// (not `[]`) on zero matches. The query_log table is genuinely
+		// empty here (cleanupStats just wiped it, seedQlog hasn't run yet),
+		// so this is the exact zero-row case a fresh instance's query log
+		// starts in.
+		empty, err := s.QueryLog().Search(ctx, QueryLogFilter{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		mustMarshalArray(t, empty)
+
 		seedQlog(t, s)
 		all, err := s.QueryLog().Search(ctx, QueryLogFilter{})
 		if err != nil || len(all) != 3 {

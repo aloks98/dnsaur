@@ -47,7 +47,11 @@ func (q *queryLogStore) Search(ctx context.Context, f QueryLogFilter) ([]QueryLo
 		return nil, err
 	}
 	defer rows.Close()
-	var out []QueryLogEntry
+	// Non-nil so zero matches marshals to JSON `[]`, not `null` — see
+	// sql.go's Groups/Clients/Lists/Rules/records.All for the same fix. A
+	// brand-new instance (or a narrow filter) legitimately has no query log
+	// entries yet.
+	out := []QueryLogEntry{}
 	for rows.Next() {
 		var e QueryLogEntry
 		if err := rows.Scan(&e.ID, &e.At, &e.InstanceID, &e.ClientIP, &e.ClientID, &e.QName, &e.QType, &e.Decision, &e.RuleID, &e.ListID, &e.Upstream, &e.RCode, &e.DurationMs); err != nil {

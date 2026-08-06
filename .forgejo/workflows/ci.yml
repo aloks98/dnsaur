@@ -5,6 +5,47 @@ on:
   pull_request:
 
 jobs:
+  web:
+    runs-on: tiny-no-docker
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: "24" }
+      - name: Enable corepack
+        run: corepack enable
+      - name: Install
+        working-directory: web
+        run: pnpm install --frozen-lockfile
+      - name: Lint
+        working-directory: web
+        run: pnpm lint
+      - name: Format check
+        working-directory: web
+        run: pnpm format:check
+      - name: Typecheck
+        working-directory: web
+        run: pnpm typecheck
+      - name: Test
+        working-directory: web
+        run: pnpm test
+      - name: Build
+        working-directory: web
+        run: pnpm build
+      # Forgejo's fork, not actions/upload-artifact. The upstream v4 action
+      # bundles @actions/artifact v2, which refuses outright to run against
+      # any host that isn't github.com — it reports the instance as GHES and
+      # exits. That check is client-side and unconditional: this Forgejo
+      # (16.0.1) implements the v4 artifact API perfectly well, the action
+      # just declines to talk to it. The fork is the same action with that
+      # guard removed. Keep upload and download on the same fork and major.
+      - uses: https://code.forgejo.org/forgejo/upload-artifact@v4
+        with:
+          name: web-dist
+          path: web/dist
+
+  # Deliberately NOT `needs: web`: the Go build/vet/lint don't depend on real
+  # dashboard assets (web/dist/.gitkeep alone satisfies the //go:embed), so a
+  # frontend hiccup must never silently skip backend verification on a PR.
   checks:
     runs-on: tiny-no-docker
     steps:
@@ -19,6 +60,7 @@ jobs:
       - name: Build
         run: CGO_ENABLED=0 go build -ldflags "-X main.Version=${GITHUB_SHA::7}" ./cmd/dnsaur
 
+  # Same as `checks`: no `needs: web`. No Go test asserts on real dist content.
   test:
     runs-on: medium
     steps:
@@ -27,3 +69,51 @@ jobs:
         with: { go-version: "1.26" }
       - name: Race tests
         run: go test -race ./...
+
+  # Playwright smoke test (web/e2e/smoke.spec.ts) against the real embedded
+  # build: webServer (web/playwright.config.ts) builds the actual dnsaur
+  # binary over the web-dist artifact from the `web` job and runs it, then
+  # a browser drives first-run setup → login → add a DNS record → dark
+  # mode persistence. Best-effort, not a merge gate — continue-on-error so
+  # a runner without reliable network access to download Chromium (or any
+  # other environment quirk) doesn't block the pipeline; see
+  # web/README.md's "End-to-end smoke test" section for the local-only
+  # fallback (`pnpm test:e2e`) this mirrors.
+  e2e:
+    runs-on: medium
+    needs: web
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version: "1.26" }
+      - uses: actions/setup-node@v4
+        with: { node-version: "24" }
+      - name: Enable corepack
+        run: corepack enable
+      - name: Install
+        working-directory: web
+        run: pnpm install --frozen-lockfile
+      - uses: https://code.forgejo.org/forgejo/download-artifact@v4
+        with:
+          name: web-dist
+          path: web/dist
+      - name: Install Chromium
+        working-directory: web
+        run: npx playwright install --with-deps chromium
+      - name: Smoke test
+        working-directory: web
+        run: pnpm test:e2e
+      # continue-on-error above means a failure leaves no other trace, so
+      # always keep the report + traces (playwright.config.ts sets
+      # trace: "on-first-retry", and CI retries once) — otherwise the smoke
+      # test can rot silently.
+      - uses: https://code.forgejo.org/forgejo/upload-artifact@v4
+        if: always()
+        with:
+          name: playwright-report
+          path: |
+            web/playwright-report
+            web/test-results
+          if-no-files-found: ignore
+          retention-days: 7

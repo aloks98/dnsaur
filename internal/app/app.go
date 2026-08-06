@@ -23,6 +23,7 @@ import (
 	"github.com/aloks98/dnsaur/internal/stats"
 	"github.com/aloks98/dnsaur/internal/store"
 	"github.com/aloks98/dnsaur/internal/upstream"
+	"github.com/aloks98/dnsaur/web"
 	"github.com/google/uuid"
 )
 
@@ -283,7 +284,7 @@ func (a *App) Start(ctx context.Context) error {
 	apiSrv := api.New(api.Deps{
 		Store: a.st, Auth: auth.New(a.st.Users(), a.st.Tokens()),
 		Engine: a.engine, Reloader: a, Logger: a.logger, Refresher: a.refresher,
-		Version: a.version,
+		Version: a.version, Static: web.Dist(),
 	})
 	ln, err := net.Listen("tcp", a.cfg.HTTPListen)
 	if err != nil {

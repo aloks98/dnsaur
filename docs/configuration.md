@@ -20,7 +20,7 @@ over built-in defaults, then overridden by environment variables.
 | YAML field | Env var | Default | Meaning |
 |---|---|---|---|
 | `dns_listen` | `DNSAUR_DNS_LISTEN` (comma-separated) | `[":53"]` | Addresses the DNS engine listens on (UDP+TCP) |
-| `http_listen` | `DNSAUR_HTTP_LISTEN` | `:8080` | Address the API/dashboard HTTP server listens on |
+| `http_listen` | `DNSAUR_HTTP_LISTEN` | `:8080` | Address the REST API *and* the web dashboard listen on — both are served by the same HTTP server (the dashboard is a static SPA embedded into the binary; the API answers under `/api/v1`, everything else falls through to the dashboard, see [`docs/architecture.md`](architecture.md)) |
 | `data_dir` | `DNSAUR_DATA_DIR` | `./data` | Directory for the SQLite DB file and cached blocklist downloads |
 | `log_level` | `DNSAUR_LOG_LEVEL` | `info` | slog level (`debug`, `info`, `warn`, `error`) |
 | `storage.driver` | `DNSAUR_STORAGE_DRIVER` | `sqlite` | `sqlite` or `postgres` |
@@ -53,7 +53,7 @@ the DB, bumps a config version, and live components reload automatically —
 |---|---|---|
 | `instance.id` | random UUID, generated per install | Stable identifier for this instance (used by future HA sync) |
 | `upstreams` | `1.1.1.1:53,1.0.0.1:53,9.9.9.9:53` | Comma-separated upstream resolver addresses (host:port; bare IPv6 and missing ports are normalized) |
-| `upstream.strategy` | `race` | Upstream selection strategy (`race` today; `failover`/`fastest` planned) |
+| `upstream.strategy` | `race` | Upstream selection strategy: `race` (query all healthy upstreams in parallel, first good answer wins), `failover` (try them in configured order, fall through on error/SERVFAIL), or `fastest` (try them ordered by measured EWMA latency, fastest first) |
 | `blocking.mode` | `null-ip` | How blocked queries are answered: `null-ip` (`0.0.0.0`) or `nxdomain` |
 | `blocking.ttl` | `30` | TTL (seconds) returned on blocked responses |
 | `cache.min_ttl` **†** | `0` | Minimum TTL (seconds) enforced on cached responses |

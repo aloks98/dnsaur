@@ -165,4 +165,3 @@ func TestUDPSizeFloor(t *testing.T) {
 		t.Error("response should contain answers (proves truncation didn't happen)")
 	}
 }
-

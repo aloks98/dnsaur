@@ -14,6 +14,13 @@ import (
 var (
 	ErrInUse    = errors.New("resource in use")
 	ErrNotFound = errors.New("not found")
+	// ErrDuplicate is a uniqueness violation — a group name, client matcher
+	// or list URL that already exists. It is user input error, so it must
+	// not be lumped in with genuine storage failures: without it the API
+	// answered "storage unavailable" (503) to someone who simply reused a
+	// name. Unique columns today: groups.name, clients.matcher, lists.url,
+	// users.username, auth_tokens.token_hash.
+	ErrDuplicate = errors.New("already exists")
 )
 
 // User represents an authenticated user.
@@ -68,14 +75,51 @@ type Client struct {
 	GroupID int64  `json:"group_id"`
 }
 
+// Outcome of the most recent refresh attempt for a filter list, persisted as
+// lists.last_status. Before these existed, a list whose URL 404s and a list
+// that simply hadn't refreshed yet were byte-for-byte identical on the wire
+// — both `entry_count: 0, last_refreshed: 0` — so the UI could not report
+// the difference, and a list contributing zero entries silently blocked
+// nothing.
+const (
+	// ListStatusPending — never attempted. This is what `0` entries and a
+	// `never` last_refreshed are allowed to mean, and nothing else.
+	ListStatusPending = "pending"
+	// ListStatusOK — fetched (or 304'd) and parsed; entries are live.
+	ListStatusOK = "ok"
+	// ListStatusStale — this attempt failed, but a previously cached copy
+	// is still compiled and enforcing. Entries are real but ageing;
+	// LastRefreshed dates the copy being served.
+	ListStatusStale = "stale"
+	// ListStatusFailed — the attempt failed and there is no usable copy.
+	// The list is blocking nothing.
+	ListStatusFailed = "failed"
+	// ListStatusEmpty — fetched and parsed fine, but produced no usable
+	// entries (every line rejected, or the file holds no domains). Also
+	// blocking nothing, but for a parser reason rather than a fetch one —
+	// LastError says which, because "0 entries" alone sends admins hunting
+	// for a download bug that isn't there.
+	ListStatusEmpty = "empty"
+)
+
 // List is a remote filter list (blocklist or allowlist).
 type List struct {
-	ID            int64  `json:"id"`
-	URL           string `json:"url"`
+	ID  int64  `json:"id"`
+	URL string `json:"url"`
+	// Name is the list's readable label, used wherever the UI would
+	// otherwise print the raw URL (assignment menus, toasts, delete
+	// confirmations). Optional on the way in — blank is stored as blank and
+	// means "use the URL-derived default" — but **never empty on the way
+	// out**: reads resolve a blank one through DeriveListName, which is
+	// also what gives rows written before this column a label.
+	Name          string `json:"name"`
 	Kind          string `json:"kind"` // "block" | "allow"
 	Enabled       bool   `json:"enabled"`
-	LastRefreshed int64  `json:"last_refreshed"`
-	EntryCount    int64  `json:"entry_count"`
+	LastRefreshed int64  `json:"last_refreshed"` // unix ms of the last successful fetch-and-parse; 0 = never
+	EntryCount    int64  `json:"entry_count"`    // unique domains currently compiled and enforcing
+	LastStatus    string `json:"last_status"`    // one of the ListStatus* constants
+	LastError     string `json:"last_error"`     // short human reason; "" when LastStatus is pending or ok
+	LastAttempt   int64  `json:"last_attempt"`   // unix ms of the last attempt, successful or not; 0 = never tried
 }
 
 // Rule is a per-group allow/block override, either literal or regex.
@@ -117,9 +161,9 @@ type QueryLogEntry struct {
 // QueryLogFilter specifies optional filters for query log search.
 // Zero values mean no constraint. Limit 0 defaults to 100, capped at 1000.
 type QueryLogFilter struct {
-	FromMs, ToMs                          int64
+	FromMs, ToMs                             int64
 	ClientIP, QNameContains, Decision, QType string
-	Limit, Offset                         int
+	Limit, Offset                            int
 }
 
 // ClientStore manages client groups and clients.
@@ -143,7 +187,29 @@ type FilterStore interface {
 	AddList(ctx context.Context, l List) (int64, error)
 	AssignList(ctx context.Context, groupID, listID int64) error
 	AddRule(ctx context.Context, r Rule) (int64, error)
+	// TouchList records a successful refresh that produced entries: status
+	// ListStatusOK, last_refreshed and last_attempt set to refreshedAt,
+	// entryCount stored, and **last_error cleared** so a list that has
+	// recovered stops reporting a failure it no longer has.
 	TouchList(ctx context.Context, id, refreshedAt, entryCount int64) error
+	// MarkListFailed records a failed *fetch* attempt without disturbing
+	// last_refreshed — that still dates the copy a stale list is serving.
+	// entryCount is how many entries remain compiled and enforcing after
+	// the failure: the cached copy's count when the cache fallback saved
+	// us, 0 when nothing is being served. That is the sole difference
+	// between ListStatusStale and ListStatusFailed, so the status is
+	// derived from it here, in one place. reason must be short enough to
+	// render in a table cell.
+	MarkListFailed(ctx context.Context, id, attemptedAt, entryCount int64, reason string) error
+	// MarkListEmpty records a fetch that succeeded and a parse that
+	// produced nothing usable (ListStatusEmpty). The download did happen,
+	// so last_refreshed advances; entry_count is 0 and reason names the
+	// parser's side of it.
+	MarkListEmpty(ctx context.Context, id, refreshedAt int64, reason string) error
+	// RenameList sets a list's display name. A blank name resets it to the
+	// URL-derived default rather than storing an empty label the UI would
+	// have nothing to render.
+	RenameList(ctx context.Context, id int64, name string) error
 	SetListEnabled(ctx context.Context, id int64, enabled bool) error
 	DeleteList(ctx context.Context, id int64) error
 	UnassignList(ctx context.Context, groupID, listID int64) error

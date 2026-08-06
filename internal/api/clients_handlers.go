@@ -57,8 +57,22 @@ func (s *Server) handleGroupCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	id, err := s.deps.Store.Clients().AddGroup(r.Context(), body.Name)
 	if err != nil {
-		storeErr(w, err)
+		storeErrDup(w, err, "a group with that name already exists")
 		return
+	}
+	// A new group inherits every existing filter list, mirroring
+	// handleListCreate. A group's ruleset is compiled only from its
+	// assigned lists, so without this a freshly created group filters
+	// nothing at all — the clients moved into it would silently stop being
+	// protected, which is the opposite of why groups exist.
+	lists, lerr := s.deps.Store.Filters().Lists(r.Context())
+	if lerr != nil {
+		slog.Error("assigning lists to new group failed", "group", id, "err", lerr)
+	}
+	for _, l := range lists {
+		if err := s.deps.Store.Filters().AssignList(r.Context(), id, l.ID); err != nil {
+			slog.Error("assigning list to new group failed", "group", id, "list", l.ID, "err", err)
+		}
 	}
 	s.reloadClients(r)
 	writeJSON(w, http.StatusCreated, map[string]int64{"id": id})
@@ -86,7 +100,7 @@ func (s *Server) handleGroupPatch(w http.ResponseWriter, r *http.Request) {
 	}
 	if body.Name != nil {
 		if err := s.deps.Store.Clients().RenameGroup(r.Context(), id, *body.Name); err != nil {
-			storeErr(w, err)
+			storeErrDup(w, err, "a group with that name already exists")
 			return
 		}
 	}
@@ -139,7 +153,7 @@ func (s *Server) handleClientCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	id, err := s.deps.Store.Clients().AddClient(r.Context(), body)
 	if err != nil {
-		storeErr(w, err)
+		storeErrDup(w, err, "another client already matches "+body.Matcher)
 		return
 	}
 	s.reloadClients(r)
@@ -159,7 +173,7 @@ func (s *Server) handleClientPut(w http.ResponseWriter, r *http.Request) {
 	}
 	body.ID = id
 	if err := s.deps.Store.Clients().UpdateClient(r.Context(), body); err != nil {
-		storeErr(w, err)
+		storeErrDup(w, err, "another client already matches "+body.Matcher)
 		return
 	}
 	s.reloadClients(r)

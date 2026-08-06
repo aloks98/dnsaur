@@ -112,6 +112,20 @@ func TestTokenLifecycle(t *testing.T) {
 	forEachDriver(t, func(t *testing.T, s Store) {
 		ctx := context.Background()
 		uid, _ := s.Users().Create(ctx, User{Username: "u2", PasswordHash: "h", CreatedAt: 1})
+		// uid is a freshly minted, never-before-used user id, so this is a
+		// safe zero-row check even against the shared postgres DB other
+		// tests in this package also write to: nothing could have created
+		// an API token for this exact uid yet. Regression coverage for
+		// Task 14's finding — ListAPI used to declare `var out []AuthToken`,
+		// which marshals to JSON `null` (not `[]`) on zero rows, crashing
+		// the Account › API Tokens page for every account that hasn't
+		// created a token yet (the default state).
+		noTokens, err := s.Tokens().ListAPI(ctx, uid)
+		if err != nil {
+			t.Fatal(err)
+		}
+		mustMarshalArray(t, noTokens)
+
 		id, err := s.Tokens().Create(ctx, AuthToken{UserID: uid, Kind: "session", TokenHash: "hash1", Scope: "write", CreatedAt: 1000, ExpiresAt: 5000})
 		if err != nil {
 			t.Fatal(err)

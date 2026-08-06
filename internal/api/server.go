@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"io/fs"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -34,6 +35,9 @@ type Deps struct {
 	Logger    *qlog.Logger
 	Refresher *filter.Refresher
 	Version   string
+	// Static serves the embedded web dashboard on non-/api paths. Nil
+	// disables it (e.g. tests that don't care about the SPA).
+	Static fs.FS
 }
 
 type Server struct {
@@ -66,6 +70,12 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/api/", func(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusNotFound, "not found")
 	})
+	// The SPA owns everything else. More specific patterns above (including
+	// the "/api/" catch-all) take precedence, so this only ever sees
+	// non-API paths.
+	if s.deps.Static != nil {
+		s.mux.Handle("/", StaticHandler(s.deps.Static))
+	}
 }
 
 func (s *Server) Handler() http.Handler {
@@ -123,11 +133,21 @@ func errJSON(w http.ResponseWriter, code int, msg string) {
 }
 
 func storeErr(w http.ResponseWriter, err error) {
+	storeErrDup(w, err, "already exists")
+}
+
+// storeErrDup is storeErr with a caller-supplied message for the duplicate
+// case, so a uniqueness violation can name the field the user actually
+// collided on instead of answering "storage unavailable" to what is really
+// user input error.
+func storeErrDup(w http.ResponseWriter, err error, dupMsg string) {
 	switch {
 	case errors.Is(err, store.ErrNotFound):
 		errJSON(w, http.StatusNotFound, "not found")
 	case errors.Is(err, store.ErrInUse):
 		errJSON(w, http.StatusConflict, "resource in use")
+	case errors.Is(err, store.ErrDuplicate):
+		errJSON(w, http.StatusConflict, dupMsg)
 	default:
 		errJSON(w, http.StatusServiceUnavailable, "storage unavailable")
 	}
