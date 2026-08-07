@@ -169,8 +169,11 @@ export function Login() {
           // Stay on the code step (the password is still valid and must not
           // be thrown away) and say what actually went wrong.
           if (err instanceof ApiError && err.status === 401 && step === "totp") {
-            const message =
-              "That code didn't match. Codes rotate every 30 seconds — wait for the next one and try again. Your password is still accepted.";
+            // Says only that the code was wrong. "Your password is still
+            // accepted" confirms the password to whoever is typing, and the
+            // rotation lecture tells the owner of an authenticator app how
+            // their authenticator app works.
+            const message = "That code didn't match.";
             setFormError({ setupRequired: false, message });
             form.resetField("totpCode");
             toast.error("Invalid verification code — try again.");
@@ -338,13 +341,10 @@ export function Login() {
                         />
                       </FormControl>
                       <FormMessage />
-                      {rejected ? (
-                        <SubmitError>{formError.message}</SubmitError>
-                      ) : (
-                        <p className="text-sm text-muted-foreground">
-                          From your authenticator app. Rotates every 30 seconds.
-                        </p>
-                      )}
+                      {/* No hint. "6-digit code" over a 000000 placeholder
+                          on a 2FA prompt does not need explaining to someone
+                          who set 2FA up. */}
+                      {rejected && <SubmitError>{formError.message}</SubmitError>}
                     </FormItem>
                   )}
                 />
