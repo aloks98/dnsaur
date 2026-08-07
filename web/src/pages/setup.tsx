@@ -419,10 +419,7 @@ export function Setup() {
                         <FormControl>
                           <Input {...field} type="password" autoComplete="new-password" />
                         </FormControl>
-                        <FormDescription>
-                          At least 8 characters. There&apos;s no recovery flow yet — store it
-                          somewhere safe.
-                        </FormDescription>
+                        <FormDescription>At least 8 characters.</FormDescription>
                         <FormMessage />
                       </FormItem>
                     )}
