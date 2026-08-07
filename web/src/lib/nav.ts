@@ -118,11 +118,17 @@ export function isNavItemActive(pathname: string, item: NavItem): boolean {
 }
 
 /**
- * Which group's tabs row 2 shows. Falls back to the first group rather than
- * to nothing: an unknown path is on its way to `/` via the catch-all redirect,
- * and an empty second row for that frame reads as a broken shell.
+ * Which group's tabs row 2 shows, or `null` when the path is in no group at
+ * all — which now means exactly one thing: the not-found screen.
+ *
+ * This used to fall back to the first group, because an unknown path was
+ * only ever a transient on its way to `/` via the catch-all redirect, and an
+ * empty second row for that one frame read as a broken shell. The redirect
+ * is gone (pages/not-found.tsx renders instead), so the fallback would now
+ * be a lie that persists: MONITOR marked, and a row of Dashboard/Query Log
+ * tabs, on a page that is neither.
  */
-export function findActiveGroup(pathname: string): NavGroup {
+export function findActiveGroup(pathname: string): NavGroup | null {
   return (
     NAV_GROUPS.find((group) => group.items.some((item) => isNavItemActive(pathname, item))) ??
     NAV_GROUPS.find(
@@ -130,6 +136,6 @@ export function findActiveGroup(pathname: string): NavGroup {
         group.basePath !== undefined &&
         (pathname === group.basePath || pathname.startsWith(`${group.basePath}/`)),
     ) ??
-    NAV_GROUPS[0]
+    null
   );
 }
