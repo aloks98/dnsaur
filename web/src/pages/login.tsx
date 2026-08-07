@@ -215,19 +215,31 @@ export function Login() {
           // screen an operator reaches before any chrome exists, and "which
           // version am I actually running?" is the first question when
           // something looks wrong. GET /health is public, so it answers even
-          // signed out.
-          <>dnsaur {health.data?.version ?? "—"} · self-hosted</>
+          // signed out. The `v` is added here rather than baked into the
+          // reported string, and stripped first so a tag that already has one
+          // doesn't render as "vv".
+          <>{health.data ? `dnsaur v${health.data.version.replace(/^v/, "")}` : "dnsaur"}</>
         ) : (
           <>Lost your authenticator? You&apos;ll need shell access to reset it.</>
         )
       }
     >
       <Card className="gap-4 p-5">
-        <p className="text-sm text-pretty text-muted-foreground">
-          {onCredentials
-            ? "Enter your credentials to continue."
-            : "Your password was accepted. One more factor to go."}
-        </p>
+        {/* Nothing on the code step, deliberately. The artboard says "Your
+            password was accepted" there, which states out loud that the
+            password was right — useful to the account's owner and equally
+            useful to someone who has only the password. The field's own hint
+            below already says where the code comes from, so the sentence was
+            not carrying anything else.
+            This narrows the leak rather than closing it: the server answers
+            428 only for credentials it accepted, so *arriving* at this step
+            is itself the signal. Removing the wording is the part the UI can
+            control. */}
+        {onCredentials && (
+          <p className="text-sm text-pretty text-muted-foreground">
+            Enter your credentials to continue.
+          </p>
+        )}
 
         {/* Only the "there is no admin account" case keeps a banner: it is
             the one failure that is not about what was typed, and the only

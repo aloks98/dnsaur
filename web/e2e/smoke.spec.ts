@@ -18,16 +18,21 @@ test("first-run setup, login, add a DNS record, dark mode persists across reload
   await page.goto("/");
   await expect(page.getByRole("heading", { name: "Set up dnsaur" })).toBeVisible();
 
+  // The wizard opens on a welcome screen; the account form is behind it.
+  await page.getByRole("button", { name: "Get started" }).click();
+  await expect(page.getByRole("heading", { name: "Create your admin" })).toBeVisible();
+
   await page.getByLabel("Username").fill(USERNAME);
   await page.getByLabel("Password", { exact: true }).fill(PASSWORD);
   await page.getByLabel("Confirm password").fill(PASSWORD);
   await page.getByRole("button", { name: "Create account" }).click();
 
-  // Skip the starter-blocklists step ("Continue" would kick off real
-  // network fetches for the StevenBlack/HaGeZi URLs) — this smoke test only
+  // Skip the starter-blocklists step (finishing would kick off real network
+  // fetches for the StevenBlack/hagezi/OISD URLs) — this smoke test only
   // needs an admin account and a session, not a configured filter setup.
-  await page.getByRole("button", { name: "I'll do this later" }).click();
-  await page.getByRole("button", { name: /go to dashboard/i }).click();
+  await page.getByRole("button", { name: "Skip for now" }).click();
+  await expect(page.getByRole("heading", { name: "dnsaur is ready" })).toBeVisible();
+  await page.getByRole("button", { name: /open the dashboard/i }).click();
   await expect(page.getByRole("heading", { name: "Dashboard" })).toBeVisible();
 
   // The dashboard is composed from rnui: four StatCards in the hairline

@@ -13,7 +13,13 @@ import (
 	"github.com/aloks98/dnsaur/internal/config"
 )
 
-var Version = "dev"
+// Version is the build's declared version, reported by GET /health and
+// shown on the login screen. The default is the repo's current version
+// rather than "dev": an unstamped local build is still a real build, and
+// "dev" told an operator nothing about which code they were running.
+// Release builds overwrite it via -ldflags (see .forgejo/workflows/ci.yml,
+// which stamps the short commit SHA).
+var Version = "0.1.0"
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)

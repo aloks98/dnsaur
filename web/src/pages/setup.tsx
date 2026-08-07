@@ -1,5 +1,5 @@
-import { useId, useState } from "react";
-import { CheckIcon, CircleAlert } from "lucide-react";
+import { useState } from "react";
+import { Check, CircleAlert, TriangleAlert } from "lucide-react";
 import { toast } from "sonner";
 import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
@@ -11,9 +11,6 @@ import {
   AlertTitle,
   Button,
   Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
   Checkbox,
   cn,
   Form,
@@ -24,38 +21,55 @@ import {
   FormLabel,
   FormMessage,
   Input,
-  Label,
-  Stepper,
-  StepperContent,
-  StepperIndicator,
-  StepperItem,
-  StepperNav,
-  StepperPanel,
-  StepperSeparator,
-  StepperTitle,
-  StepperTrigger,
 } from "@e412/rnui-react";
 import { ApiError } from "../api/client";
 import { AuthLayout } from "../components/auth-layout";
 import { authKeys, useSetup, useSetupSignIn } from "../hooks/use-auth";
 import { useAddList, useAssignGroupLists } from "../hooks/use-filters";
-import { useUpdateSetting } from "../hooks/use-settings";
 
-const DEFAULT_UPSTREAMS = "1.1.1.1:53,1.0.0.1:53,9.9.9.9:53";
 const STARTER_GROUP_ID = 1;
 
+/**
+ * Every URL here is fetched on first run, so a dead one is the worst
+ * possible first impression: the wizard reports success and the instance
+ * filters nothing.
+ *
+ * hagezi's path is `wildcard/`, not `hosts/`. The `hosts/pro.txt` this
+ * previously shipped 404s — verified — which meant every fresh install
+ * subscribed to a list that could never load.
+ */
 const STARTER_LISTS = [
   {
     key: "stevenblack",
-    name: "StevenBlack — Unified hosts",
+    name: "StevenBlack hosts",
     url: "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts",
-    description: "A broad, well-maintained baseline of ad and malware domains.",
+    description: "Ads and malware, the usual default.",
+    size: "~99k",
+    default: true,
   },
   {
     key: "hagezi",
-    name: "HaGeZi — Multi PRO",
-    url: "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/hosts/pro.txt",
-    description: "A more aggressive list covering trackers, ads, and scams.",
+    name: "hagezi pro",
+    url: "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/pro.txt",
+    description: "Larger, more aggressive. Occasional false positives.",
+    size: "~218k",
+    default: true,
+  },
+  {
+    key: "oisd",
+    name: "OISD small",
+    url: "https://small.oisd.nl/",
+    description: "Conservative and well curated.",
+    size: "~48k",
+    default: true,
+  },
+  {
+    key: "tracking",
+    name: "Kids: tracking",
+    url: "https://raw.githubusercontent.com/blocklistproject/Lists/master/tracking.txt",
+    description: "Extra trackers, useful on a kids group.",
+    size: "~34k",
+    default: false,
   },
 ] as const;
 
@@ -65,10 +79,9 @@ const STARTER_LISTS = [
  * characters). Nothing is trimmed: whitespace can be part of a password,
  * and both fields are sent exactly as typed.
  *
- * The confirmation check is a schema-level refinement with an explicit
- * `path` — it's the one rule here that needs to see a second field — and
- * the two checks on the password itself stay ordered so an empty one still
- * reads "Password is required" rather than the length complaint.
+ * The confirmation field is not in the artboard, and is kept deliberately:
+ * there is no password recovery flow, so a typo here is unrecoverable
+ * without shell access. The design's own hint says as much.
  */
 const accountFormSchema = z
   .object({
@@ -87,54 +100,129 @@ const accountFormSchema = z
 
 type AccountFormValues = z.infer<typeof accountFormSchema>;
 
-function passwordStrengthHint(password: string): string {
-  if (password.length === 0) return "Use at least 8 characters.";
-  if (password.length < 8) return "Too short — needs at least 8 characters.";
-  const variety = [/[a-z]/, /[A-Z]/, /\d/, /[^a-zA-Z0-9]/].filter((re) => re.test(password)).length;
-  if (password.length >= 14 && variety >= 3) return "Strong password.";
-  if (password.length >= 10 && variety >= 2) return "Good password.";
-  return "Okay — a longer or more varied password is stronger.";
+type Stage = "welcome" | "admin" | "lists" | "done";
+
+/** What the wizard actually managed to do, so the last screen can report it
+ * rather than claiming everything worked. */
+interface Outcome {
+  /** Lists created *and* attached to the default group. */
+  applied: number;
+  /** How many were selected — `applied < chosen` is the partial case. */
+  chosen: number;
+  /** Named so the last screen can say which one to look at. */
+  failed: string[];
+  /** False when the silent post-setup sign-in didn't work. */
+  signedIn: boolean;
+}
+
+const STEPS = [
+  { num: 1, label: "Admin", stage: "admin" },
+  { num: 2, label: "Blocklists", stage: "lists" },
+  { num: 3, label: "Done", stage: "done" },
+] as const;
+
+/** The wizard's position, as three cells across the top of the card. Absent
+ * on the welcome screen, which is before step 1 rather than part of it. */
+function StepStrip({ stage }: { stage: Stage }) {
+  const current = STEPS.findIndex((s) => s.stage === stage);
+
+  return (
+    <div className="flex items-stretch border-b border-border">
+      {STEPS.map((step, i) => {
+        const state = i < current ? "done" : i === current ? "current" : "todo";
+        return (
+          <span
+            key={step.num}
+            aria-current={state === "current" ? "step" : undefined}
+            className={cn(
+              "flex flex-1 items-center gap-2 border-r border-border px-3 py-2.5 last:border-r-0",
+              state === "current" && "bg-background shadow-[inset_0_-2px_0_var(--primary)]",
+            )}
+          >
+            <span
+              aria-hidden
+              className={cn(
+                "grid size-4 shrink-0 place-items-center font-mono text-xs font-semibold",
+                state === "todo"
+                  ? "bg-muted text-muted-foreground"
+                  : "bg-primary text-primary-foreground",
+              )}
+            >
+              {state === "done" ? <Check className="size-3" /> : step.num}
+            </span>
+            <span
+              className={cn(
+                "font-mono text-xs tracking-wider uppercase",
+                state === "current" && "font-semibold",
+                state === "todo" && "text-muted-foreground",
+              )}
+            >
+              {step.label}
+            </span>
+          </span>
+        );
+      })}
+    </div>
+  );
+}
+
+/** One line of the final report: what happened, and what it means. */
+function DoneCheck({ ok, label, detail }: { ok: boolean; label: string; detail: string }) {
+  const Icon = ok ? Check : TriangleAlert;
+  return (
+    <div className="flex items-start gap-2.5">
+      <Icon
+        aria-hidden
+        className={cn("mt-0.5 size-4 shrink-0", ok ? "text-success" : "text-warning")}
+      />
+      <span className="flex min-w-0 flex-col gap-0.5">
+        <span className="text-sm font-medium">{label}</span>
+        <span className="text-xs text-pretty text-muted-foreground">{detail}</span>
+      </span>
+    </div>
+  );
 }
 
 /**
- * First-run setup wizard: create the admin account, then optionally seed a
- * couple of starter blocklists and upstream resolvers.
+ * First-run setup wizard: welcome, create the admin account, optionally seed
+ * starter blocklists, then report what landed.
  *
  * POST /setup only creates the account — it does not start a session. Once
  * it succeeds, the wizard silently signs in (useSetupSignIn) to get a
- * session cookie for the optional step-2 writes, but deliberately does not
+ * session cookie for the optional list writes, but deliberately does not
  * invalidate the `me`/`setup` queries until the very end: doing so earlier
  * would flip the app's auth gate (App.tsx) out from under this component
- * mid-wizard. If the silent sign-in fails for any reason, step 2 is skipped
- * and step 3 points the user at the login page instead.
+ * mid-wizard. If the silent sign-in fails, the list step is skipped and the
+ * last screen points at the login page instead.
  */
 export function Setup() {
   const qc = useQueryClient();
-  const [step, setStep] = useState(1);
+  const [stage, setStage] = useState<Stage>("welcome");
   const [formError, setFormError] = useState<{ conflict: boolean; message: string } | null>(null);
-  const [loggedIn, setLoggedIn] = useState(false);
+  const [outcome, setOutcome] = useState<Outcome>({
+    applied: 0,
+    chosen: 0,
+    failed: [],
+    signedIn: false,
+  });
+  const [username, setUsername] = useState("");
+  const [selected, setSelected] = useState<Record<string, boolean>>(
+    Object.fromEntries(STARTER_LISTS.map((l) => [l.key, l.default])),
+  );
 
   const setup = useSetup();
   const signIn = useSetupSignIn();
   const addList = useAddList();
   const assignGroupLists = useAssignGroupLists();
-  const updateSetting = useUpdateSetting();
 
   const accountForm = useForm<AccountFormValues>({
     resolver: zodResolver(accountFormSchema),
     defaultValues: { username: "", password: "", confirmPassword: "" },
   });
 
-  const [upstreams, setUpstreams] = useState(DEFAULT_UPSTREAMS);
-  const [selectedLists, setSelectedLists] = useState<Record<string, boolean>>({
-    stevenblack: true,
-    hagezi: true,
-  });
-  const upstreamsId = useId();
-
   const creatingAccount = setup.isPending || signIn.isPending;
-  const applyingStarters =
-    addList.isPending || assignGroupLists.isPending || updateSetting.isPending;
+  const applyingStarters = addList.isPending || assignGroupLists.isPending;
+  const chosenCount = STARTER_LISTS.filter((l) => selected[l.key]).length;
 
   function onCreateAccount(values: AccountFormValues) {
     setFormError(null);
@@ -142,17 +230,18 @@ export function Setup() {
       { username: values.username, password: values.password },
       {
         onSuccess: () => {
+          setUsername(values.username);
           toast.success("Admin account created");
           signIn.mutate(
             { username: values.username, password: values.password },
             {
               onSuccess: () => {
-                setLoggedIn(true);
-                setStep(2);
+                setOutcome((o) => ({ ...o, signedIn: true }));
+                setStage("lists");
               },
               onError: () => {
-                setLoggedIn(false);
-                setStep(3);
+                setOutcome((o) => ({ ...o, signedIn: false }));
+                setStage("done");
               },
             },
           );
@@ -186,16 +275,16 @@ export function Setup() {
   /**
    * Best-effort, and honest about how far it got.
    *
-   * A list that is created but never assigned to a group is dead weight —
-   * it exists in the catalog and filters nothing. So a failure partway
-   * through the loop no longer abandons the ids already created: whatever
-   * was created still gets attached, and the toast says what actually
-   * landed instead of implying the whole step was a no-op.
+   * A list that is created but never assigned to a group is dead weight — it
+   * exists in the catalog and filters nothing. So a failure partway through
+   * the loop does not abandon the ids already created: whatever was created
+   * still gets attached, and the last screen says what actually landed
+   * rather than implying the whole step was a no-op.
    */
-  async function applyStarterSetup() {
-    const chosen = STARTER_LISTS.filter((l) => selectedLists[l.key]);
+  async function applyStarterLists() {
+    const chosen = STARTER_LISTS.filter((l) => selected[l.key]);
     const created: number[] = [];
-    let failed = false;
+    const failed: string[] = [];
 
     for (const list of chosen) {
       try {
@@ -204,277 +293,309 @@ export function Setup() {
         const res = await addList.mutateAsync({ url: list.url, kind: "block", name: list.name });
         created.push(res.id);
       } catch {
-        failed = true;
+        failed.push(list.name);
       }
     }
 
-    let attached = created.length;
+    let applied = created.length;
     if (created.length > 0) {
       try {
         await assignGroupLists.mutateAsync({ groupId: STARTER_GROUP_ID, listIds: created });
       } catch {
-        failed = true;
-        attached = 0;
+        // Created but unattached filters nothing, so this counts as zero
+        // applied — and the last screen has to say so.
+        applied = 0;
       }
     }
 
-    if (upstreams.trim().length > 0) {
-      try {
-        await updateSetting.mutateAsync({ key: "upstreams", value: upstreams.trim() });
-      } catch {
-        failed = true;
-      }
-    }
-
-    if (!failed) {
-      toast.success("Starter blocklists and upstreams saved");
-    } else if (attached > 0 && attached < chosen.length) {
-      toast.error(
-        `Only ${attached} of ${chosen.length} starter blocklists were saved — you can add the rest later in Filtering`,
-      );
-    } else if (attached > 0) {
-      toast.error("Starter blocklists saved, but the upstreams weren't — set them in Settings");
-    } else if (created.length > 0) {
-      // The lists exist in the catalog but the group assignment failed, so
-      // they filter nothing. "Couldn't save starter setup" would send the
-      // admin off to create them a second time; what's actually needed is to
-      // apply the ones already sitting there.
-      toast.error(
-        `${created.length} ${created.length === 1 ? "blocklist was" : "blocklists were"} created but couldn't be applied to the default group — apply ${created.length === 1 ? "it" : "them"} in Filtering`,
-      );
-    } else if (chosen.length === 0) {
-      toast.error("Couldn't save the upstreams — you can set them in Settings");
-    } else {
-      toast.error("Couldn't save starter setup — you can add lists later in Filtering");
-    }
-    setStep(3);
+    setOutcome((o) => ({ ...o, applied, chosen: chosen.length, failed }));
+    setStage("done");
   }
 
+  const partial = outcome.applied < outcome.chosen;
+
+  // The address the admin reached this page on is the best guess at what
+  // their router should point at — dnsaur has no endpoint that reports its
+  // own LAN address, and the browser already resolved one that works.
+  const resolverHost = typeof window === "undefined" ? "dnsaur" : window.location.hostname;
+
+  const COPY: Record<Stage, { eyebrow: string; title: string; footer: string; width: string }> = {
+    welcome: {
+      eyebrow: "First run",
+      title: "Set up dnsaur",
+      footer: "This runs once. Afterwards, /setup reports that setup is complete.",
+      width: "max-w-md",
+    },
+    admin: {
+      eyebrow: "First run",
+      title: "Create your admin",
+      footer: "Stored as an argon2 hash. dnsaur never sees it again.",
+      width: "max-w-md",
+    },
+    lists: {
+      eyebrow: "First run",
+      title: "Pick starter blocklists",
+      footer: "Each list is added separately, so one failure won't stop the others.",
+      width: "max-w-lg",
+    },
+    done: {
+      eyebrow: "First run",
+      title: "dnsaur is ready",
+      footer: "Nothing is filtered until clients actually query dnsaur.",
+      width: "max-w-md",
+    },
+  };
+  const copy = COPY[stage];
+
   return (
-    <AuthLayout eyebrow="First-time setup" title="Set up dnsaur" maxWidthClassName="max-w-lg">
-      <Card className="gap-6 py-6">
-        <Stepper value={step} indicators={{ completed: <CheckIcon className="size-3.5" /> }}>
-          <CardHeader className="px-6 pb-2">
-            <StepperNav>
-              <StepperItem step={1} disabled>
-                <StepperTrigger>
-                  <StepperIndicator>1</StepperIndicator>
-                  <StepperTitle>Account</StepperTitle>
-                </StepperTrigger>
-                <StepperSeparator />
-              </StepperItem>
-              <StepperItem step={2} disabled>
-                <StepperTrigger>
-                  <StepperIndicator>2</StepperIndicator>
-                  <StepperTitle>Starter setup</StepperTitle>
-                </StepperTrigger>
-                <StepperSeparator />
-              </StepperItem>
-              <StepperItem step={3} disabled>
-                <StepperTrigger>
-                  <StepperIndicator>3</StepperIndicator>
-                  <StepperTitle>Done</StepperTitle>
-                </StepperTrigger>
-              </StepperItem>
-            </StepperNav>
-          </CardHeader>
+    <AuthLayout
+      eyebrow={copy.eyebrow}
+      title={copy.title}
+      footer={copy.footer}
+      maxWidthClassName={copy.width}
+    >
+      <Card className="gap-0 p-0">
+        {/* Absent on welcome: that screen is before step 1, not part of it. */}
+        {stage !== "welcome" && <StepStrip stage={stage} />}
 
-          <CardContent className="px-6">
-            <StepperPanel>
-              <StepperContent value={1}>
-                <CardDescription className="mb-4">
-                  Create the admin account that manages this dnsaur instance.
-                </CardDescription>
+        <div className="flex flex-col gap-4 p-5">
+          {stage === "welcome" && (
+            <>
+              <p className="text-sm text-pretty text-muted-foreground">
+                No admin account exists yet, so this instance is unclaimed. Three steps: create an
+                account, pick starter blocklists, then point your router at dnsaur.
+              </p>
+              <Button type="button" onClick={() => setStage("admin")}>
+                Get started
+              </Button>
+            </>
+          )}
 
-                {formError && (
-                  <Alert variant="destructive" className="mb-4">
-                    <CircleAlert />
-                    <AlertTitle>
-                      {formError.conflict ? "Account already exists" : "Couldn't create account"}
-                    </AlertTitle>
-                    <AlertDescription>
-                      <p>{formError.message}</p>
-                      {formError.conflict && (
-                        <Button type="button" variant="outline" size="sm" onClick={goToLogin}>
-                          Go to login
-                        </Button>
-                      )}
-                    </AlertDescription>
-                  </Alert>
-                )}
+          {stage === "admin" && (
+            <>
+              <p className="text-sm text-pretty text-muted-foreground">
+                The only account, with full write access. You can add API tokens later.
+              </p>
 
-                <Form {...accountForm}>
-                  <form
-                    className="flex flex-col gap-4"
-                    onSubmit={(e) => void accountForm.handleSubmit(onCreateAccount)(e)}
-                    noValidate
-                  >
-                    <FormField
-                      control={accountForm.control}
-                      name="username"
-                      render={({ field }) => (
-                        <FormItem>
-                          <FormLabel>Username</FormLabel>
-                          <FormControl>
-                            <Input {...field} autoComplete="username" />
-                          </FormControl>
-                          <FormMessage />
-                        </FormItem>
-                      )}
-                    />
-                    <FormField
-                      control={accountForm.control}
-                      name="password"
-                      render={({ field }) => (
-                        <FormItem>
-                          <FormLabel>Password</FormLabel>
-                          <FormControl>
-                            <Input {...field} type="password" autoComplete="new-password" />
-                          </FormControl>
-                          <FormDescription>{passwordStrengthHint(field.value)}</FormDescription>
-                          <FormMessage />
-                        </FormItem>
-                      )}
-                    />
-                    <FormField
-                      control={accountForm.control}
-                      name="confirmPassword"
-                      render={({ field }) => (
-                        <FormItem>
-                          <FormLabel>Confirm password</FormLabel>
-                          <FormControl>
-                            <Input {...field} type="password" autoComplete="new-password" />
-                          </FormControl>
-                          <FormMessage />
-                        </FormItem>
-                      )}
-                    />
+              {formError && (
+                <Alert variant={formError.conflict ? "info" : "destructive"}>
+                  <CircleAlert />
+                  <AlertTitle>
+                    {formError.conflict ? "Account already exists" : "Couldn't create account"}
+                  </AlertTitle>
+                  <AlertDescription>
+                    <p>{formError.message}</p>
+                    {formError.conflict && (
+                      <Button type="button" variant="outline" size="sm" onClick={goToLogin}>
+                        Go to login
+                      </Button>
+                    )}
+                  </AlertDescription>
+                </Alert>
+              )}
+
+              <Form {...accountForm}>
+                <form
+                  className="flex flex-col gap-4"
+                  onSubmit={(e) => void accountForm.handleSubmit(onCreateAccount)(e)}
+                  noValidate
+                >
+                  <FormField
+                    control={accountForm.control}
+                    name="username"
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel>Username</FormLabel>
+                        <FormControl>
+                          <Input {...field} autoComplete="username" />
+                        </FormControl>
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />
+                  <FormField
+                    control={accountForm.control}
+                    name="password"
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel>Password</FormLabel>
+                        <FormControl>
+                          <Input {...field} type="password" autoComplete="new-password" />
+                        </FormControl>
+                        <FormDescription>
+                          At least 8 characters. There&apos;s no recovery flow yet — store it
+                          somewhere safe.
+                        </FormDescription>
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />
+                  {/* Not in the artboard, kept on purpose: with no recovery
+                      flow, a typo here costs shell access to undo. */}
+                  <FormField
+                    control={accountForm.control}
+                    name="confirmPassword"
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel>Confirm password</FormLabel>
+                        <FormControl>
+                          <Input {...field} type="password" autoComplete="new-password" />
+                        </FormControl>
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />
+                  <div className="flex flex-col gap-2">
                     <Button type="submit" disabled={creatingAccount}>
                       {creatingAccount ? "Creating account…" : "Create account"}
                     </Button>
-                  </form>
-                </Form>
-              </StepperContent>
-
-              <StepperContent value={2}>
-                <CardDescription className="mb-4">
-                  Give dnsaur a head start with a couple of curated blocklists and default upstream
-                  resolvers. You can change any of this later in Filtering and Settings.
-                </CardDescription>
-
-                <div className="flex flex-col gap-5">
-                  <fieldset
-                    disabled={applyingStarters}
-                    className="flex flex-col gap-2.5 disabled:opacity-60"
-                  >
-                    <legend className="mb-0.5 text-sm font-medium text-foreground">
-                      Starter blocklists
-                    </legend>
-                    {STARTER_LISTS.map((list) => {
-                      const checked = selectedLists[list.key] ?? false;
-                      return (
-                        <label
-                          key={list.key}
-                          htmlFor={`list-${list.key}`}
-                          className={cn(
-                            "flex cursor-pointer items-start gap-3 rounded-lg border p-3 transition-colors",
-                            checked
-                              ? "border-primary/30 bg-primary/5"
-                              : "border-border hover:bg-muted/50",
-                          )}
-                        >
-                          <Checkbox
-                            id={`list-${list.key}`}
-                            checked={checked}
-                            onCheckedChange={(next) =>
-                              setSelectedLists((prev) => ({ ...prev, [list.key]: next }))
-                            }
-                            className="mt-0.5"
-                          />
-                          <span className="flex flex-col gap-0.5">
-                            <span className="text-sm font-medium text-foreground">{list.name}</span>
-                            <span className="text-sm text-muted-foreground">
-                              {list.description}
-                            </span>
-                          </span>
-                        </label>
-                      );
-                    })}
-                  </fieldset>
-
-                  <div className="flex flex-col gap-1.5">
-                    <Label htmlFor={upstreamsId}>Upstream DNS servers</Label>
-                    <Input
-                      id={upstreamsId}
-                      value={upstreams}
-                      onChange={(e) => setUpstreams(e.target.value)}
-                      disabled={applyingStarters}
-                      className="font-mono text-sm"
-                    />
-                    <p className="text-sm text-muted-foreground">
-                      Comma-separated host:port pairs, tried in order.
-                    </p>
-                  </div>
-
-                  <div className="flex flex-wrap items-center justify-between gap-3">
                     <Button
                       type="button"
                       variant="ghost"
-                      onClick={() => setStep(3)}
-                      disabled={applyingStarters}
+                      onClick={() => setStage("welcome")}
+                      disabled={creatingAccount}
                     >
-                      I&apos;ll do this later
-                    </Button>
-                    <Button
-                      type="button"
-                      onClick={() => void applyStarterSetup()}
-                      disabled={applyingStarters}
-                    >
-                      {applyingStarters ? "Saving…" : "Continue"}
+                      Back
                     </Button>
                   </div>
-                </div>
-              </StepperContent>
+                </form>
+              </Form>
+            </>
+          )}
 
-              <StepperContent value={3}>
-                {loggedIn ? (
-                  <div className="flex flex-col items-center gap-5 py-6 text-center">
-                    <span className="relative flex size-14 items-center justify-center">
-                      <span className="absolute inset-0 rounded-full bg-info/50 motion-safe:animate-ping motion-safe:[animation-iteration-count:1]" />
-                      <span className="relative flex size-14 items-center justify-center rounded-full bg-primary text-primary-foreground">
-                        <CheckIcon className="size-6" />
+          {stage === "lists" && (
+            <>
+              <p className="text-sm text-pretty text-muted-foreground">
+                Sensible defaults for a home network. All optional.
+              </p>
+
+              <fieldset
+                disabled={applyingStarters}
+                className="flex flex-col border border-border bg-background disabled:opacity-60"
+              >
+                <legend className="sr-only">Starter blocklists</legend>
+                {STARTER_LISTS.map((list) => {
+                  const checked = selected[list.key] ?? false;
+                  return (
+                    <label
+                      key={list.key}
+                      className={cn(
+                        "flex cursor-pointer items-center gap-3 border-b border-border-muted p-3 last:border-b-0",
+                        checked && "bg-primary/5",
+                      )}
+                    >
+                      <Checkbox
+                        checked={checked}
+                        onCheckedChange={(next) =>
+                          setSelected((prev) => ({ ...prev, [list.key]: next === true }))
+                        }
+                      />
+                      <span className="flex min-w-0 flex-1 flex-col gap-0.5">
+                        <span className="text-sm font-medium">{list.name}</span>
+                        <span className="text-xs text-pretty text-muted-foreground">
+                          {list.description}
+                        </span>
                       </span>
-                    </span>
-                    <div className="flex flex-col gap-1">
-                      <h2 className="text-lg font-semibold text-foreground">You&apos;re all set</h2>
-                      <p className="text-sm text-muted-foreground">
-                        dnsaur is listening — head to the dashboard to see it in action.
-                      </p>
-                    </div>
-                    <Button type="button" onClick={goToDashboard}>
-                      Go to dashboard
-                    </Button>
-                  </div>
-                ) : (
-                  <div className="flex flex-col items-center gap-5 py-6 text-center">
-                    <span className="flex size-14 items-center justify-center rounded-full bg-muted text-muted-foreground">
-                      <CheckIcon className="size-6" />
-                    </span>
-                    <div className="flex flex-col gap-1">
-                      <h2 className="text-lg font-semibold text-foreground">Account created</h2>
-                      <p className="text-sm text-muted-foreground">
-                        Sign in with your new account to continue.
-                      </p>
-                    </div>
-                    <Button type="button" onClick={goToLogin}>
-                      Go to login
-                    </Button>
-                  </div>
+                      <span className="shrink-0 font-mono text-xs text-muted-foreground">
+                        {list.size}
+                      </span>
+                    </label>
+                  );
+                })}
+              </fieldset>
+
+              <p className="text-xs text-pretty text-muted-foreground">
+                Lists download in the background — entry counts stay at zero until the first fetch
+                lands. You can add or remove any of these later.
+              </p>
+
+              <div className="flex flex-col gap-2">
+                <Button
+                  type="button"
+                  onClick={() => void applyStarterLists()}
+                  disabled={applyingStarters || chosenCount === 0}
+                >
+                  {applyingStarters
+                    ? "Adding…"
+                    : `Add ${chosenCount} ${chosenCount === 1 ? "list" : "lists"} and finish`}
+                </Button>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  onClick={() => {
+                    setOutcome((o) => ({ ...o, applied: 0, chosen: 0, failed: [] }));
+                    setStage("done");
+                  }}
+                  disabled={applyingStarters}
+                >
+                  Skip for now
+                </Button>
+              </div>
+            </>
+          )}
+
+          {stage === "done" && (
+            <>
+              {partial && (
+                <Alert variant="warning">
+                  <TriangleAlert />
+                  <AlertTitle>
+                    {outcome.applied} of {outcome.chosen} lists added
+                  </AlertTitle>
+                  <AlertDescription>
+                    {outcome.failed.length > 0
+                      ? `${outcome.failed.join(", ")} couldn't be added.`
+                      : "The lists were created but couldn't be applied to the default group, so they are filtering nothing."}{" "}
+                    Everything else is in place and dnsaur is already resolving. You can retry or
+                    remove them from Filtering → Lists.
+                  </AlertDescription>
+                </Alert>
+              )}
+
+              <div className="flex flex-col gap-3">
+                <DoneCheck
+                  ok
+                  label="Admin account created"
+                  detail={`${username} · ${outcome.signedIn ? "signed in now" : "sign in to continue"}. 2FA can be added from Account & security.`}
+                />
+                {outcome.chosen > 0 && (
+                  <DoneCheck
+                    ok={!partial}
+                    label={
+                      partial
+                        ? `${outcome.applied} of ${outcome.chosen} blocklists added`
+                        : `${outcome.applied} blocklists added`
+                    }
+                    detail={
+                      partial
+                        ? "The rest were skipped — add them from Filtering → Lists."
+                        : "Downloading now — counts appear once the first fetch lands."
+                    }
+                  />
                 )}
-              </StepperContent>
-            </StepperPanel>
-          </CardContent>
-        </Stepper>
+                <DoneCheck
+                  ok
+                  label="Resolver is answering"
+                  detail="Upstreams 1.1.1.1, 1.0.0.1 and 9.9.9.9, racing for the first reply."
+                />
+              </div>
+
+              <div className="flex flex-col gap-1 border border-border bg-background p-3">
+                <span className="font-mono text-xs tracking-widest text-muted-foreground uppercase">
+                  Point your router here
+                </span>
+                <span className="font-mono text-sm">
+                  {resolverHost}
+                  <span className="text-muted-foreground">:53</span>
+                </span>
+              </div>
+
+              <Button type="button" onClick={outcome.signedIn ? goToDashboard : goToLogin}>
+                {outcome.signedIn ? "Open the dashboard" : "Go to login"}
+              </Button>
+            </>
+          )}
+        </div>
       </Card>
     </AuthLayout>
   );
