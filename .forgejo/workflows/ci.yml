@@ -13,9 +13,33 @@ jobs:
         with: { node-version: "24" }
       - name: Enable corepack
         run: corepack enable
+      # A fixed path passed to install, rather than asking pnpm where its
+      # store is and feeding that to the cache.
+      #
+      # That indirection is what broke the build: the resolve step was the
+      # first pnpm invocation in the job, so corepack was still fetching the
+      # pinned pnpm at that moment. Anything it printed — or a non-zero exit
+      # — left the command substitution empty, while `echo` still exited 0.
+      # The step went green having written `path=`, and the cache action
+      # then failed with "Input required and not supplied: path".
+      #
+      # A literal both steps agree on has nothing to resolve, nothing to run
+      # early, and no way to end up empty. It also sidesteps the version
+      # suffix (…/store/v11) that made hardcoding pnpm's *default* unwise.
+      #
+      # The lockfile hash is the right key here, unlike the Playwright cache
+      # below: the store holds exactly the resolved dependency set, so a
+      # changed lockfile genuinely means different contents. restore-keys is
+      # what stops that being expensive — on a miss it falls back to the
+      # newest previous store and pnpm fetches only what actually changed.
+      - uses: actions/cache@v4
+        with:
+          path: ~/.pnpm-store
+          key: pnpm-store-${{ hashFiles('web/pnpm-lock.yaml') }}
+          restore-keys: pnpm-store-
       - name: Install
         working-directory: web
-        run: pnpm install --frozen-lockfile
+        run: pnpm install --frozen-lockfile --store-dir ~/.pnpm-store
       - name: Lint
         working-directory: web
         run: pnpm lint
@@ -31,14 +55,20 @@ jobs:
       - name: Build
         working-directory: web
         run: pnpm build
-      # Forgejo's fork, not actions/upload-artifact. The upstream v4 action
-      # bundles @actions/artifact v2, which refuses outright to run against
-      # any host that isn't github.com — it reports the instance as GHES and
-      # exits. That check is client-side and unconditional: this Forgejo
-      # (16.0.1) implements the v4 artifact API perfectly well, the action
-      # just declines to talk to it. The fork is the same action with that
-      # guard removed. Keep upload and download on the same fork and major.
-      - uses: https://code.forgejo.org/forgejo/upload-artifact@v4
+      # v3, deliberately. v4 cannot work here: it bundles @actions/artifact
+      # v2, which refuses outright to run against any host that isn't
+      # github.com — it reports the instance as GHES and exits before making
+      # a request. The guard is client-side and unconditional, so this is
+      # not a capability gap; the runner serves the v4 API fine, the action
+      # just declines to talk to it.
+      #
+      # v3 predates that rewrite and speaks the v1 artifact API the runner
+      # actually implements. It is also what upstream tells GHES users to
+      # do, and what forgejo/upload-artifact — a self-described "temporary
+      # fork until v4 supports GHES" — exists to work around. Preferring the
+      # official action at v3 over a stopgap fork at v4 means one fewer
+      # unmaintained dependency. Keep upload and download on the same major.
+      - uses: actions/upload-artifact@v3
         with:
           name: web-dist
           path: web/dist
@@ -91,13 +121,53 @@ jobs:
         with: { node-version: "24" }
       - name: Enable corepack
         run: corepack enable
+      # Same store, same key as the web job — so whichever of the two runs
+      # first populates it and the other gets a hit. See there for why the
+      # path is a literal rather than read back from pnpm.
+      - uses: actions/cache@v4
+        with:
+          path: ~/.pnpm-store
+          key: pnpm-store-${{ hashFiles('web/pnpm-lock.yaml') }}
+          restore-keys: pnpm-store-
       - name: Install
         working-directory: web
-        run: pnpm install --frozen-lockfile
-      - uses: https://code.forgejo.org/forgejo/download-artifact@v4
+        run: pnpm install --frozen-lockfile --store-dir ~/.pnpm-store
+      - uses: actions/download-artifact@v3
         with:
           name: web-dist
           path: web/dist
+      # Keyed on Playwright's own version, not on the lockfile hash. The
+      # browser build is pinned to the Playwright release, so any other
+      # dependency changing has no bearing on it — hashing the lockfile
+      # would throw away a good Chromium every time an unrelated package
+      # moved, which on an active branch is most pushes.
+      #
+      # Reads it from the installed package rather than parsing the
+      # lockfile, so it is whatever pnpm actually resolved. Runs after the
+      # Install step for that reason.
+      - name: Resolve Playwright version
+        id: playwright
+        working-directory: web
+        run: |
+          # Checked rather than interpolated blind. An empty value here does
+          # not error the way an empty `path` does — it yields a valid but
+          # constant key that silently never invalidates on a Playwright
+          # upgrade, which is worse than a red step.
+          version="$(node -p "require('@playwright/test/package.json').version")"
+          [ -n "$version" ] || { echo "could not resolve the Playwright version" >&2; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      # Bare, like every other action here — it resolves to the instance's
+      # own actions/cache mirror. v4 is fine for cache; it is only the
+      # artifact actions that carry the github.com-only guard, which is why
+      # those are pinned a major back.
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: ms-playwright-chromium-${{ steps.playwright.outputs.version }}
+      # `install` alone on a cache hit: the browser is already there and it
+      # exits in about a second. `--with-deps` stays because the apt
+      # packages live outside ~/.cache and are not cacheable this way; that
+      # part is quick next to the ~130 MB download it now skips.
       - name: Install Chromium
         working-directory: web
         run: npx playwright install --with-deps chromium
@@ -108,7 +178,7 @@ jobs:
       # always keep the report + traces (playwright.config.ts sets
       # trace: "on-first-retry", and CI retries once) — otherwise the smoke
       # test can rot silently.
-      - uses: https://code.forgejo.org/forgejo/upload-artifact@v4
+      - uses: actions/upload-artifact@v3
         if: always()
         with:
           name: playwright-report

@@ -45,8 +45,7 @@ test("adding a list posts /filters/lists, the table refetches, and the new row a
   const dialog = await screen.findByRole("dialog");
 
   await user.type(within(dialog).getByLabelText(/^url$/i), "https://newlist.example.com/hosts");
-  await user.click(within(dialog).getByRole("combobox", { name: /list kind/i }));
-  await user.click(await screen.findByRole("option", { name: /^allow/i }));
+  await user.selectOptions(within(dialog).getByRole("combobox", { name: /^kind$/i }), "allow");
   await user.click(within(dialog).getByRole("button", { name: /^add list$/i }));
 
   await waitFor(() =>
@@ -147,7 +146,7 @@ test("refresh now posts /filters/refresh and shows a toast once it's accepted", 
   renderWithProviders(<ListsTab />);
   await screen.findByText("https://example.com/hosts");
 
-  await user.click(screen.getByRole("button", { name: /refresh now/i }));
+  await user.click(screen.getByRole("button", { name: /refresh all/i }));
 
   await waitFor(() => expect(refreshed).toBe(true));
   await waitFor(() => expect(successSpy).toHaveBeenCalledWith(expect.stringMatching(/refresh/i)));
@@ -176,13 +175,14 @@ test("refresh now re-reads the lists table once the server has had a moment", as
   );
 
   renderWithProviders(<ListsTab />);
-  // Two matches: the header summary line and the table's own cell.
-  expect(await screen.findAllByText(/3d ago/i)).toHaveLength(2);
+  // One match now: the row itself. The old header summary line is gone —
+  // the design moved that readout into the chrome's sub-tab bar.
+  expect(await screen.findAllByText(/3d ago/i)).toHaveLength(1);
 
-  await user.click(screen.getByRole("button", { name: /refresh now/i }));
+  await user.click(screen.getByRole("button", { name: /refresh all/i }));
 
   // The first delayed re-read lands about a second later.
-  await waitFor(() => expect(screen.getAllByText(/just now/i)).toHaveLength(2), { timeout: 4000 });
+  await waitFor(() => expect(screen.getAllByText(/just now/i)).toHaveLength(1), { timeout: 4000 });
   expect(screen.queryAllByText(/3d ago/i)).toHaveLength(0);
 }, 10_000);
 
@@ -208,14 +208,14 @@ test("deleting a list asks for confirmation, then DELETEs /filters/lists/{id}", 
   await waitFor(() => expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument());
 });
 
-test("an empty list shows EmptyState with an Add list action", async () => {
+test("an empty list says what lists are for, with the toolbar's Add still there", async () => {
   server.use(http.get("/api/v1/filters/lists", () => HttpResponse.json([])));
 
   renderWithProviders(<ListsTab />);
 
-  expect(await screen.findByText("No filter lists yet")).toBeInTheDocument();
-  // Only one "Add list" affordance when empty — the EmptyState's own
-  // action — not a redundant second button in the header above it.
+  expect(await screen.findByText(/no lists subscribed yet/i)).toBeInTheDocument();
+  // Add lives in the toolbar at all times now, so there is exactly one of
+  // it — an empty state with its own duplicate button would be two.
   expect(screen.getAllByRole("button", { name: /^add list$/i })).toHaveLength(1);
 });
 
@@ -249,7 +249,7 @@ test("a failed list names the fetch error on the row and interrupts the page", a
   expect(screen.getAllByText(/blocking nothing/i).length).toBeGreaterThanOrEqual(2);
   // "never" must not stand in for a failure any more — the pending copy is
   // reserved for a list that genuinely hasn't been tried.
-  expect(screen.queryByText(/first fetch hasn't run yet/i)).not.toBeInTheDocument();
+  expect(screen.queryByText(/added but not yet fetched/i)).not.toBeInTheDocument();
   expect(screen.queryByText("Pending")).not.toBeInTheDocument();
 });
 
@@ -275,7 +275,7 @@ test("a stale list says it is serving an older copy, not that it failed", async 
   renderWithProviders(<ListsTab />);
 
   expect(await screen.findByText("Stale")).toBeInTheDocument();
-  expect(screen.getByText(/serving a copy from 3d ago/i)).toBeInTheDocument();
+  expect(screen.getByText(/still enforcing the copy from 3d ago/i)).toBeInTheDocument();
   expect(screen.queryByText("Failed")).not.toBeInTheDocument();
   expect(screen.queryByText(/blocking nothing/i)).not.toBeInTheDocument();
   // Its entries are real, so the count still reads.
@@ -323,7 +323,7 @@ test("a never-attempted list reads pending, with no error and no alert", async (
   renderWithProviders(<ListsTab />);
 
   expect(await screen.findByText("Pending")).toBeInTheDocument();
-  expect(screen.getByText(/first fetch hasn't run yet/i)).toBeInTheDocument();
+  expect(screen.getByText(/added but not yet fetched/i)).toBeInTheDocument();
   expect(screen.queryByText(/blocking nothing/i)).not.toBeInTheDocument();
   expect(screen.queryByRole("alert")).not.toBeInTheDocument();
 });
@@ -335,8 +335,8 @@ test("a healthy list reads OK with no alert", async () => {
   renderWithProviders(<ListsTab />);
 
   expect(await screen.findByText("OK")).toBeInTheDocument();
-  // The header summary and the row both read it.
-  expect(screen.getAllByText(/refreshed 15m ago/i).length).toBeGreaterThanOrEqual(2);
+  // One match: the row. The header summary that used to repeat it is gone.
+  expect(screen.getAllByText(/refreshed 15m ago/i).length).toBe(1);
   expect(screen.queryByRole("alert")).not.toBeInTheDocument();
 });
 
@@ -425,9 +425,7 @@ test("renaming PATCHes the name, and blank resets to the derived default", async
   // client-side validation.
   await user.click(await screen.findByRole("button", { name: /rename old name/i }));
   let dialog = await screen.findByRole("dialog");
-  expect(
-    within(dialog).getByText(/leave blank to go back to example\.com hosts/i),
-  ).toBeInTheDocument();
+  expect(within(dialog).getByText(/blank goes back to example\.com hosts/i)).toBeInTheDocument();
   await user.click(within(dialog).getByRole("button", { name: /^save$/i }));
   await waitFor(() => expect(bodies).toEqual([{ name: "" }]));
 

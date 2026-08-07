@@ -98,22 +98,26 @@ test("first-run setup, login, add a DNS record, dark mode persists across reload
   // give it a tab of its own.
   await topNav.getByRole("button", { name: "Local DNS", exact: true }).click();
   await page.getByRole("menuitem", { name: "Local DNS" }).click();
-  await expect(page.getByRole("heading", { name: "Local DNS", exact: true })).toBeVisible();
+  // The page carries no heading of its own — the chrome names it, so row 2's
+  // marked tab is both the label and the proof we landed here.
   await expect(
     topNav.getByRole("navigation", { name: "Local DNS" }).getByRole("link", { name: "Local DNS" }),
   ).toHaveAttribute("aria-current", "page");
 
-  await page.getByRole("button", { name: "Add record" }).click();
-  const sheet = page.getByRole("dialog");
-  await expect(sheet).toBeVisible();
-  await sheet.getByLabel("Name").fill("nas.home.lan");
-  await sheet.getByLabel(/ipv4 address/i).fill("10.0.0.9");
-  await sheet.getByRole("button", { name: "Add record" }).click();
-  await expect(sheet).toBeHidden();
+  // The add form is the table's own first row, not a dialog: fill it in
+  // place and submit. The value field re-labels itself per record type,
+  // which is why it is addressed as "Value · IPv4" rather than "Value".
+  await page.getByLabel("Record name").fill("nas.home.lan");
+  await page.getByLabel(/value.*ipv4/i).fill("10.0.0.9");
+  await page.getByRole("button", { name: "Add", exact: true }).click();
 
-  const row = page.getByRole("row", { name: /nas\.home\.lan/ });
+  // Rows are a CSS grid rather than a table, so they are found by the slot
+  // the page marks them with.
+  const row = page.locator('[data-slot="record-row"]', { hasText: "nas.home.lan" });
   await expect(row).toBeVisible();
   await expect(row.getByText("10.0.0.9")).toBeVisible();
+  // Adding leaves the row empty and ready for the next record.
+  await expect(page.getByLabel("Record name")).toHaveValue("");
 
   // --- dark mode toggles and persists across a reload -------------------
   // Also under System: the design's bar carries no standalone theme control.
@@ -124,7 +128,9 @@ test("first-run setup, login, add a DNS record, dark mode persists across reload
   await page.keyboard.press("Escape"); // the toggle deliberately stays open
 
   await page.reload();
-  await expect(page.getByRole("heading", { name: "Local DNS", exact: true })).toBeVisible();
+  await expect(
+    topNav.getByRole("navigation", { name: "Local DNS" }).getByRole("link", { name: "Local DNS" }),
+  ).toHaveAttribute("aria-current", "page");
   await expect(page.locator("html")).toHaveClass(/dark/);
   await expect(row).toBeVisible(); // the record survived the reload too
 });
