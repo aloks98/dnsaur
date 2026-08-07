@@ -47,14 +47,20 @@ test("renders each grouped Card section with the current values populated", asyn
   expect(screen.getByLabelText(/^upstream resolvers$/i)).toHaveValue(
     "1.1.1.1:53,1.0.0.1:53,9.9.9.9:53",
   );
-  expect(screen.getByLabelText(/^blocked response ttl/i)).toHaveValue(30);
-  expect(screen.getByRole("combobox", { name: /^blocking mode$/i })).toHaveTextContent(/null ip/i);
+  // inputMode, not type="number": the value is a string on the wire and a
+  // spinner buys nothing on a seconds field.
+  expect(screen.getByLabelText(/^blocked response ttl/i)).toHaveValue("30");
 
-  // A Save affordance at both the top and bottom of the (long) page, both
-  // disabled until something changes.
-  const saveButtons = screen.getAllByRole("button", { name: /^save changes$/i });
-  expect(saveButtons).toHaveLength(2);
-  for (const button of saveButtons) expect(button).toBeDisabled();
+  // One-of choices are radio lists now, so every option is readable without
+  // opening anything.
+  expect(screen.getByRole("radio", { name: /null-ip/i })).toBeChecked();
+  expect(screen.getByRole("radio", { name: /nxdomain/i })).not.toBeChecked();
+
+  // One save bar, pinned above the scrolling sections — the second copy at
+  // the bottom of the page existed because the old layout scrolled the
+  // whole page, taking the first one out of reach.
+  const save = screen.getByRole("button", { name: /^save changes$/i });
+  expect(save).toBeDisabled();
 });
 
 test("shows a loading skeleton, then the form, once settings arrive", async () => {
@@ -113,7 +119,7 @@ test("a pre-existing invalid blocking.mode value blocks the whole save, and noth
   await user.type(upstreamsInput, ",8.8.8.8:53");
   await user.click(screen.getAllByRole("button", { name: /^save changes$/i })[0]);
 
-  expect(await screen.findByText(/must be one of: null-ip, nxdomain/i)).toBeInTheDocument();
+  expect(await screen.findByText(/pick one of the options/i)).toBeInTheDocument();
   // Give any accidental async PUT a chance to land before asserting it didn't.
   await new Promise((resolve) => setTimeout(resolve, 30));
   expect(putCalled).toBe(false);
@@ -165,36 +171,33 @@ function fieldItem(label: string): HTMLElement {
 // qlog.privacy, clients and records on every settings write, while cache.*
 // is read once when Start() builds the cache and lists.refresh_hours once
 // when the refresh ticker is scheduled.
-test("cache.* and lists.refresh_hours show a Restart required label; nothing else does", async () => {
+test("every section says whether it applies on save or waits for a restart", async () => {
   mockSettings(fullSettings());
 
   renderWithProviders(<SettingsPage />);
   await screen.findByText("Upstreams");
 
-  const needsRestart = [
-    "Minimum cache TTL (seconds)",
-    "Maximum cache TTL (seconds)",
-    "Maximum cache entries",
-    "Serve stale for (seconds)",
-    "Refresh interval (hours)",
-  ];
-  const hotReloads = [
-    "Upstream resolvers",
-    "Upstream strategy",
-    "Blocking mode",
-    "Blocked response TTL (seconds)",
-    "Query log privacy",
-    "Retention (days)",
-  ];
+  // The badge belongs to the section, not the field: cache.* is read once
+  // when Start() builds the cache and lists.refresh_hours once when the
+  // refresh ticker is scheduled, so those two groups are restart-only in
+  // their entirety. Everything else is re-read on every settings write.
+  const restartSections = ["Cache", "Lists"];
+  const instantSections = ["Upstreams", "Blocking", "Query log"];
 
-  for (const label of needsRestart) {
-    expect(within(fieldItem(label)).getByText(/restart required/i)).toBeInTheDocument();
+  for (const title of restartSections) {
+    const section = screen.getByRole("heading", { name: title }).closest("section")!;
+    expect(within(section).getByText(/needs a restart/i)).toBeInTheDocument();
+    expect(within(section).queryByText(/applies instantly/i)).not.toBeInTheDocument();
   }
-  for (const label of hotReloads) {
-    expect(within(fieldItem(label)).queryByText(/restart required/i)).not.toBeInTheDocument();
+  for (const title of instantSections) {
+    const section = screen.getByRole("heading", { name: title }).closest("section")!;
+    expect(within(section).getByText(/applies instantly/i)).toBeInTheDocument();
+    expect(within(section).queryByText(/needs a restart/i)).not.toBeInTheDocument();
   }
-  // Belt and braces: no *other* field grew one either.
-  expect(screen.getAllByText(/restart required/i)).toHaveLength(needsRestart.length);
+
+  // Belt and braces: every group is labelled, and none twice.
+  expect(screen.getAllByText(/needs a restart/i)).toHaveLength(restartSections.length);
+  expect(screen.getAllByText(/applies instantly/i)).toHaveLength(instantSections.length);
 });
 
 // The upstream strategy description used to claim "Only Race is
@@ -236,7 +239,7 @@ test("a negative cache value is blocked client-side, no PUT", async () => {
   await user.type(minTtlInput, "-5");
   await user.click(screen.getAllByRole("button", { name: /^save changes$/i })[0]);
 
-  expect(await screen.findByText(/must be zero or greater/i)).toBeInTheDocument();
+  expect(await screen.findByText(/can.t be negative/i)).toBeInTheDocument();
   await new Promise((resolve) => setTimeout(resolve, 30));
   expect(putCalled).toBe(false);
 });
@@ -268,7 +271,7 @@ test("a rejected PUT surfaces the server's error as a toast and keeps the field 
       expect.stringMatching(/invalid value for blocking\.ttl/i),
     ),
   );
-  expect(ttlInput).toHaveValue(999999999999);
+  expect(ttlInput).toHaveValue("999999999999");
 });
 
 // The worst case of the "isError swaps out already-loaded content" family,
@@ -323,10 +326,10 @@ test("a failing background refetch after a partial save keeps the form and its d
   await screen.findByText(/couldn't refresh settings/i, undefined, { timeout: 3000 });
   expect(screen.queryByText(/couldn't load settings/i)).not.toBeInTheDocument();
   expect(screen.getByLabelText(/^upstream resolvers$/i)).toHaveValue("8.8.8.8:53");
-  // One per SaveBar (top and bottom).
-  expect(screen.getAllByText(/you have unsaved changes/i)).toHaveLength(2);
-  expect(screen.getAllByRole("button", { name: /^save changes$/i })[0]).toBeEnabled();
+  // One save bar, and it still counts the one field that failed.
+  expect(screen.getByText(/1 unsaved change/i)).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: /^save changes$/i })).toBeEnabled();
   // The value that *did* save moved its baseline, so it's no longer dirty
   // but still shows what the admin typed.
-  expect(screen.getByLabelText(/^blocked response ttl/i)).toHaveValue(45);
+  expect(screen.getByLabelText(/^blocked response ttl/i)).toHaveValue("45");
 });

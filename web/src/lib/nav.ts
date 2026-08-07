@@ -33,6 +33,10 @@ export const QUERY_LOG_PATH = "/queries";
  */
 export const LOCAL_DNS_PATH = "/dns";
 
+/** Settings. Its bands run edge to edge and its save bar has to stay put
+ * while the sections scroll under it. */
+export const SETTINGS_PATH = "/settings";
+
 /**
  * Filtering › Lists. Named individually rather than matching `/filtering/*`
  * because its two sibling tabs are still on the padded layout — widening
@@ -58,6 +62,7 @@ export function isFullBleedRoute(pathname: string): boolean {
     pathname === DASHBOARD_PATH ||
     pathname === QUERY_LOG_PATH ||
     pathname === LOCAL_DNS_PATH ||
+    pathname === SETTINGS_PATH ||
     pathname === FILTERING_BASE ||
     pathname.startsWith(`${FILTERING_BASE}/`)
   );

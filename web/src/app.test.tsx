@@ -51,14 +51,20 @@ test("full-bleed routes get no page gutter; the rest keep it", async () => {
   expect(dashboardMain.className).toContain("flex-col");
   unmount();
 
-  // Local DNS joined them: its add form is the table's own first row, so the
-  // form and the rows under it have to share one edge-to-edge column grid.
-  const dns = renderWithProviders(<App />, { route: "/dns" });
-  await screen.findByRole("navigation", { name: "Local DNS" });
-  expect(screen.getByRole("main").className).not.toContain("p-6");
-  dns.unmount();
+  // Local DNS and Settings joined them: both are edge-to-edge bands whose
+  // rules have to meet the viewport, and Settings additionally pins a save
+  // bar above a scrolling body.
+  for (const route of ["/dns", "/settings"]) {
+    const view = renderWithProviders(<App />, { route });
+    await screen.findByRole("navigation", { name: route === "/dns" ? "Local DNS" : "System" });
+    expect(screen.getByRole("main").className).not.toContain("p-6");
+    view.unmount();
+  }
 
-  renderWithProviders(<App />, { route: "/settings" });
+  // Account is the last padded route. When it goes full-bleed too, this
+  // assertion has nowhere left to stand and the branch in
+  // isFullBleedRoute stops earning its keep.
+  renderWithProviders(<App />, { route: "/account" });
   await screen.findByRole("navigation", { name: "System" });
   expect(screen.getByRole("main").className).toContain("p-6");
 });
