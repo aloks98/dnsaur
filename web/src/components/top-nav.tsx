@@ -19,12 +19,14 @@ import { isAlreadyLoggedOut, useLogout, useMe, useMeInitials } from "../hooks/us
 import { useHealth } from "../hooks/use-stats";
 import {
   DASHBOARD_PATH,
+  FILTER_LISTS_PATH,
   findActiveGroup,
   isNavItemActive,
   NAV_GROUPS,
   QUERY_LOG_PATH,
   type NavGroup,
 } from "../lib/nav";
+import { useLists } from "../hooks/use-filters";
 import { useLiveTailStatus } from "../lib/live-tail";
 import { parseWindow, WINDOW_PARAM, WINDOWS } from "../lib/stats-window";
 import { DnsaurLogo } from "./dnsaur-logo";
@@ -93,6 +95,7 @@ export function TopNav({ onOpenCommandPalette }: TopNavProps) {
   // none.
   const onDashboard = pathname === DASHBOARD_PATH;
   const onQueryLog = pathname === QUERY_LOG_PATH;
+  const onFilterLists = pathname === FILTER_LISTS_PATH;
 
   return (
     <header
@@ -194,6 +197,8 @@ export function TopNav({ onOpenCommandPalette }: TopNavProps) {
           )}
 
           {onQueryLog && <QueryLogCells />}
+
+          {onFilterLists && <FilterListsCell />}
         </div>
       )}
     </header>
@@ -238,6 +243,39 @@ function QueryLogCells() {
       )}
       <TailToggleCell paused={paused} onToggle={setPaused} />
     </div>
+  );
+}
+
+/**
+ * Filtering › Lists' row-2 readout: how many lists exist, and how many
+ * domains they are actually enforcing between them.
+ *
+ * "Enforcing" excludes disabled lists and any whose status says they are
+ * contributing nothing. A total that counted those would read the same
+ * whether filtering worked or not — which is precisely the failure this
+ * screen exists to surface, so the number in the chrome must not paper
+ * over it.
+ *
+ * Reads the same query the page does; react-query dedupes, so this is a
+ * subscription rather than a second fetch. Rendered only on that route, so
+ * no other screen pays for it.
+ */
+function FilterListsCell() {
+  const lists = useLists();
+  if (!lists.data) return null;
+
+  const total = lists.data.length;
+  const entries = lists.data
+    .filter((l) => l.enabled && (l.last_status === "ok" || l.last_status === "stale"))
+    .reduce((sum, l) => sum + l.entry_count, 0);
+
+  return (
+    <output
+      aria-label="Filter lists"
+      className={cn(CELL, "ml-auto border-l border-l-border text-muted-foreground")}
+    >
+      {total} {total === 1 ? "list" : "lists"} · {entries.toLocaleString()} enforcing
+    </output>
   );
 }
 

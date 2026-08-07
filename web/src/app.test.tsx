@@ -76,7 +76,7 @@ test("/filtering forwards to Lists, and each panel is a deep-linkable route", as
     ),
   );
   // "Refresh now" belongs to the Lists panel and to no other.
-  expect(await screen.findByRole("button", { name: /refresh now/i })).toBeInTheDocument();
+  expect(await screen.findByRole("button", { name: /refresh all/i })).toBeInTheDocument();
 
   // ...and the tabs are navigation, so the URL follows the panel.
   await user.click(within(filteringTabs).getByRole("link", { name: "Groups & Clients" }));

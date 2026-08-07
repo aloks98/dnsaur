@@ -34,13 +34,26 @@ export const QUERY_LOG_PATH = "/queries";
 export const LOCAL_DNS_PATH = "/dns";
 
 /**
+ * Filtering › Lists. Named individually rather than matching `/filtering/*`
+ * because its two sibling tabs are still on the padded layout — widening
+ * this to the whole section would strip their gutter and leave them
+ * floating. Add them here as each one is rebuilt.
+ */
+export const FILTER_LISTS_PATH = "/filtering/lists";
+
+/**
  * Screens that own the whole content area rather than sitting inside the
  * shell's gutter: both are full-bleed grids of hairline-separated bands, and
  * their rules have to meet the viewport edges instead of floating in a 24px
  * frame.
  */
 export function isFullBleedRoute(pathname: string): boolean {
-  return pathname === DASHBOARD_PATH || pathname === QUERY_LOG_PATH || pathname === LOCAL_DNS_PATH;
+  return (
+    pathname === DASHBOARD_PATH ||
+    pathname === QUERY_LOG_PATH ||
+    pathname === LOCAL_DNS_PATH ||
+    pathname === FILTER_LISTS_PATH
+  );
 }
 
 export interface NavItem {
