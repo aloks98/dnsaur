@@ -376,10 +376,6 @@ export function ListsTab() {
 
   const all = useMemo(() => lists.data ?? [], [lists.data]);
   const idle = useMemo(() => all.filter(isIdle), [all]);
-  const enforcing = useMemo(
-    () => all.filter((l) => l.enabled && (l.last_status === "ok" || l.last_status === "stale")),
-    [all],
-  );
 
   const shown = useMemo(() => {
     const q = search.trim().toLowerCase();
@@ -670,17 +666,11 @@ export function ListsTab() {
         <span className="text-right">Actions</span>
       </div>
 
+      {/* No footer bar. Everything it carried is already on screen and
+          closer to where it matters: the chrome's sub-tab cell counts what
+          is enforcing, the warning names each list that is not, and the
+          refresh button's own pending state says the refresh is in flight. */}
       <div className="min-h-0 flex-1 overflow-y-auto">{body}</div>
-
-      <div className="flex shrink-0 items-center gap-4 border-t border-border px-4 py-2 font-mono text-xs text-muted-foreground">
-        <span>{enforcing.length} enforcing</span>
-        <span className={cn(idle.length > 0 && "text-destructive-foreground")}>
-          {idle.length} enabled but idle
-        </span>
-        <span className="ml-auto max-lg:hidden">
-          refresh is fire-and-forget — counts land after
-        </span>
-      </div>
 
       <RenameListDialog list={renameTarget} onClose={() => setRenameTarget(null)} />
 
