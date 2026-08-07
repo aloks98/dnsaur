@@ -39,12 +39,13 @@ export const LOCAL_DNS_PATH = "/dns";
  * this to the whole section would strip their gutter and leave them
  * floating. Add them here as each one is rebuilt.
  */
-export const FILTER_LISTS_PATH = "/filtering/lists";
-
-/** Filtering › Rules. Named alongside Lists for the same reason — Groups &
- * Clients is still on the padded layout, so this cannot yet be a prefix
- * match on the whole section. */
-export const FILTER_RULES_PATH = "/filtering/rules";
+/**
+ * Every Filtering tab. All three are full-bleed now, so this is one prefix
+ * rather than the per-path list it was while they were migrated one at a
+ * time. `/filtering` itself is only a redirect to Lists, and matching it
+ * costs nothing.
+ */
+export const FILTERING_BASE = "/filtering";
 
 /**
  * Screens that own the whole content area rather than sitting inside the
@@ -57,8 +58,8 @@ export function isFullBleedRoute(pathname: string): boolean {
     pathname === DASHBOARD_PATH ||
     pathname === QUERY_LOG_PATH ||
     pathname === LOCAL_DNS_PATH ||
-    pathname === FILTER_LISTS_PATH ||
-    pathname === FILTER_RULES_PATH
+    pathname === FILTERING_BASE ||
+    pathname.startsWith(`${FILTERING_BASE}/`)
   );
 }
 

@@ -47,6 +47,15 @@ func (s *Server) handleGroupsList(w http.ResponseWriter, r *http.Request) {
 
 type groupCreate struct {
 	Name string `json:"name"`
+	// Enabled is a pointer so "not sent" is distinguishable from "false".
+	// Omitted means enabled, which is what creating a group almost always
+	// means; a group created disabled filters nothing for anyone moved
+	// into it.
+	Enabled *bool `json:"enabled"`
+	// ListIDs, when present, is the exact set to assign — including an
+	// empty array, which means "no lists". Omitted keeps the historical
+	// behaviour of inheriting every list that exists.
+	ListIDs []int64 `json:"list_ids"`
 }
 
 func (s *Server) handleGroupCreate(w http.ResponseWriter, r *http.Request) {
@@ -60,18 +69,35 @@ func (s *Server) handleGroupCreate(w http.ResponseWriter, r *http.Request) {
 		storeErrDup(w, err, "a group with that name already exists")
 		return
 	}
-	// A new group inherits every existing filter list, mirroring
-	// handleListCreate. A group's ruleset is compiled only from its
-	// assigned lists, so without this a freshly created group filters
-	// nothing at all — the clients moved into it would silently stop being
-	// protected, which is the opposite of why groups exist.
-	lists, lerr := s.deps.Store.Filters().Lists(r.Context())
-	if lerr != nil {
-		slog.Error("assigning lists to new group failed", "group", id, "err", lerr)
+	// Applied after creation rather than in AddGroup: the store's insert
+	// takes only a name, and a second UPDATE is cheaper than a migration
+	// for a field that is almost always its default.
+	if body.Enabled != nil && !*body.Enabled {
+		if err := s.deps.Store.Clients().SetGroupEnabled(r.Context(), id, false); err != nil {
+			slog.Error("disabling new group failed", "group", id, "err", err)
+		}
 	}
-	for _, l := range lists {
-		if err := s.deps.Store.Filters().AssignList(r.Context(), id, l.ID); err != nil {
-			slog.Error("assigning list to new group failed", "group", id, "list", l.ID, "err", err)
+
+	// An explicit list_ids wins, empty array included — "assign nothing" is
+	// a real choice and has to be distinguishable from not choosing.
+	//
+	// Omitted still means every list. A group's ruleset compiles only from
+	// its assigned lists, so a group created with none filters nothing at
+	// all, and the clients moved into it would silently stop being
+	// protected — the opposite of why groups exist.
+	listIDs := body.ListIDs
+	if listIDs == nil {
+		lists, lerr := s.deps.Store.Filters().Lists(r.Context())
+		if lerr != nil {
+			slog.Error("assigning lists to new group failed", "group", id, "err", lerr)
+		}
+		for _, l := range lists {
+			listIDs = append(listIDs, l.ID)
+		}
+	}
+	for _, lid := range listIDs {
+		if err := s.deps.Store.Filters().AssignList(r.Context(), id, lid); err != nil {
+			slog.Error("assigning list to new group failed", "group", id, "list", lid, "err", err)
 		}
 	}
 	s.reloadClients(r)

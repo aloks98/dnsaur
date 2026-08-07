@@ -1,15 +1,7 @@
 import { useEffect, useMemo, useState, type ReactNode } from "react";
-import {
-  FolderTree,
-  ListChecks,
-  PencilLine,
-  Plus,
-  Trash2,
-  TriangleAlert,
-  Users,
-} from "lucide-react";
+import { CircleAlert, CircleHelp, Pencil, Plus, Trash2, TriangleAlert, X } from "lucide-react";
 import { toast } from "sonner";
-import { useForm } from "react-hook-form";
+import { useForm, useWatch } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { z } from "zod";
 import {
@@ -26,14 +18,13 @@ import {
   AlertTitle,
   Badge,
   Button,
+  cn,
   Dialog,
   DialogClose,
   DialogContent,
-  DialogDescription,
   DialogFooter,
   DialogHeader,
   DialogTitle,
-  DialogTrigger,
   DropdownMenu,
   DropdownMenuCheckboxItem,
   DropdownMenuContent,
@@ -42,44 +33,26 @@ import {
   DropdownMenuLabel,
   DropdownMenuSeparator,
   DropdownMenuTrigger,
-  EmptyState,
   Form,
   FormControl,
-  FormDescription,
   FormField,
   FormItem,
   FormLabel,
   FormMessage,
   Input,
-  Item,
-  ItemActions,
-  ItemContent,
-  ItemDescription,
-  ItemTitle,
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
+  NativeSelect,
+  NativeSelectOption,
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
   Skeleton,
   Switch,
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
+  type BadgeProps,
 } from "@e412/rnui-react";
-import type { UseQueryResult } from "@tanstack/react-query";
 import { ApiError } from "../../api/client";
 import type { Client, Group, List } from "../../api/types";
 import { useLists } from "../../hooks/use-filters";
-import {
-  useAddClient,
-  useClients,
-  useDeleteClient,
-  useUpdateClient,
-} from "../../hooks/use-clients";
+import { useAddClient, useClients, useDeleteClient } from "../../hooks/use-clients";
 import {
   useAddGroup,
   useDeleteGroup,
@@ -104,124 +77,241 @@ function friendlyDeleteError(err: unknown, fallback: string): string {
   return err instanceof ApiError ? err.message : fallback;
 }
 
-// --- Groups panel --------------------------------------------------------
+const GROUP_GRID = "grid grid-cols-[1fr_78px_156px_84px_168px_76px] items-center gap-3.5 px-4";
+const CLIENT_GRID = "grid grid-cols-[1fr_208px_152px_108px] items-center gap-3.5 px-4";
 
-const nameSchema = requiredText("Name is required");
-
-const groupFormSchema = z.object({ name: nameSchema });
-
-type GroupFormValues = z.infer<typeof groupFormSchema>;
-
-function AddGroupDialog() {
-  const [open, setOpen] = useState(false);
-  const addGroup = useAddGroup();
-  const form = useForm<GroupFormValues>({
-    resolver: zodResolver(groupFormSchema),
-    defaultValues: { name: "" },
-  });
-
-  function onOpenChange(next: boolean) {
-    setOpen(next);
-    if (!next) form.reset({ name: "" });
-  }
-
-  function onSubmit(values: GroupFormValues) {
-    addGroup.mutate(values.name.trim(), {
-      onSuccess: () => {
-        toast.success("Group added");
-        onOpenChange(false);
-      },
-      onError: (err) =>
-        toast.error(err instanceof ApiError ? err.message : "Couldn't add the group"),
-    });
-  }
-
+/** Which group a client lands in, on demand. Same treatment as the Rules
+ * tab's match order: the sequence is the answer, so the popover is a list
+ * and nothing else. */
+function ClientMatchingPopover() {
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogTrigger render={<Button type="button" size="sm" />}>
-        <Plus />
-        New group
-      </DialogTrigger>
-      <DialogContent>
-        <DialogHeader>
-          <DialogTitle>New group</DialogTitle>
-          <DialogDescription>
-            Groups scope rules, filter lists, and blocking pauses to a set of clients.
-          </DialogDescription>
-        </DialogHeader>
-        <Form {...form}>
-          <form
-            className="flex flex-col gap-4"
-            onSubmit={(e) => void form.handleSubmit(onSubmit)(e)}
-            noValidate
-          >
-            <FormField
-              control={form.control}
-              name="name"
-              render={({ field }) => (
-                <FormItem>
-                  <FormLabel>Name</FormLabel>
-                  <FormControl>
-                    <Input {...field} placeholder="Kids' devices" autoComplete="off" />
-                  </FormControl>
-                  <FormMessage />
-                </FormItem>
+    <Popover>
+      <PopoverTrigger render={<Button type="button" size="sm" variant="outline" />}>
+        <CircleHelp />
+        Client matching
+      </PopoverTrigger>
+      <PopoverContent align="start" className="w-80 p-0">
+        <p className="border-b border-border px-3 py-2.5 font-mono text-xs font-semibold tracking-widest text-muted-foreground uppercase">
+          First match wins
+        </p>
+        <ol className="flex flex-col">
+          {[
+            { label: "exact IP", pinned: true },
+            { label: "CIDR, longest prefix first", pinned: true },
+            { label: "default", pinned: false },
+          ].map((stage, i) => (
+            <li
+              key={stage.label}
+              className={cn(
+                "grid grid-cols-[22px_1fr] items-center gap-2.5 border-b border-border-muted px-3 py-1.5 last:border-b-0",
+                stage.pinned && "bg-accent",
               )}
-            />
-            <DialogFooter>
-              <DialogClose render={<Button type="button" variant="outline" />}>Cancel</DialogClose>
-              <Button type="submit" disabled={addGroup.isPending}>
-                {addGroup.isPending ? "Adding…" : "Add group"}
-              </Button>
-            </DialogFooter>
-          </form>
-        </Form>
-      </DialogContent>
-    </Dialog>
+            >
+              <span className="font-mono text-xs text-muted-foreground">{i + 1}.</span>
+              <span
+                className={cn(
+                  "font-mono text-sm",
+                  stage.pinned ? "font-semibold text-foreground" : "text-muted-foreground",
+                )}
+              >
+                {stage.label}
+              </span>
+            </li>
+          ))}
+        </ol>
+      </PopoverContent>
+    </Popover>
   );
 }
 
-function RenameGroupDialog({
-  group,
-  open,
-  onOpenChange,
-}: {
-  group: Group;
-  open: boolean;
-  onOpenChange: (open: boolean) => void;
-}) {
-  const renameGroup = useRenameGroup();
-  const form = useForm<GroupFormValues>({
-    resolver: zodResolver(groupFormSchema),
-    defaultValues: { name: group.name },
+// --- groups ---------------------------------------------------------------
+
+const nameSchema = requiredText("Name is required");
+
+/** Rename only ever changes the name. */
+const groupNameSchema = z.object({ name: nameSchema });
+type GroupNameValues = z.infer<typeof groupNameSchema>;
+
+/**
+ * Everything the add row owns, in one place.
+ *
+ * `listIds` is nullable rather than defaulting to an array: null means the
+ * picker has not been touched, which the server reads as "every list". An
+ * empty array is the different, deliberate answer of "none". Keeping that
+ * distinction in the form state is what lets the submit decide whether to
+ * send the field at all.
+ */
+const addGroupSchema = z.object({
+  name: nameSchema,
+  enabled: z.boolean(),
+  listIds: z.array(z.number()).nullable(),
+});
+type AddGroupValues = z.infer<typeof addGroupSchema>;
+
+function AddGroupRow({ allLists, onClose }: { allLists: List[]; onClose: () => void }) {
+  const addGroup = useAddGroup();
+  // All three fields live in the form, not beside it: they are one form,
+  // and a reset or a schema change has to reach all of them.
+  const form = useForm<AddGroupValues>({
+    resolver: zodResolver(addGroupSchema),
+    defaultValues: { name: "", enabled: true, listIds: null },
   });
 
-  // Re-sync whenever the dialog opens (rather than on every group.name
-  // change) — externally triggered opens (the row's edit button) don't run
-  // through this Dialog's own onOpenChange, so a plain reset-on-close
-  // wouldn't catch them.
   useEffect(() => {
-    if (open) form.reset({ name: group.name });
-  }, [open, group.name, form]);
+    form.setFocus("name");
+  }, [form]);
 
-  function onSubmit(values: GroupFormValues) {
-    renameGroup.mutate(
-      { id: group.id, name: values.name.trim() },
+  const listIds = useWatch({ control: form.control, name: "listIds" });
+  // Untouched shows what the server would do: every list.
+  const chosen = listIds ?? allLists.map((l) => l.id);
+
+  function onSubmit(values: AddGroupValues) {
+    addGroup.mutate(
+      {
+        name: values.name.trim(),
+        enabled: values.enabled,
+        // Sent only once touched. Leaving it off lets the server apply
+        // "every list", which stays correct even if a list is added
+        // between this page loading and the group being created.
+        ...(values.listIds === null ? {} : { list_ids: values.listIds }),
+      },
       {
         onSuccess: () => {
-          toast.success("Group renamed");
-          onOpenChange(false);
+          toast.success("Group added");
+          onClose();
         },
-        onError: () => toast.error(`Couldn't rename ${group.name}`),
+        onError: (err) =>
+          toast.error(err instanceof ApiError ? err.message : "Couldn't add the group"),
       },
     );
   }
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
+    <Form {...form}>
+      <form
+        onSubmit={(e) => void form.handleSubmit(onSubmit)(e)}
+        noValidate
+        data-slot="add-group-row"
+        className="shrink-0 border-b border-border bg-card shadow-[inset_3px_0_0_var(--primary)]"
+      >
+        <div className={cn(GROUP_GRID, "py-2.5")}>
+          <FormField
+            control={form.control}
+            name="name"
+            render={({ field }) => (
+              <FormItem>
+                <FormControl>
+                  <Input
+                    {...field}
+                    aria-label="Group name"
+                    placeholder="Office"
+                    autoComplete="off"
+                  />
+                </FormControl>
+                <FormMessage />
+              </FormItem>
+            )}
+          />
+          <FormField
+            control={form.control}
+            name="enabled"
+            render={({ field }) => (
+              <FormItem>
+                <FormControl>
+                  <Switch
+                    checked={field.value}
+                    onCheckedChange={field.onChange}
+                    aria-label="Enabled"
+                  />
+                </FormControl>
+              </FormItem>
+            )}
+          />
+          <FormField
+            control={form.control}
+            name="listIds"
+            render={({ field }) => (
+              <FormItem>
+                <DropdownMenu>
+                  <DropdownMenuTrigger
+                    render={<Button type="button" variant="outline" size="sm" />}
+                  >
+                    {`Lists (${chosen.length})`}
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent align="start">
+                    {allLists.length === 0 ? (
+                      <DropdownMenuItem disabled>No filter lists yet</DropdownMenuItem>
+                    ) : (
+                      allLists.map((l) => (
+                        <DropdownMenuCheckboxItem
+                          key={l.id}
+                          checked={chosen.includes(l.id)}
+                          onCheckedChange={(checked) =>
+                            field.onChange(
+                              checked ? [...chosen, l.id] : chosen.filter((x) => x !== l.id),
+                            )
+                          }
+                        >
+                          {l.name}
+                        </DropdownMenuCheckboxItem>
+                      ))
+                    )}
+                  </DropdownMenuContent>
+                </DropdownMenu>
+              </FormItem>
+            )}
+          />
+          <span className="text-right font-mono text-sm text-muted-foreground">0</span>
+          <span className="text-sm text-muted-foreground">Active</span>
+          <div className="flex items-center justify-end gap-1">
+            <Button type="submit" size="sm" disabled={addGroup.isPending}>
+              {addGroup.isPending ? "Adding…" : "Add"}
+            </Button>
+            <Button
+              type="button"
+              size="icon-sm"
+              variant="ghost"
+              aria-label="Close the add-group row"
+              onClick={onClose}
+            >
+              <X />
+            </Button>
+          </div>
+        </div>
+      </form>
+    </Form>
+  );
+}
+
+function RenameGroupDialog({ group, onClose }: { group: Group | null; onClose: () => void }) {
+  const renameGroup = useRenameGroup();
+  const form = useForm<GroupNameValues>({
+    resolver: zodResolver(groupNameSchema),
+    defaultValues: { name: group?.name ?? "" },
+  });
+
+  if (!group) return null;
+
+  function onSubmit(values: GroupNameValues) {
+    if (!group) return;
+    renameGroup.mutate(
+      { id: group.id, name: values.name.trim() },
+      {
+        onSuccess: () => {
+          toast.success("Group renamed");
+          onClose();
+        },
+        onError: (err) =>
+          toast.error(err instanceof ApiError ? err.message : "Couldn't rename the group"),
+      },
+    );
+  }
+
+  return (
+    <Dialog open onOpenChange={(next) => !next && onClose()}>
       <DialogContent>
         <DialogHeader>
-          <DialogTitle>Rename group</DialogTitle>
+          <DialogTitle>Rename this group</DialogTitle>
         </DialogHeader>
         <Form {...form}>
           <form
@@ -255,7 +345,18 @@ function RenameGroupDialog({
   );
 }
 
-function GroupListsMenu({ group, allLists }: { group: Group; allLists: List[] }) {
+/**
+ * The per-group list assignment.
+ *
+ * The failure case is the whole reason this has an error state. The toggle
+ * builds the next assignment set from what this query returned; when the
+ * query has *failed* that set is empty, so ticking one list used to PUT
+ * `[thatOne]` and silently drop every other assignment the group had. The
+ * trigger was disabled while pending but not while errored, so the click
+ * was reachable. Now a failed read replaces the control with a retry, and
+ * there is nothing to click that could write.
+ */
+function GroupListsCell({ group, allLists }: { group: Group; allLists: List[] }) {
   const groupLists = useGroupLists(group.id);
   const setGroupLists = useSetGroupLists();
   const assignedIds = useMemo(
@@ -263,16 +364,34 @@ function GroupListsMenu({ group, allLists }: { group: Group; allLists: List[] })
     [groupLists.data],
   );
 
+  if (groupLists.isError) {
+    return (
+      <Button
+        type="button"
+        size="sm"
+        variant="outline"
+        className="border-destructive text-destructive-foreground"
+        onClick={() => void groupLists.refetch()}
+        disabled={groupLists.isFetching}
+      >
+        <CircleAlert />
+        {groupLists.isFetching ? "Retrying…" : "Can't load · retry"}
+      </Button>
+    );
+  }
+
   function onToggle(listId: number, checked: boolean) {
-    const current = groupLists.data?.map((l) => l.id) ?? [];
+    // Guarded as well as hidden: without data there is no safe "next set"
+    // to compute, and sending one would be the wipe this exists to prevent.
+    if (!groupLists.data) return;
+    const current = groupLists.data.map((l) => l.id);
     const next = checked ? [...current, listId] : current.filter((id) => id !== listId);
     setGroupLists.mutate(
       { groupId: group.id, listIds: next },
       {
         // The checkbox is driven purely by server data, so nothing moves
         // until the invalidated groupLists query comes back — without this
-        // the click reads as a no-op in the meantime. Every other mutation
-        // on this tab confirms itself the same way.
+        // the click reads as a no-op in the meantime.
         onSuccess: () =>
           toast.success(
             checked ? `List applied to ${group.name}` : `List removed from ${group.name}`,
@@ -285,16 +404,16 @@ function GroupListsMenu({ group, allLists }: { group: Group; allLists: List[] })
   return (
     <DropdownMenu>
       <DropdownMenuTrigger render={<Button type="button" variant="outline" size="sm" />}>
-        <ListChecks />
         {/* A single text node, not "Lists" + a sibling element — the ARIA
             name-from-content algorithm trims each child node's own
-            contribution before concatenating with no separator, so
-            splitting the count into a sibling <span> silently loses the
-            space in the *computed accessible name* even though
-            textContent looks right. */}
+            contribution before concatenating with no separator, so splitting
+            the count into a sibling <span> silently loses the space in the
+            computed accessible name even though textContent looks right. */}
         {groupLists.isSuccess ? `Lists (${groupLists.data.length})` : "Lists"}
       </DropdownMenuTrigger>
-      <DropdownMenuContent align="end">
+      <DropdownMenuContent align="start">
+        {/* The label has to sit inside a group — base-ui's MenuGroupLabel
+            reads a context only Menu.Group provides, and throws without it. */}
         <DropdownMenuGroup>
           <DropdownMenuLabel>Lists applied to {group.name}</DropdownMenuLabel>
         </DropdownMenuGroup>
@@ -306,12 +425,12 @@ function GroupListsMenu({ group, allLists }: { group: Group; allLists: List[] })
             <DropdownMenuCheckboxItem
               key={list.id}
               checked={assignedIds.has(list.id)}
-              disabled={setGroupLists.isPending || groupLists.isPending}
+              disabled={setGroupLists.isPending || !groupLists.data}
               onCheckedChange={(checked) => onToggle(list.id, checked)}
             >
-              {/* The name, not the URL. This menu is the worst offender:
-                  a column of 90-character raw.githubusercontent.com paths
-                  is unreadable, and every hagezi entry looked identical. */}
+              {/* The name, not the URL: a column of 90-character
+                  raw.githubusercontent.com paths is unreadable, and every
+                  hagezi entry looked identical. */}
               {list.name}
             </DropdownMenuCheckboxItem>
           ))
@@ -321,186 +440,159 @@ function GroupListsMenu({ group, allLists }: { group: Group; allLists: List[] })
   );
 }
 
-function GroupRow({ group, allLists }: { group: Group; allLists: List[] }) {
+function GroupRow({
+  group,
+  allLists,
+  clientCount,
+  selected,
+  onSelect,
+  onRename,
+}: {
+  group: Group;
+  allLists: List[];
+  clientCount: number;
+  selected: boolean;
+  onSelect: () => void;
+  onRename: () => void;
+}) {
   const toggleGroup = useToggleGroup();
   const deleteGroup = useDeleteGroup();
-  const [renameOpen, setRenameOpen] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
   const isDefault = group.id === DEFAULT_GROUP_ID;
 
-  function onToggle(enabled: boolean) {
-    toggleGroup.mutate(
-      { id: group.id, enabled },
-      { onError: () => toast.error(`Couldn't ${enabled ? "enable" : "disable"} ${group.name}`) },
-    );
-  }
-
-  function onConfirmDelete() {
-    deleteGroup.mutate(group.id, {
-      onSuccess: () => {
-        toast.success(`${group.name} deleted`);
-        setDeleteOpen(false);
-      },
-      onError: (err) => {
-        toast.error(friendlyDeleteError(err, `Can't delete ${group.name} — it's still in use`));
-      },
-    });
-  }
-
   return (
-    <Item variant="outline" className="flex-wrap items-center gap-x-4 gap-y-3">
-      <ItemContent className="min-w-40">
-        <ItemTitle className="flex items-center gap-2">
-          <span className="min-w-0 truncate" title={group.name}>
+    <div
+      data-slot="group-row"
+      className={cn(
+        "border-b border-border-muted",
+        // A disabled group compiles no ruleset at all, so nothing is blocked
+        // for any of its clients. Treated like a failed list rather than a
+        // dimmed row: it is a state someone needs to notice, not a shade.
+        !group.enabled && "bg-destructive/5 shadow-[inset_3px_0_0_var(--destructive)]",
+      )}
+    >
+      <div className={cn(GROUP_GRID, "py-2.5")}>
+        <button
+          type="button"
+          onClick={onSelect}
+          aria-pressed={selected}
+          className="flex min-w-0 items-center gap-2.5 text-left"
+        >
+          <span
+            aria-hidden
+            className={cn("size-1.5 shrink-0", selected ? "bg-primary" : "bg-transparent")}
+          />
+          <span className={cn("truncate text-sm", selected ? "font-semibold" : "font-medium")}>
             {group.name}
           </span>
-          {/* "Built-in", not "Default" — the seeded group is itself
-              typically *named* "default" (see internal/app/app.go), so a
-              same-named badge would just repeat the row's own title. */}
-          {isDefault && (
-            <Badge variant="secondary" className="shrink-0">
-              Built-in
-            </Badge>
+        </button>
+        <span>
+          <Switch
+            checked={group.enabled}
+            disabled={toggleGroup.isPending}
+            onCheckedChange={(enabled) =>
+              toggleGroup.mutate(
+                { id: group.id, enabled },
+                {
+                  onError: () =>
+                    toast.error(`Couldn't ${enabled ? "enable" : "disable"} ${group.name}`),
+                },
+              )
+            }
+            aria-label={`${group.enabled ? "Disable" : "Enable"} ${group.name}`}
+          />
+        </span>
+        <span>
+          <GroupListsCell group={group} allLists={allLists} />
+        </span>
+        <span
+          className={cn(
+            "text-right font-mono text-sm",
+            clientCount === 0 && "text-muted-foreground",
           )}
-        </ItemTitle>
-        <ItemDescription>{group.enabled ? "Enforcing" : "Disabled"}</ItemDescription>
-      </ItemContent>
-      <ItemActions className="flex flex-wrap items-center gap-2">
-        <PauseControl groupId={group.id} />
-        <GroupListsMenu group={group} allLists={allLists} />
-        <Switch
-          checked={group.enabled}
-          disabled={toggleGroup.isPending}
-          onCheckedChange={onToggle}
-          aria-label={`${group.enabled ? "Disable" : "Enable"} ${group.name}`}
-        />
-        <Button
-          type="button"
-          size="icon-sm"
-          variant="ghost"
-          aria-label={`Rename ${group.name}`}
-          onClick={() => setRenameOpen(true)}
         >
-          <PencilLine />
-        </Button>
-        <Button
-          type="button"
-          size="icon-sm"
-          variant="ghost"
-          aria-label={`Delete ${group.name}`}
-          disabled={isDefault}
-          title={isDefault ? "The default group can't be deleted" : undefined}
-          onClick={() => setDeleteOpen(true)}
-        >
-          <Trash2 />
-        </Button>
-      </ItemActions>
+          {clientCount}
+        </span>
+        <span>
+          <PauseControl groupId={group.id} />
+        </span>
+        {/* Both icons. One icon beside one text button read as two
+            different kinds of thing when they are the same kind of thing. */}
+        <div className="flex items-center justify-end gap-1">
+          <Button
+            type="button"
+            size="icon-sm"
+            variant="ghost"
+            aria-label={`Rename ${group.name}`}
+            onClick={onRename}
+          >
+            <Pencil />
+          </Button>
+          <Button
+            type="button"
+            size="icon-sm"
+            variant="ghost"
+            disabled={isDefault}
+            aria-label={`Delete ${group.name}`}
+            onClick={() => setDeleteOpen(true)}
+          >
+            <Trash2 />
+          </Button>
+        </div>
+      </div>
 
-      <RenameGroupDialog group={group} open={renameOpen} onOpenChange={setRenameOpen} />
+      {isDefault && (
+        <p className="px-4 pb-2.5 pl-8 text-xs text-muted-foreground">
+          The fallback group can&apos;t be deleted.
+        </p>
+      )}
+
+      {!group.enabled && (
+        <p className="flex items-center gap-2 px-4 pb-2.5 pl-8 text-xs text-destructive-foreground">
+          <span className="font-mono font-semibold tracking-widest uppercase">Not filtering</span>
+          <span className="text-pretty">
+            Nothing is blocked for its {clientCount} {clientCount === 1 ? "client" : "clients"}.
+          </span>
+        </p>
+      )}
+
       <AlertDialog open={deleteOpen} onOpenChange={setDeleteOpen}>
         <AlertDialogContent>
           <AlertDialogHeader>
-            <AlertDialogTitle>Delete this group?</AlertDialogTitle>
+            <AlertDialogTitle>Delete {group.name}?</AlertDialogTitle>
             <AlertDialogDescription>
-              <code className="font-mono break-all text-foreground">{group.name}</code>, its rules,
-              and its list assignments will be removed. Clients assigned to it must be moved first.
+              Its clients fall back to the default group.
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
             <AlertDialogCancel>Cancel</AlertDialogCancel>
             <AlertDialogAction
               className="bg-destructive text-destructive-solid-foreground hover:bg-destructive/90"
-              onClick={onConfirmDelete}
               disabled={deleteGroup.isPending}
+              onClick={() =>
+                deleteGroup.mutate(group.id, {
+                  onSuccess: () => {
+                    toast.success(`${group.name} deleted`);
+                    setDeleteOpen(false);
+                  },
+                  onError: (err) =>
+                    toast.error(
+                      friendlyDeleteError(err, `Can't delete ${group.name} — it's still in use`),
+                    ),
+                })
+              }
             >
               {deleteGroup.isPending ? "Deleting…" : "Delete"}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
-    </Item>
+    </div>
   );
 }
 
-function GroupsPanel({ groupsQuery }: { groupsQuery: UseQueryResult<Group[]> }) {
-  const lists = useLists();
-  const allLists = lists.data ?? [];
+// --- clients --------------------------------------------------------------
 
-  let body: ReactNode;
-  if (groupsQuery.isPending) {
-    body = (
-      <div className="flex flex-col gap-2" aria-hidden="true">
-        {Array.from({ length: 3 }).map((_, i) => (
-          <Skeleton key={i} className="h-16 w-full" />
-        ))}
-      </div>
-    );
-  } else if (groupsQuery.data === undefined) {
-    body = (
-      <Alert variant="destructive">
-        <TriangleAlert />
-        <AlertTitle>Couldn&apos;t load groups</AlertTitle>
-        <AlertDescription>Try refreshing the page.</AlertDescription>
-      </Alert>
-    );
-  } else if (groupsQuery.data.length === 0) {
-    body = (
-      <EmptyState
-        icon={<FolderTree />}
-        title="No groups yet"
-        description="Create a group to scope rules and filter lists to specific clients."
-        action={<AddGroupDialog />}
-      />
-    );
-  } else {
-    body = (
-      <div className="flex flex-col gap-2">
-        {groupsQuery.data.map((group) => (
-          <GroupRow key={group.id} group={group} allLists={allLists} />
-        ))}
-      </div>
-    );
-  }
-
-  return (
-    <section className="flex flex-col gap-3">
-      <div className="flex items-center justify-between gap-3">
-        <div>
-          <h2 className="text-sm font-semibold text-foreground">Groups</h2>
-          <p className="text-sm text-muted-foreground">Policy scopes clients are assigned to.</p>
-        </div>
-        {groupsQuery.data && groupsQuery.data.length > 0 && <AddGroupDialog />}
-      </div>
-      {groupsQuery.isError && groupsQuery.data !== undefined && (
-        <StaleDataAlert
-          what="groups"
-          onRetry={() => void groupsQuery.refetch()}
-          isRetrying={groupsQuery.isFetching}
-        />
-      )}
-      {body}
-    </section>
-  );
-}
-
-// --- Clients panel ---------------------------------------------------------
-
-/** Mirrors the server's own validMatcher check (net/netip.ParseAddr or
- * ParsePrefix, see internal/api/clients_handlers.go) closely enough to
- * catch typos before they round-trip as a 400.
- *
- * One refinement rather than a chain of them, because the steps aren't
- * independent: each only makes sense once the one before it has passed,
- * and each has its own specific message. The two halves are also
- * deliberately *not* symmetric, because netip's own aren't: ParseAddr
- * accepts an RFC 4007 zone id ("fe80::1%eth0" — hence `allowZone`), while
- * ParsePrefix rejects one outright (go.dev/issue/51899) and additionally
- * rejects a prefix length with a leading sign or leading zero, which
- * strconv.Atoi would otherwise have swallowed. Both extra rejections are
- * mirrored below — not to be strict for its own sake, but because the
- * server's 400 for either reads "matcher must be an IP or CIDR and
- * group_id set", which sounds like "that isn't an IP/CIDR" for a matcher
- * whose zone id this very form accepts on its own. */
 const matcherSchema = z
   .string()
   .trim()
@@ -532,324 +624,353 @@ const matcherSchema = z
     if (Number(prefix) > max) return fail(`CIDR prefix must be between 0 and ${max}`);
   });
 
+// Optional, matching the server (internal/store's Client.Name is not
+// validated and may be empty). The old form required one, which invented a
+// constraint the API does not have.
 const clientFormSchema = z.object({
-  name: nameSchema,
+  name: z.string(),
   matcher: matcherSchema,
   groupId: z.string(),
 });
-
 type ClientFormValues = z.infer<typeof clientFormSchema>;
 
-function clientFormDefaults(client: Client | null, fallbackGroupId: number): ClientFormValues {
-  return {
-    name: client?.name ?? "",
-    matcher: client?.matcher ?? "",
-    groupId: String(client?.group_id ?? fallbackGroupId),
-  };
-}
-
-function ClientFormDialog({
-  client,
+function AddClientRow({
   groups,
-  open,
-  onOpenChange,
+  defaultGroupId,
+  onClose,
 }: {
-  /** `null` renders the "Add client" copy; a Client renders "Edit client". */
-  client: Client | null;
   groups: Group[];
-  open: boolean;
-  onOpenChange: (open: boolean) => void;
+  defaultGroupId: number;
+  onClose: () => void;
 }) {
   const addClient = useAddClient();
-  const updateClient = useUpdateClient();
-  const isEdit = client !== null;
-  const fallbackGroupId = groups[0]?.id ?? DEFAULT_GROUP_ID;
   const form = useForm<ClientFormValues>({
     resolver: zodResolver(clientFormSchema),
-    defaultValues: clientFormDefaults(client, fallbackGroupId),
+    defaultValues: { name: "", matcher: "", groupId: String(defaultGroupId) },
   });
 
-  useEffect(() => {
-    if (open) form.reset(clientFormDefaults(client, fallbackGroupId));
-  }, [open, client, fallbackGroupId, form]);
-
   function onSubmit(values: ClientFormValues) {
-    const payload = {
-      name: values.name.trim(),
-      matcher: values.matcher.trim(),
-      group_id: Number(values.groupId),
-    };
-    const onSuccess = () => {
-      toast.success(isEdit ? "Client updated" : "Client added");
-      onOpenChange(false);
-    };
-    const onError = (err: unknown) =>
-      toast.error(
-        err instanceof ApiError ? err.message : `Couldn't ${isEdit ? "update" : "add"} the client`,
-      );
-    if (isEdit && client) {
-      updateClient.mutate({ id: client.id, ...payload }, { onSuccess, onError });
-    } else {
-      addClient.mutate(payload, { onSuccess, onError });
-    }
+    addClient.mutate(
+      {
+        name: values.name.trim(),
+        matcher: values.matcher.trim(),
+        group_id: Number(values.groupId),
+      },
+      {
+        onSuccess: () => {
+          toast.success("Client added");
+          form.reset({ name: "", matcher: "", groupId: values.groupId });
+          form.setFocus("name");
+        },
+        onError: (err) =>
+          toast.error(err instanceof ApiError ? err.message : "Couldn't add the client"),
+      },
+    );
   }
 
-  const busy = addClient.isPending || updateClient.isPending;
-
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent>
-        <DialogHeader>
-          <DialogTitle>{isEdit ? "Edit client" : "Add client"}</DialogTitle>
-          <DialogDescription>
-            Match a device by its IP address or a CIDR range, then assign it to a group.
-          </DialogDescription>
-        </DialogHeader>
-        <Form {...form}>
-          <form
-            className="flex flex-col gap-4"
-            onSubmit={(e) => void form.handleSubmit(onSubmit)(e)}
-            noValidate
-          >
-            <FormField
-              control={form.control}
-              name="name"
-              render={({ field }) => (
-                <FormItem>
-                  <FormLabel>Name</FormLabel>
-                  <FormControl>
-                    <Input {...field} placeholder="Kid's laptop" autoComplete="off" />
-                  </FormControl>
-                  <FormMessage />
-                </FormItem>
-              )}
-            />
-            <FormField
-              control={form.control}
-              name="matcher"
-              render={({ field }) => (
-                <FormItem>
-                  <FormLabel>Matcher</FormLabel>
-                  <FormControl>
-                    <Input
-                      {...field}
-                      placeholder="192.168.1.42 or 192.168.1.0/24"
-                      autoComplete="off"
-                      className="font-mono"
-                    />
-                  </FormControl>
-                  <FormDescription>
-                    An IP address or CIDR range to match incoming queries against.
-                  </FormDescription>
-                  <FormMessage />
-                </FormItem>
-              )}
-            />
-            <FormField
-              control={form.control}
-              name="groupId"
-              render={({ field }) => (
-                <FormItem>
-                  <FormLabel>Group</FormLabel>
-                  <Select
-                    // `items` maps each value to its display label —
-                    // without it, SelectValue renders the raw group id
-                    // ("1") instead of the group's name (Task 12's finding;
-                    // see settings.tsx/account.tsx for the same fix).
-                    items={Object.fromEntries(groups.map((g) => [String(g.id), g.name]))}
-                    value={field.value}
-                    onValueChange={field.onChange}
-                  >
-                    <SelectTrigger aria-label="Group">
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent>
-                      {groups.map((g) => (
-                        <SelectItem key={g.id} value={String(g.id)}>
-                          {g.name}
-                        </SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
-                </FormItem>
-              )}
-            />
-            <DialogFooter>
-              <DialogClose render={<Button type="button" variant="outline" />}>Cancel</DialogClose>
-              <Button type="submit" disabled={busy}>
-                {busy ? "Saving…" : isEdit ? "Save" : "Add client"}
-              </Button>
-            </DialogFooter>
-          </form>
-        </Form>
-      </DialogContent>
-    </Dialog>
+    <Form {...form}>
+      <form
+        onSubmit={(e) => void form.handleSubmit(onSubmit)(e)}
+        noValidate
+        data-slot="add-client-row"
+        className="shrink-0 border-b border-border bg-card shadow-[inset_3px_0_0_var(--primary)]"
+      >
+        <div className={cn(CLIENT_GRID, "py-2.5")}>
+          <FormField
+            control={form.control}
+            name="name"
+            render={({ field }) => (
+              <FormItem>
+                <FormControl>
+                  <Input
+                    {...field}
+                    aria-label="Client name"
+                    placeholder="Alok's laptop — optional"
+                    autoComplete="off"
+                  />
+                </FormControl>
+              </FormItem>
+            )}
+          />
+          <FormField
+            control={form.control}
+            name="matcher"
+            render={({ field }) => (
+              <FormItem>
+                <FormControl>
+                  <Input
+                    {...field}
+                    aria-label="Matcher"
+                    placeholder="192.168.150.10 or 192.168.150.64/27"
+                    autoComplete="off"
+                    className="font-mono"
+                  />
+                </FormControl>
+              </FormItem>
+            )}
+          />
+          <FormField
+            control={form.control}
+            name="groupId"
+            render={({ field }) => (
+              <FormItem>
+                <FormControl>
+                  <NativeSelect {...field} aria-label="Client group">
+                    {groups.map((g) => (
+                      <NativeSelectOption key={g.id} value={String(g.id)}>
+                        {g.name}
+                      </NativeSelectOption>
+                    ))}
+                  </NativeSelect>
+                </FormControl>
+              </FormItem>
+            )}
+          />
+          <div className="flex items-center justify-end gap-1.5">
+            <Button type="submit" size="sm" disabled={addClient.isPending}>
+              {addClient.isPending ? "Adding…" : "Add"}
+            </Button>
+            <Button
+              type="button"
+              size="icon-sm"
+              variant="ghost"
+              aria-label="Close the add-client row"
+              onClick={onClose}
+            >
+              <X />
+            </Button>
+          </div>
+        </div>
+        <div className={cn(CLIENT_GRID, "items-start pb-2.5")}>
+          <span />
+          <span className="text-xs text-pretty text-muted-foreground">
+            <FormField control={form.control} name="matcher" render={() => <FormMessage />} />
+          </span>
+          <span />
+          <span />
+        </div>
+      </form>
+    </Form>
   );
 }
 
-function ClientsTable({
-  clients,
-  groupsById,
-  onEdit,
-  onDeleteRequest,
-}: {
-  clients: Client[];
-  groupsById: Map<number, Group>;
-  onEdit: (client: Client) => void;
-  onDeleteRequest: (client: Client) => void;
-}) {
-  return (
-    <Table>
-      <TableHeader>
-        <TableRow>
-          <TableHead>Name</TableHead>
-          <TableHead>Matcher</TableHead>
-          <TableHead>Group</TableHead>
-          <TableHead className="text-right">
-            <span className="sr-only">Actions</span>
-          </TableHead>
-        </TableRow>
-      </TableHeader>
-      <TableBody>
-        {clients.map((client) => (
-          <TableRow key={client.id}>
-            <TableCell className="max-w-56 truncate" title={client.name}>
-              {client.name}
-            </TableCell>
-            <TableCell className="font-mono text-xs">{client.matcher}</TableCell>
-            <TableCell>
-              <Badge variant="secondary">
-                {groupsById.get(client.group_id)?.name ?? `Group ${client.group_id}`}
-              </Badge>
-            </TableCell>
-            <TableCell className="text-right">
-              <div className="flex justify-end gap-1">
-                <Button
-                  type="button"
-                  size="icon-sm"
-                  variant="ghost"
-                  aria-label={`Edit ${client.name}`}
-                  onClick={() => onEdit(client)}
-                >
-                  <PencilLine />
-                </Button>
-                <Button
-                  type="button"
-                  size="icon-sm"
-                  variant="ghost"
-                  aria-label={`Delete ${client.name}`}
-                  onClick={() => onDeleteRequest(client)}
-                >
-                  <Trash2 />
-                </Button>
-              </div>
-            </TableCell>
-          </TableRow>
-        ))}
-      </TableBody>
-    </Table>
-  );
+const GROUP_BADGE: Record<string, NonNullable<BadgeProps["variant"]>> = {};
+
+function groupBadgeVariant(groupId: number): NonNullable<BadgeProps["variant"]> {
+  return GROUP_BADGE[groupId] ?? (groupId === DEFAULT_GROUP_ID ? "secondary" : "primary-light");
 }
 
-function ClientsPanel({ groups, groupsLoading }: { groups: Group[]; groupsLoading: boolean }) {
+// --- page -----------------------------------------------------------------
+
+/**
+ * Filtering › Groups & Clients. A group is a policy bucket; a client is a
+ * device pinned to exactly one of them by IP or CIDR.
+ */
+export function GroupsClientsTab() {
+  const groups = useGroups();
   const clients = useClients();
+  const lists = useLists();
   const deleteClient = useDeleteClient();
-  const [addOpen, setAddOpen] = useState(false);
-  // Open state is deliberately separate from the target rather than derived
-  // from `editTarget !== null`: the dialog stays mounted through base-ui's
-  // exit transition, so nulling the target on close would re-render the
-  // still-visible panel as the *add* variant — retitling "Edit client" to
-  // "Add client" and "Save" to "Add client" on the way out, including
-  // straight after a successful save. The target is replaced on the next
-  // open instead of cleared on close.
-  const [editTarget, setEditTarget] = useState<Client | null>(null);
-  const [editOpen, setEditOpen] = useState(false);
+
+  const [selectedGroup, setSelectedGroup] = useState<number | null>(null);
+  const [addGroupOpen, setAddGroupOpen] = useState(false);
+  const [addClientOpen, setAddClientOpen] = useState(false);
+  const [renameTarget, setRenameTarget] = useState<Group | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<Client | null>(null);
 
-  const groupsById = useMemo(() => new Map(groups.map((g) => [g.id, g])), [groups]);
-  const noGroups = !groupsLoading && groups.length === 0;
+  const allGroups = useMemo(() => groups.data ?? [], [groups.data]);
+  const allClients = useMemo(() => clients.data ?? [], [clients.data]);
+  const allLists = useMemo(() => lists.data ?? [], [lists.data]);
 
-  function onEditRequest(client: Client) {
-    setEditTarget(client);
-    setEditOpen(true);
+  const clientsByGroup = useMemo(() => {
+    const counts = new Map<number, number>();
+    for (const c of allClients) counts.set(c.group_id, (counts.get(c.group_id) ?? 0) + 1);
+    return counts;
+  }, [allClients]);
+
+  const shownClients = useMemo(
+    () =>
+      selectedGroup === null ? allClients : allClients.filter((c) => c.group_id === selectedGroup),
+    [allClients, selectedGroup],
+  );
+
+  const selectedName = allGroups.find((g) => g.id === selectedGroup)?.name;
+  const disabledCount = allGroups.filter((g) => !g.enabled).length;
+
+  let groupsBody: ReactNode;
+  if (groups.isPending) {
+    groupsBody = (
+      <div className="flex flex-col gap-2 p-4" aria-hidden="true">
+        {Array.from({ length: 3 }).map((_, i) => (
+          <Skeleton key={i} className="h-8 w-full" />
+        ))}
+      </div>
+    );
+  } else if (groups.data === undefined) {
+    groupsBody = (
+      <div className="p-4">
+        <Alert variant="destructive">
+          <TriangleAlert />
+          <AlertTitle>Couldn&apos;t load groups</AlertTitle>
+          <AlertDescription>Try refreshing the page.</AlertDescription>
+        </Alert>
+      </div>
+    );
+  } else {
+    groupsBody = allGroups.map((g) => (
+      <GroupRow
+        key={g.id}
+        group={g}
+        allLists={allLists}
+        clientCount={clientsByGroup.get(g.id) ?? 0}
+        selected={selectedGroup === g.id}
+        onSelect={() => setSelectedGroup(selectedGroup === g.id ? null : g.id)}
+        onRename={() => setRenameTarget(g)}
+      />
+    ));
   }
 
-  function onConfirmDelete() {
-    if (!deleteTarget) return;
-    const target = deleteTarget;
-    deleteClient.mutate(target.id, {
-      onSuccess: () => {
-        toast.success("Client deleted");
-        setDeleteTarget(null);
-      },
-      onError: () => toast.error(`Couldn't delete ${target.name}`),
-    });
-  }
-
-  const isEmpty = clients.data?.length === 0;
-
-  let body: ReactNode;
+  let clientsBody: ReactNode;
   if (clients.isPending) {
-    body = (
-      <div className="flex flex-col gap-2" aria-hidden="true">
+    clientsBody = (
+      <div className="flex flex-col gap-2 p-4" aria-hidden="true">
         {Array.from({ length: 4 }).map((_, i) => (
-          <Skeleton key={i} className="h-10 w-full" />
+          <Skeleton key={i} className="h-8 w-full" />
         ))}
       </div>
     );
   } else if (clients.data === undefined) {
-    body = (
-      <Alert variant="destructive">
-        <TriangleAlert />
-        <AlertTitle>Couldn&apos;t load clients</AlertTitle>
-        <AlertDescription>Try refreshing the page.</AlertDescription>
-      </Alert>
+    clientsBody = (
+      <div className="p-4">
+        <Alert variant="destructive">
+          <TriangleAlert />
+          <AlertTitle>Couldn&apos;t load clients</AlertTitle>
+          <AlertDescription>Try refreshing the page.</AlertDescription>
+        </Alert>
+      </div>
     );
-  } else if (isEmpty) {
-    body = (
-      <EmptyState
-        icon={<Users />}
-        title="No clients yet"
-        description={
-          noGroups
-            ? "Create a group first, then add a client and match it by IP or CIDR range."
-            : "Add a client and match it by IP address or CIDR range."
-        }
-        action={
-          <Button type="button" size="sm" disabled={noGroups} onClick={() => setAddOpen(true)}>
-            <Plus />
-            Add client
-          </Button>
-        }
-      />
+  } else if (shownClients.length === 0) {
+    clientsBody = (
+      <div className="flex flex-col items-center gap-2 p-8 text-center">
+        <p className="font-heading text-sm font-semibold">
+          {selectedName ? `No clients in ${selectedName}` : "No clients yet"}
+        </p>
+        <p className="text-sm text-muted-foreground">Unpinned devices fall back to default.</p>
+      </div>
     );
   } else {
-    body = (
-      <ClientsTable
-        clients={clients.data}
-        groupsById={groupsById}
-        onEdit={onEditRequest}
-        onDeleteRequest={setDeleteTarget}
-      />
-    );
+    clientsBody = shownClients.map((client) => {
+      const [addr, prefix] = client.matcher.split("/");
+      return (
+        <div
+          key={client.id}
+          data-slot="client-row"
+          className={cn(CLIENT_GRID, "border-b border-border-muted py-1.5")}
+        >
+          <span
+            className={cn(
+              "truncate text-sm",
+              client.name ? "font-medium" : "text-muted-foreground italic",
+            )}
+          >
+            {client.name || "Unnamed device"}
+          </span>
+          <span className="truncate font-mono text-sm" title={client.matcher}>
+            {addr}
+            {prefix !== undefined && <span className="text-muted-foreground">/{prefix}</span>}
+          </span>
+          <span>
+            <Badge variant={groupBadgeVariant(client.group_id)}>
+              {allGroups.find((g) => g.id === client.group_id)?.name ?? "unknown"}
+            </Badge>
+          </span>
+          <span className="flex items-center justify-end">
+            <Button
+              type="button"
+              size="sm"
+              variant="ghost"
+              aria-label={`Delete ${client.name || client.matcher}`}
+              onClick={() => setDeleteTarget(client)}
+            >
+              Delete
+            </Button>
+          </span>
+        </div>
+      );
+    });
   }
 
   return (
-    <section className="flex flex-col gap-3">
-      <div className="flex items-center justify-between gap-3">
-        <div>
-          <h2 className="text-sm font-semibold text-foreground">Clients</h2>
-          <p className="text-sm text-muted-foreground">
-            Devices matched by IP or CIDR, assigned to a group.
-          </p>
+    <div className="flex h-full min-h-0 flex-col">
+      {(groups.isError && groups.data !== undefined) ||
+      (clients.isError && clients.data !== undefined) ? (
+        <div className="shrink-0 border-b border-border p-3">
+          <StaleDataAlert
+            what="groups and clients"
+            onRetry={() => {
+              void groups.refetch();
+              void clients.refetch();
+            }}
+            isRetrying={groups.isFetching || clients.isFetching}
+          />
         </div>
-        {!isEmpty && (
+      ) : null}
+
+      {/* ---- groups ---------------------------------------------------- */}
+      <div className="flex shrink-0 items-center gap-2.5 border-b border-border px-4 py-2">
+        <h2 className="font-heading text-sm font-semibold">Groups</h2>
+        {disabledCount > 0 && (
+          <span className="font-mono text-xs text-muted-foreground">{disabledCount} disabled</span>
+        )}
+        <div className="ml-auto flex items-center gap-2">
+          <ClientMatchingPopover />
+          {!addGroupOpen && (
+            <Button type="button" size="sm" variant="outline" onClick={() => setAddGroupOpen(true)}>
+              <Plus />
+              Add group
+            </Button>
+          )}
+        </div>
+      </div>
+
+      <div
+        className={cn(
+          GROUP_GRID,
+          "shrink-0 border-b border-border py-2",
+          "font-mono text-xs tracking-widest text-muted-foreground uppercase",
+        )}
+      >
+        <span>Name</span>
+        <span>Enabled</span>
+        <span>Lists</span>
+        <span className="text-right">Clients</span>
+        <span>Blocking</span>
+        <span className="text-right">Actions</span>
+      </div>
+
+      {addGroupOpen && <AddGroupRow allLists={allLists} onClose={() => setAddGroupOpen(false)} />}
+
+      <div className="shrink-0">{groupsBody}</div>
+
+      {/* ---- clients --------------------------------------------------- */}
+      <div className="flex shrink-0 items-center gap-2.5 border-y border-border bg-card px-4 py-2">
+        <h2 className="font-heading text-sm font-semibold">Clients</h2>
+        <span className="font-mono text-xs text-muted-foreground">
+          {selectedName ? `in ${selectedName}` : "all groups"} · {shownClients.length}
+        </span>
+        {selectedGroup !== null && (
+          <Button type="button" size="sm" variant="link" onClick={() => setSelectedGroup(null)}>
+            Show all
+          </Button>
+        )}
+        {!addClientOpen && allGroups.length > 0 && (
           <Button
             type="button"
             size="sm"
-            disabled={noGroups}
-            title={noGroups ? "Create a group first" : undefined}
-            onClick={() => setAddOpen(true)}
+            variant="outline"
+            className="ml-auto"
+            onClick={() => setAddClientOpen(true)}
           >
             <Plus />
             Add client
@@ -857,23 +978,30 @@ function ClientsPanel({ groups, groupsLoading }: { groups: Group[]; groupsLoadin
         )}
       </div>
 
-      {clients.isError && clients.data !== undefined && (
-        <StaleDataAlert
-          what="clients"
-          onRetry={() => void clients.refetch()}
-          isRetrying={clients.isFetching}
+      <div
+        className={cn(
+          CLIENT_GRID,
+          "shrink-0 border-b border-border py-2",
+          "font-mono text-xs tracking-widest text-muted-foreground uppercase",
+        )}
+      >
+        <span>Name</span>
+        <span>Matcher</span>
+        <span>Group</span>
+        <span className="text-right">Actions</span>
+      </div>
+
+      {addClientOpen && allGroups.length > 0 && (
+        <AddClientRow
+          groups={allGroups}
+          defaultGroupId={selectedGroup ?? allGroups[0]?.id ?? DEFAULT_GROUP_ID}
+          onClose={() => setAddClientOpen(false)}
         />
       )}
 
-      {body}
+      <div className="min-h-0 flex-1 overflow-y-auto">{clientsBody}</div>
 
-      <ClientFormDialog client={null} groups={groups} open={addOpen} onOpenChange={setAddOpen} />
-      <ClientFormDialog
-        client={editTarget}
-        groups={groups}
-        open={editOpen}
-        onOpenChange={setEditOpen}
-      />
+      <RenameGroupDialog group={renameTarget} onClose={() => setRenameTarget(null)} />
 
       <AlertDialog
         open={deleteTarget !== null}
@@ -885,8 +1013,8 @@ function ClientsPanel({ groups, groupsLoading }: { groups: Group[]; groupsLoadin
             <AlertDialogDescription>
               {deleteTarget && (
                 <>
-                  <code className="font-mono break-all text-foreground">{deleteTarget.name}</code>{" "}
-                  will no longer be matched or assigned to a group.
+                  <code className="font-mono">{deleteTarget.matcher}</code> falls back to the
+                  default group.
                 </>
               )}
             </AlertDialogDescription>
@@ -895,32 +1023,24 @@ function ClientsPanel({ groups, groupsLoading }: { groups: Group[]; groupsLoadin
             <AlertDialogCancel>Cancel</AlertDialogCancel>
             <AlertDialogAction
               className="bg-destructive text-destructive-solid-foreground hover:bg-destructive/90"
-              onClick={onConfirmDelete}
               disabled={deleteClient.isPending}
+              onClick={() => {
+                if (!deleteTarget) return;
+                const target = deleteTarget;
+                deleteClient.mutate(target.id, {
+                  onSuccess: () => {
+                    toast.success("Client deleted");
+                    setDeleteTarget(null);
+                  },
+                  onError: () => toast.error(`Couldn't delete ${target.matcher}`),
+                });
+              }}
             >
               {deleteClient.isPending ? "Deleting…" : "Delete"}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
-    </section>
-  );
-}
-
-/**
- * Filtering › Groups & Clients — two related panels side by side on wide
- * screens (groups are few and structural; clients are the denser, more
- * numerous list that references them), stacked on narrow ones. Groups own
- * enable/pause/rename/delete plus which filter lists apply to them; Clients
- * own the IP/CIDR-to-group assignment.
- */
-export function GroupsClientsTab() {
-  const groupsQuery = useGroups();
-
-  return (
-    <div className="grid grid-cols-1 gap-8 lg:grid-cols-[minmax(0,380px)_1fr] lg:items-start">
-      <GroupsPanel groupsQuery={groupsQuery} />
-      <ClientsPanel groups={groupsQuery.data ?? []} groupsLoading={groupsQuery.isPending} />
     </div>
   );
 }

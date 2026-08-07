@@ -575,6 +575,20 @@ paths:
               required: [name]
               properties:
                 name: { type: string }
+                enabled:
+                  type: boolean
+                  default: true
+                  description: >
+                    Omitted means enabled. A disabled group compiles no
+                    ruleset, so nothing is filtered for any client in it.
+                list_ids:
+                  type: array
+                  items: { type: integer, format: int64 }
+                  description: >
+                    The exact set of lists to assign, an empty array
+                    included — "assign nothing" is a real choice. Omitted
+                    assigns every list that exists, because a group with
+                    none filters nothing at all.
       responses:
         "201":
           description: Created

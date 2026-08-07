@@ -20,11 +20,23 @@ export function useGroups() {
   });
 }
 
+/**
+ * `enabled` and `list_ids` are both optional, and omitting them is not the
+ * same as sending their falsy values: the server reads a missing
+ * `list_ids` as "inherit every list" and a missing `enabled` as true. An
+ * empty array therefore has to be sent deliberately to mean "no lists".
+ */
 export function useAddGroup() {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: (name: string) => api.post<{ id: number }>("/groups", { name }),
-    onSuccess: () => qc.invalidateQueries({ queryKey: groupKeys.all }),
+    mutationFn: (v: { name: string; enabled?: boolean; list_ids?: number[] }) =>
+      api.post<{ id: number }>("/groups", v),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: groupKeys.all });
+      // The new group may have taken list assignments with it, so the
+      // per-group list queries the Groups tab reads are now stale too.
+      void qc.invalidateQueries({ queryKey: ["filters", "groups"] });
+    },
   });
 }
 

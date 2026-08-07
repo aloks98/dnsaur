@@ -19,7 +19,7 @@ import { isAlreadyLoggedOut, useLogout, useMe, useMeInitials } from "../hooks/us
 import { useHealth } from "../hooks/use-stats";
 import {
   DASHBOARD_PATH,
-  FILTER_LISTS_PATH,
+  FILTERING_BASE,
   findActiveGroup,
   isNavItemActive,
   NAV_GROUPS,
@@ -95,7 +95,7 @@ export function TopNav({ onOpenCommandPalette }: TopNavProps) {
   // none.
   const onDashboard = pathname === DASHBOARD_PATH;
   const onQueryLog = pathname === QUERY_LOG_PATH;
-  const onFilterLists = pathname === FILTER_LISTS_PATH;
+  const onFilterLists = pathname === `${FILTERING_BASE}/lists`;
 
   return (
     <header
