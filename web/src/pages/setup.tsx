@@ -319,29 +319,30 @@ export function Setup() {
   // own LAN address, and the browser already resolved one that works.
   const resolverHost = typeof window === "undefined" ? "dnsaur" : window.location.hostname;
 
-  // The other three footers each say something an operator can act on. The
-  // welcome screen has no such line — what the artboard put there described
-  // an API endpoint, which is the app talking about itself.
-  const COPY: Record<Stage, { eyebrow: string; title: string; footer?: string; width: string }> = {
+  // No eyebrow: "FIRST RUN" was the same four times over, above headings
+  // that already say this is setup, on a screen you only ever reach on a
+  // fresh instance. The step strip carries the position it was standing in
+  // for.
+  //
+  // The last three footers each say something an operator can act on. The
+  // welcome screen has none — what the artboard put there described an API
+  // endpoint, which is the app talking about itself.
+  const COPY: Record<Stage, { title: string; footer?: string; width: string }> = {
     welcome: {
-      eyebrow: "First run",
       title: "Set up dnsaur",
       width: "max-w-md",
     },
     admin: {
-      eyebrow: "First run",
       title: "Create your admin",
       footer: "Stored as an argon2 hash. dnsaur never sees it again.",
       width: "max-w-md",
     },
     lists: {
-      eyebrow: "First run",
       title: "Pick starter blocklists",
       footer: "Each list is added separately, so one failure won't stop the others.",
       width: "max-w-lg",
     },
     done: {
-      eyebrow: "First run",
       title: "dnsaur is ready",
       footer: "Nothing is filtered until clients actually query dnsaur.",
       width: "max-w-md",
@@ -350,12 +351,7 @@ export function Setup() {
   const copy = COPY[stage];
 
   return (
-    <AuthLayout
-      eyebrow={copy.eyebrow}
-      title={copy.title}
-      footer={copy.footer}
-      maxWidthClassName={copy.width}
-    >
+    <AuthLayout title={copy.title} footer={copy.footer} maxWidthClassName={copy.width}>
       <Card className="gap-0 p-0">
         {/* Absent on welcome: that screen is before step 1, not part of it. */}
         {stage !== "welcome" && <StepStrip stage={stage} />}

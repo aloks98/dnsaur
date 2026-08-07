@@ -3,8 +3,12 @@ import { cn } from "@e412/rnui-react";
 import { DnsaurLogo } from "./dnsaur-logo";
 
 interface AuthLayoutProps {
-  /** Small uppercase label above the heading, e.g. "First-time setup". */
-  eyebrow: string;
+  /**
+   * Small uppercase label above the heading. Optional — worth it only when
+   * it tells you something the heading doesn't, like which step of two you
+   * are on. A label that merely restates the heading is noise.
+   */
+  eyebrow?: string;
   title: string;
   /**
    * Small print below the card. Screen-specific rather than fixed: the thing
@@ -47,9 +51,11 @@ export function AuthLayout({
           <DnsaurLogo size={46} className="mb-1" />
           {/* Mono, like every other label in the app that is a tag rather
               than prose — the chrome's nav cells, the table headers. */}
-          <span className="font-mono text-xs font-medium tracking-widest text-muted-foreground uppercase">
-            {eyebrow}
-          </span>
+          {eyebrow && (
+            <span className="font-mono text-xs font-medium tracking-widest text-muted-foreground uppercase">
+              {eyebrow}
+            </span>
+          )}
           <h1 className="font-heading text-2xl font-bold tracking-tight text-foreground">
             {title}
           </h1>
