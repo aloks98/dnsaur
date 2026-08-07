@@ -98,6 +98,30 @@ jobs:
         with:
           name: web-dist
           path: web/dist
+      # Keyed on Playwright's own version, not on the lockfile hash. The
+      # browser build is pinned to the Playwright release, so any other
+      # dependency changing has no bearing on it — hashing the lockfile
+      # would throw away a good Chromium every time an unrelated package
+      # moved, which on an active branch is most pushes.
+      #
+      # Reads it from the installed package rather than parsing the
+      # lockfile, so it is whatever pnpm actually resolved. Runs after the
+      # Install step for that reason.
+      - name: Resolve Playwright version
+        id: playwright
+        working-directory: web
+        run: |
+          echo "version=$(node -p "require('@playwright/test/package.json').version")" >> "$GITHUB_OUTPUT"
+      # Forgejo's mirror, same host as the artifact actions above — the
+      # upstream v4 has the same refuses-to-run-off-github.com guard.
+      - uses: https://code.forgejo.org/actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: ms-playwright-chromium-${{ steps.playwright.outputs.version }}
+      # `install` alone on a cache hit: the browser is already there and it
+      # exits in about a second. `--with-deps` stays because the apt
+      # packages live outside ~/.cache and are not cacheable this way; that
+      # part is quick next to the ~130 MB download it now skips.
       - name: Install Chromium
         working-directory: web
         run: npx playwright install --with-deps chromium
