@@ -42,7 +42,7 @@ test("authenticated user gets the two-row shell: nav groups above, the active gr
 // the viewport edges; the shell's 24px page gutter would leave every one of
 // them floating inside a frame, and a non-flex <main> would stop the split
 // claiming the leftover height its vertical rule needs.
-test("the dashboard route gets no page gutter; every other page keeps it", async () => {
+test("full-bleed routes get no page gutter; the rest keep it", async () => {
   const { unmount } = renderWithProviders(<App />);
   await screen.findByRole("navigation", { name: "Primary" });
 
@@ -51,8 +51,15 @@ test("the dashboard route gets no page gutter; every other page keeps it", async
   expect(dashboardMain.className).toContain("flex-col");
   unmount();
 
-  renderWithProviders(<App />, { route: "/dns" });
+  // Local DNS joined them: its add form is the table's own first row, so the
+  // form and the rows under it have to share one edge-to-edge column grid.
+  const dns = renderWithProviders(<App />, { route: "/dns" });
   await screen.findByRole("navigation", { name: "Local DNS" });
+  expect(screen.getByRole("main").className).not.toContain("p-6");
+  dns.unmount();
+
+  renderWithProviders(<App />, { route: "/settings" });
+  await screen.findByRole("navigation", { name: "System" });
   expect(screen.getByRole("main").className).toContain("p-6");
 });
 

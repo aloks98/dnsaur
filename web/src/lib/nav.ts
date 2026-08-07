@@ -27,13 +27,20 @@ export const DASHBOARD_PATH = "/";
 export const QUERY_LOG_PATH = "/queries";
 
 /**
+ * Local DNS. Full-bleed for the same reason the other two are, plus one of
+ * its own: its add form is the table's first row, so the form and the rows
+ * below it have to share a single column grid that runs edge to edge.
+ */
+export const LOCAL_DNS_PATH = "/dns";
+
+/**
  * Screens that own the whole content area rather than sitting inside the
  * shell's gutter: both are full-bleed grids of hairline-separated bands, and
  * their rules have to meet the viewport edges instead of floating in a 24px
  * frame.
  */
 export function isFullBleedRoute(pathname: string): boolean {
-  return pathname === DASHBOARD_PATH || pathname === QUERY_LOG_PATH;
+  return pathname === DASHBOARD_PATH || pathname === QUERY_LOG_PATH || pathname === LOCAL_DNS_PATH;
 }
 
 export interface NavItem {
