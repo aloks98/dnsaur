@@ -55,14 +55,20 @@ jobs:
       - name: Build
         working-directory: web
         run: pnpm build
-      # Forgejo's fork, not actions/upload-artifact. The upstream v4 action
-      # bundles @actions/artifact v2, which refuses outright to run against
-      # any host that isn't github.com — it reports the instance as GHES and
-      # exits. That check is client-side and unconditional: this Forgejo
-      # (16.0.1) implements the v4 artifact API perfectly well, the action
-      # just declines to talk to it. The fork is the same action with that
-      # guard removed. Keep upload and download on the same fork and major.
-      - uses: https://code.forgejo.org/forgejo/upload-artifact@v4
+      # v3, deliberately. v4 cannot work here: it bundles @actions/artifact
+      # v2, which refuses outright to run against any host that isn't
+      # github.com — it reports the instance as GHES and exits before making
+      # a request. The guard is client-side and unconditional, so this is
+      # not a capability gap; the runner serves the v4 API fine, the action
+      # just declines to talk to it.
+      #
+      # v3 predates that rewrite and speaks the v1 artifact API the runner
+      # actually implements. It is also what upstream tells GHES users to
+      # do, and what forgejo/upload-artifact — a self-described "temporary
+      # fork until v4 supports GHES" — exists to work around. Preferring the
+      # official action at v3 over a stopgap fork at v4 means one fewer
+      # unmaintained dependency. Keep upload and download on the same major.
+      - uses: actions/upload-artifact@v3
         with:
           name: web-dist
           path: web/dist
@@ -126,7 +132,7 @@ jobs:
       - name: Install
         working-directory: web
         run: pnpm install --frozen-lockfile --store-dir ~/.pnpm-store
-      - uses: https://code.forgejo.org/forgejo/download-artifact@v4
+      - uses: actions/download-artifact@v3
         with:
           name: web-dist
           path: web/dist
@@ -150,12 +156,10 @@ jobs:
           version="$(node -p "require('@playwright/test/package.json').version")"
           [ -n "$version" ] || { echo "could not resolve the Playwright version" >&2; exit 1; }
           echo "version=$version" >> "$GITHUB_OUTPUT"
-      # Bare, like checkout and setup-node — it resolves to the instance's
-      # own actions/cache mirror. The artifact steps need an explicit URL
-      # for a different reason: those point at forgejo/upload-artifact, a
-      # *fork* under another owner, so a bare actions/upload-artifact would
-      # resolve to the upstream one and hit its host guard. Same repo name
-      # here, so there is nothing to redirect.
+      # Bare, like every other action here — it resolves to the instance's
+      # own actions/cache mirror. v4 is fine for cache; it is only the
+      # artifact actions that carry the github.com-only guard, which is why
+      # those are pinned a major back.
       - uses: actions/cache@v4
         with:
           path: ~/.cache/ms-playwright
@@ -174,7 +178,7 @@ jobs:
       # always keep the report + traces (playwright.config.ts sets
       # trace: "on-first-retry", and CI retries once) — otherwise the smoke
       # test can rot silently.
-      - uses: https://code.forgejo.org/forgejo/upload-artifact@v4
+      - uses: actions/upload-artifact@v3
         if: always()
         with:
           name: playwright-report
