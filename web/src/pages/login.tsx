@@ -1,5 +1,5 @@
-import { useEffect, useState } from "react";
-import { CircleAlert, KeyRound, ShieldCheck } from "lucide-react";
+import { useEffect, useState, type ReactNode } from "react";
+import { CircleAlert, UserRound } from "lucide-react";
 import { toast } from "sonner";
 import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
@@ -11,26 +11,19 @@ import {
   AlertTitle,
   Button,
   Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
   cn,
   Form,
   FormControl,
-  FormDescription,
   FormField,
   FormItem,
   FormLabel,
   FormMessage,
   Input,
-  InputOTP,
-  InputOTPGroup,
-  InputOTPSeparator,
-  InputOTPSlot,
 } from "@e412/rnui-react";
 import { ApiError } from "../api/client";
 import { AuthLayout } from "../components/auth-layout";
 import { authKeys, useLogin } from "../hooks/use-auth";
+import { useHealth } from "../hooks/use-stats";
 import { totpCodeSchema } from "../lib/schemas";
 
 type Step = "credentials" | "totp";
@@ -86,6 +79,23 @@ function useStepTransition(step: Step) {
 }
 
 /**
+ * A rejected submission, said next to the field that was rejected rather
+ * than in a banner above the form.
+ *
+ * These are not validation messages — the form is well-formed, the server
+ * just said no — so they don't go through FormMessage, which is driven by
+ * the resolver and would be cleared by the next keystroke.
+ */
+function SubmitError({ children }: { children: ReactNode }) {
+  return (
+    <p className="flex items-start gap-2 text-sm text-destructive-foreground">
+      <CircleAlert className="mt-px size-3.5 shrink-0" aria-hidden />
+      <span className="text-pretty">{children}</span>
+    </p>
+  );
+}
+
+/**
  * Login screen with an optional TOTP second step.
  *
  * POST /auth/login can reply three different ways: 200 (session cookie set —
@@ -106,6 +116,7 @@ function useStepTransition(step: Step) {
 export function Login() {
   const qc = useQueryClient();
   const login = useLogin();
+  const health = useHealth();
   const [step, setStep] = useState<Step>("credentials");
   const [formError, setFormError] = useState<FormError | null>(null);
   const settled = useStepTransition(step);
@@ -114,6 +125,16 @@ export function Login() {
     resolver: zodResolver(step === "totp" ? totpChallengeSchema : credentialsSchema),
     defaultValues: { username: "", password: "", totpCode: "" },
   });
+
+  // Focus the code the moment the step reveals it. An `autoFocus` attribute
+  // would do the same thing but fires on mount regardless of how the field
+  // got there, which is the usability problem the a11y rule is about; this
+  // only moves focus as the direct result of the user submitting. An effect
+  // rather than a call beside setStep(): the field does not exist until the
+  // render that state change causes.
+  useEffect(() => {
+    if (step === "totp") form.setFocus("totpCode");
+  }, [step, form]);
 
   function goToSetup() {
     void qc.invalidateQueries({ queryKey: authKeys.setup });
@@ -148,10 +169,11 @@ export function Login() {
           // Stay on the code step (the password is still valid and must not
           // be thrown away) and say what actually went wrong.
           if (err instanceof ApiError && err.status === 401 && step === "totp") {
-            const message = "Invalid verification code — try again.";
+            const message =
+              "That code didn't match. Codes rotate every 30 seconds — wait for the next one and try again. Your password is still accepted.";
             setFormError({ setupRequired: false, message });
             form.resetField("totpCode");
-            toast.error(message);
+            toast.error("Invalid verification code — try again.");
             return;
           }
           if (err instanceof ApiError && err.status === 409) {
@@ -162,144 +184,171 @@ export function Login() {
           }
           const message =
             err instanceof ApiError && err.status === 401
-              ? "Invalid username or password."
+              ? // Named as the pair it is. The server checks both together
+                // and will not say which half failed, so a message blaming
+                // "username or password" invites re-typing the wrong one.
+                "That username and password don't match. Both are checked together, so either one could be wrong."
               : err instanceof ApiError
                 ? err.message
                 : "Couldn't log in — try again.";
           setFormError({ setupRequired: false, message });
           form.resetField("password");
           setStep("credentials");
-          toast.error(message);
+          toast.error("Invalid username or password.");
           form.setFocus("password");
         },
       },
     );
   }
 
-  return (
-    <AuthLayout eyebrow="Welcome back" title="Log in to dnsaur">
-      <Card className="gap-6 py-6">
-        <CardHeader className="px-6">
-          <CardDescription className="flex items-center gap-1.5">
-            {step === "credentials" ? (
-              <KeyRound className="size-3.5 shrink-0" aria-hidden />
-            ) : (
-              <ShieldCheck className="size-3.5 shrink-0" aria-hidden />
-            )}
-            {step === "credentials"
-              ? "Enter your credentials to continue."
-              : "Two-factor authentication is enabled for this account."}
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="px-6">
-          {formError && (
-            <Alert variant={formError.setupRequired ? "info" : "destructive"} className="mb-4">
-              <CircleAlert />
-              <AlertTitle>
-                {formError.setupRequired ? "No admin account yet" : "Couldn't log in"}
-              </AlertTitle>
-              <AlertDescription>
-                <p>{formError.message}</p>
-                {formError.setupRequired && (
-                  <Button type="button" variant="outline" size="sm" onClick={goToSetup}>
-                    Go to setup
-                  </Button>
-                )}
-              </AlertDescription>
-            </Alert>
-          )}
+  const onCredentials = step === "credentials";
+  // A rejected submission, as opposed to the 409 that gets its own banner.
+  const rejected = formError !== null && !formError.setupRequired;
 
-          <Form {...form}>
-            <form
-              className={cn(
-                "flex flex-col gap-4 motion-safe:transition-all motion-safe:duration-200 motion-safe:ease-out",
-                settled ? "translate-y-0 opacity-100" : "translate-y-1 opacity-0",
-              )}
-              onSubmit={(e) => void form.handleSubmit(onSubmit)(e)}
-              noValidate
-            >
-              {step === "credentials" ? (
-                <>
-                  <FormField
-                    control={form.control}
-                    name="username"
-                    render={({ field }) => (
-                      <FormItem>
-                        <FormLabel>Username</FormLabel>
-                        <FormControl>
-                          <Input {...field} autoComplete="username" />
-                        </FormControl>
-                        <FormMessage />
-                      </FormItem>
-                    )}
-                  />
-                  <FormField
-                    control={form.control}
-                    name="password"
-                    render={({ field }) => (
-                      <FormItem>
-                        <FormLabel>Password</FormLabel>
-                        <FormControl>
-                          <Input {...field} type="password" autoComplete="current-password" />
-                        </FormControl>
-                        <FormMessage />
-                      </FormItem>
-                    )}
-                  />
+  return (
+    <AuthLayout
+      eyebrow={onCredentials ? "Welcome back" : "Step 2 of 2"}
+      title={onCredentials ? "Log in to dnsaur" : "Enter your code"}
+      footer={
+        onCredentials ? (
+          // The build is worth stating on a self-hosted box: this is the one
+          // screen an operator reaches before any chrome exists, and "which
+          // version am I actually running?" is the first question when
+          // something looks wrong. GET /health is public, so it answers even
+          // signed out.
+          <>dnsaur {health.data?.version ?? "—"} · self-hosted</>
+        ) : (
+          <>Lost your authenticator? You&apos;ll need shell access to reset it.</>
+        )
+      }
+    >
+      <Card className="gap-4 p-5">
+        <p className="text-sm text-pretty text-muted-foreground">
+          {onCredentials
+            ? "Enter your credentials to continue."
+            : "Your password was accepted. One more factor to go."}
+        </p>
+
+        {/* Only the "there is no admin account" case keeps a banner: it is
+            the one failure that is not about what was typed, and the only
+            one with somewhere else to send you. Rejected credentials speak
+            next to the field instead. */}
+        {formError?.setupRequired && (
+          <Alert variant="info">
+            <CircleAlert />
+            <AlertTitle>No admin account yet</AlertTitle>
+            <AlertDescription>
+              <p>{formError.message}</p>
+              <Button type="button" variant="outline" size="sm" onClick={goToSetup}>
+                Go to setup
+              </Button>
+            </AlertDescription>
+          </Alert>
+        )}
+
+        <Form {...form}>
+          <form
+            className={cn(
+              "flex flex-col gap-4 motion-safe:transition-all motion-safe:duration-200 motion-safe:ease-out",
+              settled ? "translate-y-0 opacity-100" : "translate-y-1 opacity-0",
+            )}
+            onSubmit={(e) => void form.handleSubmit(onSubmit)(e)}
+            noValidate
+          >
+            {onCredentials ? (
+              <>
+                <FormField
+                  control={form.control}
+                  name="username"
+                  render={({ field }) => (
+                    <FormItem>
+                      <FormLabel>Username</FormLabel>
+                      <FormControl>
+                        <Input {...field} autoComplete="username" />
+                      </FormControl>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
+                <FormField
+                  control={form.control}
+                  name="password"
+                  render={({ field }) => (
+                    <FormItem>
+                      <FormLabel>Password</FormLabel>
+                      <FormControl>
+                        <Input
+                          {...field}
+                          type="password"
+                          autoComplete="current-password"
+                          aria-invalid={rejected || undefined}
+                        />
+                      </FormControl>
+                      <FormMessage />
+                      {rejected && <SubmitError>{formError.message}</SubmitError>}
+                    </FormItem>
+                  )}
+                />
+                <Button type="submit" disabled={login.isPending}>
+                  {login.isPending ? "Logging in…" : "Log in"}
+                </Button>
+              </>
+            ) : (
+              <>
+                {/* Who the code is for. On the second step the username is
+                    off screen, and a code typed against the wrong account
+                    fails with no hint as to why. */}
+                <div className="flex items-center gap-2.5 border border-border bg-background p-2.5">
+                  <UserRound className="size-4 shrink-0 text-muted-foreground" aria-hidden />
+                  <span className="min-w-0 flex-1 truncate font-mono text-sm">
+                    {form.getValues("username")}
+                  </span>
+                </div>
+
+                <FormField
+                  control={form.control}
+                  name="totpCode"
+                  render={({ field }) => (
+                    <FormItem>
+                      <FormLabel>6-digit code</FormLabel>
+                      <FormControl>
+                        <Input
+                          {...field}
+                          // Not type="number": a leading zero is significant
+                          // and spinners are nonsense here. inputMode gets
+                          // the numeric keypad on a phone without either.
+                          inputMode="numeric"
+                          autoComplete="one-time-code"
+                          maxLength={6}
+                          placeholder="000000"
+                          aria-invalid={rejected || undefined}
+                          className="h-11 text-center font-mono text-2xl tracking-widest"
+                        />
+                      </FormControl>
+                      <FormMessage />
+                      {rejected ? (
+                        <SubmitError>{formError.message}</SubmitError>
+                      ) : (
+                        <p className="text-sm text-muted-foreground">
+                          From your authenticator app. Rotates every 30 seconds.
+                        </p>
+                      )}
+                    </FormItem>
+                  )}
+                />
+
+                <div className="flex flex-col gap-2">
                   <Button type="submit" disabled={login.isPending}>
-                    {login.isPending ? "Logging in…" : "Log in"}
+                    {login.isPending ? "Verifying…" : "Verify and sign in"}
                   </Button>
-                </>
-              ) : (
-                <>
-                  <p className="text-sm text-muted-foreground">
-                    Signing in as{" "}
-                    <span className="font-medium text-foreground">
-                      {form.getValues("username")}
-                    </span>
-                    .
-                  </p>
-                  <FormField
-                    control={form.control}
-                    name="totpCode"
-                    render={({ field }) => (
-                      <FormItem>
-                        <FormLabel>Verification code</FormLabel>
-                        <FormControl>
-                          <InputOTP maxLength={6} {...field}>
-                            <InputOTPGroup>
-                              <InputOTPSlot index={0} />
-                              <InputOTPSlot index={1} />
-                              <InputOTPSlot index={2} />
-                            </InputOTPGroup>
-                            <InputOTPSeparator />
-                            <InputOTPGroup>
-                              <InputOTPSlot index={3} />
-                              <InputOTPSlot index={4} />
-                              <InputOTPSlot index={5} />
-                            </InputOTPGroup>
-                          </InputOTP>
-                        </FormControl>
-                        <FormDescription>
-                          Enter the 6-digit code from your authenticator app.
-                        </FormDescription>
-                        <FormMessage />
-                      </FormItem>
-                    )}
-                  />
-                  <div className="flex items-center justify-between gap-3">
-                    <Button type="button" variant="ghost" onClick={backToCredentials}>
-                      Back
-                    </Button>
-                    <Button type="submit" disabled={login.isPending}>
-                      {login.isPending ? "Verifying…" : "Verify"}
-                    </Button>
-                  </div>
-                </>
-              )}
-            </form>
-          </Form>
-        </CardContent>
+                  <Button type="button" variant="ghost" onClick={backToCredentials}>
+                    Back to password
+                  </Button>
+                </div>
+              </>
+            )}
+          </form>
+        </Form>
       </Card>
     </AuthLayout>
   );
