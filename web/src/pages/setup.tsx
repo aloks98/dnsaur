@@ -478,7 +478,18 @@ export function Setup() {
           )}
 
           {stage === "lists" && (
-            <>
+            // A real form, like the account step. A set of checkboxes with a
+            // submit action is a form, and without one Enter did nothing
+            // here — the only step of the wizard the keyboard couldn't
+            // finish.
+            <form
+              className="flex flex-col gap-4"
+              onSubmit={(e) => {
+                e.preventDefault();
+                void applyStarterLists();
+              }}
+              noValidate
+            >
               <p className="text-sm text-pretty text-muted-foreground">
                 Sensible defaults for a home network. All optional.
               </p>
@@ -518,17 +529,17 @@ export function Setup() {
                 })}
               </fieldset>
 
+              {/* Not "downloads in the background": the assign that follows
+                  refreshes filters synchronously, so this button holds until
+                  every list has been fetched and compiled. Saying so is what
+                  makes the wait explicable rather than a hang. */}
               <p className="text-xs text-pretty text-muted-foreground">
-                Lists download in the background — entry counts stay at zero until the first fetch
-                lands. You can add or remove any of these later.
+                These download now, so this can take a moment. You can add or remove any of them
+                later.
               </p>
 
               <div className="flex flex-col gap-2">
-                <Button
-                  type="button"
-                  onClick={() => void applyStarterLists()}
-                  disabled={applyingStarters || chosenCount === 0}
-                >
+                <Button type="submit" disabled={applyingStarters || chosenCount === 0}>
                   {applyingStarters
                     ? "Adding…"
                     : `Add ${chosenCount} ${chosenCount === 1 ? "list" : "lists"} and finish`}
@@ -545,7 +556,7 @@ export function Setup() {
                   Skip for now
                 </Button>
               </div>
-            </>
+            </form>
           )}
 
           {stage === "done" && (

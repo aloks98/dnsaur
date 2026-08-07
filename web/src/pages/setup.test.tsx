@@ -31,7 +31,7 @@ async function fillAccountForm(
 const DEFAULT_CHOSEN = 3;
 
 function onListsStep() {
-  return screen.findByText(/lists download in the background/i);
+  return screen.findByText(/these download now/i);
 }
 
 function finishButton() {
@@ -130,7 +130,7 @@ test("if the silent sign-in after setup fails, the wizard skips to done pointing
   expect(await screen.findByText(/admin account created/i)).toBeInTheDocument();
   expect(screen.getByRole("button", { name: /go to login/i })).toBeInTheDocument();
   // The list step needs a session, so it is skipped entirely.
-  expect(screen.queryByText(/lists download in the background/i)).not.toBeInTheDocument();
+  expect(screen.queryByText(/these download now/i)).not.toBeInTheDocument();
 });
 
 test("skipping the starter-lists step advances to done without creating anything", async () => {
@@ -155,6 +155,34 @@ test("skipping the starter-lists step advances to done without creating anything
   expect(creates).toBe(0);
   // Nothing was chosen, so the wizard must not claim any list result.
   expect(screen.queryByText(/blocklists added/i)).not.toBeInTheDocument();
+});
+
+// A set of checkboxes with a submit action is a form, and this step was a
+// bare fieldset with two type="button" buttons — so Enter did nothing and
+// it was the one step of the wizard a keyboard couldn't finish.
+test("Enter submits the blocklist step", async () => {
+  const user = userEvent.setup();
+  let assigned = false;
+  mockAccountCreation();
+  server.use(
+    http.post("/api/v1/filters/lists", () => HttpResponse.json({ id: 1 }, { status: 201 })),
+    http.put("/api/v1/groups/:id/lists", () => {
+      assigned = true;
+      return new HttpResponse(null, { status: 204 });
+    }),
+  );
+
+  renderWithProviders(<Setup />);
+  await fillAccountForm(user);
+  await onListsStep();
+
+  // Focus a checkbox in the set and press Enter — never touching the button.
+  const boxes = screen.getAllByRole("checkbox");
+  boxes[0].focus();
+  await user.keyboard("{Enter}");
+
+  await waitFor(() => expect(assigned).toBe(true));
+  expect(await screen.findByRole("heading", { name: /dnsaur is ready/i })).toBeInTheDocument();
 });
 
 test("finishing creates the checked lists and assigns them to the default group", async () => {
