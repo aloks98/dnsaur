@@ -22,7 +22,8 @@ import {
   FormMessage,
   Input,
 } from "@e412/rnui-react";
-import { ApiError } from "../api/client";
+import { api, ApiError } from "../api/client";
+import type { List } from "../api/types";
 import { AuthLayout } from "../components/auth-layout";
 import { authKeys, useSetup, useSetupSignIn } from "../hooks/use-auth";
 import { useAddList, useAssignGroupLists } from "../hooks/use-filters";
@@ -111,6 +112,12 @@ interface Outcome {
   chosen: number;
   /** Named so the last screen can say which one to look at. */
   failed: string[];
+  /**
+   * Domains actually compiled and enforcing, read back after the assign.
+   * 0 means "we couldn't read it", not "none" — the done screen falls back
+   * to describing the fetch rather than printing a zero it isn't sure of.
+   */
+  entries: number;
   /** False when the silent post-setup sign-in didn't work. */
   signedIn: boolean;
 }
@@ -203,6 +210,7 @@ export function Setup() {
     applied: 0,
     chosen: 0,
     failed: [],
+    entries: 0,
     signedIn: false,
   });
   const [username, setUsername] = useState("");
@@ -298,17 +306,29 @@ export function Setup() {
     }
 
     let applied = created.length;
+    let entries = 0;
     if (created.length > 0) {
       try {
         await assignGroupLists.mutateAsync({ groupId: STARTER_GROUP_ID, listIds: created });
+        // PUT /groups/{id}/lists refreshes filters *synchronously* — unlike
+        // POST /filters/lists, which backgrounds it (see
+        // internal/api/filters_handlers.go). So by the time that resolves,
+        // every list has been fetched, parsed and compiled: the pause you
+        // feel on this button is the download itself. Which means the
+        // counts are real and readable right now, rather than something to
+        // promise will appear later.
+        const lists = await api.get<List[]>("/filters/lists");
+        entries = lists.reduce((sum, l) => sum + l.entry_count, 0);
       } catch {
         // Created but unattached filters nothing, so this counts as zero
-        // applied — and the last screen has to say so.
+        // applied — and the last screen has to say so. A failed *read* also
+        // lands here, leaving entries at 0, which the done screen treats as
+        // "unknown" rather than "none".
         applied = 0;
       }
     }
 
-    setOutcome((o) => ({ ...o, applied, chosen: chosen.length, failed }));
+    setOutcome((o) => ({ ...o, applied, chosen: chosen.length, failed, entries }));
     setStage("done");
   }
 
@@ -563,7 +583,9 @@ export function Setup() {
                     detail={
                       partial
                         ? "The rest were skipped — add them from Filtering → Lists."
-                        : "Downloading now — counts appear once the first fetch lands."
+                        : outcome.entries > 0
+                          ? `${outcome.entries.toLocaleString()} domains compiled and enforcing.`
+                          : "Downloading now — counts appear once the first fetch lands."
                     }
                   />
                 )}

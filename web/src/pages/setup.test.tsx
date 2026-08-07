@@ -190,6 +190,55 @@ test("finishing creates the checked lists and assigns them to the default group"
   expect(screen.getByText(`${DEFAULT_CHOSEN} blocklists added`)).toBeInTheDocument();
 });
 
+// PUT /groups/{id}/lists refreshes filters synchronously (unlike POST
+// /filters/lists, which backgrounds it), so by the time the wizard reaches
+// the done screen the lists are already fetched, parsed and compiled.
+// Promising that counts "appear once the first fetch lands" describes a
+// wait that has already happened — the real number is readable.
+test("the done screen reports the compiled entry count, not a pending download", async () => {
+  const user = userEvent.setup();
+  mockAccountCreation();
+  server.use(
+    http.post("/api/v1/filters/lists", () => HttpResponse.json({ id: 1 }, { status: 201 })),
+    http.put("/api/v1/groups/:id/lists", () => new HttpResponse(null, { status: 204 })),
+    http.get("/api/v1/filters/lists", () =>
+      HttpResponse.json([
+        { id: 1, entry_count: 99559 },
+        { id: 2, entry_count: 218349 },
+        { id: 3, entry_count: 48000 },
+      ]),
+    ),
+  );
+
+  renderWithProviders(<Setup />);
+  await fillAccountForm(user);
+  await onListsStep();
+  await user.click(finishButton());
+
+  expect(await screen.findByText(/365,908 domains compiled and enforcing/i)).toBeInTheDocument();
+  expect(screen.queryByText(/counts appear once the first fetch lands/i)).not.toBeInTheDocument();
+});
+
+// If that read fails the wizard must not print a confident zero — it does
+// not know the count, which is a different thing from knowing it is none.
+test("an unreadable count falls back to describing the fetch, not to zero", async () => {
+  const user = userEvent.setup();
+  mockAccountCreation();
+  server.use(
+    http.post("/api/v1/filters/lists", () => HttpResponse.json({ id: 1 }, { status: 201 })),
+    http.put("/api/v1/groups/:id/lists", () => new HttpResponse(null, { status: 204 })),
+    http.get("/api/v1/filters/lists", () => HttpResponse.json({ error: "boom" }, { status: 500 })),
+  );
+
+  renderWithProviders(<Setup />);
+  await fillAccountForm(user);
+  await onListsStep();
+  await user.click(finishButton());
+
+  expect(await screen.findByRole("heading", { name: /dnsaur is ready/i })).toBeInTheDocument();
+  expect(screen.queryByText(/0 domains compiled/i)).not.toBeInTheDocument();
+});
+
 // Regression: hagezi's list lives under `wildcard/`, not `hosts/`. The
 // `hosts/pro.txt` this once shipped 404s, so every fresh install subscribed
 // to a list that could never load — and the wizard reported success.
