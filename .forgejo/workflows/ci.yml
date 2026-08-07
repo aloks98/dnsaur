@@ -26,7 +26,7 @@ jobs:
       # restore-keys is what stops that being expensive. On a miss it falls
       # back to the newest previous store, and pnpm then fetches only the
       # packages that actually changed instead of the whole tree.
-      - uses: https://code.forgejo.org/actions/cache@v4
+      - uses: actions/cache@v4
         with:
           path: ${{ steps.pnpm-store.outputs.path }}
           key: pnpm-store-${{ hashFiles('web/pnpm-lock.yaml') }}
@@ -115,7 +115,7 @@ jobs:
       - name: Resolve pnpm store
         id: pnpm-store
         run: echo "path=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
-      - uses: https://code.forgejo.org/actions/cache@v4
+      - uses: actions/cache@v4
         with:
           path: ${{ steps.pnpm-store.outputs.path }}
           key: pnpm-store-${{ hashFiles('web/pnpm-lock.yaml') }}
@@ -141,9 +141,13 @@ jobs:
         working-directory: web
         run: |
           echo "version=$(node -p "require('@playwright/test/package.json').version")" >> "$GITHUB_OUTPUT"
-      # Forgejo's mirror, same host as the artifact actions above — the
-      # upstream v4 has the same refuses-to-run-off-github.com guard.
-      - uses: https://code.forgejo.org/actions/cache@v4
+      # Bare, like checkout and setup-node — it resolves to the instance's
+      # own actions/cache mirror. The artifact steps need an explicit URL
+      # for a different reason: those point at forgejo/upload-artifact, a
+      # *fork* under another owner, so a bare actions/upload-artifact would
+      # resolve to the upstream one and hit its host guard. Same repo name
+      # here, so there is nothing to redirect.
+      - uses: actions/cache@v4
         with:
           path: ~/.cache/ms-playwright
           key: ms-playwright-chromium-${{ steps.playwright.outputs.version }}
