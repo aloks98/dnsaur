@@ -13,27 +13,33 @@ jobs:
         with: { node-version: "24" }
       - name: Enable corepack
         run: corepack enable
-      # Resolved rather than hardcoded: the store path carries a version
-      # suffix (…/store/v11 today) that moves with pnpm majors, so a literal
-      # path would silently start caching nothing after an upgrade.
-      - name: Resolve pnpm store
-        id: pnpm-store
-        run: echo "path=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
-      # The lockfile hash *is* the right key here, unlike the Playwright
-      # cache below: the store holds exactly the resolved dependency set, so
-      # a changed lockfile genuinely means different contents.
+      # A fixed path passed to install, rather than asking pnpm where its
+      # store is and feeding that to the cache.
       #
-      # restore-keys is what stops that being expensive. On a miss it falls
-      # back to the newest previous store, and pnpm then fetches only the
-      # packages that actually changed instead of the whole tree.
+      # That indirection is what broke the build: the resolve step was the
+      # first pnpm invocation in the job, so corepack was still fetching the
+      # pinned pnpm at that moment. Anything it printed — or a non-zero exit
+      # — left the command substitution empty, while `echo` still exited 0.
+      # The step went green having written `path=`, and the cache action
+      # then failed with "Input required and not supplied: path".
+      #
+      # A literal both steps agree on has nothing to resolve, nothing to run
+      # early, and no way to end up empty. It also sidesteps the version
+      # suffix (…/store/v11) that made hardcoding pnpm's *default* unwise.
+      #
+      # The lockfile hash is the right key here, unlike the Playwright cache
+      # below: the store holds exactly the resolved dependency set, so a
+      # changed lockfile genuinely means different contents. restore-keys is
+      # what stops that being expensive — on a miss it falls back to the
+      # newest previous store and pnpm fetches only what actually changed.
       - uses: actions/cache@v4
         with:
-          path: ${{ steps.pnpm-store.outputs.path }}
+          path: ~/.pnpm-store
           key: pnpm-store-${{ hashFiles('web/pnpm-lock.yaml') }}
           restore-keys: pnpm-store-
       - name: Install
         working-directory: web
-        run: pnpm install --frozen-lockfile
+        run: pnpm install --frozen-lockfile --store-dir ~/.pnpm-store
       - name: Lint
         working-directory: web
         run: pnpm lint
@@ -111,18 +117,15 @@ jobs:
         run: corepack enable
       # Same store, same key as the web job — so whichever of the two runs
       # first populates it and the other gets a hit. See there for why the
-      # path is resolved and why restore-keys matters.
-      - name: Resolve pnpm store
-        id: pnpm-store
-        run: echo "path=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
+      # path is a literal rather than read back from pnpm.
       - uses: actions/cache@v4
         with:
-          path: ${{ steps.pnpm-store.outputs.path }}
+          path: ~/.pnpm-store
           key: pnpm-store-${{ hashFiles('web/pnpm-lock.yaml') }}
           restore-keys: pnpm-store-
       - name: Install
         working-directory: web
-        run: pnpm install --frozen-lockfile
+        run: pnpm install --frozen-lockfile --store-dir ~/.pnpm-store
       - uses: https://code.forgejo.org/forgejo/download-artifact@v4
         with:
           name: web-dist
@@ -140,7 +143,13 @@ jobs:
         id: playwright
         working-directory: web
         run: |
-          echo "version=$(node -p "require('@playwright/test/package.json').version")" >> "$GITHUB_OUTPUT"
+          # Checked rather than interpolated blind. An empty value here does
+          # not error the way an empty `path` does — it yields a valid but
+          # constant key that silently never invalidates on a Playwright
+          # upgrade, which is worse than a red step.
+          version="$(node -p "require('@playwright/test/package.json').version")"
+          [ -n "$version" ] || { echo "could not resolve the Playwright version" >&2; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
       # Bare, like checkout and setup-node — it resolves to the instance's
       # own actions/cache mirror. The artifact steps need an explicit URL
       # for a different reason: those point at forgejo/upload-artifact, a
