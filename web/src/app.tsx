@@ -13,6 +13,7 @@ import { GroupsClientsTab } from "./pages/filtering/groups-clients";
 import { ListsTab } from "./pages/filtering/lists";
 import { RulesTab } from "./pages/filtering/rules";
 import { Login } from "./pages/login";
+import { NotFound } from "./pages/not-found";
 import { QueryLog } from "./pages/queries";
 import { SettingsPage } from "./pages/settings";
 import { Setup } from "./pages/setup";
@@ -86,7 +87,11 @@ export function App() {
               <Route path="dns" element={<LocalDns />} />
               <Route path="settings" element={<SettingsPage />} />
               <Route path="account" element={<Account />} />
-              <Route path="*" element={<Navigate to="/" replace />} />
+              {/* A real screen, not a redirect. Silently rewriting an
+                  unknown URL to `/` meant a broken link and a working one
+                  looked identical — the page you asked for never existed and
+                  nothing said so. */}
+              <Route path="*" element={<NotFound />} />
             </Route>
           </Routes>
         )}

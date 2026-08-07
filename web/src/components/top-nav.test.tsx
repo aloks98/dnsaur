@@ -195,6 +195,24 @@ test("a deep Filtering route lights its group and its own tab", async () => {
   );
 });
 
+// An unknown path renders pages/not-found.tsx rather than redirecting to the
+// dashboard. That makes "no group is active" a state the chrome now has to
+// hold, instead of a single frame on the way to `/`.
+test("an unknown route lights no group and drops the second row entirely", async () => {
+  renderTopNav({ route: "/nope/not-a-page" });
+
+  for (const group of ["Monitor", "Filtering", "Local DNS", "System"]) {
+    expect(screen.getByRole("button", { name: group })).toHaveAttribute("data-active", "false");
+  }
+
+  // Row 2 is gone, not merely empty: every group's <nav> is absent, while
+  // row 1's own navigation is untouched and still reachable.
+  for (const group of ["Monitor", "Filtering", "Local DNS", "System"]) {
+    expect(screen.queryByRole("navigation", { name: group })).not.toBeInTheDocument();
+  }
+  expect(screen.getByRole("navigation", { name: "Primary" })).toBeInTheDocument();
+});
+
 test("the redirecting /filtering index still lights the Filtering group", async () => {
   // The redirect to /filtering/lists lands a tick later; the chrome must not
   // blink back to Monitor in between.

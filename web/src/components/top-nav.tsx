@@ -113,7 +113,7 @@ export function TopNav({ onOpenCommandPalette }: TopNavProps) {
 
         <nav aria-label="Primary" className="dnsaur-scroll-x flex min-w-0 flex-1 items-stretch">
           {NAV_GROUPS.map((group) => (
-            <NavGroupMenu key={group.id} group={group} active={group.id === activeGroup.id} />
+            <NavGroupMenu key={group.id} group={group} active={group.id === activeGroup?.id} />
           ))}
         </nav>
 
@@ -151,42 +151,51 @@ export function TopNav({ onOpenCommandPalette }: TopNavProps) {
         </div>
       </div>
 
-      {/* ---- Row 2: the active group's pages ---------------------------- */}
-      <div className="flex h-10 items-stretch border-b border-border bg-card">
-        <nav aria-label={activeGroup.label} className="dnsaur-scroll-x flex min-w-0 items-stretch">
-          {activeGroup.items.map((item) => (
-            <NavLink
-              key={item.to}
-              to={item.to}
-              end={item.end}
-              className={cn(CELL, CELL_QUIET, isNavItemActive(pathname, item) && CELL_ACTIVE)}
-            >
-              {item.label}
-            </NavLink>
-          ))}
-        </nav>
+      {/* ---- Row 2: the active group's pages ----------------------------
+          Omitted entirely when the path is in no group (the not-found
+          screen). A row of tabs there would offer a section the current page
+          does not belong to, and an empty strip would just be a stray
+          hairline under the bar. */}
+      {activeGroup && (
+        <div className="flex h-10 items-stretch border-b border-border bg-card">
+          <nav
+            aria-label={activeGroup.label}
+            className="dnsaur-scroll-x flex min-w-0 items-stretch"
+          >
+            {activeGroup.items.map((item) => (
+              <NavLink
+                key={item.to}
+                to={item.to}
+                end={item.end}
+                className={cn(CELL, CELL_QUIET, isNavItemActive(pathname, item) && CELL_ACTIVE)}
+              >
+                {item.label}
+              </NavLink>
+            ))}
+          </nav>
 
-        {onDashboard && (
-          <div className="ml-auto flex shrink-0 items-stretch">
-            <WindowCells />
-            {/* Row 2's filled cell, and the dashboard's one call to action:
+          {onDashboard && (
+            <div className="ml-auto flex shrink-0 items-stretch">
+              <WindowCells />
+              {/* Row 2's filled cell, and the dashboard's one call to action:
                 the numbers above are a summary, the log is where you
                 actually go to look. */}
-            <NavLink
-              to="/queries"
-              className={cn(
-                CELL,
-                "border-l border-l-border bg-primary font-semibold text-primary-foreground",
-                "hover:bg-primary/90",
-              )}
-            >
-              View query log <span aria-hidden="true">→</span>
-            </NavLink>
-          </div>
-        )}
+              <NavLink
+                to="/queries"
+                className={cn(
+                  CELL,
+                  "border-l border-l-border bg-primary font-semibold text-primary-foreground",
+                  "hover:bg-primary/90",
+                )}
+              >
+                View query log <span aria-hidden="true">→</span>
+              </NavLink>
+            </div>
+          )}
 
-        {onQueryLog && <QueryLogCells />}
-      </div>
+          {onQueryLog && <QueryLogCells />}
+        </div>
+      )}
     </header>
   );
 }
