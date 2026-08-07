@@ -623,10 +623,23 @@ export function ListsTab() {
                 ? "A list is enabled but blocking nothing"
                 : `${idle.length} of ${all.length} lists are enabled but blocking nothing`}
             </AlertTitle>
+            {/* One per line, name first. Joined into a sentence these ran
+                together into an unreadable paragraph: three names, three
+                parenthesised errors, and no structure to scan. The reason a
+                list is broken is the actionable part, so it gets its own
+                line rather than a bracket — and the trailing explanation of
+                why the two failure kinds differ is already said, better, by
+                each row's own status line. */}
             <AlertDescription>
-              {idle.map((l) => `${l.name} (${l.last_error || l.last_status})`).join(", ")}. A count
-              alone would read as &ldquo;0&rdquo; for each — a failed download and a file the parser
-              rejected need different fixes.
+              <ul className="flex flex-col gap-1">
+                {idle.map((l) => (
+                  <li key={l.id} className="text-pretty">
+                    <span className="font-medium text-foreground">{l.name}</span>
+                    {" — "}
+                    {l.last_error || l.last_status}
+                  </li>
+                ))}
+              </ul>
             </AlertDescription>
           </Alert>
         </div>
