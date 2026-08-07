@@ -13,6 +13,24 @@ jobs:
         with: { node-version: "24" }
       - name: Enable corepack
         run: corepack enable
+      # Resolved rather than hardcoded: the store path carries a version
+      # suffix (…/store/v11 today) that moves with pnpm majors, so a literal
+      # path would silently start caching nothing after an upgrade.
+      - name: Resolve pnpm store
+        id: pnpm-store
+        run: echo "path=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
+      # The lockfile hash *is* the right key here, unlike the Playwright
+      # cache below: the store holds exactly the resolved dependency set, so
+      # a changed lockfile genuinely means different contents.
+      #
+      # restore-keys is what stops that being expensive. On a miss it falls
+      # back to the newest previous store, and pnpm then fetches only the
+      # packages that actually changed instead of the whole tree.
+      - uses: https://code.forgejo.org/actions/cache@v4
+        with:
+          path: ${{ steps.pnpm-store.outputs.path }}
+          key: pnpm-store-${{ hashFiles('web/pnpm-lock.yaml') }}
+          restore-keys: pnpm-store-
       - name: Install
         working-directory: web
         run: pnpm install --frozen-lockfile
@@ -91,6 +109,17 @@ jobs:
         with: { node-version: "24" }
       - name: Enable corepack
         run: corepack enable
+      # Same store, same key as the web job — so whichever of the two runs
+      # first populates it and the other gets a hit. See there for why the
+      # path is resolved and why restore-keys matters.
+      - name: Resolve pnpm store
+        id: pnpm-store
+        run: echo "path=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
+      - uses: https://code.forgejo.org/actions/cache@v4
+        with:
+          path: ${{ steps.pnpm-store.outputs.path }}
+          key: pnpm-store-${{ hashFiles('web/pnpm-lock.yaml') }}
+          restore-keys: pnpm-store-
       - name: Install
         working-directory: web
         run: pnpm install --frozen-lockfile
