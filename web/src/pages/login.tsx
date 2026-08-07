@@ -187,10 +187,7 @@ export function Login() {
           }
           const message =
             err instanceof ApiError && err.status === 401
-              ? // Named as the pair it is. The server checks both together
-                // and will not say which half failed, so a message blaming
-                // "username or password" invites re-typing the wrong one.
-                "That username and password don't match. Both are checked together, so either one could be wrong."
+              ? "Username or password is wrong."
               : err instanceof ApiError
                 ? err.message
                 : "Couldn't log in — try again.";

@@ -32,9 +32,7 @@ test("bad credentials show an inline error, a toast, and keep the user on the cr
   renderWithProviders(<Login />);
   await fillCredentials(user, "admin", "wrongpassword");
 
-  // Named as the pair the server actually checks. It will not say which half
-  // was wrong, so the message must not imply it did.
-  expect(await screen.findByText(/username and password don't match/i)).toBeInTheDocument();
+  expect(await screen.findByText(/username or password is wrong/i)).toBeInTheDocument();
   // Still on the credentials step.
   expect(screen.getByLabelText(/^username$/i)).toBeInTheDocument();
   // Password is cleared after a bad-credentials failure.
