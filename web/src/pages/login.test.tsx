@@ -32,7 +32,9 @@ test("bad credentials show an inline error, a toast, and keep the user on the cr
   renderWithProviders(<Login />);
   await fillCredentials(user, "admin", "wrongpassword");
 
-  expect(await screen.findByText(/invalid username or password/i)).toBeInTheDocument();
+  // Named as the pair the server actually checks. It will not say which half
+  // was wrong, so the message must not imply it did.
+  expect(await screen.findByText(/username and password don't match/i)).toBeInTheDocument();
   // Still on the credentials step.
   expect(screen.getByLabelText(/^username$/i)).toBeInTheDocument();
   // Password is cleared after a bad-credentials failure.
@@ -86,7 +88,7 @@ test("TOTP: a 428 on the first submit reveals a verification-code step, and resu
   renderWithProviders(<Login />);
   await fillCredentials(user);
 
-  const otpInput = await screen.findByLabelText(/verification code/i);
+  const otpInput = await screen.findByLabelText(/6-digit code/i);
   expect(screen.queryByLabelText(/^password$/i)).not.toBeInTheDocument();
 
   await user.type(otpInput, "123456");
@@ -124,19 +126,19 @@ test("TOTP: a rejected code (401) keeps the user on the code step with the passw
   renderWithProviders(<Login />);
   await fillCredentials(user);
 
-  const otpInput = await screen.findByLabelText(/verification code/i);
+  const otpInput = await screen.findByLabelText(/6-digit code/i);
   await user.type(otpInput, "000000");
   await user.click(screen.getByRole("button", { name: /verify/i }));
 
-  expect(await screen.findByText(/invalid verification code/i)).toBeInTheDocument();
+  expect(await screen.findByText(/that code didn't match/i)).toBeInTheDocument();
   // Still on the code step, not bounced back to credentials.
-  expect(screen.getByLabelText(/verification code/i)).toBeInTheDocument();
+  expect(screen.getByLabelText(/6-digit code/i)).toBeInTheDocument();
   expect(screen.queryByLabelText(/^password$/i)).not.toBeInTheDocument();
   expect(errorSpy).toHaveBeenCalledWith("Invalid verification code — try again.");
 
   // And the password survived: retrying the code re-sends it, so the user
   // never has to retype anything but the code itself.
-  await user.type(screen.getByLabelText(/verification code/i), "123456");
+  await user.type(screen.getByLabelText(/6-digit code/i), "123456");
   await user.click(screen.getByRole("button", { name: /verify/i }));
 
   await waitFor(() => expect(bodies).toHaveLength(3));

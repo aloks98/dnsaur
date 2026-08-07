@@ -16,16 +16,48 @@ function mockRecords(records: LocalRecord[]) {
   server.use(http.get("/api/v1/records", () => HttpResponse.json(records)));
 }
 
-test("renders the records table with name, type badge, value, and ttl", async () => {
+/** The rows are a CSS grid, not a semantic table, so scope by the slot the
+ * page marks them with — several of the strings under test ("A", "300")
+ * also appear in the filter select and the form row above. */
+function rows(): HTMLElement[] {
+  return Array.from(document.querySelectorAll<HTMLElement>('[data-slot="record-row"]'));
+}
+
+/** The add/edit row is always on screen — there is no dialog to open. */
+function nameField() {
+  return screen.getByLabelText(/record name/i);
+}
+function valueField(re: RegExp) {
+  return screen.getByLabelText(re);
+}
+function submit(name: RegExp) {
+  return screen.getByRole("button", { name });
+}
+
+test("renders a row per record with name, type badge, value, and ttl", async () => {
   mockRecords([record()]);
 
   renderWithProviders(<LocalDns />);
+  await screen.findByText("nas.home.lan");
 
-  const table = await screen.findByRole("table");
-  expect(within(table).getByText("nas.home.lan")).toBeInTheDocument();
-  expect(within(table).getByText("A")).toBeInTheDocument();
-  expect(within(table).getByText("192.168.1.50")).toBeInTheDocument();
-  expect(within(table).getByText("300")).toBeInTheDocument();
+  const [row] = rows();
+  expect(within(row).getByText("nas.home.lan")).toBeInTheDocument();
+  expect(within(row).getByText("A")).toBeInTheDocument();
+  expect(within(row).getByText("192.168.1.50")).toBeInTheDocument();
+  expect(within(row).getByText("300")).toBeInTheDocument();
+});
+
+// The `*.` prefix is the difference between one name and every subdomain
+// under it, and it is two characters wide in a mono string. It is marked up
+// separately so it can be picked out; that must survive.
+test("a wildcard name renders its prefix as its own element", async () => {
+  mockRecords([record({ name: "*.iot.home.lan" })]);
+
+  renderWithProviders(<LocalDns />);
+  await screen.findByText("iot.home.lan");
+
+  const [row] = rows();
+  expect(within(row).getByText("*.")).toBeInTheDocument();
 });
 
 test("an A record with an IPv6 value shows an inline error and never posts", async () => {
@@ -42,19 +74,15 @@ test("an A record with an IPv6 value shows an inline error and never posts", asy
   renderWithProviders(<LocalDns />);
   await screen.findByText("nas.home.lan");
 
-  await user.click(screen.getByRole("button", { name: /^add record$/i }));
-  const dialog = await screen.findByRole("dialog");
-
   // Type defaults to A — leave it as-is and supply an IPv6 value.
-  await user.type(within(dialog).getByLabelText(/^name$/i), "printer.home.lan");
-  await user.type(within(dialog).getByLabelText(/^ipv4 address$/i), "2001:db8::1");
-  await user.click(within(dialog).getByRole("button", { name: /^add record$/i }));
+  await user.type(nameField(), "printer.home.lan");
+  await user.type(valueField(/value.*ipv4/i), "2001:db8::1");
+  await user.click(submit(/^add$/i));
 
-  expect(await within(dialog).findByText(/enter a valid ipv4 address/i)).toBeInTheDocument();
+  expect(await screen.findByText(/enter a valid ipv4 address/i)).toBeInTheDocument();
   // Give any accidental async POST a chance to land before asserting it didn't.
   await new Promise((resolve) => setTimeout(resolve, 30));
   expect(posted).toBe(false);
-  expect(screen.getByRole("dialog")).toBeInTheDocument();
 });
 
 // The Value rule is chosen by the Type select beside it, so a *shown*
@@ -63,7 +91,7 @@ test("an A record with an IPv6 value shows an inline error and never posts", asy
 // as rejected until they submit again. Regression-worthy because the
 // re-check hangs off a read of the form's error state, and the obvious
 // read (form.formState.errors) is a render-time snapshot that can lag
-// behind inside an event handler; see the Select's onValueChange.
+// behind inside an event handler; see the type select's onChange.
 test("switching the type clears a value error the new type accepts", async () => {
   const user = userEvent.setup();
   mockRecords([record()]);
@@ -71,19 +99,15 @@ test("switching the type clears a value error the new type accepts", async () =>
   renderWithProviders(<LocalDns />);
   await screen.findByText("nas.home.lan");
 
-  await user.click(screen.getByRole("button", { name: /^add record$/i }));
-  const dialog = await screen.findByRole("dialog");
+  await user.type(nameField(), "v6.home.lan");
+  await user.type(valueField(/value.*ipv4/i), "2001:db8::1");
+  await user.click(submit(/^add$/i));
+  expect(await screen.findByText(/enter a valid ipv4 address/i)).toBeInTheDocument();
 
-  await user.type(within(dialog).getByLabelText(/^name$/i), "v6.home.lan");
-  await user.type(within(dialog).getByLabelText(/^ipv4 address$/i), "2001:db8::1");
-  await user.click(within(dialog).getByRole("button", { name: /^add record$/i }));
-  expect(await within(dialog).findByText(/enter a valid ipv4 address/i)).toBeInTheDocument();
-
-  await user.click(within(dialog).getByRole("combobox", { name: /record type/i }));
-  await user.click(await screen.findByRole("option", { name: /^aaaa$/i }));
+  await user.selectOptions(screen.getByLabelText(/^record type$/i), "AAAA");
 
   await waitFor(() =>
-    expect(within(dialog).queryByText(/enter a valid ipv4 address/i)).not.toBeInTheDocument(),
+    expect(screen.queryByText(/enter a valid ipv4 address/i)).not.toBeInTheDocument(),
   );
 });
 
@@ -98,14 +122,12 @@ test("an empty form reports the name, value and ttl errors at once", async () =>
   renderWithProviders(<LocalDns />);
   await screen.findByText("nas.home.lan");
 
-  await user.click(screen.getByRole("button", { name: /^add record$/i }));
-  const dialog = await screen.findByRole("dialog");
-  await user.clear(within(dialog).getByLabelText(/^ttl/i));
-  await user.click(within(dialog).getByRole("button", { name: /^add record$/i }));
+  await user.clear(screen.getByLabelText(/ttl in seconds/i));
+  await user.click(submit(/^add$/i));
 
-  expect(await within(dialog).findByText(/enter a domain/i)).toBeInTheDocument();
-  expect(within(dialog).getByText(/enter a valid ipv4 address/i)).toBeInTheDocument();
-  expect(within(dialog).getByText(/ttl must be a whole number/i)).toBeInTheDocument();
+  expect(await screen.findByText(/enter a domain/i)).toBeInTheDocument();
+  expect(screen.getByText(/enter a valid ipv4 address/i)).toBeInTheDocument();
+  expect(screen.getByText(/ttl must be a whole number/i)).toBeInTheDocument();
 });
 
 test("a valid add posts /records (wildcard name included) and the new row appears", async () => {
@@ -125,12 +147,9 @@ test("a valid add posts /records (wildcard name included) and the new row appear
   renderWithProviders(<LocalDns />);
   await screen.findByText("nas.home.lan");
 
-  await user.click(screen.getByRole("button", { name: /^add record$/i }));
-  const dialog = await screen.findByRole("dialog");
-
-  await user.type(within(dialog).getByLabelText(/^name$/i), "*.iot.home.lan");
-  await user.type(within(dialog).getByLabelText(/^ipv4 address$/i), "192.168.1.99");
-  await user.click(within(dialog).getByRole("button", { name: /^add record$/i }));
+  await user.type(nameField(), "*.iot.home.lan");
+  await user.type(valueField(/value.*ipv4/i), "192.168.1.99");
+  await user.click(submit(/^add$/i));
 
   await waitFor(() =>
     expect(requestBody).toEqual({
@@ -140,11 +159,26 @@ test("a valid add posts /records (wildcard name included) and the new row appear
       ttl: 300,
     }),
   );
-  expect(await screen.findByText("*.iot.home.lan")).toBeInTheDocument();
-  // Sheet closes on success (its base-ui exit animation lingers in the DOM
-  // for a frame or two even under jsdom, so this needs to be a waitFor
-  // rather than a synchronous assertion).
-  await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+  expect(await screen.findByText("iot.home.lan")).toBeInTheDocument();
+});
+
+// Adding one record is very often adding four, so the row has to come back
+// empty rather than leaving the previous name to be manually cleared.
+test("a successful add empties the form row for the next one", async () => {
+  const user = userEvent.setup();
+  mockRecords([record()]);
+  server.use(http.post("/api/v1/records", () => HttpResponse.json({ id: 2 }, { status: 201 })));
+
+  renderWithProviders(<LocalDns />);
+  await screen.findByText("nas.home.lan");
+
+  await user.type(nameField(), "printer.home.lan");
+  await user.type(valueField(/value.*ipv4/i), "192.168.1.31");
+  await user.click(submit(/^add$/i));
+
+  await waitFor(() => expect(nameField()).toHaveValue(""));
+  expect(valueField(/value.*ipv4/i)).toHaveValue("");
+  expect(screen.getByLabelText(/ttl in seconds/i)).toHaveValue("300");
 });
 
 // Regression, mirroring pages/filtering/groups-clients.test.tsx's IPv6
@@ -166,12 +200,9 @@ test("a name with mixed case and a trailing dot is accepted and posts /records",
   renderWithProviders(<LocalDns />);
   await screen.findByText("nas.home.lan");
 
-  await user.click(screen.getByRole("button", { name: /^add record$/i }));
-  const dialog = await screen.findByRole("dialog");
-
-  await user.type(within(dialog).getByLabelText(/^name$/i), "NAS.Home.LAN.");
-  await user.type(within(dialog).getByLabelText(/^ipv4 address$/i), "192.168.1.50");
-  await user.click(within(dialog).getByRole("button", { name: /^add record$/i }));
+  await user.type(nameField(), "NAS.Home.LAN.");
+  await user.type(valueField(/value.*ipv4/i), "192.168.1.50");
+  await user.click(submit(/^add$/i));
 
   await waitFor(() =>
     expect(requestBody).toEqual({
@@ -183,23 +214,24 @@ test("a name with mixed case and a trailing dot is accepted and posts /records",
   );
 });
 
-test("switching the type select updates the value field's label and placeholder", async () => {
+// One form row serves four record types, so the type select has to re-label
+// the value column, its placeholder and its hint together. If they drift,
+// the row silently asks for one thing and validates another.
+test("switching the type re-labels the value column, placeholder and hint", async () => {
   const user = userEvent.setup();
   mockRecords([record()]);
 
   renderWithProviders(<LocalDns />);
   await screen.findByText("nas.home.lan");
 
-  await user.click(screen.getByRole("button", { name: /^add record$/i }));
-  const dialog = await screen.findByRole("dialog");
+  expect(valueField(/value.*ipv4/i)).toBeInTheDocument();
+  expect(screen.getByText(/dotted-quad ipv4/i)).toBeInTheDocument();
 
-  expect(within(dialog).getByLabelText(/^ipv4 address$/i)).toBeInTheDocument();
+  await user.selectOptions(screen.getByLabelText(/^record type$/i), "AAAA");
 
-  await user.click(within(dialog).getByRole("combobox", { name: /record type/i }));
-  await user.click(await screen.findByRole("option", { name: /^aaaa$/i }));
-
-  expect(within(dialog).getByLabelText(/^ipv6 address$/i)).toBeInTheDocument();
-  expect(within(dialog).getByPlaceholderText(/2001:db8::1/i)).toBeInTheDocument();
+  expect(valueField(/value.*ipv6/i)).toBeInTheDocument();
+  expect(screen.getByPlaceholderText("fd00::1")).toBeInTheDocument();
+  expect(screen.getByText(/ipv4-mapped form/i)).toBeInTheDocument();
 });
 
 // Regression: RFC 4291 §2.2 defines a dotted-quad *tail* form for IPv6 —
@@ -222,14 +254,10 @@ test("an embedded-IPv4 (NAT64) AAAA value is accepted and posts /records", async
   renderWithProviders(<LocalDns />);
   await screen.findByText("nas.home.lan");
 
-  await user.click(screen.getByRole("button", { name: /^add record$/i }));
-  const dialog = await screen.findByRole("dialog");
-
-  await user.type(within(dialog).getByLabelText(/^name$/i), "nat64.home.lan");
-  await user.click(within(dialog).getByRole("combobox", { name: /record type/i }));
-  await user.click(await screen.findByRole("option", { name: /^aaaa$/i }));
-  await user.type(within(dialog).getByLabelText(/^ipv6 address$/i), "64:ff9b::192.0.2.1");
-  await user.click(within(dialog).getByRole("button", { name: /^add record$/i }));
+  await user.type(nameField(), "nat64.home.lan");
+  await user.selectOptions(screen.getByLabelText(/^record type$/i), "AAAA");
+  await user.type(valueField(/value.*ipv6/i), "64:ff9b::192.0.2.1");
+  await user.click(submit(/^add$/i));
 
   await waitFor(() =>
     expect(requestBody).toEqual({
@@ -262,25 +290,21 @@ test("an IPv4-mapped AAAA value posts, and the server's rejection surfaces as a 
   renderWithProviders(<LocalDns />);
   await screen.findByText("nas.home.lan");
 
-  await user.click(screen.getByRole("button", { name: /^add record$/i }));
-  const dialog = await screen.findByRole("dialog");
-
-  await user.type(within(dialog).getByLabelText(/^name$/i), "mapped.home.lan");
-  await user.click(within(dialog).getByRole("combobox", { name: /record type/i }));
-  await user.click(await screen.findByRole("option", { name: /^aaaa$/i }));
-  await user.type(within(dialog).getByLabelText(/^ipv6 address$/i), "::ffff:192.168.1.1");
-  await user.click(within(dialog).getByRole("button", { name: /^add record$/i }));
+  await user.type(nameField(), "mapped.home.lan");
+  await user.selectOptions(screen.getByLabelText(/^record type$/i), "AAAA");
+  await user.type(valueField(/value.*ipv6/i), "::ffff:192.168.1.1");
+  await user.click(submit(/^add$/i));
 
   await waitFor(() => expect(posted).toBe(true));
   await waitFor(() =>
     expect(errorSpy).toHaveBeenCalledWith(expect.stringMatching(/ipv6 address/i)),
   );
-  // The sheet stays open on a failed submission (no onSuccess close), so
-  // the admin can see the error and correct the value in place.
-  expect(screen.getByRole("dialog")).toBeInTheDocument();
+  // The typed value survives a rejected submit, so it can be corrected in
+  // place rather than retyped.
+  expect(valueField(/value.*ipv6/i)).toHaveValue("::ffff:192.168.1.1");
 });
 
-test("editing a record PUTs /records/{id} with the updated fields", async () => {
+test("editing seeds the form row and PUTs /records/{id} with the updated fields", async () => {
   const user = userEvent.setup();
   let requestUrl: string | undefined;
   let requestBody: unknown;
@@ -297,11 +321,13 @@ test("editing a record PUTs /records/{id} with the updated fields", async () => 
   await screen.findByText("printer.home.lan");
 
   await user.click(screen.getByRole("button", { name: /^edit printer\.home\.lan$/i }));
-  const dialog = await screen.findByRole("dialog");
-  const valueInput = within(dialog).getByLabelText(/^ipv4 address$/i);
+
+  // The row is now bound to that record rather than creating a new one.
+  await waitFor(() => expect(nameField()).toHaveValue("printer.home.lan"));
+  const valueInput = valueField(/value.*ipv4/i);
   await user.clear(valueInput);
   await user.type(valueInput, "192.168.1.21");
-  await user.click(within(dialog).getByRole("button", { name: /^save$/i }));
+  await user.click(submit(/^save$/i));
 
   await waitFor(() =>
     expect(requestBody).toEqual({
@@ -314,13 +340,10 @@ test("editing a record PUTs /records/{id} with the updated fields", async () => 
   expect(requestUrl).toMatch(/\/api\/v1\/records\/7$/);
 });
 
-// base-ui keeps the panel mounted through its exit transition, so whatever
-// the sheet renders while it's on the way out is visible. Deriving `open`
-// from `editTarget !== null` meant closing nulled the target *and* left the
-// panel on screen, re-rendering it as the add variant: the header flipped
-// "Edit record" -> "Add record" and the button "Save" -> "Add record" on
-// every close, including right after a successful save.
-test("closing the edit sheet keeps its Edit copy through the exit transition", async () => {
+// The row is the only form on the page, so leaving it bound to a record
+// after cancelling would mean the next "add" silently overwrote that record
+// instead of creating one.
+test("cancelling an edit returns the row to adding", async () => {
   const user = userEvent.setup();
   mockRecords([record({ id: 7, name: "printer.home.lan" })]);
 
@@ -328,16 +351,45 @@ test("closing the edit sheet keeps its Edit copy through the exit transition", a
   await screen.findByText("printer.home.lan");
 
   await user.click(screen.getByRole("button", { name: /^edit printer\.home\.lan$/i }));
-  const sheet = await screen.findByRole("dialog");
-  expect(within(sheet).getByRole("heading", { name: /^edit record$/i })).toBeInTheDocument();
+  await waitFor(() => expect(submit(/^save$/i)).toBeInTheDocument());
 
-  await user.click(within(sheet).getByRole("button", { name: /^cancel$/i }));
+  await user.click(screen.getByRole("button", { name: /cancel editing/i }));
 
-  const closing = screen.getByRole("dialog");
-  expect(within(closing).getByRole("heading", { name: /^edit record$/i })).toBeInTheDocument();
-  expect(within(closing).getByRole("button", { name: /^save$/i })).toBeInTheDocument();
+  await waitFor(() => expect(submit(/^add$/i)).toBeInTheDocument());
+  expect(nameField()).toHaveValue("");
+});
 
-  await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+test("the type filter narrows the rows, and can be cleared", async () => {
+  const user = userEvent.setup();
+  mockRecords([
+    record({ id: 1, name: "nas.home.lan", type: "A" }),
+    record({ id: 2, name: "home.lan", type: "TXT", value: "v=spf1 -all" }),
+  ]);
+
+  renderWithProviders(<LocalDns />);
+  await screen.findByText("nas.home.lan");
+  expect(rows()).toHaveLength(2);
+
+  await user.selectOptions(screen.getByLabelText(/filter by record type/i), "TXT");
+  await waitFor(() => expect(rows()).toHaveLength(1));
+  expect(screen.getByText("home.lan")).toBeInTheDocument();
+
+  await user.selectOptions(screen.getByLabelText(/filter by record type/i), "");
+  await waitFor(() => expect(rows()).toHaveLength(2));
+});
+
+test("a search with no matches says so and offers to clear the filter", async () => {
+  const user = userEvent.setup();
+  mockRecords([record()]);
+
+  renderWithProviders(<LocalDns />);
+  await screen.findByText("nas.home.lan");
+
+  await user.type(screen.getByLabelText(/search records/i), "nothing-matches-this");
+
+  expect(await screen.findByText(/no records match this filter/i)).toBeInTheDocument();
+  await user.click(screen.getByRole("button", { name: /clear it/i }));
+  await waitFor(() => expect(rows()).toHaveLength(1));
 });
 
 // A background refetch failing must not destroy content that's already
@@ -345,7 +397,7 @@ test("closing the edit sheet keeps its Edit copy through the exit transition", a
 // that refetch used to swap a correct, populated table for "Couldn't load
 // local DNS records. Try refreshing the page." — with the rows sitting in
 // the cache the whole time.
-test("a failing background refetch keeps the table and offers a retry instead", async () => {
+test("a failing background refetch keeps the rows and offers a retry instead", async () => {
   const user = userEvent.setup();
   let getCount = 0;
   server.use(
@@ -369,7 +421,6 @@ test("a failing background refetch keeps the table and offers a retry instead", 
     await screen.findByText(/couldn't refresh local dns records/i, undefined, { timeout: 3000 }),
   ).toBeInTheDocument();
   expect(screen.queryByText(/couldn't load local dns records/i)).not.toBeInTheDocument();
-  expect(screen.getByRole("table")).toBeInTheDocument();
   expect(screen.getByText("printer.home.lan")).toBeInTheDocument();
   expect(screen.getByRole("button", { name: /try again/i })).toBeInTheDocument();
 });
@@ -398,13 +449,13 @@ test("deleting a record asks for confirmation, then DELETEs /records/{id}", asyn
   await waitFor(() => expect(screen.queryByText("nas.home.lan")).not.toBeInTheDocument());
 });
 
-test("an empty list shows EmptyState with an Add record action", async () => {
+test("an empty list explains what records are for, with the form row still there", async () => {
   mockRecords([]);
 
   renderWithProviders(<LocalDns />);
 
-  expect(await screen.findByText("No local DNS records yet")).toBeInTheDocument();
-  // Only one "Add record" affordance when empty — the EmptyState's own
-  // action — not a redundant second button in the header above it.
-  expect(screen.getAllByRole("button", { name: /^add record$/i })).toHaveLength(1);
+  expect(await screen.findByText(/no local records yet/i)).toBeInTheDocument();
+  // The form is the page's permanent first row, so there is nothing to
+  // reveal and no separate "Add record" call to action.
+  expect(screen.getByRole("button", { name: /^add$/i })).toBeInTheDocument();
 });
