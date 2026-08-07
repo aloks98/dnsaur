@@ -319,11 +319,13 @@ export function Setup() {
   // own LAN address, and the browser already resolved one that works.
   const resolverHost = typeof window === "undefined" ? "dnsaur" : window.location.hostname;
 
-  const COPY: Record<Stage, { eyebrow: string; title: string; footer: string; width: string }> = {
+  // The other three footers each say something an operator can act on. The
+  // welcome screen has no such line — what the artboard put there described
+  // an API endpoint, which is the app talking about itself.
+  const COPY: Record<Stage, { eyebrow: string; title: string; footer?: string; width: string }> = {
     welcome: {
       eyebrow: "First run",
       title: "Set up dnsaur",
-      footer: "This runs once. Afterwards, /setup reports that setup is complete.",
       width: "max-w-md",
     },
     admin: {
