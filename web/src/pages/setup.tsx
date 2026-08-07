@@ -360,8 +360,7 @@ export function Setup() {
           {stage === "welcome" && (
             <>
               <p className="text-sm text-pretty text-muted-foreground">
-                No admin account exists yet, so this instance is unclaimed. Three steps: create an
-                account, pick starter blocklists, then point your router at dnsaur.
+                Create an admin account, pick some blocklists, then point your router at dnsaur.
               </p>
               <Button type="button" onClick={() => setStage("admin")}>
                 Get started

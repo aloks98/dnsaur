@@ -55,7 +55,7 @@ test("opens on a welcome screen, with the account form behind it", async () => {
   const user = userEvent.setup();
   renderWithProviders(<Setup />);
 
-  expect(await screen.findByText(/this instance is unclaimed/i)).toBeInTheDocument();
+  expect(await screen.findByText(/point your router at dnsaur/i)).toBeInTheDocument();
   expect(screen.queryByLabelText(/^username$/i)).not.toBeInTheDocument();
 
   await user.click(screen.getByRole("button", { name: /get started/i }));
