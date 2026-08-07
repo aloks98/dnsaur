@@ -41,6 +41,11 @@ export const LOCAL_DNS_PATH = "/dns";
  */
 export const FILTER_LISTS_PATH = "/filtering/lists";
 
+/** Filtering › Rules. Named alongside Lists for the same reason — Groups &
+ * Clients is still on the padded layout, so this cannot yet be a prefix
+ * match on the whole section. */
+export const FILTER_RULES_PATH = "/filtering/rules";
+
 /**
  * Screens that own the whole content area rather than sitting inside the
  * shell's gutter: both are full-bleed grids of hairline-separated bands, and
@@ -52,7 +57,8 @@ export function isFullBleedRoute(pathname: string): boolean {
     pathname === DASHBOARD_PATH ||
     pathname === QUERY_LOG_PATH ||
     pathname === LOCAL_DNS_PATH ||
-    pathname === FILTER_LISTS_PATH
+    pathname === FILTER_LISTS_PATH ||
+    pathname === FILTER_RULES_PATH
   );
 }
 

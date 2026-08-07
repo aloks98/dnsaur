@@ -1,5 +1,5 @@
-import { useEffect, useState, type ReactNode } from "react";
-import { Plus, Regex, ShieldBan, ShieldCheck, Trash2, TriangleAlert } from "lucide-react";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { CircleHelp, Plus, TriangleAlert, X } from "lucide-react";
 import { toast } from "sonner";
 import { useForm, useWatch } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
@@ -18,36 +18,20 @@ import {
   AlertTitle,
   Badge,
   Button,
-  Dialog,
-  DialogClose,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-  DialogTrigger,
-  EmptyState,
+  cn,
   Form,
   FormControl,
-  FormDescription,
   FormField,
   FormItem,
-  FormLabel,
   FormMessage,
   Input,
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
+  NativeSelect,
+  NativeSelectOption,
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
   Skeleton,
   Switch,
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
   type BadgeProps,
 } from "@e412/rnui-react";
 import { ApiError } from "../../api/client";
@@ -64,33 +48,83 @@ import { StaleDataAlert } from "../../components/stale-data-alert";
 const MAX_REGEX_PATTERN_LENGTH = 512;
 
 // The default group (id 1, seeded and undeletable — see use-groups.ts) is a
-// safe first selection: it always exists, so the Select never opens on an
+// safe first selection: it always exists, so the select never opens on an
 // empty choice while groups are still loading.
 const DEFAULT_GROUP_ID = 1;
 
-// Same red/green thread as the Lists tab's block/allow badges (see
-// lists.tsx's KIND_META) — a rule's action reads the same way wherever it
-// shows up, even though this is a distinct vocabulary (rule action, not
-// list kind or query decision).
-const ACTION_META: Record<
-  Rule["action"],
-  { label: string; variant: NonNullable<BadgeProps["variant"]>; icon: typeof ShieldBan }
-> = {
-  block: { label: "Block", variant: "destructive-light", icon: ShieldBan },
-  allow: { label: "Allow", variant: "success-light", icon: ShieldCheck },
+/** Same red/green thread as the Lists tab's block/allow badges — an action
+ * reads the same way wherever it appears, even though this is a distinct
+ * vocabulary (rule action, not list kind or query decision). */
+const ACTION_VARIANT: Record<Rule["action"], NonNullable<BadgeProps["variant"]>> = {
+  block: "destructive-light",
+  allow: "primary-light",
 };
 
-// `items` maps each value to its display label — without it, SelectValue
-// renders the raw stored value ("block") instead of the option's label
-// (Task 12's finding; see settings.tsx/account.tsx for the same fix).
-const RULE_ACTION_ITEMS: Record<Rule["action"], string> = {
-  block: ACTION_META.block.label,
-  allow: ACTION_META.allow.label,
-};
+/**
+ * Evaluation order, which is the thing people get wrong about this screen.
+ *
+ * Allow beats block, literal beats regex, and every rule beats every list.
+ * The four rule stages are emphasised and the two list stages are not,
+ * because the point being made is where *these* rules sit relative to the
+ * lists on the neighbouring tab — not that six stages exist.
+ */
+const EVAL_ORDER = [
+  { label: "literal allow", rule: true },
+  { label: "regex allow", rule: true },
+  { label: "literal block", rule: true },
+  { label: "regex block", rule: true },
+  { label: "allowlists", rule: false },
+  { label: "blocklists", rule: false },
+] as const;
 
-/** The pattern's rules depend on the Regular expression switch sitting
- * below it, so the check lives at the object level (with an explicit
- * `path`) where the refinement can see both fields at once.
+/**
+ * The order, on demand.
+ *
+ * It was a permanent band across the page, which spent a full row of
+ * vertical space on something you need once and then know. Behind a
+ * control it can also afford to be numbered and to explain itself, which
+ * the inline strip could not without becoming a paragraph.
+ */
+function MatchOrderPopover() {
+  return (
+    <Popover>
+      <PopoverTrigger render={<Button type="button" size="sm" variant="outline" />}>
+        <CircleHelp />
+        Match order
+      </PopoverTrigger>
+      <PopoverContent align="end" className="w-88 p-0">
+        <p className="border-b border-border px-3 py-2.5 font-mono text-xs font-semibold tracking-widest text-muted-foreground uppercase">
+          First match wins
+        </p>
+        <ol className="flex flex-col">
+          {EVAL_ORDER.map((stage, i) => (
+            <li
+              key={stage.label}
+              className={cn(
+                "grid grid-cols-[22px_1fr] items-center gap-2.5 border-b border-border-muted px-3 py-1.5",
+                stage.rule && "bg-accent",
+              )}
+            >
+              <span className="font-mono text-xs text-muted-foreground">{i + 1}.</span>
+              <span
+                className={cn(
+                  "font-mono text-sm",
+                  stage.rule ? "font-semibold text-foreground" : "text-muted-foreground",
+                )}
+              >
+                {stage.label}
+              </span>
+            </li>
+          ))}
+        </ol>
+      </PopoverContent>
+    </Popover>
+  );
+}
+
+/** The pattern's rules depend on the regex switch beside it, so the check
+ * lives at the object level (with an explicit `path`) where the refinement
+ * can see both fields at once.
  *
  * Neither the length cap nor the compile check runs against a trimmed
  * pattern, deliberately: leading/trailing whitespace is significant inside
@@ -117,11 +151,19 @@ const addRuleSchema = z
   });
 
 type AddRuleValues = z.infer<typeof addRuleSchema>;
-
 const ADD_RULE_DEFAULTS: AddRuleValues = { action: "block", pattern: "", is_regex: false };
 
-function AddRuleDialog({ groupId, groupName }: { groupId: number; groupName: string }) {
-  const [open, setOpen] = useState(false);
+/** Header and data rows. The form row below needs a wider third column for
+ * its switch and label, so it declares its own — but the other three tracks
+ * match, which is what keeps the form visually aligned with the table. */
+const GRID = "grid grid-cols-[104px_1fr_116px_96px] items-center gap-4 px-4";
+const FORM_GRID = "grid grid-cols-[104px_1fr_220px_96px] items-center gap-4 px-4";
+
+/**
+ * The add row: one band under the header rather than a dialog, so a rule is
+ * written on the same line the existing ones are read on.
+ */
+function AddRuleRow({ groupId, onClose }: { groupId: number; onClose: () => void }) {
   const addRule = useAddRule();
   const form = useForm<AddRuleValues>({
     resolver: zodResolver(addRuleSchema),
@@ -129,10 +171,9 @@ function AddRuleDialog({ groupId, groupName }: { groupId: number; groupName: str
   });
   const isRegex = useWatch({ control: form.control, name: "is_regex" });
 
-  function onOpenChange(next: boolean) {
-    setOpen(next);
-    if (!next) form.reset(ADD_RULE_DEFAULTS);
-  }
+  useEffect(() => {
+    form.setFocus("pattern");
+  }, [form]);
 
   function onSubmit(values: AddRuleValues) {
     addRule.mutate(
@@ -140,7 +181,11 @@ function AddRuleDialog({ groupId, groupName }: { groupId: number; groupName: str
       {
         onSuccess: () => {
           toast.success("Rule added");
-          onOpenChange(false);
+          // Stays open, cleared: adding one rule is usually adding several,
+          // and the action/regex choice is normally the same for each — so
+          // only the pattern resets.
+          form.reset({ ...form.getValues(), pattern: "" });
+          form.setFocus("pattern");
         },
         onError: (err) =>
           toast.error(err instanceof ApiError ? err.message : "Couldn't add the rule"),
@@ -149,170 +194,123 @@ function AddRuleDialog({ groupId, groupName }: { groupId: number; groupName: str
   }
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogTrigger render={<Button type="button" size="sm" />}>
-        <Plus />
-        Add rule
-      </DialogTrigger>
-      <DialogContent>
-        <DialogHeader>
-          <DialogTitle>Add a rule</DialogTitle>
-          <DialogDescription>
-            Scoped to {groupName} — matched against every query name.
-          </DialogDescription>
-        </DialogHeader>
-        <Form {...form}>
-          <form
-            className="flex flex-col gap-4"
-            onSubmit={(e) => void form.handleSubmit(onSubmit)(e)}
-            noValidate
-          >
-            <FormField
-              control={form.control}
-              name="action"
-              render={({ field }) => (
-                <FormItem>
-                  <FormLabel>Action</FormLabel>
-                  <Select
-                    items={RULE_ACTION_ITEMS}
-                    value={field.value}
-                    onValueChange={field.onChange}
-                  >
-                    <SelectTrigger aria-label="Action">
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="block">Block</SelectItem>
-                      <SelectItem value="allow">Allow</SelectItem>
-                    </SelectContent>
-                  </Select>
-                </FormItem>
-              )}
-            />
+    <Form {...form}>
+      <form
+        onSubmit={(e) => void form.handleSubmit(onSubmit)(e)}
+        noValidate
+        className="shrink-0 border-b border-border bg-card shadow-[inset_3px_0_0_var(--primary)]"
+      >
+        <div className={cn(FORM_GRID, "py-2.5")}>
+          <FormField
+            control={form.control}
+            name="action"
+            render={({ field }) => (
+              <FormItem>
+                <FormControl>
+                  <NativeSelect {...field} aria-label="Rule action">
+                    <NativeSelectOption value="block">block</NativeSelectOption>
+                    <NativeSelectOption value="allow">allow</NativeSelectOption>
+                  </NativeSelect>
+                </FormControl>
+              </FormItem>
+            )}
+          />
+          <FormField
+            control={form.control}
+            name="pattern"
+            render={({ field }) => (
+              <FormItem>
+                <FormControl>
+                  <Input
+                    {...field}
+                    aria-label="Pattern"
+                    placeholder={isRegex ? "^ads?[0-9]*\\." : "doubleclick.net"}
+                    autoComplete="off"
+                    className="font-mono"
+                  />
+                </FormControl>
+              </FormItem>
+            )}
+          />
+          <FormField
+            control={form.control}
+            name="is_regex"
+            render={({ field }) => (
+              <FormItem className="flex flex-row items-center gap-2.5">
+                <FormControl>
+                  <Switch
+                    checked={field.value}
+                    onCheckedChange={(next) => {
+                      field.onChange(next);
+                      // The pattern's rules change with this switch, so a
+                      // shown error has to be re-judged against the new mode
+                      // rather than waiting for the next submit.
+                      if (form.getFieldState("pattern").invalid) void form.trigger("pattern");
+                    }}
+                    aria-label="Regular expression"
+                  />
+                </FormControl>
+                <span
+                  className={cn(
+                    "font-mono text-xs",
+                    field.value ? "text-foreground" : "text-muted-foreground",
+                  )}
+                >
+                  regular expression
+                </span>
+              </FormItem>
+            )}
+          />
+          <div className="flex items-center justify-end gap-1.5">
+            <Button type="submit" size="sm" disabled={addRule.isPending}>
+              {addRule.isPending ? "Adding…" : "Add"}
+            </Button>
+            <Button
+              type="button"
+              size="icon-sm"
+              variant="ghost"
+              aria-label="Close the add-rule row"
+              onClick={onClose}
+            >
+              <X />
+            </Button>
+          </div>
+        </div>
+
+        {/* Under the pattern field, because it describes what that field
+            will accept — and it changes with the switch. */}
+        <div className={cn(FORM_GRID, "items-start pb-2.5")}>
+          <span />
+          <span className="text-xs text-pretty text-muted-foreground">
             <FormField
               control={form.control}
               name="pattern"
-              render={({ field }) => (
-                <FormItem>
-                  <FormLabel>Pattern</FormLabel>
-                  <FormControl>
-                    <Input
-                      {...field}
-                      placeholder={isRegex ? "^ads\\..*\\.example\\.com$" : "ads.example.com"}
-                      autoComplete="off"
-                      className="font-mono"
-                    />
-                  </FormControl>
-                  <FormDescription>
-                    {isRegex
-                      ? "Compiled as a regular expression and matched against the query name."
-                      : "Matched exactly against the query name."}
-                  </FormDescription>
+              render={() =>
+                form.formState.errors.pattern ? (
                   <FormMessage />
-                </FormItem>
-              )}
-            />
-            <FormField
-              control={form.control}
-              name="is_regex"
-              render={({ field }) => (
-                <FormItem className="flex flex-row items-center justify-between gap-4 rounded-md border border-border px-3 py-2.5">
-                  <div>
-                    <FormLabel>Regular expression</FormLabel>
-                    <FormDescription>
-                      Off matches the pattern exactly, no wildcards.
-                    </FormDescription>
-                  </div>
-                  <FormControl>
-                    {/* No explicit aria-label needed — FormField wires this
-                        control's aria-labelledby to the FormLabel below,
-                        and that takes precedence over aria-label anyway. */}
-                    <Switch checked={field.value} onCheckedChange={field.onChange} />
-                  </FormControl>
-                </FormItem>
-              )}
-            />
-            <DialogFooter>
-              <DialogClose render={<Button type="button" variant="outline" />}>Cancel</DialogClose>
-              <Button type="submit" disabled={addRule.isPending}>
-                {addRule.isPending ? "Adding…" : "Add rule"}
-              </Button>
-            </DialogFooter>
-          </form>
-        </Form>
-      </DialogContent>
-    </Dialog>
-  );
-}
-
-function RulesTable({
-  rules,
-  onDeleteRequest,
-}: {
-  rules: Rule[];
-  onDeleteRequest: (rule: Rule) => void;
-}) {
-  return (
-    <Table>
-      <TableHeader>
-        <TableRow>
-          <TableHead>Action</TableHead>
-          <TableHead>Pattern</TableHead>
-          <TableHead>Match</TableHead>
-          <TableHead className="text-right">
-            <span className="sr-only">Actions</span>
-          </TableHead>
-        </TableRow>
-      </TableHeader>
-      <TableBody>
-        {rules.map((rule) => {
-          const meta = ACTION_META[rule.action];
-          const Icon = meta.icon;
-          return (
-            <TableRow key={rule.id}>
-              <TableCell>
-                <Badge variant={meta.variant}>
-                  <Icon />
-                  {meta.label}
-                </Badge>
-              </TableCell>
-              <TableCell className="max-w-96 truncate font-mono text-xs" title={rule.pattern}>
-                {rule.pattern}
-              </TableCell>
-              <TableCell>
-                {rule.is_regex ? (
-                  <Badge variant="outline">
-                    <Regex />
-                    Regex
-                  </Badge>
                 ) : (
-                  <Badge variant="secondary">Exact</Badge>
-                )}
-              </TableCell>
-              <TableCell className="text-right">
-                <Button
-                  type="button"
-                  size="icon-sm"
-                  variant="ghost"
-                  aria-label={`Delete rule ${rule.pattern}`}
-                  onClick={() => onDeleteRequest(rule)}
-                >
-                  <Trash2 />
-                </Button>
-              </TableCell>
-            </TableRow>
-          );
-        })}
-      </TableBody>
-    </Table>
+                  <FormItem>
+                    {isRegex
+                      ? "RE2 syntax, unanchored, matched against the lowercased query name. Max 512 bytes."
+                      : "Matches this domain and every subdomain, on label boundaries. No length limit."}
+                  </FormItem>
+                )
+              }
+            />
+          </span>
+          <span />
+          <span />
+        </div>
+      </form>
+    </Form>
   );
 }
 
 /**
  * Filtering › Rules — per-domain and regex allow/block rules, scoped to one
- * group at a time via the Select at the top. Consumes use-filters.ts's
- * useRules/useAddRule/useDeleteRule (Task 9) rather than redefining them;
- * this tab is what those hooks' doc comments already point to.
+ * group at a time. A rule belongs to exactly one group; there are no global
+ * rules, which is why the group selector is the first control on the page
+ * rather than a filter among others.
  */
 export function RulesTab() {
   const groups = useGroups();
@@ -329,9 +327,21 @@ export function RulesTab() {
   const rules = useRules(groupId);
   const deleteRule = useDeleteRule();
   const [deleteTarget, setDeleteTarget] = useState<Rule | null>(null);
+  const [addOpen, setAddOpen] = useState(false);
+  const [search, setSearch] = useState("");
+  const [actionFilter, setActionFilter] = useState<"" | Rule["action"]>("");
 
-  const currentGroup = groups.data?.find((g) => g.id === groupId);
-  const groupName = currentGroup?.name ?? "this group";
+  const groupName = groups.data?.find((g) => g.id === groupId)?.name ?? "this group";
+  const all = useMemo(() => rules.data ?? [], [rules.data]);
+
+  const shown = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    return all.filter(
+      (r) =>
+        (actionFilter === "" || r.action === actionFilter) &&
+        (q === "" || r.pattern.toLowerCase().includes(q)),
+    );
+  }, [all, search, actionFilter]);
 
   function onConfirmDelete() {
     if (!deleteTarget) return;
@@ -348,79 +358,173 @@ export function RulesTab() {
     );
   }
 
-  const isEmpty = rules.data?.length === 0;
-
   let body: ReactNode;
   if (rules.isPending) {
     body = (
-      <div className="flex flex-col gap-2" aria-hidden="true">
-        {Array.from({ length: 4 }).map((_, i) => (
-          <Skeleton key={i} className="h-10 w-full" />
+      <div className="flex flex-col gap-2 p-4" aria-hidden="true">
+        {Array.from({ length: 5 }).map((_, i) => (
+          <Skeleton key={i} className="h-8 w-full" />
         ))}
       </div>
     );
   } else if (rules.data === undefined) {
     body = (
-      <Alert variant="destructive">
-        <TriangleAlert />
-        <AlertTitle>Couldn&apos;t load rules</AlertTitle>
-        <AlertDescription>Try refreshing the page.</AlertDescription>
-      </Alert>
+      <div className="p-4">
+        <Alert variant="destructive">
+          <TriangleAlert />
+          <AlertTitle>Couldn&apos;t load rules</AlertTitle>
+          <AlertDescription>Try refreshing the page.</AlertDescription>
+        </Alert>
+      </div>
     );
-  } else if (isEmpty) {
+  } else if (all.length === 0) {
     body = (
-      <EmptyState
-        icon={<Regex />}
-        title="No rules for this group yet"
-        description={`Add a block or allow rule scoped to ${groupName}.`}
-        action={<AddRuleDialog groupId={groupId} groupName={groupName} />}
-      />
+      <div className="flex flex-col items-center gap-3 p-10 text-center">
+        <p className="font-heading text-base font-semibold">No rules in {groupName}</p>
+        {/* The one thing empty does not mean here: that the group filters
+            nothing. */}
+        <p className="text-sm text-muted-foreground">Lists still apply.</p>
+        {!addOpen && (
+          <Button type="button" size="sm" onClick={() => setAddOpen(true)}>
+            <Plus />
+            Add rule
+          </Button>
+        )}
+      </div>
+    );
+  } else if (shown.length === 0) {
+    body = (
+      <p className="p-10 text-center text-sm text-muted-foreground">
+        No rules match this filter.{" "}
+        <Button
+          type="button"
+          variant="link"
+          size="sm"
+          onClick={() => {
+            setSearch("");
+            setActionFilter("");
+          }}
+        >
+          Clear it
+        </Button>
+      </p>
     );
   } else {
-    body = <RulesTable rules={rules.data} onDeleteRequest={setDeleteTarget} />;
+    body = shown.map((rule) => (
+      <div
+        key={rule.id}
+        data-slot="rule-row"
+        className={cn(GRID, "border-b border-border-muted py-2")}
+      >
+        <span>
+          <Badge variant={ACTION_VARIANT[rule.action]}>{rule.action}</Badge>
+        </span>
+        <span className="truncate font-mono text-sm" title={rule.pattern}>
+          {rule.pattern}
+        </span>
+        <span>
+          {/* Warning-toned for regex, not because it is worse, but because
+              it is the one that can match far more than it looks like it
+              will. */}
+          <Badge variant={rule.is_regex ? "warning-outline" : "outline"}>
+            {rule.is_regex ? "regex" : "literal"}
+          </Badge>
+        </span>
+        <span className="flex items-center justify-end">
+          <Button
+            type="button"
+            size="sm"
+            variant="ghost"
+            aria-label={`Delete rule ${rule.pattern}`}
+            onClick={() => setDeleteTarget(rule)}
+          >
+            Delete
+          </Button>
+        </span>
+      </div>
+    ));
   }
 
   return (
-    <div className="flex flex-col gap-4">
-      <div className="flex flex-wrap items-end justify-between gap-3">
-        <div className="flex flex-col gap-1.5">
-          <span className="text-sm font-medium text-foreground" id="rules-group-label">
+    <div className="flex h-full min-h-0 flex-col">
+      <div className="flex shrink-0 flex-wrap items-center gap-3 border-b border-border px-4 py-2.5">
+        <div className="flex items-center gap-1.5">
+          <span className="font-mono text-xs tracking-widest text-muted-foreground uppercase">
             Group
           </span>
-          <Select
-            // `items` maps each value to its display label — without it,
-            // SelectValue renders the raw group id ("1") instead of the
-            // group's name (Task 12's finding; see settings.tsx/account.tsx
-            // for the same fix).
-            items={Object.fromEntries((groups.data ?? []).map((g) => [String(g.id), g.name]))}
+          <NativeSelect
             value={String(groupId)}
-            onValueChange={(v) => setGroupId(Number(v))}
+            onChange={(e) => setGroupId(Number(e.target.value))}
             disabled={groups.isPending || !groups.data || groups.data.length === 0}
+            aria-label="Group"
           >
-            <SelectTrigger aria-labelledby="rules-group-label" className="w-56">
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              {groups.data?.map((g) => (
-                <SelectItem key={g.id} value={String(g.id)}>
-                  {g.name}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
+            {groups.data?.map((g) => (
+              <NativeSelectOption key={g.id} value={String(g.id)}>
+                {g.name}
+              </NativeSelectOption>
+            ))}
+          </NativeSelect>
         </div>
-        {!isEmpty && <AddRuleDialog groupId={groupId} groupName={groupName} />}
+        <Input
+          value={search}
+          onChange={(e) => setSearch(e.target.value)}
+          placeholder="search patterns…"
+          aria-label="Search patterns"
+          className="w-60"
+        />
+        <div className="flex items-center gap-1.5">
+          <span className="font-mono text-xs tracking-widest text-muted-foreground uppercase">
+            Action
+          </span>
+          <NativeSelect
+            value={actionFilter}
+            onChange={(e) => setActionFilter(e.target.value as "" | Rule["action"])}
+            aria-label="Filter by action"
+          >
+            <NativeSelectOption value="">All actions</NativeSelectOption>
+            <NativeSelectOption value="allow">allow</NativeSelectOption>
+            <NativeSelectOption value="block">block</NativeSelectOption>
+          </NativeSelect>
+        </div>
+        <div className="ml-auto flex items-center gap-2">
+          <MatchOrderPopover />
+          {!addOpen && (
+            <Button type="button" size="sm" onClick={() => setAddOpen(true)}>
+              <Plus />
+              Add rule
+            </Button>
+          )}
+        </div>
       </div>
 
       {rules.isError && rules.data !== undefined && (
-        <StaleDataAlert
-          what="rules"
-          onRetry={() => void rules.refetch()}
-          isRetrying={rules.isFetching}
-        />
+        <div className="shrink-0 border-b border-border p-3">
+          <StaleDataAlert
+            what="rules"
+            onRetry={() => void rules.refetch()}
+            isRetrying={rules.isFetching}
+          />
+        </div>
       )}
 
-      {body}
+      <div
+        className={cn(
+          GRID,
+          "shrink-0 border-b border-border py-2",
+          "font-mono text-xs tracking-widest text-muted-foreground uppercase",
+        )}
+      >
+        <span>Action</span>
+        <span>Pattern</span>
+        <span>Type</span>
+        <span className="text-right">Actions</span>
+      </div>
+
+      {/* Keyed on the group so switching groups gives a fresh form rather
+          than carrying a half-typed pattern across a scope change. */}
+      {addOpen && <AddRuleRow key={groupId} groupId={groupId} onClose={() => setAddOpen(false)} />}
+
+      <div className="min-h-0 flex-1 overflow-y-auto">{body}</div>
 
       <AlertDialog
         open={deleteTarget !== null}
@@ -432,7 +536,7 @@ export function RulesTab() {
             <AlertDialogDescription>
               {deleteTarget && (
                 <>
-                  The {ACTION_META[deleteTarget.action].label.toLowerCase()} rule for{" "}
+                  The {deleteTarget.action} rule for{" "}
                   <code className="font-mono break-all text-foreground">
                     {deleteTarget.pattern}
                   </code>{" "}
