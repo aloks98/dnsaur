@@ -12,6 +12,8 @@ import type {
   StatsOverview,
   TimelineBucket,
   TopEntry,
+  Zone,
+  ZoneRecord,
 } from "../api/types";
 import type { BlockingStatus } from "../hooks/use-blocking";
 
@@ -36,7 +38,7 @@ export function hourStart(hoursAgo = 0): number {
 function defaultTimeline(): TimelineBucket[] {
   return [4, 3, 2, 1, 0].map((hoursAgo) => ({
     bucket: hourStart(hoursAgo),
-    decisions: { allowed: 120, blocked: 30, cached: 90, forwarded: 40, stale: 5 },
+    decisions: { authoritative: 120, blocked: 30, cached: 90, forwarded: 40, stale: 5 },
   }));
 }
 
@@ -55,6 +57,75 @@ export function blockingHandler(pausedUntilByGroup: Record<number, number> = {})
     const status: BlockingStatus = { paused_until: pausedUntilByGroup[groupId] ?? 0 };
     return HttpResponse.json(status);
   });
+}
+
+/**
+ * One primary zone and a handful of records under it (Task 11/12 default
+ * fixture). Names are zone-relative, exactly as the wire format requires
+ * (see openapi.yaml's `/zones/{id}/records` description): "@" is the apex,
+ * "bifrost" and "*.nexus" are the non-apex examples used throughout the
+ * zones docs. rdata is DNS presentation format, not a parsed structure —
+ * "10 mail.example.com." for the MX, `0 issue "letsencrypt.org"` for the
+ * CAA — because that's the same string the server round-trips.
+ */
+function defaultZones(): Zone[] {
+  return [
+    {
+      id: 1,
+      name: "example.com",
+      type: "primary",
+      enabled: true,
+      soa_ns: "ns.example.com",
+      soa_mbox: "hostadmin.example.com",
+      soa_serial: 3,
+      soa_refresh: 900,
+      soa_retry: 300,
+      soa_expire: 604800,
+      soa_minimum: 900,
+      soa_ttl: 900,
+      primaries: "",
+      tsig_key_id: 0,
+      expires_at: 0,
+      refreshed_at: 0,
+      created_at: Date.now() - 30 * 24 * 60 * 60 * 1000,
+      modified_at: Date.now() - 15 * 60 * 1000,
+    },
+  ];
+}
+
+function defaultZoneRecords(zoneId: number): ZoneRecord[] {
+  return [
+    {
+      id: 1,
+      zone_id: zoneId,
+      name: "@",
+      type: "NS",
+      ttl: 900,
+      rdata: "ns.example.com.",
+      enabled: true,
+      comment: "",
+    },
+    {
+      id: 2,
+      zone_id: zoneId,
+      name: "bifrost",
+      type: "A",
+      ttl: 900,
+      rdata: "192.168.150.28",
+      enabled: true,
+      comment: "",
+    },
+    {
+      id: 3,
+      zone_id: zoneId,
+      name: "*.nexus",
+      type: "CNAME",
+      ttl: 900,
+      rdata: "bifrost.example.com.",
+      enabled: true,
+      comment: "wildcard for the nexus subdomain",
+    },
+  ];
 }
 
 export const handlers = [
@@ -81,7 +152,7 @@ export const handlers = [
   http.get("/api/v1/stats/overview", () => {
     // blocked + cached + forwarded is deliberately *less* than total: the
     // real handler (internal/api/queries_handlers.go) sums every decision
-    // into total, including allowed/error/local, and reports only three of
+    // into total, including authoritative/error, and reports only three of
     // them individually. A fixture where the three add up exactly would
     // green-light percentage math that can't hold on a real instance.
     const overview: StatsOverview = {
@@ -159,6 +230,28 @@ export const handlers = [
   http.get("/api/v1/clients", () => {
     const clients: Client[] = [{ id: 1, name: "Laptop", matcher: "192.168.1.10", group_id: 1 }];
     return HttpResponse.json(clients);
+  }),
+
+  // Zones (Task 11) and their records (Task 12). One zone, id 1, with a
+  // handful of records — see defaultZones/defaultZoneRecords above. Kept as
+  // GET-only defaults, same as groups/clients above: mutation endpoints
+  // (POST/PATCH/PUT/DELETE) are registered per-test via server.use(), the
+  // same way filtering/groups-clients.test.tsx does it for /groups and
+  // /clients.
+  http.get("/api/v1/zones", () => HttpResponse.json(defaultZones())),
+
+  http.get("/api/v1/zones/:id", ({ params }) => {
+    const zone = defaultZones().find((z) => z.id === Number(params.id));
+    if (!zone) return HttpResponse.json({ error: "not found" }, { status: 404 });
+    return HttpResponse.json(zone);
+  }),
+
+  http.get("/api/v1/zones/:id/records", ({ params }) => {
+    const id = Number(params.id);
+    if (!defaultZones().some((z) => z.id === id)) {
+      return HttpResponse.json({ error: "not found" }, { status: 404 });
+    }
+    return HttpResponse.json(defaultZoneRecords(id));
   }),
 
   blockingHandler(),

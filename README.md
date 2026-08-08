@@ -20,7 +20,7 @@ of truth — if it's not listed as shipped, it doesn't work yet.
 |---|---|
 | Blocking resolver (forward + cache, hosts/plain/ABP-subset blocklists) | Shipped |
 | Per-client groups (IP/CIDR matchers, per-group lists & rules) | Shipped |
-| Local DNS records | Shipped |
+| Authoritative DNS zones (primary) | Shipped |
 | Caching with TTL clamps, negative caching, serve-stale | Shipped |
 | Query log (SQLite/Postgres, buffered writes, retention pruning) | Shipped |
 | Stats (hourly rollups) | Shipped |
@@ -30,18 +30,18 @@ of truth — if it's not listed as shipped, it doesn't work yet.
 | HA config sync (primary/replica) | Planned |
 | DHCP | Planned |
 | Encrypted DNS (DoH/DoT upstream and serving) | Planned |
-| Authoritative zones + DNSSEC | Planned |
+| Zone transfers, reverse zones + DNSSEC | Planned |
 
 There's no published Docker image yet, but you no longer need to hand-edit
 the database or shell out to curl for everyday admin: a React dashboard
 (`web/`, embedded into the `dnsaur` binary and served alongside the API —
 see [`docs/architecture.md`](docs/architecture.md)) covers first-run setup,
-live query monitoring, per-client blocklists/allowlists/rules, local DNS
-records, and settings — [`docs/dashboard.md`](docs/dashboard.md) walks
+live query monitoring, per-client blocklists/allowlists/rules, authoritative
+zones, and settings — [`docs/dashboard.md`](docs/dashboard.md) walks
 through it screen by screen. The REST API under `/api/v1` (see
 [`docs/api.md`](docs/api.md)) is still there underneath it — settings,
-client groups, filter lists, local records, and more are all scriptable
-over HTTP (curl or any HTTP client) too, dashboard or not.
+client groups, filter lists, zones, and more are all scriptable over HTTP
+(curl or any HTTP client) too, dashboard or not.
 
 ## Quick start
 

@@ -59,7 +59,7 @@ curl or any HTTP client.
   it; `POST /auth/totp/disable` (`{code}`) turns it off. Once enabled,
   `totp_code` is required on every login.
 
-## Quick example: setup → login → create a record
+## Quick example: setup → login → create a zone
 
 ```sh
 BASE=http://localhost:8080/api/v1
@@ -75,11 +75,18 @@ curl -sX POST "$BASE/auth/login" \
   -d '{"username":"admin","password":"correct-horse-battery"}' \
   -c cookies.txt
 
-# Use the session cookie to create a local DNS record
-curl -sX POST "$BASE/records" \
+# Use the session cookie to create a zone (SOA fields are optional — defaults
+# are generated from the name)
+curl -sX POST "$BASE/zones" \
   -H 'Content-Type: application/json' \
   -b cookies.txt \
-  -d '{"name":"nas.home.arpa","type":"A","value":"192.168.1.10","ttl":300}'
+  -d '{"name":"home.lan"}'
+
+# Add a record — name is relative to the zone's apex
+curl -sX POST "$BASE/zones/1/records" \
+  -H 'Content-Type: application/json' \
+  -b cookies.txt \
+  -d '{"name":"nas","type":"A","rdata":"192.168.1.10","ttl":300}'
 ```
 
 ## Endpoints
@@ -123,9 +130,24 @@ Full parameter/response detail lives in `internal/api/openapi.yaml`
   `DELETE /filters/lists/{id}`, `DELETE /filters/rules/{id}` (delete a
   per-group rule), `POST /filters/refresh` (`202`, kicks off an
   asynchronous refresh of all lists).
-- **Records** — `GET /records`, `POST /records`, `PUT /records/{id}`,
-  `DELETE /records/{id}` — local `A`/`AAAA`/`CNAME`/`TXT` records,
-  wildcard names (`*.parent`) allowed, TTL 1–86400s.
+- **Zones** — `GET /zones`, `POST /zones`, `GET /zones/{id}`,
+  `PATCH /zones/{id}`, `DELETE /zones/{id}` (cascades its records).
+  Authoritative DNS zones: a name inside an enabled zone is answered or
+  refused, never forwarded upstream. `name` alone is enough to create one —
+  SOA fields default to generated values, and an apex NS record is created
+  alongside it. Only `type: "primary"` can be created or patched in this
+  release; `secondary`, `stub` and `forwarder` exist in the schema for zone
+  transfers to come but 400 today.
+- **Zone records** — `GET /zones/{id}/records`, `POST /zones/{id}/records`,
+  `PUT /zones/{id}/records/{rid}`, `DELETE /zones/{id}/records/{rid}` —
+  records within a zone, named relative to its apex (`@`, `bifrost`, `*`,
+  `*.nexus`; a fully-qualified name has the apex stripped automatically).
+  `rdata` is DNS presentation format, validated by handing it to the same
+  DNS parser (`miekg/dns`) that builds the record dnsaur serves, so a `400`
+  carries that parser's own error text. Three write conflicts return `409`:
+  a CNAME beside another record at the same name (RFC 1034 §3.6.2), a CNAME
+  at the zone apex (RFC 1912 §2.4), and a TTL that disagrees with the rest
+  of an RRSet (RFC 2181 §5.2).
 - **Queries** — `GET /queries` (search the query log; filters: `from`,
   `to`, `client`, `q`, `decision`, `type`, `limit` [default 100, capped
   1000], `offset`), `GET /queries/tail` (live tail as Server-Sent Events,

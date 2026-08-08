@@ -7,9 +7,8 @@ import type { ApiToken } from "../api/types";
 // internal/api/tokens_handlers.go). GET /tokens never includes the hash —
 // store.AuthToken.TokenHash is `json:"-"` server-side, so ApiToken (api/
 // types.ts) has no field for it at all. One query key, invalidated
-// wholesale by every mutation, the same shape as use-records.ts/
-// use-clients.ts: the token list is never large enough to warrant per-row
-// cache surgery.
+// wholesale by every mutation, the same shape as use-clients.ts: the token
+// list is never large enough to warrant per-row cache surgery.
 export const tokenKeys = {
   all: ["tokens"] as const,
 };

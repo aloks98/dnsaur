@@ -20,7 +20,7 @@ func TestChainOrderAndShortCircuit(t *testing.T) {
 			return HandlerFunc(func(ctx context.Context, req *Request) (*Response, error) {
 				order = append(order, name)
 				if answer {
-					return &Response{Msg: new(dns.Msg), Decision: DecisionLocal}, nil
+					return &Response{Msg: new(dns.Msg), Decision: DecisionAuthoritative}, nil
 				}
 				return next.ServeDNS(ctx, req)
 			})
@@ -34,7 +34,7 @@ func TestChainOrderAndShortCircuit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resp.Decision != DecisionLocal {
+	if resp.Decision != DecisionAuthoritative {
 		t.Fatalf("decision %s", resp.Decision)
 	}
 	if len(order) != 2 || order[0] != "a" || order[1] != "b" {

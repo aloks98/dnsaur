@@ -28,7 +28,7 @@ tags:
   - name: Groups
   - name: Clients
   - name: Filters
-  - name: Records
+  - name: Zones
   - name: Queries
   - name: Stats
   - name: Tokens
@@ -103,6 +103,71 @@ components:
             unix ms of the last attempt, successful or not; 0 = never tried.
             Differs from last_refreshed on a failing list, which is what lets
             the UI say "tried 5m ago, still serving Tuesday's copy".
+    Zone:
+      type: object
+      description: >
+        An authoritative DNS zone: a claim of authority over a suffix, not
+        an override on top of an upstream forwarder. A name the zone
+        doesn't hold answers authoritative NXDOMAIN carrying this zone's
+        SOA — it never falls through upstream.
+      properties:
+        id: { type: integer, format: int64 }
+        name: { type: string, description: apex, lowercase, no trailing dot, e.g. example.com }
+        type:
+          type: string
+          description: >
+            primary | secondary | stub | forwarder | internal; defaults to
+            primary. Milestone A creates and serves primary zones; the
+            other values are accepted and stored but not yet acted on.
+        enabled: { type: boolean }
+        soa_ns: { type: string }
+        soa_mbox: { type: string }
+        soa_serial: { type: integer, format: int64 }
+        soa_refresh: { type: integer, format: int64, description: seconds }
+        soa_retry: { type: integer, format: int64, description: seconds }
+        soa_expire: { type: integer, format: int64, description: seconds }
+        soa_minimum:
+          type: integer
+          format: int64
+          description: >
+            seconds; the negative-cache TTL for NXDOMAINs this zone hands
+            out (RFC 2308), not a floor on positive answers.
+        soa_ttl:
+          type: integer
+          format: int64
+          description: >
+            seconds; the SOA record's own header TTL, distinct from
+            soa_minimum. Fixed at 900 in Milestone A — there is no request
+            field to set it, on create or patch.
+        primaries: { type: string, description: secondary/stub/forwarder only; unused and empty for primary/internal }
+        tsig_key_id: { type: integer, format: int64 }
+        expires_at: { type: integer, format: int64, description: unix ms; secondary only, 0 otherwise }
+        refreshed_at: { type: integer, format: int64, description: unix ms; secondary only, 0 otherwise }
+        created_at: { type: integer, format: int64 }
+        modified_at: { type: integer, format: int64 }
+    ZoneRecord:
+      type: object
+      description: >
+        One resource record within a zone, named relative to the zone's
+        apex.
+      properties:
+        id: { type: integer, format: int64 }
+        zone_id: { type: integer, format: int64 }
+        name:
+          type: string
+          description: >
+            Owner name relative to the zone apex: "@" for the apex itself,
+            "bifrost", "*", "*.nexus".
+        type: { type: string, description: "DNS RR type, e.g. A, AAAA, CNAME, MX, TXT, CAA, NS" }
+        ttl: { type: integer, format: int64, description: seconds }
+        rdata:
+          type: string
+          description: >
+            DNS presentation format, rdata portion only — "192.168.150.28"
+            for A, "10 mail.example.com." for MX, "0 issue
+            \"letsencrypt.org\"" for CAA.
+        enabled: { type: boolean }
+        comment: { type: string }
   responses:
     ReadOnlyToken:
       description: read-only token used for a write operation
@@ -1137,10 +1202,10 @@ paths:
         "403":
           $ref: "#/components/responses/ReadOnlyToken"
 
-  /records:
+  /zones:
     get:
-      tags: [Records]
-      summary: List local DNS records
+      tags: [Zones]
+      summary: List authoritative zones
       responses:
         "200":
           description: OK
@@ -1148,36 +1213,52 @@ paths:
             application/json:
               schema:
                 type: array
-                items:
-                  type: object
-                  properties:
-                    id: { type: integer, format: int64 }
-                    name: { type: string, description: domain name; wildcard *.parent allowed }
-                    type: { type: string, enum: [A, AAAA, CNAME, TXT] }
-                    value: { type: string }
-                    ttl: { type: integer, minimum: 1, maximum: 86400 }
+                items: { $ref: "#/components/schemas/Zone" }
         "401":
           description: authentication required
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
+        "503":
+          description: storage unavailable
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
     post:
-      tags: [Records]
-      summary: Create a local DNS record
+      tags: [Zones]
+      summary: Create a zone
+      description: >
+        name alone is enough to create a working zone: soa_ns defaults to
+        "ns.<name>", soa_mbox to "hostadmin.<name>", and soa_refresh,
+        soa_retry, soa_expire and soa_minimum default to 900, 300, 604800
+        and 900 seconds respectively. type defaults to primary.
+
+
+        Creating a zone also creates its apex NS record, pointed at
+        soa_ns — RFC 2181 §10.1 requires an authoritative zone to carry NS
+        records at its apex, so a zone is never left without one. That
+        insert is best-effort: the zone itself is already committed by the
+        time it runs, so a failure there is logged, not surfaced, and
+        GET /zones/{id}/records is the way to confirm the NS record exists.
       requestBody:
         required: true
         content:
           application/json:
             schema:
               type: object
-              required: [name, type, value, ttl]
+              required: [name]
               properties:
-                name: { type: string, description: domain name; wildcard *.parent allowed }
-                type: { type: string, enum: [A, AAAA, CNAME, TXT] }
-                value:
+                name: { type: string, description: apex domain name, e.g. example.com }
+                type:
                   type: string
-                  description: IPv4 for A, IPv6 for AAAA, domain for CNAME, text for TXT
-                ttl: { type: integer, minimum: 1, maximum: 86400 }
+                  description: primary | secondary | stub | forwarder | internal; defaults to primary
+                enabled: { type: boolean, default: true }
+                soa_ns: { type: string, description: 'defaults to "ns.<name>"' }
+                soa_mbox: { type: string, description: 'defaults to "hostadmin.<name>"' }
+                soa_refresh: { type: integer, format: int64, description: seconds; defaults to 900 }
+                soa_retry: { type: integer, format: int64, description: seconds; defaults to 300 }
+                soa_expire: { type: integer, format: int64, description: seconds; defaults to 604800 }
+                soa_minimum: { type: integer, format: int64, description: seconds; defaults to 900 }
       responses:
         "201":
           description: Created
@@ -1188,7 +1269,7 @@ paths:
                 properties:
                   id: { type: integer, format: int64 }
         "400":
-          description: invalid name, type, value or ttl (see message)
+          description: invalid json, or name must be a valid domain name
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -1199,33 +1280,80 @@ paths:
               schema: { $ref: "#/components/schemas/Error" }
         "403":
           $ref: "#/components/responses/ReadOnlyToken"
+        "409":
+          description: a zone with that name already exists
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503":
+          description: storage unavailable
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
 
-  /records/{id}:
+  /zones/{id}:
     parameters:
       - name: id
         in: path
         required: true
         schema: { type: integer, format: int64 }
-    put:
-      tags: [Records]
-      summary: Replace a local DNS record
+    get:
+      tags: [Zones]
+      summary: Get a zone
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Zone" }
+        "400":
+          description: bad id
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401":
+          description: authentication required
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "404":
+          description: not found
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503":
+          description: storage unavailable
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+    patch:
+      tags: [Zones]
+      summary: Update a zone
+      description: >
+        Every property is optional; only fields present are changed. Same
+        name validation as create applies when name is sent. soa_ttl is not
+        editable here — see the Zone schema.
       requestBody:
         required: true
         content:
           application/json:
             schema:
               type: object
-              required: [name, type, value, ttl]
               properties:
-                name: { type: string }
-                type: { type: string, enum: [A, AAAA, CNAME, TXT] }
-                value: { type: string }
-                ttl: { type: integer, minimum: 1, maximum: 86400 }
+                name: { type: string, description: apex domain name, e.g. example.com }
+                type: { type: string, description: primary | secondary | stub | forwarder | internal }
+                enabled: { type: boolean }
+                soa_ns: { type: string }
+                soa_mbox: { type: string }
+                soa_refresh: { type: integer, format: int64, description: seconds }
+                soa_retry: { type: integer, format: int64, description: seconds }
+                soa_expire: { type: integer, format: int64, description: seconds }
+                soa_minimum: { type: integer, format: int64, description: seconds }
       responses:
         "204":
           description: No Content
         "400":
-          description: bad id, or invalid name, type, value or ttl
+          description: bad id, invalid json, or name must be a valid domain name
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -1241,9 +1369,20 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
+        "409":
+          description: a zone with that name already exists
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503":
+          description: storage unavailable
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
     delete:
-      tags: [Records]
-      summary: Delete a local DNS record
+      tags: [Zones]
+      summary: Delete a zone
+      description: Deletes every record in the zone along with it (ON DELETE CASCADE).
       responses:
         "204":
           description: No Content
@@ -1261,6 +1400,248 @@ paths:
           $ref: "#/components/responses/ReadOnlyToken"
         "404":
           description: not found
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503":
+          description: storage unavailable
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /zones/{id}/records:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: integer, format: int64, description: zone id }
+    get:
+      tags: [Zones]
+      summary: List a zone's records
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/ZoneRecord" }
+        "400":
+          description: bad id
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401":
+          description: authentication required
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "404":
+          description: zone not found
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503":
+          description: storage unavailable
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+    post:
+      tags: [Zones]
+      summary: Create a record in a zone
+      description: >
+        rdata is DNS presentation format — the rdata portion only, e.g.
+        "192.168.150.28" for A, "10 mail.example.com." for MX, "0 issue
+        \"letsencrypt.org\"" for CAA. It is validated by handing
+        "<name> <ttl> IN <type> <rdata>" to the same DNS parser
+        (miekg/dns) that builds the RR served to resolvers, so a 400 here
+        carries that parser's own error text, not a generic message — any
+        type it can parse is accepted without an API change, and an
+        accepted record is by construction a servable one.
+
+
+        name is zone-relative ("@", "bifrost", "*", "*.nexus"); omitted or
+        equal to the zone's own name means the apex. A name that already
+        carries the zone's apex as a suffix (e.g. "www.example.com" typed
+        against zone "example.com") has that suffix stripped rather than
+        doubled.
+
+
+        Three write conflicts are rejected with 409 rather than accepted
+        and left to break resolution later, checked in this order:
+          - a CNAME at the zone apex (RFC 1912 §2.4)
+          - a CNAME landing beside another record at the same name, or a
+            record landing beside an existing CNAME, in either order
+            (RFC 1034 §3.6.2 — a CNAME must be the only record at its name)
+          - a TTL that doesn't match the rest of the RRSet already at this
+            name and type (RFC 2181 §5.2 — every RR in an RRSet must share
+            one TTL)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [type, rdata]
+              properties:
+                name: { type: string, description: 'zone-relative owner name; omitted means the apex ("@")' }
+                type: { type: string, description: "DNS RR type, e.g. A, AAAA, CNAME, MX, TXT, CAA, NS" }
+                ttl:
+                  type: integer
+                  format: int64
+                  minimum: 0
+                  maximum: 2147483647
+                  description: >
+                    seconds; above 2147483647 is rejected (RFC 2181 §8 — a
+                    resolver would read it back via two's-complement
+                    wraparound, not as typed)
+                rdata: { type: string, description: DNS presentation format, rdata portion only }
+                enabled: { type: boolean, default: true }
+                comment: { type: string }
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: { type: integer, format: int64 }
+        "400":
+          description: >
+            invalid json; ttl above 2147483647 (RFC 2181 §8); or rdata
+            that fails to parse against name, ttl and type — message is
+            the DNS parser's own error text
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401":
+          description: authentication required
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "403":
+          $ref: "#/components/responses/ReadOnlyToken"
+        "404":
+          description: zone not found
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "409":
+          description: >
+            CNAME at the zone apex (RFC 1912 §2.4); CNAME beside another
+            record at the same name in either write order (RFC 1034
+            §3.6.2); or a TTL that doesn't match the rest of the RRSet at
+            this name and type (RFC 2181 §5.2) — checked in that order
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503":
+          description: storage unavailable
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /zones/{id}/records/{rid}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: integer, format: int64, description: zone id }
+      - name: rid
+        in: path
+        required: true
+        schema: { type: integer, format: int64, description: record id }
+    put:
+      tags: [Zones]
+      summary: Replace a record in a zone
+      description: >
+        Same rdata validation and 409 conflict rules as
+        POST /zones/{id}/records — see that operation's description. rid
+        must belong to the zone named by id, or the request 404s the same
+        as an unknown record.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [type, rdata]
+              properties:
+                name: { type: string, description: 'zone-relative owner name; omitted means the apex ("@")' }
+                type: { type: string, description: "DNS RR type, e.g. A, AAAA, CNAME, MX, TXT, CAA, NS" }
+                ttl:
+                  type: integer
+                  format: int64
+                  minimum: 0
+                  maximum: 2147483647
+                  description: seconds; above 2147483647 is rejected (RFC 2181 §8)
+                rdata: { type: string, description: DNS presentation format, rdata portion only }
+                enabled: { type: boolean, default: true }
+                comment: { type: string }
+      responses:
+        "204":
+          description: No Content
+        "400":
+          description: >
+            bad id, invalid json; ttl above 2147483647 (RFC 2181 §8); or
+            rdata that fails to parse — message is the DNS parser's own
+            error text
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401":
+          description: authentication required
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "403":
+          $ref: "#/components/responses/ReadOnlyToken"
+        "404":
+          description: zone not found, or rid is not a record of this zone
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "409":
+          description: >
+            CNAME at the zone apex (RFC 1912 §2.4); CNAME beside another
+            record at the same name in either write order (RFC 1034
+            §3.6.2); or a TTL that doesn't match the rest of the RRSet at
+            this name and type (RFC 2181 §5.2) — checked in that order
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503":
+          description: storage unavailable
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+    delete:
+      tags: [Zones]
+      summary: Delete a record from a zone
+      description: rid must belong to the zone named by id, or the request 404s the same as an unknown record.
+      responses:
+        "204":
+          description: No Content
+        "400":
+          description: bad id
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401":
+          description: authentication required
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "403":
+          $ref: "#/components/responses/ReadOnlyToken"
+        "404":
+          description: zone not found, or rid is not a record of this zone
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503":
+          description: storage unavailable
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -1284,7 +1665,7 @@ paths:
           schema: { type: string, description: substring match on query name }
         - name: decision
           in: query
-          schema: { type: string, description: e.g. blocked, forwarded, cached, stale }
+          schema: { type: string, enum: [blocked, authoritative, cached, stale, forwarded, error], description: how the query was answered; `authoritative` is an answer from a zone this server holds }
         - name: type
           in: query
           schema: { type: string, description: DNS query type, e.g. A, AAAA }

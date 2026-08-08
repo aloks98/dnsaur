@@ -69,9 +69,11 @@ the DB, bumps a config version, and live components reload automatically —
 background refresh ticker are sized/scheduled then); a running instance
 must be restarted to pick up changes to these keys. Everything else in the
 table — blocking mode/TTL, upstreams, upstream strategy, clients, groups,
-lists, rules, local records, and query-log privacy — applies live via the
-settings change-notification channel, no restart needed. This is a
-documented Phase 1 limitation, expected to be revisited in a later phase.
+lists, rules, zones and their records, and query-log privacy — applies
+live, no restart needed: settings keys through the change-notification
+channel, and clients, filters and zones through a reload the write handler
+triggers directly. This is a documented Phase 1 limitation, expected to be
+revisited in a later phase.
 
 Two internal key prefixes (`instance.*` and future `stats.*` bookkeeping)
 are not meant to be user-edited and are excluded from the settings API

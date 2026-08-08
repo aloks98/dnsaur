@@ -124,7 +124,7 @@ test("row 1 carries the mark, the wordmark and the four nav groups", async () =>
     within(primary)
       .getAllByRole("button")
       .map((button) => button.textContent),
-  ).toEqual(["Monitor", "Filtering", "Local DNS", "System"]);
+  ).toEqual(["Monitor", "Filtering", "Zones", "System"]);
 });
 
 // Four disclosure chevrons in a row said nothing the marked group and the
@@ -138,7 +138,7 @@ test("the group cells carry no disclosure chevron", async () => {
   const groups = within(primary).getAllByRole("button");
   // Nothing in a group cell but its name — no icon, and no "▾" typed as
   // text either.
-  expect(groups.map((g) => g.textContent)).toEqual(["Monitor", "Filtering", "Local DNS", "System"]);
+  expect(groups.map((g) => g.textContent)).toEqual(["Monitor", "Filtering", "Zones", "System"]);
   for (const group of groups) {
     expect(group.querySelector("svg")).toBeNull();
     // Still a real menu button — the affordance moved to semantics, not away.
@@ -201,13 +201,13 @@ test("a deep Filtering route lights its group and its own tab", async () => {
 test("an unknown route lights no group and drops the second row entirely", async () => {
   renderTopNav({ route: "/nope/not-a-page" });
 
-  for (const group of ["Monitor", "Filtering", "Local DNS", "System"]) {
+  for (const group of ["Monitor", "Filtering", "Zones", "System"]) {
     expect(screen.getByRole("button", { name: group })).toHaveAttribute("data-active", "false");
   }
 
   // Row 2 is gone, not merely empty: every group's <nav> is absent, while
   // row 1's own navigation is untouched and still reachable.
-  for (const group of ["Monitor", "Filtering", "Local DNS", "System"]) {
+  for (const group of ["Monitor", "Filtering", "Zones", "System"]) {
     expect(screen.queryByRole("navigation", { name: group })).not.toBeInTheDocument();
   }
   expect(screen.getByRole("navigation", { name: "Primary" })).toBeInTheDocument();
@@ -223,11 +223,11 @@ test("the redirecting /filtering index still lights the Filtering group", async 
 // The group is named for the one thing behind it. "Network" promised DHCP,
 // interfaces and encrypted DNS, none of which exist.
 test("a group with a single page still gets its row-2 tab", async () => {
-  renderTopNav({ route: "/dns" });
+  renderTopNav({ route: "/zones" });
 
-  expect(screen.getByRole("button", { name: "Local DNS" })).toHaveAttribute("data-active", "true");
+  expect(screen.getByRole("button", { name: "Zones" })).toHaveAttribute("data-active", "true");
   expect(screen.queryByRole("button", { name: "Network" })).not.toBeInTheDocument();
-  expect(within(tabs("Local DNS")).getByRole("link", { name: "Local DNS" })).toHaveAttribute(
+  expect(within(tabs("Zones")).getByRole("link", { name: "Zones" })).toHaveAttribute(
     "aria-current",
     "page",
   );
@@ -236,11 +236,11 @@ test("a group with a single page still gets its row-2 tab", async () => {
 test("a group menu lists its pages as menu items and navigates to them", async () => {
   renderTopNav({ route: "/" });
 
-  const menu = openGroup("Local DNS");
-  const item = within(menu).getByRole("menuitem", { name: /local dns/i });
+  const menu = openGroup("Zones");
+  const item = within(menu).getByRole("menuitem", { name: /zones/i });
   fireEvent.click(item);
 
-  await waitFor(() => expect(screen.getByTestId("pathname")).toHaveTextContent("/dns"));
+  await waitFor(() => expect(screen.getByTestId("pathname")).toHaveTextContent("/zones"));
 });
 
 test("the search cell opens the command palette", async () => {

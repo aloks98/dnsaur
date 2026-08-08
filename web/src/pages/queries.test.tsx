@@ -708,10 +708,10 @@ test("the search box says what the server actually does with % and _", async () 
   expect(hint).toHaveTextContent("substring of q_name — % and _ are ignored");
 });
 
-// DecisionAllowed exists in the Go enum (internal/dnssrv/pipeline.go) but is
-// never assigned: an allow rule only *skips* blocking, so the row is logged
-// with whatever the downstream stage produced. Offering it advertised a
-// filter that always returns zero rows.
+// There is no `allowed` in the Go enum (internal/dnssrv/pipeline.go) at
+// all: an allow rule only *skips* blocking, so the row is logged with
+// whatever the downstream stage produced. Offering it as a filter would
+// advertise a query that always returns zero rows.
 test("the decision filter offers the six decisions the resolver writes, and never 'allowed'", async () => {
   renderQueryLog();
   await firstSource();
@@ -721,7 +721,7 @@ test("the decision filter offers the six decisions the resolver writes, and neve
     within(select)
       .getAllByRole("option")
       .map((o) => o.textContent),
-  ).toEqual(["All decisions", "blocked", "forwarded", "cached", "stale", "local", "error"]);
+  ).toEqual(["All decisions", "blocked", "forwarded", "cached", "stale", "authoritative", "error"]);
 });
 
 test("picking a decision calls GET /queries?decision=… and renders the results", async () => {

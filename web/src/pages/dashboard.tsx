@@ -67,13 +67,13 @@ function clockTime(atMs: number): string {
 /**
  * Per-decision tint, shared by the live rows.
  *
- * The seven-way decision vocabulary is the resolver's (see
+ * The six-way decision vocabulary is the resolver's (see
  * internal/dnssrv/pipeline.go); this is the design's flat, text-only reading
  * of it, not the query log's badge-and-icon treatment — twelve badges in a
  * 340px-adjacent column would be the loudest thing on the page.
  *
- * There is no `allowed` entry on purpose: the pipeline never writes that
- * decision, so a row can't carry it.
+ * There is no `allowed` entry on purpose: there is no such decision in the
+ * Go enum, so a row can't carry it.
  */
 const DECISION_TONE: Record<string, string> = {
   blocked: "text-destructive",
@@ -83,7 +83,7 @@ const DECISION_TONE: Record<string, string> = {
   stale: "text-warn",
   cached: "text-muted-foreground",
   forwarded: "text-foreground",
-  local: "text-primary",
+  authoritative: "text-primary",
 };
 
 function decisionTone(decision: string): string {
@@ -248,7 +248,7 @@ function StatStrip({
           className={STAT_CELL}
           title="Queries"
           value={total.toLocaleString()}
-          description="every decision, incl. local + error"
+          description="every decision, incl. authoritative + error"
         />
         <StatCard
           className={STAT_CELL}
@@ -387,7 +387,7 @@ const SERVED_DECISIONS = ["forwarded", "cached", "stale"] as const;
  */
 const SERIES_SERVED = "Forwarded + cached";
 const SERIES_BLOCKED = "Blocked";
-const SERIES_OTHER = "Local + error";
+const SERIES_OTHER = "Authoritative + error";
 
 /**
  * Timeline buckets → three continuous stacked series.
@@ -404,11 +404,12 @@ const SERIES_OTHER = "Local + error";
  * The three bands partition `total` exactly, because they have to add up to
  * the same number the strip above reports. Two are named sets of decisions
  * (served, blocked); the third is *everything else the bucket contained* —
- * local answers and errors today, and whatever decision the resolver grows
- * next without this chart quietly dropping it on the floor. Splitting local
- * and error out of the old "Resolved" band is the point of the third
- * series: a failed resolve is not a query dnsaur served, and burying it
- * under the same colour as a cache hit hid every upstream outage.
+ * authoritative answers and errors today, and whatever decision the
+ * resolver grows next without this chart quietly dropping it on the floor.
+ * Splitting authoritative and error out of the old "Resolved" band is the
+ * point of the third series: a failed resolve is not a query dnsaur served,
+ * and burying it under the same colour as a cache hit hid every upstream
+ * outage.
  */
 function timelineSeries(buckets: TimelineBucket[], hours: number) {
   const byBucket = new Map<number, Record<string, number>>();
@@ -609,7 +610,7 @@ function VolumeBody({ buckets, hours }: { buckets: TimelineBucket[]; hours: numb
   return (
     <figure
       className="h-full"
-      aria-label={`Query volume over ${categories.length} hourly buckets: ${grand.toLocaleString()} queries — ${totalServed.toLocaleString()} forwarded or cached, ${totalBlocked.toLocaleString()} blocked, ${totalOther.toLocaleString()} local or error`}
+      aria-label={`Query volume over ${categories.length} hourly buckets: ${grand.toLocaleString()} queries — ${totalServed.toLocaleString()} forwarded or cached, ${totalBlocked.toLocaleString()} blocked, ${totalOther.toLocaleString()} authoritative or error`}
     >
       <VolumeChart
         categories={categories}
@@ -883,9 +884,9 @@ function LiveQueries({
                   {entry.decision}
                 </td>
                 {/* Empty for anything the resolver answered itself — a
-                    blocked, local or cached query never went upstream, and
-                    an em dash says that rather than leaving a gap that
-                    reads as missing data. */}
+                    blocked, authoritative or cached query never went
+                    upstream, and an em dash says that rather than leaving a
+                    gap that reads as missing data. */}
                 <td className={cn(CELL_PAD, "truncate text-muted-foreground")}>
                   {entry.upstream === "" ? EM_DASH : entry.upstream}
                 </td>

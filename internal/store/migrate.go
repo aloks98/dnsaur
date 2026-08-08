@@ -32,7 +32,20 @@ func migrate(ctx context.Context, db *sql.DB, dialect string) error {
 	if err != nil {
 		return err
 	}
-	provider, err := goose.NewProvider(gooseDialect, db, sub)
+	// Version 5 (zonemigrate.go) is a Go migration, not SQL: converting
+	// local_records into zones needs suffix grouping and CNAME-conflict
+	// detection that SQLite has no regexp_replace to express, and doing it
+	// in Go once instead of twice (per dialect) keeps one tested
+	// implementation instead of two that could disagree. It runs via
+	// RunTx, not RunDB — see upZonesData's doc comment: with
+	// SetMaxOpenConns(1) on sqlite, RunDB deadlocks every fresh-install
+	// migration by asking the (already fully checked-out) connection pool
+	// for a second connection.
+	provider, err := goose.NewProvider(gooseDialect, db, sub, goose.WithGoMigrations(
+		goose.NewGoMigration(5, &goose.GoFunc{RunTx: func(ctx context.Context, tx *sql.Tx) error {
+			return upZonesData(ctx, tx, dialect)
+		}}, nil),
+	))
 	if err != nil {
 		return fmt.Errorf("goose provider: %w", err)
 	}

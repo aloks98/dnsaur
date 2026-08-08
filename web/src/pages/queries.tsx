@@ -130,8 +130,8 @@ function clientNameMap(clients: Client[] | undefined): Map<number, string> {
  * The one badge on this screen is the inspector's chip, below.
  *
  * There is no `allowed` entry, here or in the filter below, on purpose:
- * DecisionAllowed exists in the Go enum but is never assigned. An allow rule
- * only *skips* blocking, so the row is logged with whatever the downstream
+ * there is no such decision in the Go enum at all. An allow rule only
+ * *skips* blocking, so the row is logged with whatever the downstream
  * stage produced. Offering it as a filter advertised a query that always
  * returns zero rows.
  */
@@ -143,7 +143,7 @@ const DECISION_TONE: Record<string, string> = {
   stale: "text-warn",
   cached: "text-muted-foreground",
   forwarded: "text-foreground",
-  local: "text-primary",
+  authoritative: "text-primary",
 };
 
 /**
@@ -159,13 +159,13 @@ const DECISION_BADGE: Record<string, NonNullable<BadgeProps["variant"]>> = {
   blocked: "destructive-light",
   error: "destructive-light",
   stale: "warning-light",
-  local: "primary-light",
+  authoritative: "primary-light",
   cached: "secondary",
   forwarded: "outline",
 };
 
 /** The decisions the resolver actually writes — the filter's whole vocabulary. */
-const DECISIONS = ["blocked", "forwarded", "cached", "stale", "local", "error"];
+const DECISIONS = ["blocked", "forwarded", "cached", "stale", "authoritative", "error"];
 
 /**
  * The record types worth offering as a fixed list.

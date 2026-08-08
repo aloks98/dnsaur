@@ -128,14 +128,105 @@ point at it — move them first.
 
 ---
 
-## Local DNS
+## Zones
 
-Names you answer yourself, ahead of any upstream. Four record types: **A**,
-**AAAA**, **CNAME**, **TXT**.
+An authoritative DNS zone: a suffix you hold, not a set of overrides on top
+of the upstream resolver. That distinction has one concrete consequence —
+**a name inside a zone you hold is never forwarded.** A name that exists
+answers; a name that exists with a different type is `NOERROR` with an empty
+answer (NODATA); a name that doesn't exist at all is an authoritative
+`NXDOMAIN`. Either negative case carries the zone's SOA, so resolvers cache
+the absence instead of asking again on every lookup. Nothing falls through
+to the upstream — that's what makes split-horizon work: an internal name
+under a domain you also happen to own publicly no longer leaks upstream, and
+a public record can no longer shadow an internal one you haven't defined
+yet.
 
-Local records are consulted after filtering and before the cache and upstream,
-so a local record answers even for a name that an upstream would resolve
-differently.
+Zones are checked before the cache and upstream, same as the old local
+records were — the miss behaviour above is the whole point of the change.
+
+Milestone A serves **primary** zones only. `secondary`, `stub` and
+`forwarder` exist in the type list for zones to come but are refused on
+create or edit with `400` until transfers are built.
+
+### Records
+
+A record's name is relative to its zone's apex: `@` for the apex itself,
+`bifrost` for `bifrost.<zone>`, `*` and `*.nexus` for wildcards. Typing the
+fully-qualified name works too — a trailing copy of the zone's own name is
+stripped automatically, so `bifrost.home.lan` and `bifrost` land on the same
+record in zone `home.lan`.
+
+The record's value (`rdata`) is DNS presentation format — the same syntax a
+zone file uses: `192.168.150.28` for an A record, `10 mail.example.com.` for
+MX, `0 issue "letsencrypt.org"` for CAA. It's validated by handing it to the
+same DNS parser that builds the record dnsaur serves, so a rejected value
+comes back with that parser's own error text rather than a made-up message —
+and any type the parser understands works without dnsaur itself changing.
+
+**Quote TXT values.** Presentation format is not a free-text field: spaces
+separate values and `;` starts a comment. Pasted raw, `v=spf1 -all` is
+stored as two strings and `v=DKIM1; k=rsa; p=...` is truncated at the
+semicolon without any error. Wrapped in quotes — `"v=spf1 -all"` — the
+whole thing is one value, which is what a TXT record almost always means.
+Anything over 255 bytes, like a 2048-bit DKIM key, is written as adjacent
+quoted strings that the reader joins back together: `"part one" "part two"`.
+
+Three writes are refused, all `409`:
+
+- a CNAME landing beside another record at the same name, in either write
+  order (RFC 1034 §3.6.2 — a CNAME must be the only record at its name)
+- a CNAME at the zone apex, where the SOA and NS already live (RFC 1912 §2.4)
+- a record whose TTL disagrees with others already at that name and type
+  (RFC 2181 §5.2 — one TTL per record set)
+
+### Upgrading from Local DNS records
+
+Existing local records became zones automatically the first time this
+version starts. Each record was grouped under a zone by its last two
+labels (`nas.home.lan` groups under `home.lan`) and rewritten to a name
+relative to that apex.
+
+**Every other name under a migrated apex stops resolving.** A local record
+was an override: `nas.home.lan` answered locally and everything else under
+`home.lan` went upstream. A zone is a suffix you hold, so once `home.lan`
+is a zone, `anything-else.home.lan` gets an authoritative `NXDOMAIN` from
+this server and is never forwarded. That is what being authoritative
+means, and it is intended — it is also the single most visible change in
+this release. Check the zone list after upgrading and delete any zone
+whose apex you did not mean to take over.
+
+That matters most when the inferred apex is wrong, and the last-two-labels
+rule gets multi-label public suffixes wrong. A record named
+`nas.home.example.co.uk` produces a zone with apex **`co.uk`** — with a
+generated SOA and apex NS, exactly like any other. From then on this
+server answers `NXDOMAIN` for every `.co.uk` name any client asks for.
+The same goes for `com.au`, `co.jp`, and the rest. **Delete that zone**,
+create one at the apex you actually hold (`example.co.uk`), and re-add the
+names under it. Inferring this correctly needs a public-suffix list, which
+is a dependency and a download for a conversion that runs once.
+
+A flat table had no rules a zone now enforces, so some data was changed or
+dropped in the conversion — check the server log for `WARN` lines naming
+the affected records after upgrading:
+
+- **A CNAME at the zone apex was dropped.** The apex now always carries an
+  SOA and NS record, so a CNAME there is a conflict that didn't exist before.
+- **A CNAME sharing a name with another record was dropped**, keeping the
+  other record — losing an alias costs less than losing an address.
+- **Records of the same name and type with different TTLs were normalised
+  to the lowest TTL among them**, never dropped.
+- **A TTL above 2147483647 was clamped** to that value (RFC 2181 §8 — a
+  higher value reads back as negative, meaning "never cache").
+- **A wildcard label that wasn't leftmost** (`a.*.home.lan`) **was kept
+  as-is** — that's a literal name under RFC 4592, not a wildcard — but it's
+  almost never what was intended, so it's logged.
+- **TXT values were quoted**, so what you stored is what still gets served
+  — a local record held its value literally, a zone record holds
+  presentation format, and copying one into the other unquoted would have
+  truncated every DKIM key at its first `;`. A value over 255 bytes was
+  split into adjacent quoted strings (RFC 1035 §3.3.14); readers join them
+  back together, and such a value could not be served at all before.
 
 ---
 

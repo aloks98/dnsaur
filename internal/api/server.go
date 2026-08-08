@@ -23,7 +23,7 @@ var openapiDoc []byte
 
 type Reloader interface {
 	ReloadClients(ctx context.Context) error
-	ReloadRecords(ctx context.Context) error
+	ReloadZones(ctx context.Context) error
 	RefreshFilters(ctx context.Context) error
 }
 
@@ -63,9 +63,10 @@ func (s *Server) routes() {
 	s.settingsRoutes()
 	s.clientsRoutes()
 	s.filtersRoutes()
-	s.recordsRoutes()
 	s.queriesRoutes()
 	s.tokensRoutes()
+	s.zonesRoutes()
+	s.zoneRecordsRoutes()
 	// Later tasks append their routes here.
 	s.mux.HandleFunc("/api/", func(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusNotFound, "not found")

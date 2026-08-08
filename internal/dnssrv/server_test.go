@@ -54,7 +54,7 @@ func TestEDNSEchoOnSynthesizedResponse(t *testing.T) {
 		m.SetReply(req.Msg)
 		rr, _ := dns.NewRR(req.Msg.Question[0].Name + " 300 IN A 1.2.3.4")
 		m.Answer = append(m.Answer, rr)
-		return &Response{Msg: m, Decision: DecisionLocal}, nil
+		return &Response{Msg: m, Decision: DecisionAuthoritative}, nil
 	})
 	s := NewServer("127.0.0.1:0", h)
 	if err := s.Start(); err != nil {
@@ -94,7 +94,7 @@ func TestNonEDNSNoUnsolicited(t *testing.T) {
 		m.SetReply(req.Msg)
 		rr, _ := dns.NewRR(req.Msg.Question[0].Name + " 300 IN A 1.2.3.4")
 		m.Answer = append(m.Answer, rr)
-		return &Response{Msg: m, Decision: DecisionLocal}, nil
+		return &Response{Msg: m, Decision: DecisionAuthoritative}, nil
 	})
 	s := NewServer("127.0.0.1:0", h)
 	if err := s.Start(); err != nil {
@@ -133,7 +133,7 @@ func TestUDPSizeFloor(t *testing.T) {
 			rr, _ := dns.NewRR(req.Msg.Question[0].Name + " 300 IN TXT \"very long text record for testing truncation behavior with multiple entries\"")
 			m.Answer = append(m.Answer, rr)
 		}
-		return &Response{Msg: m, Decision: DecisionLocal}, nil
+		return &Response{Msg: m, Decision: DecisionAuthoritative}, nil
 	})
 	s := NewServer("127.0.0.1:0", h)
 	if err := s.Start(); err != nil {

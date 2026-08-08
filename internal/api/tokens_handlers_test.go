@@ -28,7 +28,10 @@ func TestAPITokenLifecycle(t *testing.T) {
 	var roCreated map[string]any
 	_ = json.Unmarshal(w.Body.Bytes(), &roCreated)
 	ro, _ := roCreated["token"].(string)
-	req0 := httptest.NewRequest("POST", "/api/v1/records", stringsReader(`{"name":"x.home.lan","type":"A","value":"10.0.0.1","ttl":60}`))
+	// Any mutating, requireAuth-wrapped route works as the scope probe here;
+	// POST /api/v1/zones is used since /api/v1/records (Task 8) no longer
+	// exists.
+	req0 := httptest.NewRequest("POST", "/api/v1/zones", stringsReader(`{"name":"ro-probe.test"}`))
 	req0.Header.Set("Authorization", "Bearer "+ro)
 	req0.Header.Set("Content-Type", "application/json")
 	rec0 := httptest.NewRecorder()

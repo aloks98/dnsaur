@@ -7,7 +7,6 @@ import { useMe, useSetupState } from "./hooks/use-auth";
 import { useTheme } from "./lib/theme";
 import { Account } from "./pages/account";
 import { Dashboard } from "./pages/dashboard";
-import { LocalDns } from "./pages/dns";
 import { FilteringLayout } from "./pages/filtering";
 import { GroupsClientsTab } from "./pages/filtering/groups-clients";
 import { ListsTab } from "./pages/filtering/lists";
@@ -17,6 +16,8 @@ import { NotFound } from "./pages/not-found";
 import { QueryLog } from "./pages/queries";
 import { SettingsPage } from "./pages/settings";
 import { Setup } from "./pages/setup";
+import { ZoneDetail } from "./pages/zones/detail";
+import { ZonesList } from "./pages/zones/list";
 
 function FullPageSpinner() {
   return (
@@ -84,7 +85,10 @@ export function App() {
                 <Route path="rules" element={<RulesTab />} />
                 <Route path="clients" element={<GroupsClientsTab />} />
               </Route>
-              <Route path="dns" element={<LocalDns />} />
+              <Route path="zones">
+                <Route index element={<ZonesList />} />
+                <Route path=":id" element={<ZoneDetail />} />
+              </Route>
               <Route path="settings" element={<SettingsPage />} />
               <Route path="account" element={<Account />} />
               {/* A real screen, not a redirect. Silently rewriting an

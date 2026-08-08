@@ -30,7 +30,7 @@ func TestOpenAPIServedAndCoversRoutes(t *testing.T) {
 		"/groups", "/groups/{id}", "/groups/{id}/lists", "/groups/{id}/rules",
 		"/clients", "/clients/{id}",
 		"/filters/lists", "/filters/lists/{id}", "/filters/rules/{id}", "/filters/refresh",
-		"/records", "/records/{id}",
+		"/zones", "/zones/{id}", "/zones/{id}/records", "/zones/{id}/records/{rid}",
 		"/queries", "/queries/tail",
 		"/stats/overview", "/stats/timeline", "/stats/top",
 		"/tokens", "/tokens/{id}",

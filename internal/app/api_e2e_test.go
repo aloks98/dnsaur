@@ -127,14 +127,27 @@ func TestAPIEndToEnd(t *testing.T) {
 		t.Fatalf("login: %d", resp.StatusCode)
 	}
 
-	// record via API → resolvable via DNS
-	resp = postJSON(t, c, apiURL(a, "/api/v1/records"), `{"name":"svc.home.lan","type":"A","value":"10.0.0.42","ttl":60}`)
+	// A zone and a zone record, both created through the API itself (Task 7,
+	// Task 8) rather than seeded straight through the store — this exercises
+	// the same write paths those tasks added, then proves the record is
+	// resolvable via DNS, authoritatively: this milestone's payoff. The
+	// local_records endpoint this block used to smoke-test
+	// (POST /api/v1/records) is gone entirely as of Task 8, not merely
+	// unwired from DNS answers — see internal/api/zonerecords_handlers.go.
+	resp = postJSON(t, c, apiURL(a, "/api/v1/zones"), `{"name":"e412.test"}`)
+	var zoneCreated struct{ ID int64 }
+	_ = json.NewDecoder(resp.Body).Decode(&zoneCreated)
 	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusCreated {
-		t.Fatalf("record: %d", resp.StatusCode)
+		t.Fatalf("zone create: %d", resp.StatusCode)
 	}
-	if got := digA(t, a.DNSAddr(), "svc.home.lan"); got != "10.0.0.42" {
-		t.Fatalf("record not live: %s", got)
+	resp = postJSON(t, c, apiURL(a, fmt.Sprintf("/api/v1/zones/%d/records", zoneCreated.ID)), `{"name":"svc","type":"A","ttl":60,"rdata":"10.0.0.42"}`)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("zone record create: %d", resp.StatusCode)
+	}
+	if got := digA(t, a.DNSAddr(), "svc.e412.test"); got != "10.0.0.42" {
+		t.Fatalf("zone record not live: %s", got)
 	}
 
 	// blocklist via API → blocked (nxdomain mode)

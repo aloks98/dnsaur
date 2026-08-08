@@ -121,6 +121,64 @@ func TestMigrateExistingDatabaseGainsListStatus(t *testing.T) {
 	}
 }
 
+// TestMigrateExistingZoneGainsSOATTL is 0006's upgrade path. A zone row
+// written before soa_ttl existed has to come out of the migration with a
+// usable header TTL: 0 would mean every negative answer this zone hands out
+// is uncacheable (RFC 2308 §5 takes min(SOAMinimum, SOATTL)), turning a
+// silent schema addition into a query-rate regression for every resolver
+// pointed at it. The default matches soa_minimum's, so nothing changes for
+// a row that never set either.
+func TestMigrateExistingZoneGainsSOATTL(t *testing.T) {
+	ctx := context.Background()
+	dsn := filepath.Join(t.TempDir(), "prezones.db")
+
+	raw, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sub, err := fs.Sub(migrationsFS, "migrations/sqlite")
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider, err := goose.NewProvider(goose.DialectSQLite3, raw, sub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Stop at 0004: zones exists, soa_ttl does not.
+	if _, err := provider.UpTo(ctx, 4); err != nil {
+		t.Fatalf("legacy migrate: %v", err)
+	}
+	if _, err := raw.ExecContext(ctx,
+		`INSERT INTO zones (name, type, enabled, soa_ns, soa_mbox, soa_serial, soa_minimum)
+		 VALUES ('legacy.test', 'primary', 1, 'ns.legacy.test', 'hostadmin.legacy.test', 4, 600)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := Open(ctx, "sqlite", dsn)
+	if err != nil {
+		t.Fatalf("upgrading a database with zones failed: %v", err)
+	}
+	defer func() { _ = s.Close() }()
+
+	zs, err := s.Zones().Zones(ctx)
+	if err != nil {
+		t.Fatalf("reading zones after upgrade: %v", err)
+	}
+	if len(zs) != 1 || zs[0].Name != "legacy.test" {
+		t.Fatalf("zones after upgrade = %+v, want the pre-existing legacy.test", zs)
+	}
+	if zs[0].SOATTL != 900 {
+		t.Errorf("SOATTL = %d, want the 900 default — a 0 here makes every negative answer uncacheable", zs[0].SOATTL)
+	}
+	// The rest of the row is untouched.
+	if zs[0].SOAMinimum != 600 || zs[0].SOASerial != 4 {
+		t.Errorf("row mangled by the migration: %+v", zs[0])
+	}
+}
+
 func TestMigrateIdempotent(t *testing.T) {
 	dsn := filepath.Join(t.TempDir(), "t.db")
 	ctx := context.Background()

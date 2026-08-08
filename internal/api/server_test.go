@@ -34,7 +34,7 @@ func (f *fakeReloader) ReloadClients(ctx context.Context) error {
 	f.clients++
 	return nil
 }
-func (f *fakeReloader) ReloadRecords(ctx context.Context) error {
+func (f *fakeReloader) ReloadZones(ctx context.Context) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.records++

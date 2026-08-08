@@ -32,7 +32,7 @@ test("opening the palette lists every page, grouped by nav section", async () =>
     "Lists",
     "Rules",
     "Groups & Clients",
-    "Local DNS",
+    "Zones",
     "Settings",
     "Account",
   ]) {
@@ -40,12 +40,12 @@ test("opening the palette lists every page, grouped by nav section", async () =>
   }
   // ...under the same four headings the top bar's first row shows, in the
   // same order. Read off cmdk's own heading elements rather than by text:
-  // the Local DNS group and its single page are deliberately named the
-  // same thing, so a plain text query can't tell a heading from an option.
+  // the Zones group and its single page are deliberately named the same
+  // thing, so a plain text query can't tell a heading from an option.
   expect([...document.querySelectorAll("[cmdk-group-heading]")].map((h) => h.textContent)).toEqual([
     "Monitor",
     "Filtering",
-    "Local DNS",
+    "Zones",
     "System",
   ]);
 });
@@ -78,8 +78,8 @@ test("selecting a page navigates to it", async () => {
   }
   renderWithProviders(<NavHarness />);
 
-  await userEvent.click(await screen.findByRole("option", { name: "Local DNS" }));
+  await userEvent.click(await screen.findByRole("option", { name: "Zones" }));
 
-  await waitFor(() => expect(screen.getByTestId("pathname")).toHaveTextContent("/dns"));
+  await waitFor(() => expect(screen.getByTestId("pathname")).toHaveTextContent("/zones"));
   expect(onOpenChange).toHaveBeenCalledWith(false);
 });

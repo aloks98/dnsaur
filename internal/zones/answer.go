@@ -1,0 +1,299 @@
+package zones
+
+import (
+	"strings"
+
+	"github.com/aloks98/dnsaur/internal/store"
+	"github.com/miekg/dns"
+)
+
+// maxCNAMEChase bounds how far an in-zone CNAME chain is followed. A chain
+// longer than this is a loop or a mistake; either way the answer stops here
+// rather than recursing until the process dies, which would make one bad
+// record a remote crash.
+const maxCNAMEChase = 8
+
+// Answer fills m with this zone's response to qname/qtype and reports
+// whether the zone answered at all.
+//
+// handled is false only for zone types that name somewhere else to ask
+// rather than holding data (forwarder, stub — Milestone D); for those, m is
+// left untouched for the rest of the pipeline. Every other type answers,
+// and that is the whole difference between a zone and the override list it
+// replaced: inside a zone we hold, a query never leaves. A name we do not
+// have is an authoritative NXDOMAIN carrying our SOA, not a lookup upstream
+// that leaks an internal name and lets a public record shadow it.
+//
+// The order below is RFC 1034 §4.3.2:
+//
+//	zone cut above or at the name → referral, aa=0
+//	name exists  → its CNAME, else its records of qtype, else NODATA + SOA
+//	name absent  → the wildcard at the closest encloser, else NXDOMAIN + SOA
+//
+// qname must be inside this zone; Index.Find is what establishes that.
+func (z *Zone) Answer(m *dns.Msg, qname string, qtype uint16) (handled bool) {
+	switch strings.ToLower(z.Type) {
+	case "forwarder", "stub":
+		return false
+	}
+	m.Authoritative = true
+	m.Rcode = dns.RcodeSuccess
+	z.resolve(m, dns.Fqdn(qname), RelName(qname, z.Name), qtype, 0)
+	return true
+}
+
+// resolve answers for one name, and is re-entered for each in-zone CNAME
+// target so a chased name gets the same treatment the queried one did —
+// including the zone-cut check, which a target below a delegation still
+// needs.
+func (z *Zone) resolve(m *dns.Msg, fqdn, rel string, qtype uint16, depth int) {
+	// RFC 1034 §4.3.2 step 3(b): a name at or below a zone cut is the
+	// child's to serve. Checked first, because records stored below the cut
+	// must not be answered from here even though they are in our table.
+	if z.referral(m, rel) {
+		return
+	}
+
+	// The apex's SOA is a zones-row field rather than a zone_records row
+	// (its serial needs managed increments), so it has to be served from
+	// there or the zone has no answer for its own SOA.
+	if rel == apexName && qtype == dns.TypeSOA {
+		m.Answer = append(m.Answer, z.SOA())
+		return
+	}
+
+	if exact := z.rrs(rel); len(exact) > 0 {
+		if z.fill(m, fqdn, exact, qtype, depth) {
+			return
+		}
+		// The name exists with other types. RFC 4592 §2.2: a wildcard must
+		// not answer for a name that exists, so this is NODATA and the
+		// wildcard below is not consulted. Without this, every NODATA under
+		// a wildcard silently returns the wildcard's address instead.
+		z.deny(m, dns.RcodeSuccess)
+		return
+	}
+
+	// A name with descendants exists as an empty non-terminal even with no
+	// records of its own, and so does the apex (its SOA is there). RFC 8020
+	// makes NXDOMAIN a claim about the name *and everything below it*, so
+	// answering it here would tell every resolver to stop asking for the
+	// names below that do exist. It is NODATA — and, being an existing
+	// name, it is not a wildcard match either (RFC 4592 §3.3.1).
+	if rel == apexName || z.hasDescendant(rel) {
+		z.deny(m, dns.RcodeSuccess)
+		return
+	}
+
+	if w := z.wildcard(rel); len(w) > 0 {
+		if z.fill(m, fqdn, w, qtype, depth) {
+			return
+		}
+		z.deny(m, dns.RcodeSuccess)
+		return
+	}
+
+	z.deny(m, dns.RcodeNameError)
+}
+
+// fill appends the records of qtype from recs to m.Answer under the owner
+// name fqdn, following a CNAME instead if one is present, and reports
+// whether it produced anything. A false return is the NODATA case: this
+// name exists, but not with the type asked for.
+func (z *Zone) fill(m *dns.Msg, fqdn string, recs []store.ZoneRecord, qtype uint16, depth int) bool {
+	// RFC 1034 §3.6.2: a CNAME is the only data a name may hold, so any
+	// query for a different type is answered by following it. Asking for
+	// the CNAME itself is answered directly — following it would return
+	// data for a name the client did not ask about.
+	if qtype != dns.TypeCNAME {
+		for _, r := range recs {
+			if rrType(r) == dns.TypeCNAME {
+				return z.chase(m, fqdn, r, qtype, depth)
+			}
+		}
+	}
+	n := 0
+	for _, r := range recs {
+		if rrType(r) != qtype {
+			continue
+		}
+		rr, err := ToRR(fqdn, r)
+		if err != nil {
+			// Unservable rdata reads as absent rather than taking the rest
+			// of the RRset down with it — but note what "absent" costs
+			// inside a zone: the name can fall to authoritative NODATA and
+			// is never forwarded, so a row that lands here is a record that
+			// silently disappeared, not one that degrades to an upstream
+			// lookup.
+			//
+			// The API validates writes through this same dns.NewRR, so no
+			// row written through it can land here. It is not the only
+			// writer, though: internal/store's local_records migration
+			// (zonemigrate.go) inserts rows directly, which is exactly why
+			// it converts a TXT value into quoted presentation format
+			// rather than copying the stored bytes across.
+			continue
+		}
+		m.Answer = append(m.Answer, rr)
+		n++
+	}
+	return n > 0
+}
+
+// chase appends the CNAME and, when its target is inside this zone,
+// continues resolving there so the client gets the address in the same
+// response instead of paying a round trip for it. An out-of-zone target is
+// left for the pipeline: the CNAME alone is still an authoritative answer.
+func (z *Zone) chase(m *dns.Msg, fqdn string, rec store.ZoneRecord, qtype uint16, depth int) bool {
+	rr, err := ToRR(fqdn, rec)
+	if err != nil {
+		return false
+	}
+	cn, ok := rr.(*dns.CNAME)
+	if !ok {
+		return false
+	}
+	m.Answer = append(m.Answer, cn)
+	if depth+1 >= maxCNAMEChase || !z.owns(cn.Target) {
+		return true
+	}
+	// The rcode describes the end of the chain: an in-zone target that does
+	// not exist is NXDOMAIN, with the CNAME kept in ANSWER.
+	z.resolve(m, dns.Fqdn(cn.Target), RelName(cn.Target, z.Name), qtype, depth+1)
+	return true
+}
+
+// deny writes a negative answer: rcode, and the zone's SOA in AUTHORITY so
+// a resolver can cache the absence instead of re-asking on every lookup
+// (RFC 2308 §3). AA stays set — a negative answer from the zone that holds
+// the name is authoritative.
+func (z *Zone) deny(m *dns.Msg, rcode int) {
+	m.Rcode = rcode
+	soa := z.SOA()
+	// RFC 2308 §5: the negative TTL is min(MINIMUM, the SOA record's own
+	// TTL). That number is how long every resolver on the network caches
+	// this absence, so taking the larger of the two would keep a
+	// newly-added record invisible for exactly that long.
+	soa.Hdr.Ttl = min(z.SOAMinimum, z.SOATTL)
+	m.Ns = append(m.Ns, soa)
+}
+
+// referral walks from rel up to (not including) the apex looking for a zone
+// cut — an NS record below the apex — and writes the referral if it finds
+// one. NS *at* the apex is this zone's own authority (RFC 2181 §10.1), not
+// a cut, so it is never reached by this walk.
+func (z *Zone) referral(m *dns.Msg, rel string) bool {
+	if rel == apexName {
+		return false
+	}
+	labels := dns.SplitDomainName(normalizeName(rel))
+	for i := range labels {
+		cut := strings.Join(labels[i:], ".")
+		owner := dns.Fqdn(cut + "." + z.Name)
+		var auth, glue []dns.RR
+		for _, r := range z.rrs(cut) {
+			if rrType(r) != dns.TypeNS {
+				continue
+			}
+			rr, err := ToRR(owner, r)
+			if err != nil {
+				continue
+			}
+			ns, ok := rr.(*dns.NS)
+			if !ok {
+				continue
+			}
+			auth = append(auth, ns)
+			glue = append(glue, z.glue(ns.Ns)...)
+		}
+		if len(auth) == 0 {
+			continue
+		}
+		// We are not authoritative below a cut, and saying otherwise would
+		// make a stale copy of the child's data look official.
+		m.Authoritative = false
+		m.Ns = append(m.Ns, auth...)
+		m.Extra = append(m.Extra, glue...)
+		return true
+	}
+	return false
+}
+
+// glue returns this zone's addresses for a delegated nameserver. Only
+// in-zone names qualify: an address for a nameserver named outside this
+// zone is not ours to vouch for, and the resolver can look it up itself.
+func (z *Zone) glue(target string) []dns.RR {
+	if !z.owns(target) {
+		return nil
+	}
+	fqdn := dns.Fqdn(target)
+	var out []dns.RR
+	for _, r := range z.rrs(RelName(target, z.Name)) {
+		switch rrType(r) {
+		case dns.TypeA, dns.TypeAAAA:
+			if rr, err := ToRR(fqdn, r); err == nil {
+				out = append(out, rr)
+			}
+		}
+	}
+	return out
+}
+
+// wildcard returns the records of the source of synthesis for rel, which
+// RFC 4592 §3.3.1 defines as "*." + the closest encloser — not any wildcard
+// further up. Because the asterisk is only ever placed leftmost here and
+// lookups are exact, a stored name like "a.*" is a literal that answers for
+// itself and synthesises for nothing (RFC 4592 §2.1.1).
+func (z *Zone) wildcard(rel string) []store.ZoneRecord {
+	if ce := z.closestEncloser(rel); ce != apexName {
+		return z.rrs("*." + ce)
+	}
+	return z.rrs("*")
+}
+
+// closestEncloser returns the deepest ancestor of rel that exists — with
+// records of its own or as an empty non-terminal. rel itself is excluded:
+// this is only called once rel is known not to exist. The apex always
+// exists, so the walk always terminates.
+func (z *Zone) closestEncloser(rel string) string {
+	labels := dns.SplitDomainName(normalizeName(rel))
+	for i := 1; i < len(labels); i++ {
+		anc := strings.Join(labels[i:], ".")
+		if len(z.rrs(anc)) > 0 || z.hasDescendant(anc) {
+			return anc
+		}
+	}
+	return apexName
+}
+
+// hasDescendant reports whether any name in the zone sits below rel, which
+// is what makes rel exist as an empty non-terminal. It scans the zone's
+// names, which costs O(records) on the miss paths that reach it; a
+// homelab zone is small enough that a precomputed set of non-terminals
+// would be more state to keep correct than it saves.
+func (z *Zone) hasDescendant(rel string) bool {
+	suffix := "." + normalizeName(rel)
+	for name := range z.Records {
+		if strings.HasSuffix(name, suffix) {
+			return true
+		}
+	}
+	return false
+}
+
+// rrs returns the records stored at rel, a name relative to the apex.
+func (z *Zone) rrs(rel string) []store.ZoneRecord {
+	return z.Records[normalizeName(rel)]
+}
+
+// owns reports whether name is inside this zone.
+func (z *Zone) owns(name string) bool {
+	n, apex := normalizeName(name), normalizeName(z.Name)
+	return n == apex || strings.HasSuffix(n, "."+apex)
+}
+
+// rrType is a record's stored type as a wire type, or 0 for a type
+// miekg/dns does not know — which matches no query.
+func rrType(r store.ZoneRecord) uint16 {
+	return dns.StringToType[strings.ToUpper(r.Type)]
+}

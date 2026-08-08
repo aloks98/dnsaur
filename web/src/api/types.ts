@@ -74,12 +74,61 @@ export interface Rule {
   is_regex: boolean;
 }
 
-export interface LocalRecord {
+/**
+ * An authoritative DNS zone (Go: store.Zone) — a claim of authority over a
+ * suffix, not an override on top of an upstream forwarder. A name inside an
+ * enabled zone is answered from it or refused by it; it is never forwarded,
+ * which is what replaced the old flat local_records override table (the
+ * Local DNS page, retired in Task 12).
+ */
+export interface Zone {
   id: number;
+  /** Apex, lowercase, no trailing dot, e.g. "example.com". */
   name: string;
-  type: "A" | "AAAA" | "CNAME" | "TXT";
-  value: string;
+  /**
+   * primary | secondary | stub | forwarder | internal; defaults to primary.
+   * Milestone A creates and serves primary zones only — the rest are
+   * accepted and stored but not yet acted on.
+   */
+  type: "primary" | "secondary" | "stub" | "forwarder" | "internal";
+  enabled: boolean;
+  soa_ns: string;
+  soa_mbox: string;
+  soa_serial: number;
+  soa_refresh: number;
+  soa_retry: number;
+  soa_expire: number;
+  /** Negative-cache TTL (RFC 2308) for NXDOMAINs this zone hands out — not a floor on positive answers. */
+  soa_minimum: number;
+  /** The SOA record's own header TTL, distinct from soa_minimum. Fixed at 900 in Milestone A — no request field sets it. */
+  soa_ttl: number;
+  /** secondary/stub/forwarder only; unused and empty for primary/internal. */
+  primaries: string;
+  tsig_key_id: number;
+  /** Unix ms; secondary only, 0 otherwise. */
+  expires_at: number;
+  /** Unix ms; secondary only, 0 otherwise. */
+  refreshed_at: number;
+  created_at: number;
+  modified_at: number;
+}
+
+/** One resource record within a zone (Go: store.ZoneRecord), named relative to the zone's apex. */
+export interface ZoneRecord {
+  id: number;
+  zone_id: number;
+  /** Owner name relative to the zone apex: "@" for the apex itself, "bifrost", "*", "*.nexus". */
+  name: string;
+  /** DNS RR type, e.g. A, AAAA, CNAME, MX, TXT, CAA, NS. */
+  type: string;
   ttl: number;
+  /**
+   * DNS presentation format, rdata portion only — "192.168.150.28" for A,
+   * "10 mail.example.com." for MX, `0 issue "letsencrypt.org"` for CAA.
+   */
+  rdata: string;
+  enabled: boolean;
+  comment: string;
 }
 
 export interface QueryEntry {

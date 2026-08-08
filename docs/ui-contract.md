@@ -189,7 +189,7 @@ JSON *string* even for numeric settings. **204** on success.
 | 400 | `invalid value for <key>` |
 | 503 | `storage unavailable` |
 
-Full key list, defaults and reload behaviour in §3.8.
+Full key list, defaults and reload behaviour in §3.9.
 
 #### Blocking pause
 | Endpoint | Params | Success |
@@ -305,34 +305,122 @@ already committed, leaving the group with a partial set.
 
 ---
 
-### 2.6 Local DNS records
+### 2.6 Zones and zone records
+
+`/records` is gone. Local overrides were replaced by real authoritative
+zones — a name inside an enabled zone is answered or refused and **never
+forwarded**, which is the entire point of the change (see
+`docs/superpowers/specs/2026-08-08-zones-design.md` §1).
 
 | Endpoint | Success |
 |---|---|
-| `GET /records` | 200 array |
-| `POST /records` | 201 `{"id":1}` |
-| `PUT /records/{id}` | 204 (full replace) |
-| `DELETE /records/{id}` | 204 |
+| `GET /zones` | 200 array |
+| `POST /zones` | 201 `{"id":1}` |
+| `GET /zones/{id}` | 200 object |
+| `PATCH /zones/{id}` | 204 |
+| `DELETE /zones/{id}` | 204 — cascades every record in the zone |
+| `GET /zones/{id}/records` | 200 array |
+| `POST /zones/{id}/records` | 201 `{"id":1}` |
+| `PUT /zones/{id}/records/{rid}` | 204 (full replace) |
+| `DELETE /zones/{id}/records/{rid}` | 204 |
+
+Real capture, `POST /zones {"name":"home.lan"}` then `GET /zones`:
 
 ```json
-[{"id":1,"name":"nas.home.arpa","type":"A","value":"192.168.1.10","ttl":300}]
+[{"id":1,"name":"home.lan","type":"primary","enabled":true,
+  "soa_ns":"ns.home.lan","soa_mbox":"hostadmin.home.lan","soa_serial":1,
+  "soa_refresh":900,"soa_retry":300,"soa_expire":604800,"soa_minimum":900,
+  "soa_ttl":900,"primaries":"","tsig_key_id":0,"expires_at":0,
+  "refreshed_at":0,"created_at":1786219213980,"modified_at":1786219213980}]
 ```
 
-All eight validation strings, verbatim:
+`type` omitted on create defaults to `primary`. **`primary` is the only type
+this milestone's API will create or patch** — real-captured: `POST /zones`
+with `"type":"internal"` 400s `only primary zones are supported`, the exact
+same message as `"secondary"`. The check
+(`internal/api/zones_handlers.go`'s `zoneTypePrimary`) is an equality test
+against `"primary"`, not an allowlist that happens to include it — so
+`internal` isn't a quiet exception, it 400s like every other non-`primary`
+value. `internal`, `secondary`, `stub` and `forwarder` all exist in the
+schema and are rendered by the zone list/detail badges (§3.6, §8) for zones
+however they come to exist — API-created zones just can't be one yet.
 
-| Error string |
-|---|
-| `invalid json` |
-| `name must be a domain (wildcard *.parent allowed)` |
-| `ttl must be 1-86400` |
-| `value must be an IPv4 address` |
-| `value must be an IPv6 address` |
-| `cname target must be a domain` |
-| `txt value required` |
-| `type must be A, AAAA, CNAME or TXT` |
+Creating a zone also inserts its apex NS record (`name: "@"`, pointed at
+`soa_ns`) — RFC 2181 §10.1 requires apex NS on every authoritative zone.
+That insert is best-effort against an already-committed zone: a failure is
+logged, not surfaced, so `GET /zones/{id}/records` is how to confirm it
+landed. `soa_ttl` is fixed at `900` — there is no request field to set it,
+on create or patch.
 
-There is **no uniqueness constraint** on records — duplicates are accepted
-silently and all matching rows are answered.
+Zone create/patch errors:
+
+| Status | Error string |
+|---|---|
+| 400 | `invalid json` |
+| 400 | `bad id` |
+| 400 | `name must be a valid domain name` |
+| 400 | `only primary zones are supported` |
+| 404 | `not found` |
+| 409 | `a zone with that name already exists` |
+| 503 | `storage unavailable` |
+
+Real capture, `GET /zones/1/records` after adding an A record at `bifrost`
+(name typed relative) and another at `nas.home.lan` (typed fully-qualified —
+the apex is stripped):
+
+```json
+[{"id":1,"zone_id":1,"name":"@","type":"NS","ttl":3600,
+  "rdata":"ns.home.lan.","enabled":true,"comment":""},
+ {"id":2,"zone_id":1,"name":"bifrost","type":"A","ttl":300,
+  "rdata":"192.168.150.28","enabled":true,"comment":""},
+ {"id":3,"zone_id":1,"name":"nas","type":"A","ttl":300,
+  "rdata":"192.168.1.10","enabled":true,"comment":""}]
+```
+
+`rdata` is DNS presentation format — the rdata portion only
+(`192.168.150.28` for A, `10 mail.example.com.` for MX,
+`0 issue "letsencrypt.org"` for CAA). It's validated by handing
+`"<name> <ttl> IN <type> <rdata>"` to `dns.NewRR` — the same parser that
+builds the RR the resolver actually serves — so an accepted record is by
+construction servable, and a `400` carries that parser's own error text.
+Real capture, an unparseable A record:
+
+```json
+{"error":"dns: bad A A: \"not-an-ip\" at line: 1:32"}
+```
+
+`name` is zone-relative: `@` (or blank, or the zone's own name) means the
+apex; `bifrost`, `*`, `*.nexus` name anything else. A name carrying the
+zone's own apex as a suffix has that suffix stripped rather than doubled.
+
+Three write conflicts, checked in this order and each real-captured:
+
+| Order | Status | Error string | RFC |
+|---|---|---|---|
+| 1 | 409 | `CNAME is not allowed at the zone apex (RFC 1912 §2.4)` | 1912 §2.4 |
+| 2 | 409 | `CNAME cannot coexist with another record at the same name (RFC 1034 §3.6.2)` | 1034 §3.6.2 |
+| 3 | 409 | `records in the same RRSet must share one TTL (RFC 2181 §5.2)` | 2181 §5.2 |
+
+Rule 2 fires in either write order — a CNAME landing beside an existing
+record, or a record landing beside an existing CNAME. Rule 1 only applies
+at `@`: the zone's SOA/NS live on the `zones` row rather than as a
+`zone_records` row, so the ordinary sibling check (rule 2) would see an
+apex with nothing recorded there and miss an apex CNAME on its own — it
+needs the dedicated rule.
+
+Other errors:
+
+| Status | Error string | When |
+|---|---|---|
+| 400 | `bad id` | zone or record id fails to parse as a positive int64 |
+| 400 | `invalid json` | |
+| 400 | `ttl must not exceed 2147483647 (RFC 2181 §8)` | |
+| 404 | `not found` | unknown zone id, on `/zones/{id}` **or any `/zones/{id}/records*` route**, or `rid` doesn't belong to the zone named by `id` — real-captured; `openapi.yaml`'s per-route "zone not found" / "rid is not a record of this zone" wording is a description of the situation, not the actual response body, which is always the flat `{"error":"not found"}` |
+| 503 | `storage unavailable` | |
+
+There is **no uniqueness constraint** on records beyond the three conflicts
+above — two `TXT` records at the same name, for instance, are both stored
+and both answered.
 
 ---
 
@@ -359,17 +447,19 @@ written in flush batches, `id DESC` is only approximately newest-first.
 **No total count, no cursor, no `has_more`.** The client infers "more available"
 from `len(result) == limit`.
 
-Real capture (`?limit=2`):
+Real capture (`?limit=2`) — both rows decided by the same zone, one NODATA
+(name exists, wrong type) and one NXDOMAIN (name absent); `decision` is
+`authoritative` either way, only `r_code` differs:
 ```json
-[{"id":7,"at":1785946876523,
-  "instance_id":"29cbba52-a6e1-4088-89a3-3d14e32dcfa5",
+[{"id":3,"at":1786219236223,
+  "instance_id":"1fc5e9d1-9dc8-406f-a86e-555a39f48de2",
   "client_ip":"127.0.0.1","client_id":0,
-  "q_name":"ads.example.com","q_type":"A","decision":"blocked",
-  "rule_id":1,"list_id":0,"upstream":"","r_code":"NOERROR","duration_ms":0},
- {"id":6,"at":1785946876505,
-  "instance_id":"29cbba52-a6e1-4088-89a3-3d14e32dcfa5",
+  "q_name":"doesnotexist.home.lan","q_type":"A","decision":"authoritative",
+  "rule_id":0,"list_id":0,"upstream":"","r_code":"NXDOMAIN","duration_ms":0},
+ {"id":2,"at":1786219236203,
+  "instance_id":"1fc5e9d1-9dc8-406f-a86e-555a39f48de2",
   "client_ip":"127.0.0.1","client_id":0,
-  "q_name":"nas.home.arpa","q_type":"A","decision":"local",
+  "q_name":"bifrost.home.lan","q_type":"AAAA","decision":"authoritative",
   "rule_id":0,"list_id":0,"upstream":"","r_code":"NOERROR","duration_ms":0}]
 ```
 
@@ -426,20 +516,21 @@ Shared param:
 ```json
 {"blocked":2,"cached":0,"clients":1,"forwarded":10,"total":14}
 ```
-- `total` = the sum of **every** decision bucket, including `local` and `error`.
+- `total` = the sum of **every** decision bucket, including `authoritative`
+  and `error`.
 - `cached` = `cached` + `stale`.
 - `clients` = distinct `client_ip` keys in the window — **not** a count of
   configured client rows.
 
-**`blocked + cached + forwarded ≤ total`**, and the gap is `local` + `error`.
-Any UI computing "allowed = total − blocked" will be wrong.
+**`blocked + cached + forwarded ≤ total`**, and the gap is `authoritative` +
+`error`. Any UI computing "allowed = total − blocked" will be wrong.
 
 #### `GET /stats/timeline`
 Ascending by bucket; `bucket` is a **unix-seconds hour start**. Only non-zero
 decisions appear — missing keys default to 0. **No zero-filling**, so a quiet
 hour is simply absent.
 ```json
-[{"bucket":1785945600,"decisions":{"blocked":2,"forwarded":10,"local":2}}]
+[{"bucket":1785945600,"decisions":{"blocked":2,"forwarded":10,"authoritative":2}}]
 ```
 
 #### `GET /stats/top`
@@ -509,26 +600,29 @@ another user's token *and* any underlying storage failure.
 | `decision` | string | enum below | |
 | `rule_id` | int64 | FK → `rules.id` | **`0` = not attributed**; non-zero only for a rule-driven block |
 | `list_id` | int64 | FK → `lists.id` | **`0` = not attributed**; non-zero only for a list-driven block |
-| `upstream` | string | `host:port` | **`""` = never left the box** (blocked/local/cached/stale/error) |
+| `upstream` | string | `host:port` | **`""` = never left the box** (blocked/authoritative/cached/stale/error) |
 | `r_code` | string | `NOERROR`, `NXDOMAIN`, `SERVFAIL`, `REFUSED`, … | |
 | `duration_ms` | int64 | whole ms, truncated | sub-millisecond answers record `0` |
 
-**`decision` enum** (`internal/dnssrv/pipeline.go:14-22`):
+**`decision` enum** (`internal/dnssrv/pipeline.go:12-20`):
 
 | Value | Meaning |
 |---|---|
 | `blocked` | a rule or list matched |
-| `local` | answered from a local record |
+| `authoritative` | answered (or authoritatively refused) by a zone this instance holds — was `local` before zones replaced the flat local-records table; see §2.6 |
 | `cached` | fresh cache hit |
 | `stale` | upstream failed, served an expired entry (TTL rewritten to 30) |
 | `forwarded` | answered by an upstream |
 | `error` | handler error, or RFC 9520 failure cache → SERVFAIL |
-| `allowed` | **TODO — defined but never written.** No code path assigns it. An allow rule only *skips* blocking, so the row is logged with whatever the downstream stage produced. |
 
-> Verified live: filtering by each value returns `blocked` 2, `forwarded` 10,
-> `local` 2, and **`allowed` 0**. The query-log filter placeholder used to read
-> `"blocked, allowed, cached…"`, advertising a value that can never match; it
-> now reads `"blocked, forwarded, cached…"`.
+There is no `allowed` value. It used to be declared but never written (dead
+since it was added); the zones work deleted the constant outright rather
+than leaving it as an unused TODO — see §10 item 2.
+
+> Verified live: an exact-match query, a NODATA (name exists, wrong type)
+> and an NXDOMAIN (name absent) against the same zone all logged
+> `decision: "authoritative"`, distinguished only by `r_code` — real capture
+> in §2.6.
 
 ### 3.2 Filter list
 
@@ -654,28 +748,65 @@ The default group is created only when the table is empty, named `default`, and
 on a fresh DB gets id **1**. Two places hardcode `1`: deletion refuses it, and
 unmatched clients fall back to it.
 
-### 3.6 Local DNS record
+### 3.6 Zone
 
 | Field | Type | Notes |
 |---|---|---|
-| `name` | string | trimmed, trailing dot stripped, **lowercased**; **no trailing dot is added**. Leading `*.` wildcard allowed. Must contain a `.`; no space, `/` or `\` |
-| `type` | string | `A` \| `AAAA` \| `CNAME` \| `TXT`, uppercased before storage |
-| `value` | string | per-type rules below |
-| `ttl` | uint32 | **seconds, 1–86400 inclusive** — `0` fails, so it is effectively required |
+| `id` | int64 | |
+| `name` | string | apex, lowercase, no trailing dot |
+| `type` | string | `primary` \| `secondary` \| `stub` \| `forwarder` \| `internal`; only `primary` is creatable/patchable this milestone (§2.6) |
+| `enabled` | bool | a disabled zone is skipped by lookup entirely — it neither answers nor claims the name, so queries under it fall through to a shallower enabled zone or upstream, exactly as if the zone didn't exist (`internal/zones/zone.go`'s `Index.Find`) |
+| `soa_ns`, `soa_mbox` | string | default to `ns.<name>` / `hostadmin.<name>` on create |
+| `soa_serial` | uint32 | starts at `1`; bumped by one on every record create/update/delete in the zone (`BumpSerial`, best-effort — logged, not surfaced, on failure) |
+| `soa_refresh`, `soa_retry`, `soa_expire` | uint32 (seconds) | default 900 / 300 / 604800 |
+| `soa_minimum` | uint32 (seconds) | negative-cache TTL advertised for this zone's NXDOMAINs (RFC 2308), not a floor on positive answers; default 900 |
+| `soa_ttl` | uint32 (seconds) | the SOA record's own header TTL, independent of `soa_minimum` — RFC 2308 §5 needs both to express `min(minimum, ttl)`. Fixed at `900`; **no request field sets it**, on create or patch |
+| `primaries`, `tsig_key_id`, `expires_at`, `refreshed_at` | string / int64 | secondary/stub/forwarder only (Milestone D); always empty/`0` for `primary`/`internal` |
+| `created_at`, `modified_at` | int64 (unix ms) | |
 
-- `A` — must parse as IP with `To4() != nil`. Stored verbatim, not canonicalised.
-- `AAAA` — must parse as IP with `To4() == nil`, which **rejects IPv4-mapped
-  forms** like `::ffff:192.0.2.1`. The web client deliberately does not
-  replicate that narrowing and lets the server 400.
-- `CNAME` — lowercased and dot-stripped **before storage**; must contain a `.`.
-- `TXT` — any non-empty string. No length check and **no chunking at 255
-  bytes**.
+### 3.7 Zone record
 
-Resolution: exact name first, then `*.parent` walking up labels; CNAME chains
-followed up to 8 hops, and a non-local target is resolved through the rest of
-the pipeline and merged. Answers are marked authoritative.
+| Field | Type | Notes |
+|---|---|---|
+| `id` | int64 | |
+| `zone_id` | int64 | FK → `zones.id` |
+| `name` | string | relative to the zone apex: `@`, `bifrost`, `*`, `*.nexus` — never a fully-qualified name in storage, even if one was typed on write (§2.6) |
+| `type` | string | any DNS RR type `dns.NewRR` parses — not a closed enum on the server; the dashboard's create/edit form offers `A`, `AAAA`, `CNAME`, `TXT`, `MX`, `SRV`, `NS`, `CAA` (§8) |
+| `ttl` | uint32 (seconds) | `0`–`2147483647` (RFC 2181 §8); every record in the same (`name`,`type`) RRSet must share one value (RFC 2181 §5.2, 409 on mismatch) |
+| `rdata` | string | DNS presentation format, rdata portion only — validated by `dns.NewRR`, not a per-type schema |
+| `enabled` | bool | a disabled record is dropped when the zone's served snapshot is built (`NewZone`) — indistinguishable from never having been written, so it can't turn an NXDOMAIN into a NODATA or suppress a wildcard that should otherwise match |
+| `comment` | string | free text, never interpreted |
 
-### 3.7 Upstream
+**Answering** (`internal/zones/answer.go`, `Zone.Answer`) — the zone cut is
+found first (deepest enabled zone whose apex suffixes the query name wins;
+`e412.in` beats `in` if both exist), then, once inside a zone:
+
+1. An `NS` record below the apex is a delegation: referral (`NS` in
+   AUTHORITY, in-zone glue in ADDITIONAL, `aa=0`), not an answer from here.
+2. An exact name+type match answers, `aa=1`.
+3. An exact name match with a `CNAME` present follows it — appending the
+   `CNAME` and, if the target is inside this zone, continuing resolution
+   there (up to 8 hops) so the final answer lands in one response. A query
+   for the `CNAME` itself is not followed.
+4. An exact name match with other types but not the one asked for is
+   NODATA: `NOERROR`, empty ANSWER, the zone's SOA in AUTHORITY.
+5. A name that doesn't exist but has descendants (an empty non-terminal —
+   including the apex itself) is also NODATA, not NXDOMAIN — RFC 8020 makes
+   NXDOMAIN a claim about the name *and everything below it*.
+6. Otherwise, the wildcard at the closest existing encloser is tried
+   (`*.<encloser>` only — RFC 4592 §3.3.1, not a walk up through every
+   ancestor); a wildcard **never** matches a name that exists with other
+   types (RFC 4592 §2.2), which step 4 already excludes by construction.
+   `a.*.zone` (asterisk not leftmost) is a literal owner name, not a
+   wildcard (RFC 4592 §2.1.1) — legal data, answers only for itself.
+7. Nothing matched: NXDOMAIN, SOA in AUTHORITY.
+
+Every negative answer's AUTHORITY-section SOA carries
+`ttl = min(soa_minimum, soa_ttl)` (RFC 2308 §5). `forwarder`/`stub` zone
+types don't hold data and never reach this logic (Milestone D); the resolver
+treats them as if the name weren't covered at all and falls through.
+
+### 3.8 Upstream
 
 **There is no upstream table and no upstream entity.** Upstreams are a single
 comma-separated settings string. Accepted forms: `1.1.1.1`, `1.1.1.1:53`,
@@ -703,7 +834,7 @@ all are down, all are tried anyway; failures are negatively cached **30s** per
 exists and `New` implements it, but nothing ever populates it: no setting, no
 table, no API.
 
-### 3.8 Settings keys
+### 3.9 Settings keys
 
 Full editable allowlist. Values are always strings on the wire.
 
@@ -727,14 +858,14 @@ No upper bound on any integer key. `blocking.mode` treats **anything ≠
 Non-editable keys that exist but are stripped from `GET /settings`:
 `instance.id`, `stats.watermark`.
 
-### 3.9 Tokens
+### 3.10 Tokens
 
 `kind` is `session` or `api` — **not** a DB or API-level enum, just the only two
 values the code writes. Session tokens always have `scope: "write"`, `name: ""`,
 and a 30-day expiry; API tokens have `expires_at: 0` (never). Token material is
 32 random bytes, base64url for the plaintext, SHA-256 hex stored.
 
-### 3.10 DHCP lease — **TODO, nothing exists**
+### 3.11 DHCP lease — **TODO, nothing exists**
 
 There is no lease entity, no table, no route, no UI type, and no `:67` listener.
 A case-insensitive search for `dhcp` across all Go, SQL, and TypeScript files
@@ -746,7 +877,7 @@ document either.
 
 Anything a UI shows for DHCP today would be invented.
 
-### 3.11 Never serialized
+### 3.12 Never serialized
 
 | Struct | Field |
 |---|---|
@@ -880,8 +1011,12 @@ no `onMutate` and no `setQueryData` in the whole client.
 | Groups | Apply/remove a list | `PUT /groups/{id}/lists` | `Couldn't update lists for ${group.name}` |
 | Clients | Edit / Add | `PUT|POST /clients` | server message, else `Couldn't ${update\|add} the client` |
 | Clients | Delete | `DELETE /clients/{id}` | `Couldn't delete ${target.name}` |
-| Local DNS | Edit / Add | `PUT|POST /records` | server message, else `Couldn't ${update\|add} the record` |
-| Local DNS | Delete | `DELETE /records/{id}` | `Couldn't delete ${target.name}` |
+| Zones | Add | `POST /zones` | server message, else `Couldn't add the zone` |
+| Zones | Delete | `DELETE /zones/{id}` | `Couldn't delete ${target.name}` |
+| Zone detail | Enable / disable | `PATCH /zones/{id}` | `Couldn't ${enabled ? "disable" : "enable"} ${target.name}` |
+| Zone detail | Save SOA | `PATCH /zones/{id}` | server message, else `Couldn't save the SOA` |
+| Zone detail | Edit / Add record | `PUT\|POST /zones/{id}/records[/{rid}]` | server message, else `Couldn't ${update\|add} the record` |
+| Zone detail | Delete record | `DELETE /zones/{id}/records/{rid}` | `Couldn't delete ${target.name}` |
 | Account | Revoke token | `DELETE /tokens/{id}` | `Couldn't revoke ${token.name}` |
 | Account | Create token | `POST /tokens` | server message, else `Couldn't create the token` |
 | Account | Enable 2FA | `POST /auth/totp/start` | server message, else `Couldn't start setup — try again` |
@@ -923,7 +1058,8 @@ The client distinguishes two error cases, and the distinction is load-bearing:
 | Rules | 4 skeletons | `No rules for this group yet` | `Couldn't load rules` | stale banner |
 | Groups | 3 skeletons | `No groups yet` | `Couldn't load groups` | stale banner |
 | Clients | 4 skeletons | `No clients yet` | `Couldn't load clients` | stale banner |
-| Local DNS | 4 skeletons | `No local DNS records yet` | `Couldn't load local DNS records` | stale banner |
+| Zones | 4 skeletons | `No zones yet` | `Couldn't load zones` | stale banner |
+| Zone detail | 4 skeletons (zone), then 4 more (records) | `No records yet. Add one above and dnsaur will answer for this zone directly.` (unfiltered) / `No records match this filter.` (filtered) | `Couldn't load this zone` (zone) / `Couldn't load records` (records) | stale banner on **records only** — a background zone refetch failing has no banner of its own |
 | Settings | layout-shaped skeleton | n/a (fixed 11 fields) | `Couldn't load settings` | stale banner, "Any edits below are untouched." |
 | Account | 2-card skeleton | `No API tokens yet` | `Couldn't load your account` | stale banner |
 
@@ -974,7 +1110,8 @@ typing in an input.
 | Filtering → Lists | `/filtering/lists` (`/filtering` redirects here) |
 | Filtering → Rules | `/filtering/rules` |
 | Filtering → Groups & Clients | `/filtering/clients` |
-| Local DNS | `/dns` |
+| Zones | `/zones` |
+| Zone detail | `/zones/{id}` |
 | Settings | `/settings` |
 | Account & security | `/account` |
 | Login | pre-shell |
@@ -995,17 +1132,20 @@ typing in an input.
 
 | Screen | Status |
 |---|---|
-| **404 / unknown route** | `path="*"` silently redirects to Dashboard; there is no not-found screen |
-| **DHCP** | nothing exists (§3.10) |
+| **404 / unknown route** | renders a dedicated not-found screen inside the shell, no group marked in row 2 (`pages/not-found.tsx`) — this table is stale on this point in older captures; `path="*"` no longer redirects |
+| **DHCP** | nothing exists (§3.11) |
 | **Encrypted DNS (DoH/DoT)** | no code |
-| **Authoritative zones / DNSSEC** | no code |
+| **Zone transfers (secondary/stub/forwarder), reverse zones, DNSSEC** | schema and UI badges exist for the non-`primary` zone types (§3.6), but create/patch reject anything but `primary` with `400`; no transfer client/server, no PTR/reverse-zone handling, no signing — Milestones B–E |
 | **HA / cluster UI** | no code; the spec anticipated a health-strip stub, which does not exist |
 
-The nav contains exactly the eight implemented routes, in four groups
+The nav contains exactly the eight implemented leaf routes, in four groups
 (Monitor: Dashboard, Query Log · Filtering: Lists, Rules, Groups & Clients ·
-Network: Local DNS · System: Settings, Account) — there are no dead nav
-entries pointing at unbuilt screens. Theme and log out live under System too;
-the shell has no sidebar and no avatar.
+Zones: Zones · System: Settings, Account) — there are no dead nav entries
+pointing at unbuilt screens. The group holding Zones is internally still
+named `network` (a stable id for keys/tests), but its label and only child
+are both "Zones" — it replaced the flat Local DNS override table, not just
+its own nav entry. Theme and log out live under System too; the shell has
+no sidebar and no avatar.
 
 ### Dashboard layout (`/`)
 
@@ -1013,8 +1153,9 @@ A full-bleed grid of hairline-separated bands, no cards, everything mono:
 
 1. **Stat strip** — `QUERIES` / `BLOCKED` / `CACHE HIT RATE` / `ACTIVE CLIENTS`
    from `GET /stats/overview`. Both percentages divide by `total`, which sums
-   *every* decision including `local` and `error` — so `blocked + cached +
-   forwarded ≤ total`, and no "allowed" figure is ever derived by subtraction.
+   *every* decision including `authoritative` and `error` — so
+   `blocked + cached + forwarded ≤ total`, and no "allowed" figure is ever
+   derived by subtraction.
 2. **Query volume** — rnui `BarChart`, `RESOLVED` stacked under `BLOCKED`
    ("resolved" = every non-`blocked` decision, errors included, so the two
    bands total the strip above). `GET /stats/timeline` returns only hours that
@@ -1028,8 +1169,8 @@ A full-bleed grid of hairline-separated bands, no cards, everything mono:
    proportional bar sized against the largest value *in that panel*.
 
 **Decision colours** (live rows): `blocked`/`error` destructive, `stale` warn,
-`cached` muted, `forwarded` foreground, `local` primary. There is no `allowed`
-— the resolver never writes it.
+`cached` muted, `forwarded` foreground, `authoritative` primary. There is no
+`allowed` — the value doesn't exist in the Go enum at all (§3.1).
 
 **The rate readout** next to `LIVE QUERIES` has no endpoint: it is measured
 from arrivals on the tail over a rolling 30s window, and renders nothing until
@@ -1051,9 +1192,11 @@ back to 24h. That row also carries the app's one filled cell,
 Collected because each one has already caused, or would cause, a wrong UI.
 
 1. **`total` ≠ blocked + cached + forwarded.** `total` sums *every* decision
-   including `local` and `error`. Don't compute "allowed" by subtraction.
-2. **`decision: "allowed"` never occurs.** Offering it as a filter yields an
-   always-empty result.
+   including `authoritative` and `error`. Don't compute "allowed" by
+   subtraction.
+2. **There is no `allowed` decision.** It isn't merely unused — the constant
+   was deleted from the Go enum (§3.1), so offering it as a filter is not
+   just always-empty, it's offering a value the server has never heard of.
 3. **SSE rows have `id: 0`.** Don't key, dedupe or correlate on it.
 4. **Stats lag the query log by up to 60s**, and by up to ~120s of wall clock
    before a 30s-polling dashboard reflects them. A fresh install legitimately
@@ -1095,8 +1238,9 @@ Go source. **The code is the source of truth.**
    chokepoints every write passes through, and mapped to **409** with a
    message naming the collision.
 2. ~~The query-log decision filter advertises `allowed`.~~ **Fixed** — the
-   placeholder no longer offers a value the resolver never writes. The
-   `allowed` enum member itself still exists unused in the Go source; see §3.1.
+   placeholder no longer offers a value the resolver never writes, and as of
+   the zones work the `allowed` enum member is gone from the Go source too
+   (`internal/dnssrv/pipeline.go`), not merely unused; see §3.1.
 3. ~~A failed filter-list fetch is invisible: the UI shows `0 entries /
    never refreshed`, exactly what an unrefreshed list looks like.~~
    **Fixed.** `internal/filter/refresh.go` fell back to the on-disk cache on
@@ -1136,3 +1280,13 @@ Go source. **The code is the source of truth.**
     implemented** — no such string exists in the client.
 13. The spec's "keeps retrying" behaviour for the API-unreachable banner is
     **not implemented**: recovery requires the manual Retry button.
+14. `openapi.yaml`'s `POST /zones` and `PATCH /zones/{id}` request bodies
+    describe `type` as "primary | secondary | stub | forwarder | internal;
+    defaults to primary", reading as if all five are accepted input values.
+    Real-captured: only `primary` (or omitting the field) succeeds — every
+    other value, `internal` included, 400s `only primary zones are
+    supported`, identically to `secondary`. See §2.6.
+15. `openapi.yaml`'s 404 responses on the `/zones/{id}/records*` routes
+    describe the situation ("zone not found", "rid is not a record of this
+    zone") rather than the response body, which is always the flat
+    `{"error":"not found"}` used everywhere else 404 is returned. See §2.6.

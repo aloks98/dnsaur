@@ -97,7 +97,7 @@ function chart(): HTMLElement {
  */
 const SERVED = "Forwarded + cached";
 const BLOCKED = "Blocked";
-const OTHER = "Local + error";
+const OTHER = "Authoritative + error";
 
 function seriesEl(name: string): HTMLElement {
   const el = chart().querySelector(`[data-series="${name}"]`);
@@ -196,7 +196,7 @@ test("each stat says what it actually counts", async () => {
   renderWithProviders(<Dashboard />);
 
   await screen.findByText("1,000");
-  expect(statCard("Queries")).toHaveTextContent("every decision, incl. local + error");
+  expect(statCard("Queries")).toHaveTextContent("every decision, incl. authoritative + error");
   expect(statCard("Blocked")).toHaveTextContent("250 blocked");
   expect(statCard("Cached")).toHaveTextContent("400 cached + stale");
   expect(statCard("Client IPs seen")).toHaveTextContent("distinct client_ip, not client rows");
@@ -220,9 +220,10 @@ test("the stat cells keep the grid's hairlines and none of Card's own chrome", a
   }
 });
 
-// `total` sums *every* decision the resolver writes — local and error
-// included — so blocked + cached + forwarded is legitimately less than it,
-// and nothing on this page may derive an "allowed" count by subtraction.
+// `total` sums *every* decision the resolver writes — authoritative and
+// error included — so blocked + cached + forwarded is legitimately less
+// than it, and nothing on this page may derive an "allowed" count by
+// subtraction.
 test("percentages divide by the reported total, never by a derived remainder", async () => {
   server.use(
     http.get("/api/v1/stats/overview", () =>
@@ -320,7 +321,7 @@ test("the chart stacks three bands bottom-up, in square bars", async () => {
 // same colour as a cache hit, so an upstream outage looked like traffic.
 // The three bands still have to partition `total` exactly — the strip above
 // sums every decision, and a chart that doesn't add up to it is lying.
-test("errors and local answers get their own band, and the three still total the strip", async () => {
+test("errors and authoritative answers get their own band, and the three still total the strip", async () => {
   server.use(
     http.get("/api/v1/stats/overview", () =>
       HttpResponse.json({ total: 24, blocked: 5, cached: 4, forwarded: 10, clients: 3 }),
@@ -329,7 +330,7 @@ test("errors and local answers get their own band, and the three still total the
       HttpResponse.json([
         {
           bucket: hourStart(0),
-          decisions: { forwarded: 10, blocked: 5, error: 3, cached: 2, stale: 2, local: 2 },
+          decisions: { forwarded: 10, blocked: 5, error: 3, cached: 2, stale: 2, authoritative: 2 },
         },
       ]),
     ),
@@ -338,7 +339,7 @@ test("errors and local answers get their own band, and the three still total the
   renderWithProviders(<Dashboard />, { route: "/?window=1h" });
 
   // 10 forwarded + 2 cached + 2 stale = 14 served; 5 blocked; 3 error + 2
-  // local = 5 other. 14 + 5 + 5 = 24, the total the strip reports.
+  // authoritative = 5 other. 14 + 5 + 5 = 24, the total the strip reports.
   expect(await screen.findByText(`${SERVED}: 0,14`)).toBeInTheDocument();
   expect(screen.getByText(`${BLOCKED}: 0,5`)).toBeInTheDocument();
   expect(screen.getByText(`${OTHER}: 0,5`)).toBeInTheDocument();
@@ -346,9 +347,9 @@ test("errors and local answers get their own band, and the three still total the
 });
 
 // The remainder band is deliberately "everything the bucket contained that
-// the other two didn't claim", not a hardcoded {local, error}: a decision
-// the resolver grows later must show up somewhere rather than being
-// silently dropped out of a chart that claims to total the strip.
+// the other two didn't claim", not a hardcoded {authoritative, error}: a
+// decision the resolver grows later must show up somewhere rather than
+// being silently dropped out of a chart that claims to total the strip.
 test("a decision the page has never heard of still lands in a band", async () => {
   server.use(
     http.get("/api/v1/stats/timeline", () =>
@@ -412,13 +413,13 @@ test("the header names the real granularity, admits the lag, and legends all thr
 test("the chart carries a text alternative naming all three totals", async () => {
   renderWithProviders(<Dashboard />);
 
-  // Default fixture: 5 buckets × {allowed:120, blocked:30, cached:90,
+  // Default fixture: 5 buckets × {authoritative:120, blocked:30, cached:90,
   // forwarded:40, stale:5} — 135 served, 30 blocked and 120 unrecognised
   // per bucket.
   const figure = await screen.findByRole("figure");
   expect(figure).toHaveAccessibleName(/675 forwarded or cached/);
   expect(figure).toHaveAccessibleName(/150 blocked/);
-  expect(figure).toHaveAccessibleName(/600 local or error/);
+  expect(figure).toHaveAccessibleName(/600 authoritative or error/);
   expect(figure).toHaveAccessibleName(/1,425 queries/);
   expect(figure).toHaveAccessibleName(/hourly buckets/);
 });
@@ -625,8 +626,8 @@ test("HOSTNAME resolves through the client registry, and shows an em dash when i
 });
 
 // The decision vocabulary is the resolver's (internal/dnssrv/pipeline.go).
-// There is no `allowed` — the pipeline never writes it — so nothing here
-// may invent one.
+// There is no `allowed` — no such decision exists — so nothing here may
+// invent one.
 test("each decision gets its own tone, and blocked/error are the loud ones", async () => {
   renderWithProviders(<Dashboard />);
   const source = await firstSource();
@@ -636,7 +637,7 @@ test("each decision gets its own tone, and blocked/error are the loud ones", asy
     entry({ id: 3, q_name: "stale.example", decision: "stale" }),
     entry({ id: 4, q_name: "cached.example", decision: "cached" }),
     entry({ id: 5, q_name: "forwarded.example", decision: "forwarded" }),
-    entry({ id: 6, q_name: "local.example", decision: "local" }),
+    entry({ id: 6, q_name: "authoritative.example", decision: "authoritative" }),
   ]);
 
   const toneOf = (decision: string) =>
@@ -646,7 +647,7 @@ test("each decision gets its own tone, and blocked/error are the loud ones", asy
   expect(toneOf("stale")).toContain("text-warn");
   expect(toneOf("cached")).toContain("text-muted-foreground");
   expect(toneOf("forwarded")).toContain("text-foreground");
-  expect(toneOf("local")).toContain("text-primary");
+  expect(toneOf("authoritative")).toContain("text-primary");
 });
 
 // There is no rate endpoint; the number is measured from arrivals on the

@@ -21,8 +21,8 @@ terminal upstream forwarder. Each stage can answer the query outright
 
 ```
                  ┌─────────────────────────────────────────────────────────┐
- UDP/TCP :53 ───►│  qlog  →  recovery  →  client-id  →  filter  →  local   │
-                 │  records  →  cache  →  upstream forwarder               │
+ UDP/TCP :53 ───►│  qlog  →  recovery  →  client-id  →  filter  →  zones   │
+                 │  →  cache  →  upstream forwarder                        │
                  └─────────────────────────────────────────────────────────┘
 ```
 
@@ -40,9 +40,15 @@ terminal upstream forwarder. Each stage can answer the query outright
    evaluated before lists and allow before block — see
    [`dashboard.md`](dashboard.md#the-order-that-matters) for the full
    six-stage precedence.
-5. **local records** — serves locally-defined DNS records before ever
-   asking upstream. Future DHCP-registered hostnames and authoritative
-   zones plug in at this stage.
+5. **zones** — answers authoritatively for the suffixes this server holds,
+   before the cache or any upstream is consulted, and tags the result
+   `authoritative` in the query log. This is a zone cut, not a set of
+   overrides: once a zone claims a name, that name is *never* forwarded.
+   It either answers, or returns NODATA (name exists, wrong type) or
+   NXDOMAIN (name absent), each carrying the zone's SOA so resolvers cache
+   the absence. A qname no zone claims passes straight through untouched.
+   Future DHCP-registered hostnames register into a zone at this stage.
+   See [`dashboard.md`](dashboard.md#zones) for the user-facing rules.
 6. **cache** — in-memory cache keyed on (qname, qtype), respecting upstream
    TTLs with configurable min/max clamps, negative caching, and
    serve-stale-on-failure with background refresh.
@@ -64,13 +70,13 @@ stages are purely additive — no rewiring of existing ones.
 | `internal/dnssrv` | DNS listeners, the `Handler`/`Middleware` pipeline abstraction, panic recovery |
 | `internal/clients` | Client registry: IP/CIDR matching to client + group |
 | `internal/filter` | Blocklist/allowlist engine, list parsing, per-client-group rules, background refresh |
-| `internal/records` | Locally-defined DNS records |
+| `internal/zones` | Authoritative zones: zone cut and deepest-match lookup, apex-relative names, RR construction from stored presentation-format rdata, and the NODATA/NXDOMAIN/wildcard/CNAME/referral answering rules |
 | `internal/cache` | In-memory DNS response cache (TTL clamps, negative caching, serve-stale) |
 | `internal/upstream` | Upstream forwarders and selection strategy |
 | `internal/qlog` | Async query logging and retention pruning |
 | `internal/stats` | Hourly stats rollups from the query log |
 | `internal/store` | Storage interfaces plus SQLite/Postgres implementations, migrations, settings |
-| `internal/api` | HTTP REST API server + handlers (`/api/v1`: setup, settings, blocking, groups, clients, filters, records, queries, stats, tokens), embedded OpenAPI 3.1 doc; also mounts the web dashboard's static files (`internal/api.StaticHandler`) on every non-`/api` path when `Deps.Static` is set. The static mount — and only the static mount, so SSE on `/api/v1/queries/tail` stays unbuffered — gzips responses and sets `Content-Security-Policy` (`frame-ancestors 'none'`), `X-Content-Type-Options: nosniff`, `Referrer-Policy: same-origin`, and `X-Frame-Options: DENY` |
+| `internal/api` | HTTP REST API server + handlers (`/api/v1`: setup, settings, blocking, groups, clients, filters, zones, queries, stats, tokens), embedded OpenAPI 3.1 doc; also mounts the web dashboard's static files (`internal/api.StaticHandler`) on every non-`/api` path when `Deps.Static` is set. The static mount — and only the static mount, so SSE on `/api/v1/queries/tail` stays unbuffered — gzips responses and sets `Content-Security-Policy` (`frame-ancestors 'none'`), `X-Content-Type-Options: nosniff`, `Referrer-Policy: same-origin`, and `X-Frame-Options: DENY` |
 | `internal/auth` | Auth service: argon2id password hashing, session + scoped (read/write) API tokens, optional TOTP 2FA |
 | `web` | The dashboard's Go-side glue: `//go:embed all:dist` over the React SPA's Vite build output, exposed as `web.Dist() fs.FS` for `internal/app` to hand to `internal/api.Deps.Static`. The actual frontend source (React 19 + TypeScript + Tailwind + TanStack Query, see `web/README.md`) lives under `web/src`, built independently (`pnpm build`) before the Go build embeds its output |
 
@@ -80,14 +86,23 @@ Planned, not yet present: `internal/dhcp` (Phase 2), `internal/sync`
 ## Storage model
 
 - `internal/store` defines storage-agnostic interfaces (`Store`,
-  `SettingsStore`, `ClientStore`, `FilterStore`, `RecordStore`,
+  `SettingsStore`, `ClientStore`, `FilterStore`, `ZoneStore`,
   `QueryLogStore`, `StatsStore`, `UserStore`, `TokenStore`); SQLite
   (`modernc.org/sqlite`, no CGO) is the default driver, Postgres (`pgx`) is
   an opt-in alternative, selected at startup by `storage.driver` /
   `storage.dsn`.
 - Schema is managed by versioned, per-dialect SQL migrations
   (`internal/store/migrations/{sqlite,postgres}`), applied automatically at
-  startup via `goose`.
+  startup via `goose`. One of them is a Go migration rather than SQL
+  (`internal/store/zonemigrate.go`): converting the pre-zones flat
+  `local_records` table into zones needs to infer a zone apex per record,
+  reconcile data a flat table allowed and a zone does not, and rewrite TXT
+  values from literal strings into presentation format — none of which is
+  expressible in SQL. Its `local_records` source rows are deliberately kept
+  after the conversion, not dropped: the conversion alters data, so the
+  originals are the only surviving record of what the user wrote. `Store`
+  therefore still exposes `RecordStore` over that table, but nothing serves
+  from it.
 - Almost all runtime configuration lives in a `settings` key/value table in
   the database, not in the bootstrap YAML. `internal/app` seeds sane
   defaults on first run, and components subscribe to a change notification

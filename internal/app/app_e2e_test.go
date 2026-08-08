@@ -59,7 +59,19 @@ func TestEndToEnd(t *testing.T) {
 	if err := s.Filters().AssignList(ctx, 1, lid); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Records().Add(ctx, store.LocalRecord{Name: "nas.home.lan", Type: "A", Value: "10.0.0.9", TTL: 300}); err != nil {
+	// A record inside a zone we hold: seeded through the zones store since
+	// the zones CRUD API doesn't exist yet (Task 8). Serving this
+	// authoritatively — never forwarding it — is this milestone's payoff.
+	zid, err := s.Zones().AddZone(ctx, store.Zone{
+		Name: "home.lan", Type: "primary", Enabled: true,
+		SOANS: "ns1.home.lan", SOAMbox: "hostadmin.home.lan",
+		SOASerial: 1, SOARefresh: 900, SOARetry: 300, SOAExpire: 604800,
+		SOAMinimum: 900, SOATTL: 900,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Zones().AddRecord(ctx, store.ZoneRecord{ZoneID: zid, Name: "nas", Type: "A", TTL: 300, RData: "10.0.0.9", Enabled: true}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -84,8 +96,22 @@ func TestEndToEnd(t *testing.T) {
 		t.Fatalf("not blocked: %v", r.Answer)
 	}
 	if r := ask("nas.home.lan"); r.Answer[0].(*dns.A).A.String() != "10.0.0.9" {
-		t.Fatalf("local record: %v", r.Answer)
+		t.Fatalf("zone record: %v", r.Answer)
 	}
+
+	// The actual deliverable: a name inside our zone with no record must
+	// come back NXDOMAIN from us, and must never reach the upstream. Rcode
+	// alone would not prove that — the upstream could answer NXDOMAIN too —
+	// so the upstream hit count is what actually distinguishes "we refused
+	// it" from "we forwarded it and relayed the refusal."
+	hitsBeforeZoneMiss := upstreamHits.Load()
+	if r := ask("nothere.home.lan"); r.Rcode != dns.RcodeNameError {
+		t.Fatalf("undefined name inside our zone: rcode=%d, want NXDOMAIN", r.Rcode)
+	}
+	if upstreamHits.Load() != hitsBeforeZoneMiss {
+		t.Fatal("undefined name inside our zone reached the upstream — the leak this milestone exists to close")
+	}
+
 	if r := ask("clean.example.org"); r.Answer[0].(*dns.A).A.String() != "9.9.9.9" {
 		t.Fatalf("forward: %v", r.Answer)
 	}

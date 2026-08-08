@@ -55,6 +55,7 @@ type Store interface {
 	Stats() StatsStore
 	Users() UserStore
 	Tokens() TokenStore
+	Zones() ZoneStore
 	Close() error
 }
 

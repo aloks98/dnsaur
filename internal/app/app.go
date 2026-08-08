@@ -19,10 +19,10 @@ import (
 	"github.com/aloks98/dnsaur/internal/dnssrv"
 	"github.com/aloks98/dnsaur/internal/filter"
 	"github.com/aloks98/dnsaur/internal/qlog"
-	"github.com/aloks98/dnsaur/internal/records"
 	"github.com/aloks98/dnsaur/internal/stats"
 	"github.com/aloks98/dnsaur/internal/store"
 	"github.com/aloks98/dnsaur/internal/upstream"
+	"github.com/aloks98/dnsaur/internal/zones"
 	"github.com/aloks98/dnsaur/web"
 	"github.com/google/uuid"
 )
@@ -82,7 +82,7 @@ type App struct {
 	st        store.Store
 	registry  *clients.Registry
 	engine    *filter.Engine
-	resolver  *records.Resolver
+	resolver  *zones.Resolver
 	refresher *filter.Refresher
 	logger    *qlog.Logger
 	fwd       *swappable
@@ -120,7 +120,7 @@ func New(ctx context.Context, cfg *config.Config, version string) (*App, error) 
 		st:       st,
 		registry: clients.NewRegistry(st.Clients()),
 		engine:   filter.NewEngine(),
-		resolver: records.NewResolver(st.Records()),
+		resolver: zones.NewResolver(st.Zones()),
 		fwd:      &swappable{},
 		ready:    make(chan struct{}),
 	}
@@ -206,7 +206,7 @@ func (a *App) applySettings(ctx context.Context) {
 		slog.Error("client reload failed", "err", err)
 	}
 	if err := a.resolver.Reload(ctx); err != nil {
-		slog.Error("records reload failed", "err", err)
+		slog.Error("zones reload failed", "err", err)
 	}
 	if a.logger != nil {
 		a.logger.SetPrivacy(a.getSetting(ctx, "qlog.privacy"))
@@ -367,7 +367,7 @@ func (a *App) DNSAddr() string {
 func (a *App) HTTPAddr() string { return a.apiAddr }
 
 func (a *App) ReloadClients(ctx context.Context) error  { return a.registry.Reload(ctx) }
-func (a *App) ReloadRecords(ctx context.Context) error  { return a.resolver.Reload(ctx) }
+func (a *App) ReloadZones(ctx context.Context) error    { return a.resolver.Reload(ctx) }
 func (a *App) RefreshFilters(ctx context.Context) error { return a.refresher.RefreshAll(ctx) }
 
 func (a *App) Shutdown(ctx context.Context) error {

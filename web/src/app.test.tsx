@@ -27,7 +27,7 @@ test("authenticated user gets the two-row shell: nav groups above, the active gr
     within(primary)
       .getAllByRole("button")
       .map((button) => button.textContent),
-  ).toEqual(["Monitor", "Filtering", "Local DNS", "System"]);
+  ).toEqual(["Monitor", "Filtering", "Zones", "System"]);
 
   // Row 2 is the active group's pages, and "/" makes that Monitor.
   const monitorTabs = screen.getByRole("navigation", { name: "Monitor" });
@@ -48,7 +48,7 @@ test("authenticated user gets the two-row shell: nav groups above, the active gr
 // a time; Account was the last padded one, and once it went the branch
 // always took the same side.
 test("the shell gives every route the full viewport, and never scrolls itself", async () => {
-  for (const route of ["/", "/queries", "/filtering/lists", "/dns", "/settings", "/account"]) {
+  for (const route of ["/", "/queries", "/filtering/lists", "/zones", "/settings", "/account"]) {
     const view = renderWithProviders(<App />, { route });
     await screen.findByRole("navigation", { name: "Primary" });
 

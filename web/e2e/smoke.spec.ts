@@ -3,15 +3,15 @@ import { expect, test } from "@playwright/test";
 // One end-to-end path through the real embedded build (see
 // ../playwright.config.ts's webServer): first-run setup creates the admin
 // account, then a real login (not just the wizard's own silent sign-in),
-// then a concrete CRUD action (add a local DNS record) and a persisted
-// preference (dark mode surviving a reload). Deliberately a single spec,
-// not a suite — this is a ship gate ("does the real build actually work
-// end to end"), not page-by-page coverage; that's what the ~115 Vitest
-// component tests are for.
+// then a concrete CRUD action (create a zone and add a record to it) and a
+// persisted preference (dark mode surviving a reload). Deliberately a
+// single spec, not a suite — this is a ship gate ("does the real build
+// actually work end to end"), not page-by-page coverage; that's what the
+// Vitest component tests are for.
 const USERNAME = "e2e-admin";
 const PASSWORD = "correct horse battery staple";
 
-test("first-run setup, login, add a DNS record, dark mode persists across reload", async ({
+test("first-run setup, login, create a zone and add a record, dark mode persists across reload", async ({
   page,
 }) => {
   // --- first-run setup: create the admin account -----------------------
@@ -92,32 +92,45 @@ test("first-run setup, login, add a DNS record, dark mode persists across reload
   await topNav.getByRole("button", { name: /resume tail/i }).click();
   await expect(topNav.getByRole("button", { name: /pause tail/i })).toBeVisible();
 
-  // --- add a local DNS record, see it listed ----------------------------
-  // Local DNS is the group's only page and now its name too, so it's
-  // reached through that group's menu — and once there, row 2 must still
-  // give it a tab of its own.
-  await topNav.getByRole("button", { name: "Local DNS", exact: true }).click();
-  await page.getByRole("menuitem", { name: "Local DNS" }).click();
-  // The page carries no heading of its own — the chrome names it, so row 2's
-  // marked tab is both the label and the proof we landed here.
+  // --- create a zone, open it, add a record, see it listed --------------
+  // Zones is the group's only page and now its name too, so it's reached
+  // through that group's menu — and once there, row 2 must still give it a
+  // tab of its own.
+  await topNav.getByRole("button", { name: "Zones", exact: true }).click();
+  await page.getByRole("menuitem", { name: "Zones" }).click();
+  // The list page carries no heading of its own — the chrome names it, so
+  // row 2's marked tab is both the label and the proof we landed here.
   await expect(
-    topNav.getByRole("navigation", { name: "Local DNS" }).getByRole("link", { name: "Local DNS" }),
+    topNav.getByRole("navigation", { name: "Zones" }).getByRole("link", { name: "Zones" }),
   ).toHaveAttribute("aria-current", "page");
 
-  // The add form is the table's own first row, not a dialog: fill it in
-  // place and submit. The value field re-labels itself per record type,
-  // which is why it is addressed as "Value · IPv4" rather than "Value".
-  await page.getByLabel("Record name").fill("nas.home.lan");
-  await page.getByLabel(/value.*ipv4/i).fill("10.0.0.9");
+  // A fresh instance has no zones, so the empty state's own CTA and the
+  // header's both say "New zone" — either opens the same inline create row.
+  await page.getByRole("button", { name: "New zone" }).first().click();
+  await page.getByLabel("Zone name").fill("home.lan");
+  await page.getByRole("button", { name: "Add", exact: true }).click();
+
+  // The zone name is a link straight into its detail page (Task 12). Exact,
+  // since the row's own Edit icon-button renders as a same-target link too
+  // ("Edit home.lan").
+  await page.getByRole("link", { name: "home.lan", exact: true }).click();
+  await expect(page.getByText("home.lan", { exact: true })).toBeVisible();
+  await expect(page.getByText("Enabled", { exact: true })).toBeVisible();
+
+  // The add form is the records grid's own first row, not a dialog: fill it
+  // in place and submit. Data is one text input regardless of record type —
+  // the DNS parser validates it server-side, there is no per-type form.
+  await page.getByLabel("Zone record name").fill("bifrost");
+  await page.getByLabel("Data", { exact: true }).fill("10.0.0.9");
   await page.getByRole("button", { name: "Add", exact: true }).click();
 
   // Rows are a CSS grid rather than a table, so they are found by the slot
   // the page marks them with.
-  const row = page.locator('[data-slot="record-row"]', { hasText: "nas.home.lan" });
+  const row = page.locator('[data-testid="zone-record-row"]', { hasText: "bifrost" });
   await expect(row).toBeVisible();
   await expect(row.getByText("10.0.0.9")).toBeVisible();
   // Adding leaves the row empty and ready for the next record.
-  await expect(page.getByLabel("Record name")).toHaveValue("");
+  await expect(page.getByLabel("Zone record name")).toHaveValue("");
 
   // --- dark mode toggles and persists across a reload -------------------
   // Also under System: the design's bar carries no standalone theme control.
@@ -129,7 +142,7 @@ test("first-run setup, login, add a DNS record, dark mode persists across reload
 
   await page.reload();
   await expect(
-    topNav.getByRole("navigation", { name: "Local DNS" }).getByRole("link", { name: "Local DNS" }),
+    topNav.getByRole("navigation", { name: "Zones" }).getByRole("link", { name: "Zones" }),
   ).toHaveAttribute("aria-current", "page");
   await expect(page.locator("html")).toHaveClass(/dark/);
   await expect(row).toBeVisible(); // the record survived the reload too

@@ -12,13 +12,12 @@ import (
 type Decision string
 
 const (
-	DecisionAllowed   Decision = "allowed"
-	DecisionBlocked   Decision = "blocked"
-	DecisionLocal     Decision = "local"
-	DecisionCached    Decision = "cached"
-	DecisionStale     Decision = "stale"
-	DecisionForwarded Decision = "forwarded"
-	DecisionError     Decision = "error"
+	DecisionBlocked       Decision = "blocked"
+	DecisionAuthoritative Decision = "authoritative"
+	DecisionCached        Decision = "cached"
+	DecisionStale         Decision = "stale"
+	DecisionForwarded     Decision = "forwarded"
+	DecisionError         Decision = "error"
 )
 
 type ClientInfo struct {

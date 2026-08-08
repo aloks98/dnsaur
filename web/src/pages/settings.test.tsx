@@ -245,8 +245,8 @@ test("a negative cache value is blocked client-side, no PUT", async () => {
 });
 
 // A failed PUT (server 400s the value for a reason the client didn't
-// anticipate) surfaces via toast, mirroring dns.tsx's own
-// server-rejection-surfaces-as-a-toast convention, and keeps the admin's
+// anticipate) surfaces via toast — the same server-rejection-surfaces-as-a-
+// toast convention used throughout the app — and keeps the admin's
 // attempted value in the field so they can see and correct it.
 test("a rejected PUT surfaces the server's error as a toast and keeps the field editable", async () => {
   const user = userEvent.setup();
