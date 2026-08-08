@@ -36,7 +36,10 @@ terminal upstream forwarder. Each stage can answer the query outright
    the client registry. Unknown IPs fall into the default group.
 4. **filter** — checks the qname against the client's group blocklists,
    allowlists, and regex rules. A block returns a configured response
-   (null IP or NXDOMAIN) and is tagged `blocked` in the log.
+   (null IP or NXDOMAIN) and is tagged `blocked` in the log. Rules are
+   evaluated before lists and allow before block — see
+   [`dashboard.md`](dashboard.md#the-order-that-matters) for the full
+   six-stage precedence.
 5. **local records** — serves locally-defined DNS records before ever
    asking upstream. Future DHCP-registered hostnames and authoritative
    zones plug in at this stage.

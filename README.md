@@ -37,7 +37,8 @@ the database or shell out to curl for everyday admin: a React dashboard
 (`web/`, embedded into the `dnsaur` binary and served alongside the API —
 see [`docs/architecture.md`](docs/architecture.md)) covers first-run setup,
 live query monitoring, per-client blocklists/allowlists/rules, local DNS
-records, and settings. The REST API under `/api/v1` (see
+records, and settings — [`docs/dashboard.md`](docs/dashboard.md) walks
+through it screen by screen. The REST API under `/api/v1` (see
 [`docs/api.md`](docs/api.md)) is still there underneath it — settings,
 client groups, filter lists, local records, and more are all scriptable
 over HTTP (curl or any HTTP client) too, dashboard or not.
@@ -88,6 +89,7 @@ now, building from source is the only supported install path.
 
 ## Documentation
 
+- [`docs/dashboard.md`](docs/dashboard.md) — using the web UI: what each screen decides, and the rules behind it
 - [`docs/architecture.md`](docs/architecture.md) — middleware pipeline, package map, storage model
 - [`docs/configuration.md`](docs/configuration.md) — bootstrap YAML/env vars and DB-managed settings
 - [`docs/api.md`](docs/api.md) — REST API (auth, endpoints, examples)

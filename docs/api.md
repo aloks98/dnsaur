@@ -107,7 +107,9 @@ Full parameter/response detail lives in `internal/api/openapi.yaml`
 - **Blocking** — `GET /blocking?group_id=` (pause status),
   `POST /blocking/pause` (`{group_id, minutes}`, pauses 1–1440 minutes),
   `DELETE /blocking/pause?group_id=` (resume/cancel a pause).
-- **Groups** — `GET /groups`, `POST /groups`, `PATCH /groups/{id}`
+- **Groups** — `GET /groups`, `POST /groups` (`{name[, enabled][, list_ids]}`
+  — `enabled` defaults to true; `list_ids` omitted assigns **every** list,
+  while an explicit `[]` assigns none), `PATCH /groups/{id}`
   (rename/enable/disable), `DELETE /groups/{id}`,
   `GET /groups/{id}/lists` and `PUT /groups/{id}/lists` (assign filter
   lists to a group), `GET /groups/{id}/rules` and `POST /groups/{id}/rules`

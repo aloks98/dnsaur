@@ -1,8 +1,8 @@
 # dnsaur UI contract
 
-What the dashboard and the API actually do **today**, on branch
-`feat/web-dashboard`. Every endpoint, field, enum value and error string below
-was read out of the Go source and then verified against a running instance —
+What the dashboard and the API actually do **today**, on `main`. Every
+endpoint, field, enum value and error string below was read out of the Go
+source and then verified against a running instance —
 the example responses are real captures from a seeded SQLite instance, not
 hand-written samples.
 
@@ -11,6 +11,7 @@ the design specs; where a spec promised something the code doesn't do, it is
 listed as TODO with the gap named.
 
 Related: [`api.md`](api.md) is the human-facing API guide,
+[`dashboard.md`](dashboard.md) is the user guide to the screens themselves,
 [`architecture.md`](architecture.md) covers the resolver pipeline. This
 document is the contract a UI can be built against.
 
@@ -214,7 +215,7 @@ Path ids must parse as int64 **and be > 0**, else 400 `bad id`. So `0`, `-1`,
 | Endpoint | Success | Notes |
 |---|---|---|
 | `GET /groups` | 200 array | ordered by id |
-| `POST /groups` | 201 `{"id":2}` | body `{"name"}`, required non-empty |
+| `POST /groups` | 201 `{"id":2}` | body `{"name"[, "enabled"][, "list_ids"]}`; `name` required non-empty. `enabled` omitted = true. `list_ids` omitted = every existing list; `[]` = none |
 | `PATCH /groups/{id}` | 204 | body `{"name"?, "enabled"?}` — both optional pointers; `{}` is a legal no-op |
 | `DELETE /groups/{id}` | 204 | cascades the group's `group_lists` and `rules` |
 | `GET /clients` | 200 array | |
