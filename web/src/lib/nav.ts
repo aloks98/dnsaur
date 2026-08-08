@@ -26,47 +26,9 @@ export const DASHBOARD_PATH = "/";
  */
 export const QUERY_LOG_PATH = "/queries";
 
-/**
- * Local DNS. Full-bleed for the same reason the other two are, plus one of
- * its own: its add form is the table's first row, so the form and the rows
- * below it have to share a single column grid that runs edge to edge.
- */
-export const LOCAL_DNS_PATH = "/dns";
-
-/** Settings. Its bands run edge to edge and its save bar has to stay put
- * while the sections scroll under it. */
-export const SETTINGS_PATH = "/settings";
-
-/**
- * Filtering › Lists. Named individually rather than matching `/filtering/*`
- * because its two sibling tabs are still on the padded layout — widening
- * this to the whole section would strip their gutter and leave them
- * floating. Add them here as each one is rebuilt.
- */
-/**
- * Every Filtering tab. All three are full-bleed now, so this is one prefix
- * rather than the per-path list it was while they were migrated one at a
- * time. `/filtering` itself is only a redirect to Lists, and matching it
- * costs nothing.
- */
+/** The Filtering section's base. `/filtering` itself only redirects to
+ * Lists; the chrome uses this to recognise the section and its tabs. */
 export const FILTERING_BASE = "/filtering";
-
-/**
- * Screens that own the whole content area rather than sitting inside the
- * shell's gutter: both are full-bleed grids of hairline-separated bands, and
- * their rules have to meet the viewport edges instead of floating in a 24px
- * frame.
- */
-export function isFullBleedRoute(pathname: string): boolean {
-  return (
-    pathname === DASHBOARD_PATH ||
-    pathname === QUERY_LOG_PATH ||
-    pathname === LOCAL_DNS_PATH ||
-    pathname === SETTINGS_PATH ||
-    pathname === FILTERING_BASE ||
-    pathname.startsWith(`${FILTERING_BASE}/`)
-  );
-}
 
 export interface NavItem {
   to: string;

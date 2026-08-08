@@ -5,9 +5,11 @@ import {
   Pencil,
   Plus,
   ShieldCheck,
-  Trash2,
   TriangleAlert,
   type LucideIcon,
+  Copy,
+  Lock,
+  X,
 } from "lucide-react";
 import { toast } from "sonner";
 import { useForm, type Control } from "react-hook-form";
@@ -28,13 +30,6 @@ import {
   AlertTitle,
   Badge,
   Button,
-  Card,
-  CardAction,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
-  CopyButton,
   Dialog,
   DialogClose,
   DialogContent,
@@ -42,6 +37,8 @@ import {
   DialogFooter,
   DialogHeader,
   DialogTitle,
+  cn,
+  CopyButton,
   EmptyState,
   Form,
   FormControl,
@@ -51,24 +48,14 @@ import {
   FormLabel,
   FormMessage,
   Input,
+  NativeSelect,
+  NativeSelectOption,
   InputOTP,
   InputOTPGroup,
   InputOTPSeparator,
   InputOTPSlot,
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-  Separator,
   Skeleton,
   Spinner,
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
 } from "@e412/rnui-react";
 import { ApiError } from "../api/client";
 import type { ApiToken } from "../api/types";
@@ -199,44 +186,37 @@ function CodeField({
  * call site would be an unrelated instance that resetting wouldn't touch
  * (the same reasoning as TokensCard's createToken; see NewTokenDialog).
  */
-function TotpEnableDialog({
-  open,
-  onOpenChange,
+function TotpEnrollRow({
   enrollment,
   totpConfirm,
+  onDone,
 }: {
-  open: boolean;
-  onOpenChange: (open: boolean) => void;
-  enrollment: { secret: string; otpauth_url: string } | null;
+  enrollment: { secret: string; otpauth_url: string };
   totpConfirm: ReturnType<typeof useTotpConfirm>;
+  onDone: () => void;
 }) {
   const form = useForm<CodeFormValues>({
     resolver: zodResolver(codeFormSchema),
     defaultValues: { code: "" },
   });
-  const qrDataUrl = useQrDataUrl(open ? (enrollment?.otpauth_url ?? null) : null);
-
-  useEffect(() => {
-    if (open) form.reset({ code: "" });
-  }, [open, form]);
+  const qrDataUrl = useQrDataUrl(enrollment.otpauth_url);
 
   function onSubmit(values: CodeFormValues) {
-    if (!enrollment) return;
     totpConfirm.mutate(
       { secret: enrollment.secret, code: values.code },
       {
         onSuccess: () => {
           toast.success("Two-factor authentication enabled");
-          onOpenChange(false);
+          onDone();
         },
         onError: (err) => {
           form.setError("code", {
             message: err instanceof ApiError ? err.message : "Invalid code — try again",
           });
           // `keepError` matters here — resetField clears a field's error by
-          // default, which would silently wipe the message just set above
-          // in the same tick. This only clears the entered digits so the
-          // admin can retype, without erasing the reason it failed.
+          // default, which would silently wipe the message just set above in
+          // the same tick. This only clears the entered digits so the admin
+          // can retype, without erasing the reason it failed.
           form.resetField("code", { keepError: true });
         },
       },
@@ -244,74 +224,62 @@ function TotpEnableDialog({
   }
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent>
-        <DialogHeader>
-          <DialogTitle>Set up two-factor authentication</DialogTitle>
-          <DialogDescription>
-            Scan the QR code with your authenticator app, or enter the setup key manually.
-          </DialogDescription>
-        </DialogHeader>
-
-        {enrollment && (
-          <Form {...form}>
-            <form
-              className="flex flex-col gap-4"
-              onSubmit={(e) => void form.handleSubmit(onSubmit)(e)}
-              noValidate
-            >
-              <div className="flex justify-center">
-                {/* A fixed white surface regardless of theme — an inverted
-                    (light-on-dark) QR code isn't reliably scannable by
-                    every reader, so this deliberately doesn't follow the
-                    app's dark-mode card background here. A light shadow
-                    (instead of relying on the border alone) keeps it from
-                    reading as a flat cutout against a dark popover. Sized
-                    to the 160px image plus its 12px (p-3) padding on each
-                    side, so the loading Spinner reserves the same
-                    footprint and nothing jumps once the QR image lands. */}
-                <div className="flex size-[184px] items-center justify-center rounded-lg border bg-white p-3 shadow-sm">
-                  {qrDataUrl ? (
-                    <img
-                      src={qrDataUrl}
-                      alt="QR code for two-factor setup — scan with your authenticator app"
-                      className="size-40"
-                    />
-                  ) : (
-                    // A fixed gray, not text-muted-foreground: that token is
-                    // theme-relative and, in dark mode, resolves to a pale
-                    // gray meant for dark surfaces — nearly invisible on
-                    // this box's always-white background.
-                    <Spinner className="size-6 text-gray-400" />
-                  )}
-                </div>
-              </div>
-
-              <div className="flex flex-col gap-1.5">
-                <p className="text-xs text-muted-foreground">
-                  Can&apos;t scan? Enter this key manually:
-                </p>
-                <CopyableCode value={enrollment.secret} label="setup key" />
-              </div>
-
-              <CodeField
-                control={form.control}
-                description="Enter the 6-digit code your authenticator app is now showing."
+    <Form {...form}>
+      <form
+        className="grid grid-cols-[auto_1fr] items-start gap-5 p-5"
+        onSubmit={(e) => void form.handleSubmit(onSubmit)(e)}
+        noValidate
+      >
+        <div className="flex flex-col items-center gap-2">
+          {/* A fixed white surface regardless of theme — an inverted
+              (light-on-dark) QR isn't reliably scannable by every reader, so
+              this deliberately does not follow the app's dark background.
+              Sized to the 160px image plus its 12px padding each side, so
+              the Spinner reserves the same footprint and nothing jumps. */}
+          <div className="flex size-[184px] items-center justify-center border border-border bg-white p-3">
+            {qrDataUrl ? (
+              <img
+                src={qrDataUrl}
+                alt="QR code for two-factor setup — scan with your authenticator app"
+                className="size-40"
               />
+            ) : (
+              // A fixed gray, not text-muted-foreground: that token is
+              // theme-relative and in dark mode resolves to a pale gray for
+              // dark surfaces — nearly invisible on an always-white box.
+              <Spinner className="size-6 text-gray-400" />
+            )}
+          </div>
+          <span className="font-mono text-xs tracking-widest text-muted-foreground uppercase">
+            Scan in your app
+          </span>
+        </div>
 
-              <DialogFooter>
-                <DialogClose render={<Button type="button" variant="outline" />}>
-                  Cancel
-                </DialogClose>
-                <Button type="submit" disabled={totpConfirm.isPending}>
-                  {totpConfirm.isPending ? "Confirming…" : "Confirm"}
-                </Button>
-              </DialogFooter>
-            </form>
-          </Form>
-        )}
-      </DialogContent>
-    </Dialog>
+        <div className="flex min-w-0 flex-col gap-4">
+          <div className="flex flex-col gap-1.5">
+            <p className="text-sm font-medium">Or enter this secret manually</p>
+            <CopyableCode value={enrollment.secret} label="setup key" />
+            <p className="text-xs text-muted-foreground">
+              Nothing is saved until you confirm a code.
+            </p>
+          </div>
+
+          {/* No width cap on the field: CodeField renders six OTP slots and
+              a separator, which is wider than any guess — constraining it
+              made the button overlap the last slots. Each item sizes itself
+              and the row wraps if the band is narrow. */}
+          <div className="flex flex-wrap items-end gap-3">
+            <CodeField control={form.control} />
+            <Button type="submit" disabled={totpConfirm.isPending}>
+              {totpConfirm.isPending ? "Confirming…" : "Turn on 2FA"}
+            </Button>
+            <Button type="button" variant="ghost" onClick={onDone}>
+              Cancel
+            </Button>
+          </div>
+        </div>
+      </form>
+    </Form>
   );
 }
 
@@ -401,6 +369,44 @@ function TotpDisableDialog({
   );
 }
 
+/** The band every section on this page sits in — the same 288px label
+ * column Settings uses, so the two System tabs read as one shape. */
+function Section({
+  title,
+  icon: Icon,
+  badge,
+  description,
+  grow = false,
+  children,
+}: {
+  title: string;
+  icon: LucideIcon;
+  badge?: ReactNode;
+  description: string;
+  /** Lets the tokens list take the leftover height and scroll inside it. */
+  grow?: boolean;
+  children: ReactNode;
+}) {
+  return (
+    <section
+      className={cn(
+        "grid grid-cols-[288px_1fr] border-b border-border",
+        grow ? "min-h-0 flex-1" : "shrink-0",
+      )}
+    >
+      <div className="flex flex-col items-start gap-2 border-r border-border p-5">
+        <h2 className="flex items-center gap-2 font-heading text-base font-semibold">
+          <Icon className="size-4 shrink-0 text-muted-foreground" aria-hidden="true" />
+          {title}
+        </h2>
+        {badge}
+        <p className="text-xs text-pretty text-muted-foreground">{description}</p>
+      </div>
+      <div className="flex min-w-0 flex-col">{children}</div>
+    </section>
+  );
+}
+
 function TotpCard({ enabled }: { enabled: boolean }) {
   // All three TOTP mutations are owned here, not inside the dialogs that
   // use them, so this component can reset() the exact instances that hold
@@ -454,50 +460,57 @@ function TotpCard({ enabled }: { enabled: boolean }) {
   }
 
   return (
-    <Card>
-      <CardHeader>
-        <CardTitle className="flex items-center gap-2">
-          <ShieldCheck className="size-4 text-muted-foreground" aria-hidden="true" />
-          Two-factor authentication
-          <Badge variant={enabled ? "success-light" : "secondary"} size="sm">
-            {enabled ? "Enabled" : "Disabled"}
-          </Badge>
-        </CardTitle>
-        <CardDescription>
-          Require a 6-digit code from an authenticator app in addition to your password at sign-in.
-        </CardDescription>
-      </CardHeader>
-      <CardContent>
-        <div className="flex flex-wrap items-center justify-between gap-3">
+    <Section
+      title="Two-factor authentication"
+      icon={ShieldCheck}
+      badge={
+        <Badge variant={enabled ? "success-light" : enableOpen ? "warning-light" : "secondary"}>
+          {enabled ? "Enabled" : enableOpen ? "Setting up" : "Disabled"}
+        </Badge>
+      }
+      description="A code from your authenticator app, plus your password."
+    >
+      {enableOpen && enrollment ? (
+        <TotpEnrollRow
+          enrollment={enrollment}
+          totpConfirm={totpConfirm}
+          onDone={() => onEnableOpenChange(false)}
+        />
+      ) : (
+        <div className="flex flex-wrap items-center gap-5 p-5">
           <p className="text-sm text-muted-foreground">
-            {enabled
-              ? "Your account currently requires a code at sign-in."
-              : "Your account can currently be signed into with just a password."}
+            {enabled ? "Required at every sign-in." : "Password only, right now."}
           </p>
-          {enabled ? (
-            <Button type="button" variant="outline" size="sm" onClick={() => setDisableOpen(true)}>
-              Disable 2FA
-            </Button>
-          ) : (
-            <Button type="button" size="sm" onClick={onStartEnroll} disabled={totpStart.isPending}>
-              {totpStart.isPending ? "Starting…" : "Enable 2FA"}
-            </Button>
-          )}
+          <div className="ml-auto">
+            {enabled ? (
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={() => setDisableOpen(true)}
+              >
+                Disable 2FA
+              </Button>
+            ) : (
+              <Button
+                type="button"
+                size="sm"
+                onClick={onStartEnroll}
+                disabled={totpStart.isPending}
+              >
+                {totpStart.isPending ? "Starting…" : "Set up 2FA"}
+              </Button>
+            )}
+          </div>
         </div>
-      </CardContent>
+      )}
 
-      <TotpEnableDialog
-        open={enableOpen}
-        onOpenChange={onEnableOpenChange}
-        enrollment={enrollment}
-        totpConfirm={totpConfirm}
-      />
       <TotpDisableDialog
         open={disableOpen}
         onOpenChange={onDisableOpenChange}
         totpDisable={totpDisable}
       />
-    </Card>
+    </Section>
   );
 }
 
@@ -548,21 +561,28 @@ function tokenFormDefaults(): TokenFormValues {
   return { name: "", scope: "read" };
 }
 
-function NewTokenDialog({
+/** One declaration of the column geometry, shared by the header, the
+ * create row and every token row. */
+const TOKEN_GRID = "grid grid-cols-[1fr_104px_108px_116px_96px_84px] items-center gap-3.5 px-5";
+
+/**
+ * The create row: a band under the header rather than a dialog, so a token
+ * is written on the line the existing ones are read on.
+ *
+ * `createToken` is lifted from here up to TokensCard and passed down, so
+ * that component can reset() this exact mutation instance once the reveal
+ * is dismissed — a useMutation() call site owns its own `.data`, and a
+ * second useCreateToken() there would be an unrelated instance clearing
+ * nothing.
+ */
+function NewTokenRow({
   createToken,
-  open,
-  onOpenChange,
   onCreated,
+  onClose,
 }: {
-  // Lifted from a local useCreateToken() call up to TokensCard and passed
-  // down, so TokensCard can reset() this exact mutation instance once the
-  // reveal dialog closes — a useMutation() call site owns its own `.data`;
-  // a second, separate useCreateToken() call in TokensCard would create an
-  // unrelated instance and not actually clear anything.
   createToken: ReturnType<typeof useCreateToken>;
-  open: boolean;
-  onOpenChange: (open: boolean) => void;
   onCreated: (result: { id: number; token: string }) => void;
+  onClose: () => void;
 }) {
   const form = useForm<TokenFormValues>({
     resolver: zodResolver(tokenFormSchema),
@@ -570,8 +590,8 @@ function NewTokenDialog({
   });
 
   useEffect(() => {
-    if (open) form.reset(tokenFormDefaults());
-  }, [open, form]);
+    form.setFocus("name");
+  }, [form]);
 
   function onSubmit(values: TokenFormValues) {
     createToken.mutate(
@@ -579,7 +599,7 @@ function NewTokenDialog({
       {
         onSuccess: (result) => {
           toast.success("Token created");
-          onOpenChange(false);
+          onClose();
           onCreated(result);
         },
         onError: (err) =>
@@ -589,190 +609,77 @@ function NewTokenDialog({
   }
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent>
-        <DialogHeader>
-          <DialogTitle>New token</DialogTitle>
-          <DialogDescription>
-            Create a scoped credential a script or another tool can use to call the dnsaur API.
-          </DialogDescription>
-        </DialogHeader>
-        <Form {...form}>
-          <form
-            className="flex flex-col gap-4"
-            onSubmit={(e) => void form.handleSubmit(onSubmit)(e)}
-            noValidate
-          >
-            <FormField
-              control={form.control}
-              name="name"
-              render={({ field }) => (
-                <FormItem>
-                  <FormLabel>Name</FormLabel>
-                  <FormControl>
-                    <Input {...field} placeholder="Home Assistant" autoComplete="off" />
-                  </FormControl>
-                  <FormDescription>A label to help you recognize this token later.</FormDescription>
-                  <FormMessage />
-                </FormItem>
-              )}
-            />
-            <FormField
-              control={form.control}
-              name="scope"
-              render={({ field }) => (
-                <FormItem>
-                  <FormLabel>Scope</FormLabel>
-                  {/* `items` maps each value to its display label — without
-                      it, SelectValue renders the raw stored value ("read")
-                      instead of the option's label (Task 12's finding). */}
-                  <Select
-                    items={Object.fromEntries(SCOPE_OPTIONS.map((o) => [o.value, o.label]))}
-                    value={field.value}
-                    onValueChange={field.onChange}
-                  >
-                    <SelectTrigger aria-label="Scope">
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent>
-                      {SCOPE_OPTIONS.map((option) => (
-                        <SelectItem key={option.value} value={option.value}>
-                          {option.label}
-                        </SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
-                  <FormDescription>
-                    Read-only tokens can fetch data. Read & write tokens can also change it.
-                  </FormDescription>
-                </FormItem>
-              )}
-            />
-            <DialogFooter>
-              <DialogClose render={<Button type="button" variant="outline" />}>Cancel</DialogClose>
-              <Button type="submit" disabled={createToken.isPending}>
-                {createToken.isPending ? "Creating…" : "Create token"}
-              </Button>
-            </DialogFooter>
-          </form>
-        </Form>
-      </DialogContent>
-    </Dialog>
-  );
-}
-
-/**
- * The one-time plaintext reveal — the single highest-stakes moment on this
- * page (closing without copying loses the token forever; dnsaur only ever
- * stores a hash of it, see store.AuthToken.TokenHash). Deliberately no
- * plain "Close" affordance in the footer: the one button there names the
- * consequence directly, and the Alert above states the fact rather than
- * dramatizing it — the stakes carry the design, not extra chrome.
- * `showCloseButton={false}` on DialogContent turns off rnui's default
- * top-right X icon, so the deliberate footer button really is the only
- * *labeled* dismissal — the design intent this component already claimed
- * before the X was actually suppressed. (Escape / backdrop click still
- * close it, same as every other dialog on this page; trapping the dialog
- * open entirely would be a bigger, separate UX call this fix doesn't make.)
- * The caller (TokensCard) is responsible for resetting the createToken
- * mutation whenever this closes — see its onOpenChange.
- */
-function TokenRevealDialog({
-  result,
-  onOpenChange,
-}: {
-  result: { id: number; token: string } | null;
-  onOpenChange: (open: boolean) => void;
-}) {
-  return (
-    <Dialog open={result !== null} onOpenChange={onOpenChange}>
-      <DialogContent showCloseButton={false}>
-        <DialogHeader>
-          <DialogTitle>Copy your token now</DialogTitle>
-          {/* States context, not the warning — the Alert right below owns
-              that, so the two don't repeat "you won't see this again"
-              back to back. */}
-          <DialogDescription>Your token was created successfully.</DialogDescription>
-        </DialogHeader>
-        {result && (
-          <div className="flex flex-col gap-4">
-            <Alert variant="warning">
-              <TriangleAlert />
-              <AlertTitle>You won&apos;t see this again</AlertTitle>
-              <AlertDescription>
-                Copy it now and store it somewhere safe. dnsaur only keeps a hash of it — if
-                it&apos;s lost, revoke this token and create a new one.
-              </AlertDescription>
-            </Alert>
-            <CopyableCode value={result.token} label="token" />
-            <DialogFooter>
-              <Button type="button" onClick={() => onOpenChange(false)}>
-                I&apos;ve saved it — close
-              </Button>
-            </DialogFooter>
+    <Form {...form}>
+      <form
+        onSubmit={(e) => void form.handleSubmit(onSubmit)(e)}
+        noValidate
+        data-slot="new-token-row"
+        className="shrink-0 border-b border-border bg-card shadow-[inset_3px_0_0_var(--primary)]"
+      >
+        <div className={cn(TOKEN_GRID, "py-2.5")}>
+          <FormField
+            control={form.control}
+            name="name"
+            render={({ field }) => (
+              <FormItem>
+                <FormControl>
+                  <Input
+                    {...field}
+                    aria-label="Name"
+                    placeholder="homeassistant"
+                    autoComplete="off"
+                  />
+                </FormControl>
+              </FormItem>
+            )}
+          />
+          <FormField
+            control={form.control}
+            name="scope"
+            render={({ field }) => (
+              <FormItem>
+                <FormControl>
+                  <NativeSelect {...field} aria-label="Scope">
+                    {SCOPE_OPTIONS.map((option) => (
+                      <NativeSelectOption key={option.value} value={option.value}>
+                        {option.value}
+                      </NativeSelectOption>
+                    ))}
+                  </NativeSelect>
+                </FormControl>
+              </FormItem>
+            )}
+          />
+          {/* The three the server fills in, shown so the row lines up with
+              the header and says what the token will be. */}
+          <span className="font-mono text-sm text-muted-foreground">now</span>
+          <span className="font-mono text-sm text-muted-foreground">—</span>
+          <span className="font-mono text-sm text-muted-foreground">never</span>
+          <div className="flex items-center justify-end gap-1.5">
+            <Button type="submit" size="sm" disabled={createToken.isPending}>
+              {createToken.isPending ? "Creating…" : "Create"}
+            </Button>
+            <Button
+              type="button"
+              size="icon-sm"
+              variant="ghost"
+              aria-label="Close the new-token row"
+              onClick={onClose}
+            >
+              <X />
+            </Button>
+          </div>
+        </div>
+        {/* Validation only. The hints that were here described a name
+            field, a two-option select and a fact the reveal banner states
+            far more loudly a second later. */}
+        {form.formState.errors.name && (
+          <div className={cn(TOKEN_GRID, "pb-2.5 text-xs")}>
+            <FormField control={form.control} name="name" render={() => <FormMessage />} />
           </div>
         )}
-      </DialogContent>
-    </Dialog>
-  );
-}
-
-function TokensTable({
-  tokens,
-  onRevokeRequest,
-}: {
-  tokens: ApiToken[];
-  onRevokeRequest: (token: ApiToken) => void;
-}) {
-  return (
-    <Table>
-      <TableHeader>
-        <TableRow>
-          <TableHead>Name</TableHead>
-          <TableHead>Scope</TableHead>
-          <TableHead>Created</TableHead>
-          <TableHead>Last used</TableHead>
-          <TableHead className="text-right">
-            <span className="sr-only">Actions</span>
-          </TableHead>
-        </TableRow>
-      </TableHeader>
-      <TableBody>
-        {tokens.map((token) => (
-          <TableRow key={token.id}>
-            <TableCell className="max-w-48 truncate" title={token.name}>
-              {token.name}
-            </TableCell>
-            <TableCell>
-              <TokenScopeBadge scope={token.scope} />
-            </TableCell>
-            <TableCell
-              className="text-muted-foreground tabular-nums"
-              title={new Date(token.created_at).toLocaleString()}
-            >
-              {relativeTime(token.created_at)}
-            </TableCell>
-            <TableCell
-              className="text-muted-foreground tabular-nums"
-              title={token.last_used ? new Date(token.last_used).toLocaleString() : undefined}
-            >
-              {relativeTime(token.last_used)}
-            </TableCell>
-            <TableCell className="text-right">
-              <Button
-                type="button"
-                size="icon-sm"
-                variant="ghost"
-                aria-label={`Revoke ${token.name}`}
-                onClick={() => onRevokeRequest(token)}
-              >
-                <Trash2 />
-              </Button>
-            </TableCell>
-          </TableRow>
-        ))}
-      </TableBody>
-    </Table>
+      </form>
+    </Form>
   );
 }
 
@@ -834,6 +741,12 @@ function TokensCard() {
         <AlertDescription>Try refreshing the page.</AlertDescription>
       </Alert>
     );
+  } else if (isEmpty && addOpen) {
+    // The create row above is already the answer to both halves of the
+    // empty state — there's something here now, and the way to start is
+    // open. Offering "New token" under a form that opened for that click
+    // just makes the button look broken.
+    body = null;
   } else if (isEmpty) {
     body = (
       <EmptyState
@@ -849,47 +762,155 @@ function TokensCard() {
       />
     );
   } else {
-    body = <TokensTable tokens={tokens.data} onRevokeRequest={setRevokeTarget} />;
+    body = tokens.data.map((token) => (
+      <div
+        key={token.id}
+        data-slot="token-row"
+        className={cn(
+          TOKEN_GRID,
+          "border-b border-border-muted py-2.5",
+          // The one just created, so it stays findable after the banner
+          // above it is dismissed.
+          revealResult?.id === token.id && "bg-primary/5",
+        )}
+      >
+        <span className="truncate font-mono text-sm" title={token.name}>
+          {token.name}
+        </span>
+        <span>
+          <TokenScopeBadge scope={token.scope} />
+        </span>
+        <span
+          className="font-mono text-sm text-muted-foreground"
+          title={new Date(token.created_at).toLocaleString()}
+        >
+          {relativeTime(token.created_at)}
+        </span>
+        <span
+          className={cn(
+            "font-mono text-sm",
+            token.last_used ? "text-foreground" : "text-muted-foreground",
+          )}
+          title={token.last_used ? new Date(token.last_used).toLocaleString() : undefined}
+        >
+          {relativeTime(token.last_used)}
+        </span>
+        <span className="font-mono text-sm text-muted-foreground">never</span>
+        <span className="flex items-center justify-end">
+          <Button
+            type="button"
+            size="sm"
+            variant="ghost"
+            aria-label={`Revoke ${token.name}`}
+            onClick={() => setRevokeTarget(token)}
+          >
+            Revoke
+          </Button>
+        </span>
+      </div>
+    ));
   }
 
   return (
-    <Card>
-      <CardHeader>
-        <CardTitle className="flex items-center gap-2">
-          <KeyRound className="size-4 text-muted-foreground" aria-hidden="true" />
-          API tokens
-        </CardTitle>
-        <CardDescription>
-          Scoped credentials scripts and other tools can use to call the dnsaur API instead of your
-          session.
-        </CardDescription>
-        {!isEmpty && (
-          <CardAction>
-            <Button type="button" size="sm" onClick={() => setAddOpen(true)}>
-              <Plus />
-              New token
+    <Section
+      title="API tokens"
+      icon={KeyRound}
+      description="Scoped credentials for scripts and tools."
+      grow
+    >
+      {/* A banner, not a dialog. This is the only time the plaintext will
+          ever exist on screen, and a modal invites the two gestures that
+          lose it — Escape, and a click on the backdrop. This one goes away
+          only when its own button says the token has been saved. */}
+      {revealResult && (
+        <div className="shrink-0 border-b border-border bg-invert p-5 text-invert-foreground">
+          <div className="flex items-center gap-2.5">
+            <span className="bg-warning px-2 py-1 font-mono text-xs font-semibold tracking-widest text-warning-solid-foreground uppercase">
+              Shown once
+            </span>
+            <p className="font-heading text-sm font-semibold">
+              Copy your token now — it can&apos;t be shown again
+            </p>
+          </div>
+          <p className="mt-3 border border-invert-foreground/25 bg-invert-foreground/5 p-3 font-mono text-base break-all">
+            {revealResult.token}
+          </p>
+          <div className="mt-3 flex flex-wrap items-center gap-2">
+            <Button
+              type="button"
+              size="sm"
+              onClick={() => {
+                void navigator.clipboard?.writeText(revealResult.token);
+                toast.success("Token copied");
+              }}
+            >
+              <Copy />
+              Copy token
             </Button>
-          </CardAction>
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              onClick={() => onDismissReveal(false)}
+            >
+              I&apos;ve saved it
+            </Button>
+            <span className="ml-auto font-mono text-xs opacity-75">
+              Leaving this page discards it.
+            </span>
+          </div>
+        </div>
+      )}
+
+      <div className="flex shrink-0 items-center gap-2.5 border-b border-border px-5 py-2.5">
+        <span className="font-mono text-xs text-muted-foreground">
+          {tokens.data
+            ? `${tokens.data.length} ${tokens.data.length === 1 ? "token" : "tokens"} · none expire`
+            : ""}
+        </span>
+        {!isEmpty && !addOpen && (
+          <Button type="button" size="sm" className="ml-auto" onClick={() => setAddOpen(true)}>
+            <Plus />
+            New token
+          </Button>
         )}
-      </CardHeader>
-      <CardContent className="flex flex-col gap-4">
+      </div>
+
+      <div
+        className={cn(
+          TOKEN_GRID,
+          "shrink-0 border-b border-border py-2",
+          "font-mono text-xs tracking-widest text-muted-foreground uppercase",
+        )}
+      >
+        <span>Name</span>
+        <span>Scope</span>
+        <span>Created</span>
+        <span>Last used</span>
+        <span>Expires</span>
+        <span className="text-right">Actions</span>
+      </div>
+
+      {addOpen && (
+        <NewTokenRow
+          createToken={createToken}
+          onCreated={setRevealResult}
+          onClose={() => setAddOpen(false)}
+        />
+      )}
+
+      <div className="min-h-0 flex-1 overflow-y-auto">
         {tokens.isError && tokens.data !== undefined && (
-          <StaleDataAlert
-            what="API tokens"
-            onRetry={() => void tokens.refetch()}
-            isRetrying={tokens.isFetching}
-          />
+          <div className="p-3">
+            <StaleDataAlert
+              what="API tokens"
+              onRetry={() => void tokens.refetch()}
+              isRetrying={tokens.isFetching}
+            />
+          </div>
         )}
         {body}
-      </CardContent>
-
-      <NewTokenDialog
-        createToken={createToken}
-        open={addOpen}
-        onOpenChange={setAddOpen}
-        onCreated={setRevealResult}
-      />
-      <TokenRevealDialog result={revealResult} onOpenChange={onDismissReveal} />
+      </div>
 
       <AlertDialog
         open={revokeTarget !== null}
@@ -919,7 +940,7 @@ function TokensCard() {
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
-    </Card>
+    </Section>
   );
 }
 
@@ -927,85 +948,70 @@ function TokensCard() {
 
 function AccountSkeleton() {
   return (
-    <div className="flex flex-col gap-6" aria-hidden="true">
-      <Card>
-        <CardHeader>
-          <Skeleton className="h-5 w-56" />
-          <Skeleton className="mt-1.5 h-4 w-80" />
-        </CardHeader>
-        <CardContent>
-          <Skeleton className="h-9 w-full max-w-sm" />
-        </CardContent>
-      </Card>
-      <Card>
-        <CardHeader>
-          <Skeleton className="h-5 w-28" />
-          <Skeleton className="mt-1.5 h-4 w-72" />
-        </CardHeader>
-        <CardContent className="flex flex-col gap-2">
-          {Array.from({ length: 3 }).map((_, i) => (
-            <Skeleton key={i} className="h-10 w-full" />
-          ))}
-        </CardContent>
-      </Card>
+    <div className="flex flex-col" aria-hidden="true">
+      {Array.from({ length: 2 }).map((_, i) => (
+        <div key={i} className="grid grid-cols-[288px_1fr] border-b border-border">
+          <div className="flex flex-col gap-2 border-r border-border p-5">
+            <Skeleton className="h-5 w-40" />
+            <Skeleton className="h-4 w-24" />
+          </div>
+          <div className="flex flex-col gap-3 p-5">
+            <Skeleton className="h-8 w-full" />
+            <Skeleton className="h-8 w-2/3" />
+          </div>
+        </div>
+      ))}
     </div>
   );
 }
 
-/**
- * Account & security — two-factor authentication and API token management
- * (Task 13). GET /auth/me gates both sections (TOTP needs totp_enabled to
- * pick a flow; tokens don't depend on it, but there's no reason to show
- * them before the page even knows who's asking).
- *
- * No password-change section: internal/api/openapi.yaml's Auth tag has no
- * change-password endpoint at this milestone (only login/logout/me/totp/*).
- * A disabled form here would look broken rather than honest, so this says
- * so in one quiet line instead of pretending the control exists.
- */
+// --- page ------------------------------------------------------------------
+
 export function Account() {
   const me = useMe();
 
   return (
-    <div className="flex flex-col gap-6">
-      <div>
-        <h1 className="text-2xl font-heading font-semibold text-foreground">Account & security</h1>
-        <p className="mt-1 text-sm text-muted-foreground">
-          Two-factor authentication and API tokens for this account.
-        </p>
-        <p className="mt-2 text-xs text-muted-foreground">
-          Password changes aren&apos;t available yet — that&apos;s planned for a future update.
-        </p>
-      </div>
-
-      <Separator />
-
+    <div className="flex h-full min-h-0 flex-col">
       {me.isPending && <AccountSkeleton />}
 
       {me.isError && me.data === undefined && (
-        <Alert variant="destructive">
-          <TriangleAlert />
-          <AlertTitle>Couldn&apos;t load your account</AlertTitle>
-          <AlertDescription>Try refreshing the page.</AlertDescription>
-        </Alert>
+        <div className="p-5">
+          <Alert variant="destructive">
+            <TriangleAlert />
+            <AlertTitle>Couldn&apos;t load your account</AlertTitle>
+            <AlertDescription>Try refreshing the page.</AlertDescription>
+          </Alert>
+        </div>
       )}
 
       {/* `data !== undefined`, not `isSuccess` — a failed background
           refetch (every TOTP mutation invalidates `me`) flips isSuccess
           false while data is still perfectly good, and unmounting these
-          cards mid-flow would throw away the enrollment dialog's state
+          sections mid-flow would throw away the enrollment dialog's state
           along with them. */}
       {me.data !== undefined && (
         <>
           {me.isError && (
-            <StaleDataAlert
-              what="your account"
-              onRetry={() => void me.refetch()}
-              isRetrying={me.isFetching}
-            />
+            <div className="shrink-0 border-b border-border p-3">
+              <StaleDataAlert
+                what="your account"
+                onRetry={() => void me.refetch()}
+                isRetrying={me.isFetching}
+              />
+            </div>
           )}
           <TotpCard enabled={me.data.totp_enabled} />
           <TokensCard />
+          <Section
+            title="Password"
+            icon={Lock}
+            badge={<Badge variant="secondary">Planned</Badge>}
+            description="The password you sign in with."
+          >
+            <p className="p-5 text-sm text-muted-foreground">
+              Password changes aren&apos;t available yet — that&apos;s planned for a future update.
+            </p>
+          </Section>
         </>
       )}
     </div>

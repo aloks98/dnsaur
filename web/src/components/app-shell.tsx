@@ -1,7 +1,5 @@
 import { useState } from "react";
 import { Outlet, useLocation } from "react-router";
-import { cn } from "@e412/rnui-react";
-import { isFullBleedRoute } from "../lib/nav";
 import { CommandPalette } from "./command-palette";
 import { ErrorBoundary } from "./error-boundary";
 import { TopNav } from "./top-nav";
@@ -21,23 +19,18 @@ export function AppShell() {
     // height and then stopped short of the bottom of the page.
     <div className="flex h-screen flex-col overflow-hidden bg-background">
       <TopNav onOpenCommandPalette={() => setPaletteOpen(true)} />
-      {/* Every page gets the shell's gutter except the dashboard and the
-          query log, which are full-bleed grids of hairline-separated bands —
-          their rules have to meet the viewport edges, not float inside a
-          24px frame. `flex flex-col` is what lets those pages claim the
-          remaining height, so their vertical rules run to the bottom of the
-          window however few rows they have. */}
-      {/* min-h-0 lets the flex child actually shrink; without it a long
-          table forces the main element past the viewport and the internal
-          scroller never engages. Padded routes keep the ordinary page
-          scroll; full-bleed routes own their own scrolling, because the
-          thing that should scroll there is one pane, not the chrome. */}
-      <main
-        className={cn(
-          "flex min-h-0 flex-1 flex-col",
-          isFullBleedRoute(pathname) ? "overflow-hidden" : "overflow-y-auto p-6",
-        )}
-      >
+      {/* No gutter, and no scrolling here. Every screen is a full-bleed
+          grid of hairline-separated bands whose rules have to meet the
+          viewport edges rather than float inside a 24px frame, and each
+          owns its own scrolling — the thing that should scroll is one pane,
+          not the chrome.
+          This used to branch per route while the screens were rebuilt one
+          at a time; once Account was the last one left, the branch always
+          took the same side.
+          `flex flex-col` is what lets a page claim the remaining height, and
+          min-h-0 lets it actually shrink — without it a long table forces
+          <main> past the viewport and the internal scroller never engages. */}
+      <main className="flex min-h-0 flex-1 flex-col overflow-hidden">
         {/* Keyed on the path: this shell is the persistent layout element,
             so one instance of the boundary outlives every sibling route
             change. Without the key, a page that throws once leaves

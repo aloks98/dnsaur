@@ -113,7 +113,7 @@ test("TOTP off shows Enable 2FA; TOTP on shows Disable 2FA and an Enabled badge"
   mockTokens([]);
   const off = renderWithProviders(<Account />);
   await screen.findByText("Two-factor authentication");
-  expect(screen.getByRole("button", { name: /^enable 2fa$/i })).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: /^set up 2fa$/i })).toBeInTheDocument();
   expect(screen.queryByRole("button", { name: /^disable 2fa$/i })).not.toBeInTheDocument();
   expect(screen.getByText(/^disabled$/i)).toBeInTheDocument();
   off.unmount();
@@ -122,7 +122,7 @@ test("TOTP off shows Enable 2FA; TOTP on shows Disable 2FA and an Enabled badge"
   renderWithProviders(<Account />);
   await screen.findByText("Two-factor authentication");
   expect(screen.getByRole("button", { name: /^disable 2fa$/i })).toBeInTheDocument();
-  expect(screen.queryByRole("button", { name: /^enable 2fa$/i })).not.toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: /^set up 2fa$/i })).not.toBeInTheDocument();
   expect(screen.getByText(/^enabled$/i)).toBeInTheDocument();
 });
 
@@ -154,20 +154,19 @@ test("TOTP enable: start then confirm with a code refetches me and flips the car
   renderWithProviders(<Account />);
   await screen.findByText("Two-factor authentication");
 
-  await user.click(screen.getByRole("button", { name: /^enable 2fa$/i }));
+  await user.click(screen.getByRole("button", { name: /^set up 2fa$/i }));
 
-  const dialog = await screen.findByRole("dialog");
-  expect(within(dialog).getByText(/set up two-factor authentication/i)).toBeInTheDocument();
-  // The setup key is shown for manual entry, and the QR is rendered from it.
-  expect(within(dialog).getByText("JBSWY3DPEHPK3PXP")).toBeInTheDocument();
-  expect(await within(dialog).findByRole("img", { name: /qr code/i })).toBeInTheDocument();
+  // Enrollment happens in the section itself, not a dialog — the QR, the
+  // secret and the confirm field are all on the page at once.
+  expect(await screen.findByText("JBSWY3DPEHPK3PXP")).toBeInTheDocument();
+  expect(await screen.findByRole("img", { name: /qr code/i })).toBeInTheDocument();
+  expect(screen.getByText(/setting up/i)).toBeInTheDocument();
 
-  await user.type(within(dialog).getByLabelText(/verification code/i), "123456");
-  await user.click(within(dialog).getByRole("button", { name: /^confirm$/i }));
+  await user.type(screen.getByLabelText(/verification code/i), "123456");
+  await user.click(screen.getByRole("button", { name: /^turn on 2fa$/i }));
 
   await waitFor(() => expect(confirmBody).toEqual({ secret: "JBSWY3DPEHPK3PXP", code: "123456" }));
   await waitFor(() => expect(successSpy).toHaveBeenCalledWith("Two-factor authentication enabled"));
-  await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
 
   // me was invalidated and refetched — the card now shows the enabled state.
   expect(await screen.findByRole("button", { name: /^disable 2fa$/i })).toBeInTheDocument();
@@ -194,18 +193,16 @@ test("TOTP enable: dismissing without confirming clears the setup key and QR fro
   renderWithProviders(<Account />);
   await screen.findByText("Two-factor authentication");
 
-  await user.click(screen.getByRole("button", { name: /^enable 2fa$/i }));
-  const dialog = await screen.findByRole("dialog");
-  expect(within(dialog).getByText("JBSWY3DPEHPK3PXP")).toBeInTheDocument();
-  expect(await within(dialog).findByRole("img", { name: /qr code/i })).toBeInTheDocument();
+  await user.click(screen.getByRole("button", { name: /^set up 2fa$/i }));
+  expect(await screen.findByText("JBSWY3DPEHPK3PXP")).toBeInTheDocument();
+  expect(await screen.findByRole("img", { name: /qr code/i })).toBeInTheDocument();
 
-  await user.click(within(dialog).getByRole("button", { name: /^cancel$/i }));
+  await user.click(screen.getByRole("button", { name: /^cancel$/i }));
 
-  await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
-  expect(screen.queryByText("JBSWY3DPEHPK3PXP")).not.toBeInTheDocument();
+  await waitFor(() => expect(screen.queryByText("JBSWY3DPEHPK3PXP")).not.toBeInTheDocument());
   expect(screen.queryByRole("img", { name: /qr code/i })).not.toBeInTheDocument();
   // Still off — nothing was confirmed.
-  expect(screen.getByRole("button", { name: /^enable 2fa$/i })).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: /^set up 2fa$/i })).toBeInTheDocument();
 });
 
 // The leak the DOM assertions above can't see. TotpEnableDialog is rendered
@@ -238,16 +235,15 @@ test("TOTP enable: the shared secret is gone from mutation state once enrollment
   const { client } = renderWithQueryClient(<Account />);
   await screen.findByText("Two-factor authentication");
 
-  await user.click(screen.getByRole("button", { name: /^enable 2fa$/i }));
-  const dialog = await screen.findByRole("dialog");
+  await user.click(screen.getByRole("button", { name: /^set up 2fa$/i }));
+  await screen.findByText(TOTP_SECRET);
   // Sanity check: while the flow is open the secret genuinely is in
   // mutation state, so the assertion below is testing something.
   expect(mutationStateJson(client)).toContain(TOTP_SECRET);
 
-  await user.type(within(dialog).getByLabelText(/verification code/i), "123456");
-  await user.click(within(dialog).getByRole("button", { name: /^confirm$/i }));
+  await user.type(screen.getByLabelText(/verification code/i), "123456");
+  await user.click(screen.getByRole("button", { name: /^turn on 2fa$/i }));
 
-  await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
   await waitFor(() => expect(mutationStateJson(client)).not.toContain(TOTP_SECRET));
   expect(screen.queryByText(TOTP_SECRET)).not.toBeInTheDocument();
 });
@@ -278,7 +274,7 @@ test("TOTP disable: a valid code disables 2FA, me refetches, and the code doesn'
 
   await waitFor(() => expect(disableBody).toEqual({ code: "654321" }));
   await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
-  expect(await screen.findByRole("button", { name: /^enable 2fa$/i })).toBeInTheDocument();
+  expect(await screen.findByRole("button", { name: /^set up 2fa$/i })).toBeInTheDocument();
   // Lower stakes than the shared secret (single-use, time-limited) but the
   // same lingering-variables leak, closed the same way.
   await waitFor(() => expect(mutationStateJson(client)).not.toContain("654321"));
@@ -316,6 +312,22 @@ test("shows an EmptyState with a New token action when there are no tokens", asy
   expect(screen.getByRole("button", { name: /new token/i })).toBeInTheDocument();
 });
 
+test("the empty state gives way to the create row rather than sitting under it", async () => {
+  mockMe();
+  mockTokens([]);
+
+  const user = userEvent.setup();
+  renderWithProviders(<Account />);
+  await screen.findByText(/no api tokens yet/i);
+  await user.click(screen.getByRole("button", { name: /new token/i }));
+
+  expect(document.querySelector('[data-slot="new-token-row"]')).toBeInTheDocument();
+  // Both halves of the empty state are now false: there is something
+  // here, and the way to start is already open.
+  expect(screen.queryByText("No API tokens yet")).not.toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: /new token/i })).not.toBeInTheDocument();
+});
+
 test("renders the tokens table with name, scope badge, and relative created/last-used times", async () => {
   mockMe();
   mockTokens([
@@ -329,8 +341,12 @@ test("renders the tokens table with name, scope badge, and relative created/last
   expect(screen.getByText("Read-only")).toBeInTheDocument();
   expect(screen.getByText("Read & write")).toBeInTheDocument();
   expect(screen.getByText("CI script")).toBeInTheDocument();
-  // last_used: 0 reads as "never" (relativeTime's sentinel), not an epoch date.
-  expect(screen.getByText("never")).toBeInTheDocument();
+
+  // last_used: 0 reads as "never" (relativeTime's sentinel), not an epoch
+  // date. Scoped to the row: the grid also has an Expires column, which
+  // reads "never" for every token since API tokens do not expire.
+  const rows = document.querySelectorAll<HTMLElement>('[data-slot="token-row"]');
+  expect(within(rows[1]).getAllByText("never").length).toBeGreaterThanOrEqual(1);
 });
 
 // Required test (d): the API omits token_hash, and the table must never
@@ -362,26 +378,33 @@ test("the tokens table never renders a token_hash, even if the server response i
   expect(screen.queryByText(/token_hash/i)).not.toBeInTheDocument();
 });
 
-test("the New token Scope select shows human labels, not raw values", async () => {
+// The row's scope control is a native select carrying the stored values —
+// "read" and "write" are what the API takes and what the row's badge shows,
+// so a prettier label here would be a third name for the same thing.
+test("the new-token row posts the scope that was picked", async () => {
   const user = userEvent.setup();
+  let body: unknown;
   mockMe();
   mockTokens([]);
+  server.use(
+    http.post("/api/v1/tokens", async ({ request }) => {
+      body = await request.json();
+      return HttpResponse.json({ id: 1, token: "dnsaur_pat_abcdef123456" }, { status: 201 });
+    }),
+  );
 
   renderWithProviders(<Account />);
-  await screen.findByText("No API tokens yet");
+  await screen.findByText(/no api tokens yet/i);
   await user.click(screen.getByRole("button", { name: /new token/i }));
 
-  const dialog = await screen.findByRole("dialog");
-  const scopeTrigger = within(dialog).getByRole("combobox", { name: /^scope$/i });
-  expect(scopeTrigger).toHaveTextContent(/read-only/i);
+  const row = document.querySelector<HTMLElement>('[data-slot="new-token-row"]')!;
+  await user.type(within(row).getByLabelText(/^name$/i), "grafana");
+  await user.selectOptions(within(row).getByLabelText(/^scope$/i), "write");
+  await user.click(within(row).getByRole("button", { name: /^create$/i }));
 
-  await user.click(scopeTrigger);
-  await user.click(screen.getByRole("option", { name: /read & write/i }));
-  expect(scopeTrigger).toHaveTextContent(/read & write/i);
+  await waitFor(() => expect(body).toEqual({ name: "grafana", scope: "write" }));
 });
 
-// Required test (a): the plaintext token is shown exactly once, then gone
-// for good once the reveal dialog is dismissed.
 test("creating a token reveals the plaintext exactly once, then it's gone", async () => {
   const user = userEvent.setup();
   mockMe();
@@ -402,20 +425,27 @@ test("creating a token reveals the plaintext exactly once, then it's gone", asyn
   await screen.findByText("No API tokens yet");
 
   await user.click(screen.getByRole("button", { name: /new token/i }));
-  const createDialog = await screen.findByRole("dialog");
+  const createDialog = document.querySelector<HTMLElement>('[data-slot="new-token-row"]')!;
   await user.type(within(createDialog).getByLabelText(/^name$/i), "Home Assistant");
-  await user.click(within(createDialog).getByRole("button", { name: /^create token$/i }));
+  await user.click(within(createDialog).getByRole("button", { name: /^create$/i }));
 
   await waitFor(() => expect(createBody).toEqual({ name: "Home Assistant", scope: "read" }));
   await waitFor(() => expect(successSpy).toHaveBeenCalledWith("Token created"));
 
-  const revealDialog = await screen.findByRole("dialog", { name: /copy your token now/i });
-  expect(within(revealDialog).getByText("dnsaur_pat_abcdef123456")).toBeInTheDocument();
+  // A banner, not a dialog: this is the only time the plaintext exists on
+  // screen, and a modal invites the two gestures that lose it — Escape and
+  // a backdrop click. It goes only when its own button is pressed.
+  expect(await screen.findByText(/copy your token now/i)).toBeInTheDocument();
+  expect(screen.getByText("dnsaur_pat_abcdef123456")).toBeInTheDocument();
 
-  await user.click(within(revealDialog).getByRole("button", { name: /i.ve saved it/i }));
+  await user.keyboard("{Escape}");
+  expect(screen.getByText("dnsaur_pat_abcdef123456")).toBeInTheDocument();
 
-  await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
-  expect(screen.queryByText("dnsaur_pat_abcdef123456")).not.toBeInTheDocument();
+  await user.click(screen.getByRole("button", { name: /i.ve saved it/i }));
+
+  await waitFor(() =>
+    expect(screen.queryByText("dnsaur_pat_abcdef123456")).not.toBeInTheDocument(),
+  );
 
   // The row now exists, but only its name/scope show — never the plaintext.
   expect(await screen.findByText("Home Assistant")).toBeInTheDocument();
@@ -426,8 +456,7 @@ test("creating a token reveals the plaintext exactly once, then it's gone", asyn
   // just the local `revealResult` state that gates rendering it. Reopening
   // "New token" afterward must not surface the earlier plaintext anywhere.
   await user.click(screen.getByRole("button", { name: /new token/i }));
-  const reopenedDialog = await screen.findByRole("dialog");
-  expect(within(reopenedDialog).getByText(/new token/i)).toBeInTheDocument();
+  expect(await screen.findByLabelText(/^name$/i)).toBeInTheDocument();
   expect(screen.queryByText("dnsaur_pat_abcdef123456")).not.toBeInTheDocument();
 });
 
@@ -463,7 +492,7 @@ test("revoking a token DELETEs it and the row disappears", async () => {
   expect(await screen.findByText("No API tokens yet")).toBeInTheDocument();
 });
 
-test("a failed token creation surfaces the server's error as a toast and leaves the dialog open", async () => {
+test("a failed token creation surfaces the server's error as a toast and leaves the row open", async () => {
   const user = userEvent.setup();
   mockMe();
   mockTokens([]);
@@ -477,10 +506,13 @@ test("a failed token creation surfaces the server's error as a toast and leaves 
   renderWithProviders(<Account />);
   await screen.findByText("No API tokens yet");
   await user.click(screen.getByRole("button", { name: /new token/i }));
-  const dialog = await screen.findByRole("dialog");
-  await user.type(within(dialog).getByLabelText(/^name$/i), "Anything");
-  await user.click(within(dialog).getByRole("button", { name: /^create token$/i }));
+  const row = document.querySelector<HTMLElement>('[data-slot="new-token-row"]')!;
+  await user.type(within(row).getByLabelText(/^name$/i), "Anything");
+  await user.click(within(row).getByRole("button", { name: /^create$/i }));
 
   await waitFor(() => expect(errorSpy).toHaveBeenCalledWith("name required"));
-  expect(screen.getByRole("dialog")).toBeInTheDocument();
+  // The row stays put with the typed name intact, so it can be corrected
+  // rather than retyped.
+  expect(document.querySelector('[data-slot="new-token-row"]')).toBeInTheDocument();
+  expect(within(row).getByLabelText(/^name$/i)).toHaveValue("Anything");
 });

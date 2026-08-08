@@ -42,31 +42,26 @@ test("authenticated user gets the two-row shell: nav groups above, the active gr
 // the viewport edges; the shell's 24px page gutter would leave every one of
 // them floating inside a frame, and a non-flex <main> would stop the split
 // claiming the leftover height its vertical rule needs.
-test("full-bleed routes get no page gutter; the rest keep it", async () => {
-  const { unmount } = renderWithProviders(<App />);
-  await screen.findByRole("navigation", { name: "Primary" });
-
-  const dashboardMain = screen.getByRole("main");
-  expect(dashboardMain.className).not.toContain("p-6");
-  expect(dashboardMain.className).toContain("flex-col");
-  unmount();
-
-  // Local DNS and Settings joined them: both are edge-to-edge bands whose
-  // rules have to meet the viewport, and Settings additionally pins a save
-  // bar above a scrolling body.
-  for (const route of ["/dns", "/settings"]) {
+// Every screen is a full-bleed grid of hairline-separated bands, so <main>
+// carries no gutter and does not scroll — each page owns its own scrolling
+// pane. This used to branch per route while the screens were rebuilt one at
+// a time; Account was the last padded one, and once it went the branch
+// always took the same side.
+test("the shell gives every route the full viewport, and never scrolls itself", async () => {
+  for (const route of ["/", "/queries", "/filtering/lists", "/dns", "/settings", "/account"]) {
     const view = renderWithProviders(<App />, { route });
-    await screen.findByRole("navigation", { name: route === "/dns" ? "Local DNS" : "System" });
-    expect(screen.getByRole("main").className).not.toContain("p-6");
+    await screen.findByRole("navigation", { name: "Primary" });
+
+    const main = screen.getByRole("main");
+    expect(main.className).not.toContain("p-6");
+    expect(main.className).toContain("overflow-hidden");
+    // flex-col + min-h-0 is what lets a page claim the leftover height and
+    // still shrink; without it a long table pushes <main> past the viewport
+    // and the page's own scroller never engages.
+    expect(main.className).toContain("flex-col");
+    expect(main.className).toContain("min-h-0");
     view.unmount();
   }
-
-  // Account is the last padded route. When it goes full-bleed too, this
-  // assertion has nowhere left to stand and the branch in
-  // isFullBleedRoute stops earning its keep.
-  renderWithProviders(<App />, { route: "/account" });
-  await screen.findByRole("navigation", { name: "System" });
-  expect(screen.getByRole("main").className).toContain("p-6");
 });
 
 test("/filtering forwards to Lists, and each panel is a deep-linkable route", async () => {
