@@ -71,6 +71,16 @@ function recordRows(): HTMLElement[] {
   return Array.from(document.querySelectorAll<HTMLElement>('[data-testid="zone-record-row"]'));
 }
 
+/** Mocks both the zone and its records fetch and renders the detail page for
+ * it — used by tests that only care about the zone itself (its type) rather
+ * than a specific record set, so they don't have to call mockZone/mockRecords
+ * separately. */
+function renderZoneDetail({ zone: z, records = [] }: { zone: Zone; records?: ZoneRecord[] }) {
+  mockZone(z);
+  mockRecords(z.id, records);
+  return renderDetail(`/zones/${z.id}`);
+}
+
 afterEach(() => vi.restoreAllMocks());
 
 // Record `name` is zone-apex-relative — "@" is the literal, stored value
@@ -119,7 +129,7 @@ test("a parser error from the API lands on the data field", async () => {
   expect(screen.getByLabelText(/^data$/i)).toHaveAttribute("aria-invalid", "true");
 });
 
-// One text input serves eight record types; the DNS parser (not a per-type
+// One text input serves nine record types; the DNS parser (not a per-type
 // form) is what actually validates the value, so the placeholder is the
 // only per-type guidance the row gives.
 test("the placeholder follows the selected type", async () => {
@@ -551,4 +561,24 @@ test("an empty zone explains there are no records yet", async () => {
 
   renderDetail();
   expect(await screen.findByText("0 records")).toBeInTheDocument();
+});
+
+test("PTR is offered as a record type and its placeholder is a name", async () => {
+  const user = userEvent.setup();
+  renderZoneDetail({ zone: zone({ id: 1, name: "150.168.192.in-addr.arpa" }) });
+  const row = await screen.findByTestId("record-form-row");
+  await user.selectOptions(within(row).getByLabelText(/type/i), "PTR");
+  // PTR rdata is a domain name, not an address (RFC 1034) — a placeholder
+  // showing an IP would teach exactly the wrong thing.
+  expect(within(row).getByLabelText(/data/i)).toHaveAttribute("placeholder", "bifrost.e412.in.");
+});
+
+test("a built-in zone offers no way to change it", async () => {
+  renderZoneDetail({ zone: zone({ id: 1, name: "localhost", type: "internal" }) });
+  await screen.findByText("localhost");
+  expect(screen.queryByRole("button", { name: /add record/i })).not.toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: /delete zone/i })).not.toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: /disable zone/i })).not.toBeInTheDocument();
+  // Its records are still listed — reading is the point of showing it at all.
+  expect(await screen.findByText("Built-in")).toBeInTheDocument();
 });

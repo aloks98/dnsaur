@@ -89,15 +89,19 @@ function TypeAwareFieldsHarness({ type }: { type: Zone["type"] }) {
 afterEach(() => vi.restoreAllMocks());
 
 // The RFC 6303 zones exist to stop junk queries reaching the roots;
-// offering a delete that the API refuses is a button that lies.
+// offering a delete that the API refuses is a button that lies. Built-ins
+// sit behind the collapsed disclosure now, so it has to be opened first.
 test("internal zones cannot be deleted", async () => {
+  const user = userEvent.setup();
   mockZones([
     zone({ id: 1, name: "e412.in", type: "primary" }),
     zone({ id: 2, name: "localhost", type: "internal" }),
   ]);
   renderWithProviders(<ZonesList />);
+  await user.click(await screen.findByRole("button", { name: /built-in zone/i }));
   const rows = await screen.findAllByTestId("zone-row");
 
+  expect(rows).toHaveLength(2);
   expect(within(rows[0]).getByRole("button", { name: /delete/i })).toBeInTheDocument();
   expect(within(rows[1]).queryByRole("button", { name: /delete/i })).not.toBeInTheDocument();
 });
@@ -106,16 +110,117 @@ test("internal zones cannot be deleted", async () => {
 // merely omit buttons, it says BUILT-IN outright, and the name itself is
 // plain text with a padlock rather than the primary-coloured link editable
 // zones get — three separate "this is not yours to change" signals, all
-// pinned together since they're one design decision.
+// pinned together since they're one design decision. Only one built-in
+// zone here, so the disclosure's own label is singular too.
 test("an internal zone shows Built-in instead of action buttons, and a padlock beside its plain (non-link) name", async () => {
+  const user = userEvent.setup();
   mockZones([zone({ id: 2, name: "localhost", type: "internal" })]);
   renderWithProviders(<ZonesList />);
+  await user.click(await screen.findByRole("button", { name: /1 built-in zone/i }));
   const rows = await screen.findAllByTestId("zone-row");
 
   expect(within(rows[0]).getByText(/built-in/i)).toBeInTheDocument();
   expect(within(rows[0]).queryByRole("button")).not.toBeInTheDocument();
   expect(within(rows[0]).queryByRole("link", { name: "localhost" })).not.toBeInTheDocument();
   expect(within(rows[0]).getByText("localhost")).toBeInTheDocument();
+});
+
+// The redesign's whole point: RFC 6303 seeds 15 built-in zones (see
+// internal/store/builtins.go), which must never make the header count or
+// the empty state believe the user has zones of their own. The bug this
+// pins: counting `all.length`/`all.length === 0` over the *whole* list
+// (built-ins included) would report "15 zones" and could never show "No
+// zones yet" on a fresh install, since the built-ins are always present.
+test("the header count and the empty state ignore built-in zones — a list of only built-ins shows No zones yet", async () => {
+  mockZones(
+    Array.from({ length: 15 }, (_, i) =>
+      zone({ id: i + 1, name: `builtin${i}.arpa`, type: "internal" }),
+    ),
+  );
+  renderWithProviders(<ZonesList />);
+
+  expect(await screen.findByText("No zones yet")).toBeInTheDocument();
+  expect(screen.getByText("Everything is forwarded upstream.")).toBeInTheDocument();
+  expect(screen.getByText("0 zones")).toBeInTheDocument();
+  expect(screen.queryByText("15 zones")).not.toBeInTheDocument();
+  // The 15 built-ins still exist — just behind their own disclosure, not
+  // counted as the user's own.
+  expect(screen.getByRole("button", { name: /15 built-in zones/i })).toBeInTheDocument();
+});
+
+// Default state is collapsed, and the built-in rows genuinely aren't in
+// the DOM (not merely hidden) — the whole reason this redesign exists is
+// to stop 15 RFC 6303 zones from burying the one or two a user cares about.
+test("the built-ins disclosure is collapsed by default and its rows are not rendered", async () => {
+  mockZones([
+    zone({ id: 1, name: "e412.in" }),
+    zone({ id: 2, name: "localhost", type: "internal" }),
+  ]);
+  renderWithProviders(<ZonesList />);
+
+  const trigger = await screen.findByRole("button", { name: /built-in zone/i });
+  expect(trigger).toHaveAttribute("aria-expanded", "false");
+  expect(screen.getAllByTestId("zone-row")).toHaveLength(1);
+  expect(screen.queryByText("localhost")).not.toBeInTheDocument();
+});
+
+test("expanding the disclosure reveals built-in rows with a BUILT-IN cell and no edit or delete buttons", async () => {
+  const user = userEvent.setup();
+  mockZones([
+    zone({ id: 1, name: "e412.in" }),
+    zone({ id: 2, name: "localhost", type: "internal" }),
+  ]);
+  renderWithProviders(<ZonesList />);
+  const trigger = await screen.findByRole("button", { name: /built-in zone/i });
+
+  await user.click(trigger);
+
+  expect(trigger).toHaveAttribute("aria-expanded", "true");
+  const rows = await screen.findAllByTestId("zone-row");
+  expect(rows).toHaveLength(2);
+  const builtinRow = rows[1];
+  expect(within(builtinRow).getByText("localhost")).toBeInTheDocument();
+  expect(within(builtinRow).getByText(/built-in/i)).toBeInTheDocument();
+  expect(within(builtinRow).queryByRole("button", { name: /edit/i })).not.toBeInTheDocument();
+  expect(within(builtinRow).queryByRole("button", { name: /delete/i })).not.toBeInTheDocument();
+});
+
+test("the built-ins disclosure label pluralises the count", async () => {
+  mockZones([zone({ id: 1, name: "localhost", type: "internal" })]);
+  const single = renderWithProviders(<ZonesList />);
+  const singleTrigger = await screen.findByRole("button", { name: /built-in zone/i });
+  expect(within(singleTrigger).getByText("1 built-in zone")).toBeInTheDocument();
+  single.unmount();
+
+  mockZones(
+    Array.from({ length: 15 }, (_, i) =>
+      zone({ id: i + 1, name: `builtin${i}.arpa`, type: "internal" }),
+    ),
+  );
+  renderWithProviders(<ZonesList />);
+  const manyTrigger = await screen.findByRole("button", { name: /built-in zone/i });
+  expect(within(manyTrigger).getByText("15 built-in zones")).toBeInTheDocument();
+});
+
+// It's a real control (role="button" from a native <button>, keyboard
+// focusable) — not a clickable div that only reacts to a mouse.
+test("the built-ins disclosure toggles on Enter or Space, not just click", async () => {
+  const user = userEvent.setup();
+  mockZones([
+    zone({ id: 1, name: "e412.in" }),
+    zone({ id: 2, name: "localhost", type: "internal" }),
+  ]);
+  renderWithProviders(<ZonesList />);
+  const trigger = await screen.findByRole("button", { name: /built-in zone/i });
+
+  trigger.focus();
+  await user.keyboard("{Enter}");
+  expect(trigger).toHaveAttribute("aria-expanded", "true");
+  expect(await screen.findAllByTestId("zone-row")).toHaveLength(2);
+
+  await user.keyboard(" ");
+  expect(trigger).toHaveAttribute("aria-expanded", "false");
+  await waitFor(() => expect(screen.getAllByTestId("zone-row")).toHaveLength(1));
 });
 
 test("the create row posts the typed name and closes", async () => {
@@ -247,6 +352,7 @@ test("a disabled zone's status reads Disabled", async () => {
 // from a direct DB write or a future migration, and a row that can't
 // render its own type is worse than one that can.
 test("an existing zone row of each non-primary type still renders its badge, and internal also its Built-in cell", async () => {
+  const user = userEvent.setup();
   mockZones([
     zone({ id: 11, name: "sec.example.com", type: "secondary" }),
     zone({ id: 12, name: "stub.example.com", type: "stub" }),
@@ -254,8 +360,10 @@ test("an existing zone row of each non-primary type still renders its badge, and
     zone({ id: 14, name: "localhost", type: "internal" }),
   ]);
   renderWithProviders(<ZonesList />);
+  await user.click(await screen.findByRole("button", { name: /built-in zone/i }));
   const rows = await screen.findAllByTestId("zone-row");
 
+  expect(rows).toHaveLength(4);
   expect(within(rows[0]).getByText("secondary")).toBeInTheDocument();
   expect(within(rows[1]).getByText("stub")).toBeInTheDocument();
   expect(within(rows[2]).getByText("forwarder")).toBeInTheDocument();
@@ -394,4 +502,19 @@ test("a non-expired secondary shows no EXPIRED warning row", async () => {
 
   expect(screen.queryByText("Expired")).not.toBeInTheDocument();
   expect(screen.queryByRole("button", { name: /retry transfer/i })).not.toBeInTheDocument();
+});
+
+test("a long .arpa apex does not break the zones-list grid", async () => {
+  const user = userEvent.setup();
+  mockZones([
+    zone({
+      id: 1,
+      name: "1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.ip6.arpa",
+      type: "internal",
+    }),
+  ]);
+  renderWithProviders(<ZonesList />);
+  await user.click(await screen.findByRole("button", { name: /1 built-in zone/i }));
+  const cell = await screen.findByTitle(/ip6\.arpa$/);
+  expect(cell).toHaveClass("truncate");
 });

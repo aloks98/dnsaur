@@ -137,17 +137,39 @@ Full parameter/response detail lives in `internal/api/openapi.yaml`
   SOA fields default to generated values, and an apex NS record is created
   alongside it. Only `type: "primary"` can be created or patched in this
   release; `secondary`, `stub` and `forwarder` exist in the schema for zone
-  transfers to come but 400 today.
+  transfers to come but 400 today. `type: "internal"` is the fifth: the
+  built-in zones (`localhost` plus every RFC 6303 §4 reverse zone except
+  the private ranges — `BuiltinZones` in `internal/store/builtins.go` has
+  the exact list), seeded at migration and never created through this
+  API. Every write to an `internal` zone or its records — `PATCH` or
+  `DELETE` on the zone, or any write under `/zones/{id}/records` — is
+  refused with `409`. A reverse zone for your own network isn't a distinct
+  type; it's an ordinary `primary` zone whose `name` ends in
+  `in-addr.arpa` or `ip6.arpa` (e.g. `168.192.in-addr.arpa`).
 - **Zone records** — `GET /zones/{id}/records`, `POST /zones/{id}/records`,
   `PUT /zones/{id}/records/{rid}`, `DELETE /zones/{id}/records/{rid}` —
   records within a zone, named relative to its apex (`@`, `bifrost`, `*`,
   `*.nexus`; a fully-qualified name has the apex stripped automatically).
   `rdata` is DNS presentation format, validated by handing it to the same
   DNS parser (`miekg/dns`) that builds the record dnsaur serves, so a `400`
-  carries that parser's own error text. Three write conflicts return `409`:
-  a CNAME beside another record at the same name (RFC 1034 §3.6.2), a CNAME
-  at the zone apex (RFC 1912 §2.4), and a TTL that disagrees with the rest
-  of an RRSet (RFC 2181 §5.2).
+  carries that parser's own error text. `PTR` is a normal record type here
+  like any other — its `rdata` is a domain name, not an address (RFC
+  1034); the address is encoded in the record's `name` instead. Three
+  write conflicts return `409`: a CNAME beside another record at the same
+  name (RFC 1034 §3.6.2), a CNAME at the zone apex (RFC 1912 §2.4), and a
+  TTL that disagrees with the rest of an RRSet (RFC 2181 §5.2) — plus a
+  fourth, any write at all under an `internal` zone (see Zones above).
+  Creating, updating or deleting an `A`/`AAAA` record also writes, moves,
+  or removes the matching `PTR` in whichever enabled `primary` zone covers
+  that address, inside the same request — see
+  [`dashboard.md`](dashboard.md#auto-ptr) for the exact rules (no reverse
+  zone means no PTR and no error; an address that already has a PTR keeps
+  it; a hand-written PTR is never touched). `DELETE /zones/{id}` does the
+  same for the whole zone at once: the zone's own records go with it, and
+  every PTR they owned is retired from the reverse zone that outlives
+  them, under the same check. This can bump the **SOA serial of a
+  different zone** than the one in the request path — the reverse zone's,
+  not just the forward zone's — since its contents just changed too.
 - **Queries** — `GET /queries` (search the query log; filters: `from`,
   `to`, `client`, `q`, `decision`, `type`, `limit` [default 100, capped
   1000], `offset`), `GET /queries/tail` (live tail as Server-Sent Events,

@@ -56,12 +56,12 @@ import {
 } from "../../hooks/use-zones";
 import { StaleDataAlert } from "../../components/stale-data-alert";
 
-// The eight record types the create/edit row's select offers — this list is
+// The nine record types the create/edit row's select offers — this list is
 // the union dns.NewRR (the server's own validator, see
 // internal/api/zonerecords_handlers.go's buildZoneRecord) round-trips for a
 // hand-authored zone. rdata itself gets no per-type schema at all: see
 // DATA_PLACEHOLDER's own comment for why.
-const RECORD_TYPES = ["A", "AAAA", "CNAME", "TXT", "MX", "SRV", "NS", "CAA"] as const;
+const RECORD_TYPES = ["A", "AAAA", "CNAME", "TXT", "MX", "SRV", "NS", "CAA", "PTR"] as const;
 type RecordType = (typeof RECORD_TYPES)[number];
 
 /**
@@ -77,6 +77,12 @@ type RecordType = (typeof RECORD_TYPES)[number];
  * stores two strings and a DKIM key pasted in raw silently truncates at the
  * first semicolon. Quoting is what makes a TXT value one literal string,
  * and the placeholder is where a user learns that.
+ *
+ * PTR's placeholder is a name, not an address — deliberately, since it's the
+ * one type where that distinction bites: the *record's own name* is what
+ * encodes the address (e.g. "10" under 150.168.192.in-addr.arpa), and the
+ * rdata just names the host it points at. A placeholder shaped like an IP
+ * would teach exactly the wrong thing and produce a value dns.NewRR rejects.
  */
 const DATA_PLACEHOLDER: Record<RecordType, string> = {
   A: "192.168.150.28",
@@ -87,6 +93,7 @@ const DATA_PLACEHOLDER: Record<RecordType, string> = {
   SRV: "0 5 5060 sip.home.lan.",
   NS: "ns1.home.lan.",
   CAA: '0 issue "letsencrypt.org"',
+  PTR: "bifrost.e412.in.",
 };
 
 /** A category tag, not a verdict — exact mapping from the artboard. */
@@ -99,6 +106,7 @@ const RECORD_TYPE_VARIANT: Record<RecordType, NonNullable<BadgeProps["variant"]>
   SRV: "secondary",
   NS: "primary-light",
   CAA: "warning-light",
+  PTR: "secondary",
 };
 
 /** The header band's zone-type badge. Mirrors list.tsx's TYPE_VARIANT (kept
@@ -270,6 +278,7 @@ function RecordFormRow({
         onSubmit={(e) => void form.handleSubmit(onSubmit)(e)}
         noValidate
         data-slot="zone-record-form-row"
+        data-testid="record-form-row"
         className={cn(
           "shrink-0 border-b border-border bg-card shadow-[inset_3px_0_0_var(--primary)]",
           isEdit && "bg-primary/5",
@@ -397,10 +406,12 @@ function RecordFormRow({
 
 function RecordRow({
   record,
+  readOnly,
   onEdit,
   onDelete,
 }: {
   record: ZoneRecord;
+  readOnly: boolean;
   onEdit: () => void;
   onDelete: () => void;
 }) {
@@ -418,26 +429,31 @@ function RecordRow({
       <span className="truncate font-mono text-sm" title={record.rdata}>
         {record.rdata}
       </span>
-      <div className="flex items-center justify-end gap-1">
-        <Button
-          type="button"
-          size="icon-sm"
-          variant="ghost"
-          aria-label={`Edit ${label}`}
-          onClick={onEdit}
-        >
-          <Pencil />
-        </Button>
-        <Button
-          type="button"
-          size="icon-sm"
-          variant="ghost"
-          aria-label={`Delete ${label}`}
-          onClick={onDelete}
-        >
-          <Trash2 />
-        </Button>
-      </div>
+      {/* A built-in zone's records are readable but not editable — the
+          server 409s every write to one (see ZoneDetail's own comment), so
+          these icons are omitted rather than left to fail on click. */}
+      {!readOnly && (
+        <div className="flex items-center justify-end gap-1">
+          <Button
+            type="button"
+            size="icon-sm"
+            variant="ghost"
+            aria-label={`Edit ${label}`}
+            onClick={onEdit}
+          >
+            <Pencil />
+          </Button>
+          <Button
+            type="button"
+            size="icon-sm"
+            variant="ghost"
+            aria-label={`Delete ${label}`}
+            onClick={onDelete}
+          >
+            <Trash2 />
+          </Button>
+        </div>
+      )}
     </div>
   );
 }
@@ -563,8 +579,9 @@ function SoaBand({ zone }: { zone: Zone }) {
               // gap-1 matches the header's back link above, so the SOA label
               // and "Zones" start at the same x. Both rows are px-4 with a
               // size-3.5 chevron, so the gap is the only thing that can
-              // misalign them.
-              className="flex min-w-0 flex-1 items-center gap-1 text-left"
+              // misalign them. cursor-pointer explicitly: Tailwind v4
+              // preflight sets no cursor on <button>.
+              className="flex min-w-0 flex-1 cursor-pointer items-center gap-1 text-left"
             >
               <ChevronRight
                 aria-hidden="true"
@@ -797,6 +814,11 @@ export function ZoneDetail() {
   }
 
   const z = zone.data;
+  // The RFC 6303 zones seeded at migration (localhost, the reverse-mapping
+  // arpa zones, …) — the server 409s every write to one ("built-in zones
+  // cannot be changed"), so every control that would produce that 409 is
+  // omitted here rather than left to fail on click.
+  const isInternal = z.type === "internal";
 
   let body: ReactNode;
   if (records.isPending) {
@@ -830,6 +852,7 @@ export function ZoneDetail() {
       <RecordRow
         key={record.id}
         record={record}
+        readOnly={isInternal}
         onEdit={() => setEditing(record)}
         onDelete={() => setDeleteRecordTarget(record)}
       />
@@ -854,29 +877,45 @@ export function ZoneDetail() {
           {z.enabled ? "Enabled" : "Disabled"}
         </Badge>
         <div className="ml-auto flex shrink-0 items-center gap-2">
-          <Button
-            type="button"
-            size="sm"
-            onClick={() => {
-              setEditing(null);
-              setFocusCue((c) => c + 1);
-            }}
-          >
-            <Plus />
-            Add record
-          </Button>
-          <Button
-            type="button"
-            size="sm"
-            variant="outline"
-            onClick={onToggleEnabled}
-            disabled={updateZone.isPending}
-          >
-            {z.enabled ? "Disable zone" : "Enable zone"}
-          </Button>
-          <Button type="button" size="sm" variant="ghost" onClick={() => setDeleteZoneOpen(true)}>
-            Delete zone
-          </Button>
+          {isInternal ? (
+            // Same marker, same wording as the zones list's Actions cell
+            // (list.tsx's ZoneRow) — not merely omitting the buttons, but
+            // saying outright why they're gone.
+            <span className="font-mono text-xs tracking-widest text-muted-foreground uppercase">
+              Built-in
+            </span>
+          ) : (
+            <>
+              <Button
+                type="button"
+                size="sm"
+                onClick={() => {
+                  setEditing(null);
+                  setFocusCue((c) => c + 1);
+                }}
+              >
+                <Plus />
+                Add record
+              </Button>
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                onClick={onToggleEnabled}
+                disabled={updateZone.isPending}
+              >
+                {z.enabled ? "Disable zone" : "Enable zone"}
+              </Button>
+              <Button
+                type="button"
+                size="sm"
+                variant="ghost"
+                onClick={() => setDeleteZoneOpen(true)}
+              >
+                Delete zone
+              </Button>
+            </>
+          )}
         </div>
       </div>
 
@@ -941,13 +980,16 @@ export function ZoneDetail() {
         <span className="text-right">Actions</span>
       </div>
 
-      {/* Create/edit row */}
-      <RecordFormRow
-        zoneId={z.id}
-        editing={editing}
-        focusCue={focusCue}
-        onDone={() => setEditing(null)}
-      />
+      {/* Create/edit row — omitted for a built-in zone; see isInternal's
+          own comment. */}
+      {!isInternal && (
+        <RecordFormRow
+          zoneId={z.id}
+          editing={editing}
+          focusCue={focusCue}
+          onDone={() => setEditing(null)}
+        />
+      )}
 
       <div className="min-h-0 flex-1 overflow-y-auto">{body}</div>
 

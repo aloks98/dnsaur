@@ -274,3 +274,64 @@ explicit rule.
 - **6891** (EDNS0): handled by miekg/dns at the server layer, not here.
 - **9460** (SVCB/HTTPS): storable as rdata today because `dns.NewRR` parses
   them; no special serving logic.
+
+---
+
+## 7. Milestone B: reverse zones, PTR, and the built-ins
+
+Decided 2026-08-09.
+
+### Which RFC 6303 zones ship
+
+**Only the five that can never hold a useful record**: `localhost`,
+`127.in-addr.arpa`, `0.in-addr.arpa`, `255.in-addr.arpa`, and
+`1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.ip6.arpa`
+(`::1`). Type `internal`, read-only, seeded at migration.
+
+RFC 6303 also lists the RFC 1918 reverse ranges — `10.in-addr.arpa`,
+`168.192.in-addr.arpa`, `16`–`31.172.in-addr.arpa` — and dnsaur deliberately
+does **not** seed them. An empty authoritative zone NXDOMAINs everything under
+it, so seeding `168.192.in-addr.arpa` would make PTR records for the user's own
+LAN impossible: the very thing a homelab wants reverse DNS for. Those stay
+unclaimed so the user can create them as `primary` zones and put real PTRs in.
+The cost is that reverse lookups for un-recorded private addresses still leak
+upstream; that is the right trade for a server whose LAN is the point.
+
+### Auto-PTR
+
+A/AAAA writes maintain the matching PTR **server-side, inside the same
+request** — no second call from any client.
+
+| Event | Behaviour |
+|---|---|
+| A/AAAA created, matching reverse zone exists | write the PTR |
+| no matching reverse zone | do nothing — never auto-create a zone |
+| a PTR already exists for that address | leave it, WARN. First wins. |
+| A/AAAA updated | move the PTR, only if it still points at this name |
+| A/AAAA deleted | remove the PTR, only if it still points at this name |
+
+The "still points at this name" guard is what stops an automatic write
+clobbering a PTR the user set by hand.
+
+**Two names, one address** has no correct answer — a PTR is effectively
+one-per-address, so `bifrost` and `nas` both at `192.168.150.10` means one owns
+the reverse. First-write-wins with a WARN is the chosen rule; it is stated here
+because it is a decision, not a derivation.
+
+### Internal zones must be read-only at the API, not just in the UI
+
+Carried from Milestone A's review as a deferred finding: `PATCH` and `DELETE`
+on a zone, and every write under `/zones/{id}/records`, must reject
+`type == "internal"` with **409**. Today only the UI hides those controls,
+which was harmless while nothing created internal zones and stops being
+harmless the moment this milestone seeds five.
+
+### RFC conformance added here
+
+| RFC | Rule |
+|---|---|
+| **6303** | which zones are served locally, and why the RFC 1918 ones are excluded |
+| **1035 §3.5** | `in-addr.arpa` is the four octets reversed |
+| **3596 §2.5** | `ip6.arpa` is 32 nibbles, reversed, dot-separated |
+| **1034** | PTR names a host; the rdata is a domain name, not an address |
+| **2317** | classless delegation of `in-addr.arpa` — noted, NOT implemented; a `/24`-aligned homelab does not need it |

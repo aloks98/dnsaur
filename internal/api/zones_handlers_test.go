@@ -53,6 +53,86 @@ func (ts *zoneTestServer) records(t *testing.T, zoneID int64) []store.ZoneRecord
 	return recs
 }
 
+// recordsByType is records() narrowed to one RR type — for assertions about
+// a single type in a zone that also holds records the test didn't write
+// (every API-created zone gets an apex NS, and a reverse zone gets its PTRs
+// alongside it).
+func (ts *zoneTestServer) recordsByType(t *testing.T, zoneID int64, recType string) []store.ZoneRecord {
+	t.Helper()
+	var out []store.ZoneRecord
+	for _, r := range ts.records(t, zoneID) {
+		if r.Type == recType {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// allZones is every zone in the store, built-ins included — for assertions
+// about the zone set as a whole rather than one zone the test created.
+func (ts *zoneTestServer) allZones(t *testing.T) []store.Zone {
+	t.Helper()
+	zs, err := ts.store.Zones().Zones(t.Context())
+	if err != nil {
+		t.Fatalf("zones: %v", err)
+	}
+	return zs
+}
+
+// createZone creates a zone through POST /api/v1/zones and returns its id,
+// failing the test if the create didn't. Unlike newTestServerWithZone
+// (zonerecords_handlers_test.go), which seeds through the store to leave the
+// apex bare, this goes through the handler — so the zone is exactly what a
+// user would get, apex NS included.
+func (ts *zoneTestServer) createZone(t *testing.T, name string) int64 {
+	t.Helper()
+	rec := ts.do(t, "POST", "/api/v1/zones", fmt.Sprintf(`{"name":%q}`, name))
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create zone %q: status = %d body = %s", name, rec.Code, rec.Body)
+	}
+	return createdID(t, rec)
+}
+
+// createRecord creates a record through POST /api/v1/zones/{id}/records and
+// returns its id, failing the test if the create didn't.
+func (ts *zoneTestServer) createRecord(t *testing.T, zoneID int64, body string) int64 {
+	t.Helper()
+	rec := ts.do(t, "POST", fmt.Sprintf("/api/v1/zones/%d/records", zoneID), body)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create record in zone %d: status = %d body = %s", zoneID, rec.Code, rec.Body)
+	}
+	return createdID(t, rec)
+}
+
+// createdID reads the {"id": N} body both create handlers answer with.
+func createdID(t *testing.T, rec *httptest.ResponseRecorder) int64 {
+	t.Helper()
+	var got struct{ ID int64 }
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal create response %s: %v", rec.Body, err)
+	}
+	if got.ID == 0 {
+		t.Fatalf("create response carried no id: %s", rec.Body)
+	}
+	return got.ID
+}
+
+// zoneIDByName looks up a seeded zone's id by name. The built-in zones
+// (store.BuiltinZones) are seeded by migration rather than created through
+// the API, so tests that need one of their ids can't get it back from a
+// create response the way every other zone test does.
+func (ts *zoneTestServer) zoneIDByName(t *testing.T, name string) int64 {
+	t.Helper()
+	zs := ts.allZones(t)
+	for _, z := range zs {
+		if z.Name == name {
+			return z.ID
+		}
+	}
+	t.Fatalf("no zone named %q among %+v", name, zs)
+	return 0
+}
+
 func TestZoneCreateDefaultsSOA(t *testing.T) {
 	srv := newTestServer(t)
 	rec := srv.do(t, "POST", "/api/v1/zones", `{"name":"e412.in"}`)
@@ -186,8 +266,22 @@ func TestZonesListAndGet(t *testing.T) {
 	} else {
 		var zs []store.Zone
 		_ = json.Unmarshal(rec.Body.Bytes(), &zs)
-		if len(zs) != 1 || zs[0].ID != got.ID {
-			t.Fatalf("list = %+v, want one zone with id %d", zs, got.ID)
+		// Every fresh store also carries the RFC 6303 built-in zones
+		// (store.BuiltinZones), so the list holds those plus the one zone
+		// this test created — an exact count, not just "contains it", so a
+		// bug that duplicates or leaks an extra zone through this exact
+		// create+list path would still be caught.
+		if want := 1 + len(store.BuiltinZones); len(zs) != want {
+			t.Fatalf("list = %d zones (%+v), want %d (the built-ins + the created zone)", len(zs), zs, want)
+		}
+		var found bool
+		for _, z := range zs {
+			if z.ID == got.ID {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("list = %+v, want it to contain the created zone id %d", zs, got.ID)
 		}
 	}
 
@@ -269,5 +363,36 @@ func TestZoneDeleteUnknownIs404(t *testing.T) {
 	srv := newTestServer(t)
 	if rec := srv.do(t, "DELETE", "/api/v1/zones/999999", ""); rec.Code != http.StatusNotFound {
 		t.Fatalf("status = %d, want 404", rec.Code)
+	}
+}
+
+// A built-in zone is infrastructure, not content. The UI already hides these
+// controls; without a server guard the API would honour a request the UI
+// never offers, and a built-in could be edited or deleted out from under it.
+func TestInternalZoneRejectsWrites(t *testing.T) {
+	srv := newTestServer(t)
+	id := srv.zoneIDByName(t, "localhost")
+
+	if rec := srv.do(t, "PATCH", fmt.Sprintf("/api/v1/zones/%d", id), `{"enabled":false}`); rec.Code != http.StatusConflict {
+		t.Errorf("PATCH status = %d, want 409", rec.Code)
+	}
+	if rec := srv.do(t, "DELETE", fmt.Sprintf("/api/v1/zones/%d", id), ""); rec.Code != http.StatusConflict {
+		t.Errorf("DELETE status = %d, want 409", rec.Code)
+	}
+	body := `{"name":"x","type":"A","ttl":300,"rdata":"1.2.3.4"}`
+	if rec := srv.do(t, "POST", fmt.Sprintf("/api/v1/zones/%d/records", id), body); rec.Code != http.StatusConflict {
+		t.Errorf("record POST status = %d, want 409", rec.Code)
+	}
+}
+
+// Reading is fine — the UI lists them and shows their records.
+func TestInternalZoneAllowsReads(t *testing.T) {
+	srv := newTestServer(t)
+	id := srv.zoneIDByName(t, "localhost")
+	if rec := srv.do(t, "GET", fmt.Sprintf("/api/v1/zones/%d", id), ""); rec.Code != http.StatusOK {
+		t.Errorf("GET zone status = %d, want 200", rec.Code)
+	}
+	if rec := srv.do(t, "GET", fmt.Sprintf("/api/v1/zones/%d/records", id), ""); rec.Code != http.StatusOK {
+		t.Errorf("GET records status = %d, want 200", rec.Code)
 	}
 }

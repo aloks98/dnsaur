@@ -147,7 +147,9 @@ records were — the miss behaviour above is the whole point of the change.
 
 Milestone A serves **primary** zones only. `secondary`, `stub` and
 `forwarder` exist in the type list for zones to come but are refused on
-create or edit with `400` until transfers are built.
+create or edit with `400` until transfers are built. A fifth type,
+`internal`, also exists — see Built-in zones below; it's never created
+through this UI, only seeded.
 
 ### Records
 
@@ -179,6 +181,84 @@ Three writes are refused, all `409`:
 - a CNAME at the zone apex, where the SOA and NS already live (RFC 1912 §2.4)
 - a record whose TTL disagrees with others already at that name and type
   (RFC 2181 §5.2 — one TTL per record set)
+
+### Built-in zones
+
+A fixed set of zones exists from the moment this server starts, always
+enabled and shown as **Built-in** in the zone list: `localhost` plus every
+RFC 6303 §4 reverse zone *except* the private ranges (see below) — the
+exact list is [`internal/store/builtins.go`](../internal/store/builtins.go)'s
+`BuiltinZones`. Without them, a query for `localhost` or a PTR lookup for
+`127.0.0.1` would leave this server and go looking for an answer from the
+public root and TLD servers, which don't (and shouldn't) have one. They're
+type `internal` and read-only: no add/edit/delete on their records, no
+renaming or deleting the zone itself — every such write is refused with
+`409`.
+
+RFC 6303 also lists the RFC 1918 private-address reverse ranges —
+`10.in-addr.arpa`, `168.192.in-addr.arpa`, and `16.172.in-addr.arpa`
+through `31.172.in-addr.arpa` (172.16.0.0/12 needs all sixteen, since the
+range isn't byte-aligned) — and dnsaur deliberately does **not** seed
+them. An empty authoritative zone answers NXDOMAIN for everything under
+it, so seeding `168.192.in-addr.arpa` at install would permanently block
+the one thing a homelab wants reverse DNS for: a PTR record on its own
+LAN. The built-in zone would already own the whole range and refuse
+every write to it, forever. The same reasoning excludes `d.f.ip6.arpa`
+(RFC 6303 §4.4): `fd00::/8` is IPv6 Unique Local Addresses (RFC 4193) —
+the IPv6 equivalent of RFC 1918 — and what a homelab numbers its own LAN
+with if it uses IPv6 at all.
+
+**To get PTR records for your network, create the reverse zone
+yourself.** A reverse zone isn't a special kind of zone — it's an
+ordinary **primary** zone whose apex happens to be the reversed network
+prefix, ending in `in-addr.arpa` (IPv4) or `ip6.arpa` (IPv6). For a
+`192.168.0.0/16` network, create a zone named `168.192.in-addr.arpa`; for
+just `192.168.1.0/24`, `1.168.192.in-addr.arpa`. An IPv6 ULA network
+works the same way — `d.f.ip6.arpa` for all of `fd00::/8`, or a more
+specific zone for just your `/48` or `/64`. Create it the same way
+as any other zone — the name alone is enough, SOA and apex NS are
+generated same as for a forward zone. Once it exists, reverse lookups
+for addresses in that range are answered from it, and — see Auto-PTR
+below — adding a matching A record starts writing PTRs into it
+automatically.
+
+### Auto-PTR
+
+Adding an A or AAAA record writes the matching PTR record automatically,
+in whichever reverse zone covers that address, in the same request — no
+second write, no separate step. A PTR's rdata is a domain name, not an
+address (RFC 1034): the address lives in the record's *name* (reversed,
+dotted, under `in-addr.arpa` or `ip6.arpa`), not in its value — the
+rdata is the forward name the address belongs to.
+
+The rules, and the ones that are easy to be surprised by:
+
+- **It never creates a zone.** If no reverse zone covers the address,
+  nothing is written — no PTR, and no error either: the forward write
+  still succeeds exactly as if auto-PTR didn't exist. Create the reverse
+  zone first (above) if you want the PTR.
+- **First name wins.** If a PTR already exists at that address, it's
+  left alone, whichever name is being added or edited now. A PTR is
+  effectively one-per-address, so when two names share an address, the
+  one that got a PTR first keeps it.
+- **A hand-written PTR is never overwritten or deleted by the automatic
+  path.** Auto-PTR only ever touches a PTR it can confirm still points
+  at the forward name it's currently processing; a PTR you added
+  yourself under a different name is left alone no matter what forward
+  records come and go.
+- **Deleting a zone retires the PTRs its records owned.** The reverse
+  zone is a separate zone and outlives the delete, so its PTRs are
+  removed one by one under the same "still points at this name" check —
+  a PTR you wrote by hand, or one owned by a name in some other zone
+  that shares the address, survives untouched.
+- **Moving a name orphans its PTR.** If the name that owns a PTR changes
+  address, or is deleted, that PTR is removed — and nothing takes its
+  place, even if another name still resolves to the old address. The
+  address is left with no PTR at all until some record is created or
+  updated at that address, which then claims it under first-wins above.
+  This is intentional, not a bug: first-wins only ever lets the record
+  actually being written claim an address, never a bystander that
+  happened to already be pointing there.
 
 ### Upgrading from Local DNS records
 

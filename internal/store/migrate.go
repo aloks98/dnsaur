@@ -45,6 +45,19 @@ func migrate(ctx context.Context, db *sql.DB, dialect string) error {
 		goose.NewGoMigration(5, &goose.GoFunc{RunTx: func(ctx context.Context, tx *sql.Tx) error {
 			return upZonesData(ctx, tx, dialect)
 		}}, nil),
+		// Version 7 (builtins.go) is Go, not SQL, for the same reason as
+		// version 5: it inserts into both zones and zone_records with a
+		// generated SOA, an apex NS, and (per builtinRecords) each built-in
+		// zone's content, all in one pass — reusing zonemigrate.go's
+		// dbtx-based helpers keeps one definition of "what a well-formed
+		// new zone looks like" instead of a second one written in SQL.
+		// There is deliberately no 0007_builtins.sql — the version number
+		// is claimed here. Pre-release, this is the only migration
+		// seedBuiltinZones needs: there is no shipped database yet that ran
+		// an older version of it and would need a separate backfill.
+		goose.NewGoMigration(7, &goose.GoFunc{RunTx: func(ctx context.Context, tx *sql.Tx) error {
+			return upBuiltinZones(ctx, tx, dialect)
+		}}, nil),
 	))
 	if err != nil {
 		return fmt.Errorf("goose provider: %w", err)

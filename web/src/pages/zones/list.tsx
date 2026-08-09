@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { Link } from "react-router";
-import { Lock, Pencil, Plus, Trash2, TriangleAlert, X } from "lucide-react";
+import { ChevronRight, Lock, Pencil, Plus, Trash2, TriangleAlert, X } from "lucide-react";
 import { toast } from "sonner";
 import { useForm, type Control } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
@@ -20,6 +20,9 @@ import {
   Badge,
   Button,
   cn,
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
   Form,
   FormControl,
   FormField,
@@ -424,7 +427,9 @@ function ZoneRow({ zone, onDelete }: { zone: Zone; onDelete: () => void }) {
         <span className="text-right font-mono text-xs">{relativeTime(zone.modified_at)}</span>
         <span className="flex items-center justify-end">
           {isInternal ? (
-            <span className="font-mono text-xs tracking-widest text-muted-foreground uppercase">
+            // 9.5px, not text-xs (12px) — matches the Expired badge's own
+            // text-[9.5px] below and the artboard's spec for this cell.
+            <span className="font-mono text-[9.5px] tracking-widest text-muted-foreground uppercase">
               Built-in
             </span>
           ) : (
@@ -474,6 +479,53 @@ function ZoneRow({ zone, onDelete }: { zone: Zone; onDelete: () => void }) {
 }
 
 /**
+ * The collapsed-by-default row between the user's own zones and the RFC
+ * 6303 built-ins (see internal/store/builtins.go) — 15 of them, seeded so
+ * loopback and the reverse-mapping arpa ranges stop reaching the root
+ * servers, and enough to bury the one or two zones a user actually cares
+ * about if they rendered inline. Built on rnui's Collapsible (already used
+ * for the zone detail page's SOA band — see detail.tsx's SoaBand) rather
+ * than a hand-rolled clickable div: CollapsibleTrigger renders a real
+ * `<button>`, which is Enter/Space-operable and carries `role="button"`
+ * without any of that having to be wired up by hand here. The panel is
+ * unmounted (not merely hidden) while closed — rnui's default — so the
+ * built-in rows genuinely aren't in the DOM until asked for.
+ *
+ * No trailing "Show"/"Hide" word (deviation from the artboard, recorded in
+ * the redesign notes) — the caret already carries the state and the row
+ * is evidently clickable, so the word would only repeat it. Nothing lost
+ * for assistive tech either: the count label is the button's own
+ * accessible name and `aria-expanded` carries the state regardless.
+ */
+function BuiltinsDisclosure({ zones }: { zones: Zone[] }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <Collapsible open={open} onOpenChange={setOpen}>
+      <CollapsibleTrigger
+        type="button"
+        className="flex w-full cursor-pointer items-center gap-[9px] border-b border-border-muted px-4 py-[9px] text-left font-mono text-[11px] text-muted-foreground select-none hover:bg-muted hover:text-foreground"
+      >
+        <ChevronRight
+          aria-hidden="true"
+          className={cn("size-3 shrink-0 transition-transform", open && "rotate-90")}
+        />
+        <span>
+          {zones.length} built-in {zones.length === 1 ? "zone" : "zones"}
+        </span>
+      </CollapsibleTrigger>
+      <CollapsibleContent>
+        {zones.map((zone) => (
+          // Built-ins never take onDelete (ZoneRow omits the button
+          // entirely for `internal` zones — see its own comment), so this
+          // is never actually called.
+          <ZoneRow key={zone.id} zone={zone} onDelete={() => {}} />
+        ))}
+      </CollapsibleContent>
+    </Collapsible>
+  );
+}
+
+/**
  * Zones — the authoritative DNS zones this instance serves, replacing the
  * old flat Local DNS override table (see api/types.ts's Zone doc). A name
  * inside an enabled zone is answered or refused, never forwarded.
@@ -489,6 +541,17 @@ export function ZonesList() {
   const [deleteTarget, setDeleteTarget] = useState<Zone | null>(null);
 
   const all = useMemo(() => zones.data ?? [], [zones.data]);
+  // The header count and the empty state must count only the user's own
+  // zones — the 15 RFC 6303 built-ins (internal/store/builtins.go) are
+  // always present, so counting `all` would say "15 zones" on a fresh
+  // install and `all.length === 0` could never be true, meaning the "No
+  // zones yet" guidance would never show.
+  const { mine, builtins } = useMemo(() => {
+    const mine: Zone[] = [];
+    const builtins: Zone[] = [];
+    for (const zone of all) (zone.type === "internal" ? builtins : mine).push(zone);
+    return { mine, builtins };
+  }, [all]);
 
   function onConfirmDelete() {
     if (!deleteTarget) return;
@@ -521,30 +584,41 @@ export function ZonesList() {
         </Alert>
       </div>
     );
-  } else if (all.length === 0) {
-    body = (
-      <div className="flex h-full flex-col items-center justify-center gap-2 p-8 text-center">
-        <p className="font-heading text-sm font-semibold">No zones yet</p>
-        <p className="text-sm text-muted-foreground">Everything is forwarded upstream.</p>
-        {!addOpen && (
-          <Button type="button" size="sm" onClick={() => setAddOpen(true)}>
-            <Plus />
-            New zone
-          </Button>
-        )}
-      </div>
-    );
   } else {
-    body = all.map((zone) => (
-      <ZoneRow key={zone.id} zone={zone} onDelete={() => setDeleteTarget(zone)} />
-    ));
+    // Rows and the empty state are mutually exclusive, so the disclosure
+    // sits between them unconditionally: with rows it trails them (the
+    // artboard's own order); with none, it leads the empty state instead
+    // of trailing it — the empty state is `h-full` (it centers in
+    // whatever height it's given), so trailing it here would push "N
+    // built-in zones" entirely below the fold.
+    body = (
+      <>
+        {mine.length > 0 &&
+          mine.map((zone) => (
+            <ZoneRow key={zone.id} zone={zone} onDelete={() => setDeleteTarget(zone)} />
+          ))}
+        {builtins.length > 0 && <BuiltinsDisclosure zones={builtins} />}
+        {mine.length === 0 && (
+          <div className="flex h-full flex-col items-center justify-center gap-2 p-8 text-center">
+            <p className="font-heading text-sm font-semibold">No zones yet</p>
+            <p className="text-sm text-muted-foreground">Everything is forwarded upstream.</p>
+            {!addOpen && (
+              <Button type="button" size="sm" onClick={() => setAddOpen(true)}>
+                <Plus />
+                New zone
+              </Button>
+            )}
+          </div>
+        )}
+      </>
+    );
   }
 
   return (
     <div className="flex h-full min-h-0 flex-col">
       <div className="flex shrink-0 items-center gap-2.5 border-b border-border bg-card px-4 py-2.5">
         <span className="font-mono text-xs text-muted-foreground">
-          {all.length} {all.length === 1 ? "zone" : "zones"}
+          {mine.length} {mine.length === 1 ? "zone" : "zones"}
         </span>
         {!addOpen && (
           <Button type="button" size="sm" className="ml-auto" onClick={() => setAddOpen(true)}>

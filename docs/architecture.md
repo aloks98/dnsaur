@@ -47,6 +47,13 @@ terminal upstream forwarder. Each stage can answer the query outright
    It either answers, or returns NODATA (name exists, wrong type) or
    NXDOMAIN (name absent), each carrying the zone's SOA so resolvers cache
    the absence. A qname no zone claims passes straight through untouched.
+   The same stage answers reverse (`PTR`) queries — an `in-addr.arpa` or
+   `ip6.arpa` name is just another apex a zone can claim, forward and
+   reverse are not different code paths. A fixed set of zones is always
+   present — `localhost` plus every RFC 6303 §4 reverse zone except the
+   private ranges (`BuiltinZones` in `internal/store/builtins.go`) —
+   seeded at migration so those names never reach an upstream; every
+   write to one of them is refused with `409` at the API layer instead.
    Future DHCP-registered hostnames register into a zone at this stage.
    See [`dashboard.md`](dashboard.md#zones) for the user-facing rules.
 6. **cache** — in-memory cache keyed on (qname, qtype), respecting upstream

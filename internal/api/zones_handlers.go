@@ -250,6 +250,12 @@ func (s *Server) handleZonePatch(w http.ResponseWriter, r *http.Request) {
 		storeErr(w, err)
 		return
 	}
+	// A built-in zone is seeded infrastructure (RFC 6303), not user content —
+	// see internal/store/builtins.go. Reads are fine; writes are not.
+	if z.Type == "internal" {
+		errJSON(w, http.StatusConflict, "built-in zones cannot be changed")
+		return
+	}
 
 	if body.Name != nil {
 		name, ok := normalizeZoneName(*body.Name)
@@ -299,12 +305,39 @@ func (s *Server) handleZoneDelete(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusBadRequest, "bad id")
 		return
 	}
+	z, err := s.deps.Store.Zones().Zone(r.Context(), id)
+	if err != nil {
+		storeErr(w, err)
+		return
+	}
+	// A built-in zone is seeded infrastructure (RFC 6303), not user content —
+	// see internal/store/builtins.go. Reads are fine; writes are not.
+	if z.Type == "internal" {
+		errJSON(w, http.StatusConflict, "built-in zones cannot be changed")
+		return
+	}
+	// Read the records before the delete takes them: they are the only copy
+	// of the addresses whose PTRs this zone owns, and retireZonePTRs needs
+	// them after the rows are gone.
+	recs, err := s.deps.Store.Zones().Records(r.Context(), id)
+	if err != nil {
+		storeErr(w, err)
+		return
+	}
 	// zone_records rows for this zone go with it — ON DELETE CASCADE in the
 	// 0004 migration (zoneStore.DeleteZone), not application logic here.
 	if err := s.deps.Store.Zones().DeleteZone(r.Context(), id); err != nil {
 		storeErr(w, err)
 		return
 	}
+	// The cascade stops at this zone's own rows. Every PTR auto-PTR wrote for
+	// them sits in a *reverse* zone that survives the delete, so retiring
+	// them is application logic and has to happen here — deleting one A
+	// record removes its PTR (handleZoneRecordDelete), and deleting the zone
+	// that holds it must not be the way to leave the reverse pointing at a
+	// name that no longer exists. Before the reload, so the same rebuild
+	// serves both halves — see handleZoneRecordCreate.
+	s.retireZonePTRs(r.Context(), recs, z.Name)
 	s.reloadZones(r)
 	w.WriteHeader(http.StatusNoContent)
 }

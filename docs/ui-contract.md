@@ -318,7 +318,7 @@ forwarded**, which is the entire point of the change (see
 | `POST /zones` | 201 `{"id":1}` |
 | `GET /zones/{id}` | 200 object |
 | `PATCH /zones/{id}` | 204 |
-| `DELETE /zones/{id}` | 204 — cascades every record in the zone |
+| `DELETE /zones/{id}` | 204 — cascades every record in the zone, and retires the PTRs those records owned from whatever reverse zone holds them (the cascade cannot reach those: they are rows in a different zone) |
 | `GET /zones/{id}/records` | 200 array |
 | `POST /zones/{id}/records` | 201 `{"id":1}` |
 | `PUT /zones/{id}/records/{rid}` | 204 (full replace) |
@@ -757,7 +757,7 @@ unmatched clients fall back to it.
 | `type` | string | `primary` \| `secondary` \| `stub` \| `forwarder` \| `internal`; only `primary` is creatable/patchable this milestone (§2.6) |
 | `enabled` | bool | a disabled zone is skipped by lookup entirely — it neither answers nor claims the name, so queries under it fall through to a shallower enabled zone or upstream, exactly as if the zone didn't exist (`internal/zones/zone.go`'s `Index.Find`) |
 | `soa_ns`, `soa_mbox` | string | default to `ns.<name>` / `hostadmin.<name>` on create |
-| `soa_serial` | uint32 | starts at `1`; bumped by one on every record create/update/delete in the zone (`BumpSerial`, best-effort — logged, not surfaced, on failure) |
+| `soa_serial` | uint32 | starts at `1`; bumped by one on every record create/update/delete in the zone — **and on a reverse zone whose PTR auto-PTR just wrote, moved or retired**, so one write addressed to a forward zone can move two zones' serials, and a reverse zone's serial can move with no request ever naming it (`BumpSerial`, best-effort — logged, not surfaced, on failure) |
 | `soa_refresh`, `soa_retry`, `soa_expire` | uint32 (seconds) | default 900 / 300 / 604800 |
 | `soa_minimum` | uint32 (seconds) | negative-cache TTL advertised for this zone's NXDOMAINs (RFC 2308), not a floor on positive answers; default 900 |
 | `soa_ttl` | uint32 (seconds) | the SOA record's own header TTL, independent of `soa_minimum` — RFC 2308 §5 needs both to express `min(minimum, ttl)`. Fixed at `900`; **no request field sets it**, on create or patch |
@@ -771,7 +771,7 @@ unmatched clients fall back to it.
 | `id` | int64 | |
 | `zone_id` | int64 | FK → `zones.id` |
 | `name` | string | relative to the zone apex: `@`, `bifrost`, `*`, `*.nexus` — never a fully-qualified name in storage, even if one was typed on write (§2.6) |
-| `type` | string | any DNS RR type `dns.NewRR` parses — not a closed enum on the server; the dashboard's create/edit form offers `A`, `AAAA`, `CNAME`, `TXT`, `MX`, `SRV`, `NS`, `CAA` (§8) |
+| `type` | string | any DNS RR type `dns.NewRR` parses — not a closed enum on the server; the dashboard's create/edit form offers `A`, `AAAA`, `CNAME`, `TXT`, `MX`, `SRV`, `NS`, `CAA`, `PTR` (§8) |
 | `ttl` | uint32 (seconds) | `0`–`2147483647` (RFC 2181 §8); every record in the same (`name`,`type`) RRSet must share one value (RFC 2181 §5.2, 409 on mismatch) |
 | `rdata` | string | DNS presentation format, rdata portion only — validated by `dns.NewRR`, not a per-type schema |
 | `enabled` | bool | a disabled record is dropped when the zone's served snapshot is built (`NewZone`) — indistinguishable from never having been written, so it can't turn an NXDOMAIN into a NODATA or suppress a wildcard that should otherwise match |
@@ -1135,7 +1135,7 @@ typing in an input.
 | **404 / unknown route** | renders a dedicated not-found screen inside the shell, no group marked in row 2 (`pages/not-found.tsx`) — this table is stale on this point in older captures; `path="*"` no longer redirects |
 | **DHCP** | nothing exists (§3.11) |
 | **Encrypted DNS (DoH/DoT)** | no code |
-| **Zone transfers (secondary/stub/forwarder), reverse zones, DNSSEC** | schema and UI badges exist for the non-`primary` zone types (§3.6), but create/patch reject anything but `primary` with `400`; no transfer client/server, no PTR/reverse-zone handling, no signing — Milestones B–E |
+| **Zone transfers (secondary/stub/forwarder), DNSSEC** | schema and UI badges exist for the non-`primary` zone types (§3.6), but create/patch reject anything but `primary` with `400`; no transfer client/server, no signing — Milestones D–E. **Reverse zones are no longer on this list**: `PTR` is a normal record type, a reverse zone is an ordinary `primary` zone ending in `.arpa`, the RFC 6303 §4 built-ins (`internal/store/builtins.go`'s `BuiltinZones`) are seeded as `type: internal` (read-only, `409` on any write), and an A/AAAA write maintains the matching PTR server-side in the same request |
 | **HA / cluster UI** | no code; the spec anticipated a health-strip stub, which does not exist |
 
 The nav contains exactly the eight implemented leaf routes, in four groups

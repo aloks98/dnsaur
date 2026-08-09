@@ -158,17 +158,22 @@ func (s *Server) bumpZoneSerial(r *http.Request, zoneID int64) {
 	}
 }
 
-// findRecord reports whether id is among existing — used to check a
+// findRecord returns the record with this id from existing — used to check a
 // {rid} path segment actually belongs to the zone in the {id} segment
 // before an update or delete touches it, since UpdateRecord/DeleteRecord
 // key on record id alone and don't themselves check zone_id.
-func findRecord(existing []store.ZoneRecord, id int64) bool {
+//
+// It hands back the row rather than just reporting that it exists because
+// auto-PTR needs the pre-write record: on update and delete, the address the
+// record used to carry is the only way to find the PTR that has to move or
+// go with it.
+func findRecord(existing []store.ZoneRecord, id int64) (store.ZoneRecord, bool) {
 	for _, e := range existing {
 		if e.ID == id {
-			return true
+			return e, true
 		}
 	}
-	return false
+	return store.ZoneRecord{}, false
 }
 
 func (s *Server) handleZoneRecordsList(w http.ResponseWriter, r *http.Request) {
@@ -200,6 +205,12 @@ func (s *Server) handleZoneRecordCreate(w http.ResponseWriter, r *http.Request) 
 		storeErr(w, err)
 		return
 	}
+	// A built-in zone is seeded infrastructure (RFC 6303), not user content —
+	// see internal/store/builtins.go. Reads are fine; writes are not.
+	if zone.Type == "internal" {
+		errJSON(w, http.StatusConflict, "built-in zones cannot be changed")
+		return
+	}
 	body, err := decode[zoneRecordWrite](r)
 	if err != nil {
 		errJSON(w, http.StatusBadRequest, "invalid json")
@@ -221,6 +232,10 @@ func (s *Server) handleZoneRecordCreate(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	s.bumpZoneSerial(r, zid)
+	// Before the reload, not after: the reload below then publishes the
+	// forward record and its PTR together, in one snapshot rebuild, so the
+	// reverse answer is live by the time this request is answered.
+	s.syncPTR(r.Context(), nil, &rec, zone.Name)
 	s.reloadZones(r)
 	writeJSON(w, http.StatusCreated, map[string]int64{"id": id})
 }
@@ -241,6 +256,12 @@ func (s *Server) handleZoneRecordUpdate(w http.ResponseWriter, r *http.Request) 
 		storeErr(w, err)
 		return
 	}
+	// A built-in zone is seeded infrastructure (RFC 6303), not user content —
+	// see internal/store/builtins.go. Reads are fine; writes are not.
+	if zone.Type == "internal" {
+		errJSON(w, http.StatusConflict, "built-in zones cannot be changed")
+		return
+	}
 	body, err := decode[zoneRecordWrite](r)
 	if err != nil {
 		errJSON(w, http.StatusBadRequest, "invalid json")
@@ -251,7 +272,8 @@ func (s *Server) handleZoneRecordUpdate(w http.ResponseWriter, r *http.Request) 
 		storeErr(w, err)
 		return
 	}
-	if !findRecord(existing, rid) {
+	old, ok := findRecord(existing, rid)
+	if !ok {
 		errJSON(w, http.StatusNotFound, "not found")
 		return
 	}
@@ -266,6 +288,10 @@ func (s *Server) handleZoneRecordUpdate(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	s.bumpZoneSerial(r, zid)
+	// old carries the address the record used to have, which is the only
+	// way to find the PTR this write has to move. See handleZoneRecordCreate
+	// for why this runs before the reload.
+	s.syncPTR(r.Context(), &old, &rec, zone.Name)
 	s.reloadZones(r)
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -281,12 +307,24 @@ func (s *Server) handleZoneRecordDelete(w http.ResponseWriter, r *http.Request) 
 		errJSON(w, http.StatusBadRequest, "bad id")
 		return
 	}
+	zone, err := s.deps.Store.Zones().Zone(r.Context(), zid)
+	if err != nil {
+		storeErr(w, err)
+		return
+	}
+	// A built-in zone is seeded infrastructure (RFC 6303), not user content —
+	// see internal/store/builtins.go. Reads are fine; writes are not.
+	if zone.Type == "internal" {
+		errJSON(w, http.StatusConflict, "built-in zones cannot be changed")
+		return
+	}
 	existing, err := s.deps.Store.Zones().Records(r.Context(), zid)
 	if err != nil {
 		storeErr(w, err)
 		return
 	}
-	if !findRecord(existing, rid) {
+	old, ok := findRecord(existing, rid)
+	if !ok {
 		errJSON(w, http.StatusNotFound, "not found")
 		return
 	}
@@ -295,6 +333,10 @@ func (s *Server) handleZoneRecordDelete(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	s.bumpZoneSerial(r, zid)
+	// The record is gone, so its PTR goes with it — old is the only copy of
+	// the address left. See handleZoneRecordCreate for why this runs before
+	// the reload.
+	s.syncPTR(r.Context(), &old, nil, zone.Name)
 	s.reloadZones(r)
 	w.WriteHeader(http.StatusNoContent)
 }

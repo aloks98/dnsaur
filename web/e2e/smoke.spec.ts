@@ -104,8 +104,11 @@ test("first-run setup, login, create a zone and add a record, dark mode persists
     topNav.getByRole("navigation", { name: "Zones" }).getByRole("link", { name: "Zones" }),
   ).toHaveAttribute("aria-current", "page");
 
-  // A fresh instance has no zones, so the empty state's own CTA and the
-  // header's both say "New zone" — either opens the same inline create row.
+  // A fresh instance seeds 15 RFC 6303 built-in zones (localhost, the
+  // reverse-mapping arpa zones, …) at migration, but the list groups them
+  // behind their own collapsed disclosure and never counts them as the
+  // user's own — so this is still the empty state, with both the header's
+  // and the empty state's own "New zone" visible. `.first()` picks either.
   await page.getByRole("button", { name: "New zone" }).first().click();
   await page.getByLabel("Zone name").fill("home.lan");
   await page.getByRole("button", { name: "Add", exact: true }).click();
@@ -114,8 +117,22 @@ test("first-run setup, login, create a zone and add a record, dark mode persists
   // since the row's own Edit icon-button renders as a same-target link too
   // ("Edit home.lan").
   await page.getByRole("link", { name: "home.lan", exact: true }).click();
-  await expect(page.getByText("home.lan", { exact: true })).toBeVisible();
-  await expect(page.getByText("Enabled", { exact: true })).toBeVisible();
+
+  // The 15 built-ins stay behind their collapsed disclosure (never
+  // expanded in this test), so the list page shows exactly one row —
+  // home.lan — at this point. But a bare page-wide "Enabled" text query is
+  // still ambiguous: the click above resolves the URL before React
+  // actually swaps the DOM, leaving a window where the list page's own
+  // "Enabled" is still rendered alongside the detail page's header, which
+  // says it too. Scope to the element for *this* zone specifically
+  // instead: "home.lan" is always a unique text node (it's the only zone
+  // with that name, on either page), and its immediate parent is exactly
+  // the row or header band that also holds its own status text — never
+  // another zone's.
+  const zoneName = page.getByText("home.lan", { exact: true });
+  await expect(zoneName).toBeVisible();
+  const zoneEntry = zoneName.locator("xpath=..");
+  await expect(zoneEntry.getByText("Enabled", { exact: true })).toBeVisible();
 
   // The add form is the records grid's own first row, not a dialog: fill it
   // in place and submit. Data is one text input regardless of record type —

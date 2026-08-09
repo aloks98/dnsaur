@@ -19,6 +19,7 @@ export const zoneKeys = {
 // rather than get one of them for free through query-key prefix matching —
 // the same reasoning as filterKeys.lists/groups in use-filters.ts.
 export const zoneRecordKeys = {
+  all: ["zoneRecords"] as const,
   list: (zoneId: number) => ["zoneRecords", zoneId] as const,
 };
 
@@ -88,9 +89,14 @@ export function useDeleteZone() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (id: number) => api.del<void>(`/zones/${id}`),
+    // Records too, and every zone's: deleting a zone drops its own records
+    // (which no longer have a page to be stale on) but also retires the PTRs
+    // they owned from a reverse zone that is still there — see
+    // invalidateZoneAndRecords.
     onSuccess: (_data, id) => {
       void qc.invalidateQueries({ queryKey: zoneKeys.all });
       void qc.invalidateQueries({ queryKey: zoneKeys.detail(id) });
+      void qc.invalidateQueries({ queryKey: zoneRecordKeys.all });
     },
   });
 }
@@ -108,9 +114,22 @@ export function useZoneRecords(zoneId: number) {
  * query — the zones list (Task 11) reads soa_serial straight off useZones,
  * and a zone detail page (Task 12) would read it off useZone(zoneId).
  * Invalidating only zoneRecordKeys would leave both showing a stale serial.
+ *
+ * The records half is the whole `zoneRecords` key space, not just the zone
+ * that was written to, because a record write is not confined to that zone:
+ * writing an A/AAAA record makes the server write the matching PTR into
+ * whichever reverse zone covers the address (auto-PTR, internal/api/autoptr.go),
+ * and a zone delete retires the PTRs its records owned. The zone id in the
+ * request says nothing about which reverse zone that was, and the client has
+ * no way to compute it — the server picks the longest-matching enabled
+ * primary zone. Refetching every mounted record list is the cheap, correct
+ * answer; guessing at one reverse zone would leave a detail page showing a
+ * record set that no longer exists whenever the guess is wrong. The zone
+ * queries below already invalidate wholesale for the same reason (the
+ * reverse zone's serial moved too).
  */
 function invalidateZoneAndRecords(qc: ReturnType<typeof useQueryClient>, zoneId: number) {
-  void qc.invalidateQueries({ queryKey: zoneRecordKeys.list(zoneId) });
+  void qc.invalidateQueries({ queryKey: zoneRecordKeys.all });
   void qc.invalidateQueries({ queryKey: zoneKeys.all });
   void qc.invalidateQueries({ queryKey: zoneKeys.detail(zoneId) });
 }
