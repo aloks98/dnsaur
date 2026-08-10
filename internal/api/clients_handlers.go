@@ -11,14 +11,14 @@ import (
 )
 
 func (s *Server) clientsRoutes() {
-	s.mux.HandleFunc("GET /api/v1/groups", s.requireAuth(s.handleGroupsList))
-	s.mux.HandleFunc("POST /api/v1/groups", s.requireAuth(s.handleGroupCreate))
-	s.mux.HandleFunc("PATCH /api/v1/groups/{id}", s.requireAuth(s.handleGroupPatch))
-	s.mux.HandleFunc("DELETE /api/v1/groups/{id}", s.requireAuth(s.handleGroupDelete))
-	s.mux.HandleFunc("GET /api/v1/clients", s.requireAuth(s.handleClientsList))
-	s.mux.HandleFunc("POST /api/v1/clients", s.requireAuth(s.handleClientCreate))
-	s.mux.HandleFunc("PUT /api/v1/clients/{id}", s.requireAuth(s.handleClientPut))
-	s.mux.HandleFunc("DELETE /api/v1/clients/{id}", s.requireAuth(s.handleClientDelete))
+	s.route("GET /api/v1/groups", s.requireAuth(s.handleGroupsList))
+	s.route("POST /api/v1/groups", s.requireAuth(s.handleGroupCreate))
+	s.route("PATCH /api/v1/groups/{id}", s.requireAuth(s.handleGroupPatch))
+	s.route("DELETE /api/v1/groups/{id}", s.requireAuth(s.handleGroupDelete))
+	s.route("GET /api/v1/clients", s.requireAuth(s.handleClientsList))
+	s.route("POST /api/v1/clients", s.requireAuth(s.handleClientCreate))
+	s.route("PUT /api/v1/clients/{id}", s.requireAuth(s.handleClientPut))
+	s.route("DELETE /api/v1/clients/{id}", s.requireAuth(s.handleClientDelete))
 }
 
 func pathID(r *http.Request) (int64, bool) {

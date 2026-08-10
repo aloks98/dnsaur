@@ -11,16 +11,16 @@ import (
 )
 
 func (s *Server) filtersRoutes() {
-	s.mux.HandleFunc("GET /api/v1/filters/lists", s.requireAuth(s.handleListsGet))
-	s.mux.HandleFunc("POST /api/v1/filters/lists", s.requireAuth(s.handleListCreate))
-	s.mux.HandleFunc("PATCH /api/v1/filters/lists/{id}", s.requireAuth(s.handleListPatch))
-	s.mux.HandleFunc("DELETE /api/v1/filters/lists/{id}", s.requireAuth(s.handleListDelete))
-	s.mux.HandleFunc("GET /api/v1/groups/{id}/lists", s.requireAuth(s.handleGroupListsGet))
-	s.mux.HandleFunc("PUT /api/v1/groups/{id}/lists", s.requireAuth(s.handleGroupListsPut))
-	s.mux.HandleFunc("GET /api/v1/groups/{id}/rules", s.requireAuth(s.handleRulesGet))
-	s.mux.HandleFunc("POST /api/v1/groups/{id}/rules", s.requireAuth(s.handleRuleCreate))
-	s.mux.HandleFunc("DELETE /api/v1/filters/rules/{id}", s.requireAuth(s.handleRuleDelete))
-	s.mux.HandleFunc("POST /api/v1/filters/refresh", s.requireAuth(s.handleRefresh))
+	s.route("GET /api/v1/filters/lists", s.requireAuth(s.handleListsGet))
+	s.route("POST /api/v1/filters/lists", s.requireAuth(s.handleListCreate))
+	s.route("PATCH /api/v1/filters/lists/{id}", s.requireAuth(s.handleListPatch))
+	s.route("DELETE /api/v1/filters/lists/{id}", s.requireAuth(s.handleListDelete))
+	s.route("GET /api/v1/groups/{id}/lists", s.requireAuth(s.handleGroupListsGet))
+	s.route("PUT /api/v1/groups/{id}/lists", s.requireAuth(s.handleGroupListsPut))
+	s.route("GET /api/v1/groups/{id}/rules", s.requireAuth(s.handleRulesGet))
+	s.route("POST /api/v1/groups/{id}/rules", s.requireAuth(s.handleRuleCreate))
+	s.route("DELETE /api/v1/filters/rules/{id}", s.requireAuth(s.handleRuleDelete))
+	s.route("POST /api/v1/filters/refresh", s.requireAuth(s.handleRefresh))
 }
 
 // refreshFilters runs with a context stripped of cancellation: the write

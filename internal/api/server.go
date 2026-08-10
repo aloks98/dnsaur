@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aloks98/dnsaur/internal/auth"
@@ -40,22 +41,62 @@ type Deps struct {
 	Static fs.FS
 }
 
+// routeReg is one handler registered through route(): the pattern handed to
+// the mux, and the handler itself.
+type routeReg struct {
+	pattern string
+	handler http.HandlerFunc
+}
+
 type Server struct {
 	deps Deps
-	mux  *http.ServeMux
+	// routes records every handler registered through route(), in
+	// registration order, so the OpenAPI test (openapi_test.go) can assert
+	// the served spec against the routes that actually exist instead of
+	// against a second hand-maintained list that can drift from both.
+	// http.ServeMux exposes no way to enumerate its own patterns, so this
+	// is the only route to that information.
+	//
+	// mux does not exist until Handler() builds it from this slice (see
+	// buildMux). That is deliberate: New()/registerRoutes() only ever call
+	// route(), never touch a mux directly, so there is no live *http.ServeMux
+	// in scope during route registration for a stray s.mux.HandleFunc to
+	// reach for. Such a call — bypassing route(), and so the recording this
+	// test depends on — nil-panics instead of silently registering an
+	// undocumented-and-invisible endpoint. A test fixture that needs an
+	// extra route (see server_test.go) calls route() too, the same as
+	// production code; it's the only supported way in.
+	routes      []routeReg
+	mux         *http.ServeMux
+	buildMuxOne sync.Once
 }
 
 func New(d Deps) *Server {
-	s := &Server{deps: d, mux: http.NewServeMux()}
-	s.routes()
+	s := &Server{deps: d}
+	s.registerRoutes()
 	return s
 }
 
-func (s *Server) routes() {
-	s.mux.HandleFunc("GET /api/v1/health", func(w http.ResponseWriter, r *http.Request) {
+// route registers a handler, remembering both the pattern and the handler —
+// see the routes field. It does not touch a mux; that only happens once, in
+// buildMux, the first time Handler() is called. It is the only supported way
+// to add an endpoint.
+//
+// Ordering constraint: a route() call after the first Handler() call is
+// recorded — it still shows up to the OpenAPI test — but never served,
+// because buildMux has already run and won't run again. In practice this
+// means all route() calls belong in registerRoutes (or something it calls),
+// finished before anything ever calls Handler(); that's what every
+// production call site and every test fixture already does.
+func (s *Server) route(pattern string, h http.HandlerFunc) {
+	s.routes = append(s.routes, routeReg{pattern, h})
+}
+
+func (s *Server) registerRoutes() {
+	s.route("GET /api/v1/health", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "version": s.deps.Version})
 	})
-	s.mux.HandleFunc("GET /api/v1/openapi.yaml", func(w http.ResponseWriter, r *http.Request) {
+	s.route("GET /api/v1/openapi.yaml", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/yaml")
 		_, _ = w.Write(openapiDoc)
 	})
@@ -68,18 +109,44 @@ func (s *Server) routes() {
 	s.zonesRoutes()
 	s.zoneRecordsRoutes()
 	// Later tasks append their routes here.
-	s.mux.HandleFunc("/api/", func(w http.ResponseWriter, r *http.Request) {
+	//
+	// This catch-all is registered through route() like everything else —
+	// it is one of the 51 HandleFunc call sites — but the OpenAPI test
+	// excludes the bare "/api/" pattern from the spec comparison: it has no
+	// method verb and does not name a resource, it only turns any
+	// unmatched "/api/..." request into a JSON 404 instead of falling
+	// through to the SPA mount below. There is nothing for a spec to
+	// document.
+	s.route("/api/", func(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusNotFound, "not found")
 	})
-	// The SPA owns everything else. More specific patterns above (including
-	// the "/api/" catch-all) take precedence, so this only ever sees
-	// non-API paths.
-	if s.deps.Static != nil {
-		s.mux.Handle("/", StaticHandler(s.deps.Static))
-	}
+}
+
+// buildMux turns the recorded routes slice into a real *http.ServeMux. It
+// runs at most once (see Handler): registration must be finished — every
+// route() call made — before the mux exists, which is what keeps a stray
+// s.mux.HandleFunc from bypassing route()'s recording (see the routes field
+// doc).
+func (s *Server) buildMux() {
+	s.buildMuxOne.Do(func() {
+		mux := http.NewServeMux()
+		for _, rt := range s.routes {
+			mux.HandleFunc(rt.pattern, rt.handler)
+		}
+		// The SPA owns everything else. More specific patterns above
+		// (including the "/api/" catch-all) take precedence, so this only
+		// ever sees non-API paths. Deliberately not routed through route():
+		// it serves the dashboard, not a JSON API endpoint, so it has no
+		// place in the OpenAPI spec either.
+		if s.deps.Static != nil {
+			mux.Handle("/", StaticHandler(s.deps.Static))
+		}
+		s.mux = mux
+	})
 }
 
 func (s *Server) Handler() http.Handler {
+	s.buildMux()
 	var h http.Handler = s.mux
 	h = requestLog(h)
 	h = recoverPanic(h)

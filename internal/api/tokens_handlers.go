@@ -7,12 +7,12 @@ import (
 )
 
 func (s *Server) tokensRoutes() {
-	s.mux.HandleFunc("GET /api/v1/tokens", s.requireAuth(s.handleTokensList))
-	s.mux.HandleFunc("POST /api/v1/tokens", s.requireAuth(s.handleTokenCreate))
-	s.mux.HandleFunc("DELETE /api/v1/tokens/{id}", s.requireAuth(s.handleTokenRevoke))
-	s.mux.HandleFunc("POST /api/v1/auth/totp/start", s.requireAuth(s.handleTOTPStart))
-	s.mux.HandleFunc("POST /api/v1/auth/totp/confirm", s.requireAuth(s.handleTOTPConfirm))
-	s.mux.HandleFunc("POST /api/v1/auth/totp/disable", s.requireAuth(s.handleTOTPDisable))
+	s.route("GET /api/v1/tokens", s.requireAuth(s.handleTokensList))
+	s.route("POST /api/v1/tokens", s.requireAuth(s.handleTokenCreate))
+	s.route("DELETE /api/v1/tokens/{id}", s.requireAuth(s.handleTokenRevoke))
+	s.route("POST /api/v1/auth/totp/start", s.requireAuth(s.handleTOTPStart))
+	s.route("POST /api/v1/auth/totp/confirm", s.requireAuth(s.handleTOTPConfirm))
+	s.route("POST /api/v1/auth/totp/disable", s.requireAuth(s.handleTOTPDisable))
 }
 
 func (s *Server) handleTokensList(w http.ResponseWriter, r *http.Request) {

@@ -38,11 +38,11 @@ func nonNegInt(v string) bool {
 }
 
 func (s *Server) settingsRoutes() {
-	s.mux.HandleFunc("GET /api/v1/settings", s.requireAuth(s.handleSettingsGet))
-	s.mux.HandleFunc("PUT /api/v1/settings", s.requireAuth(s.handleSettingsPut))
-	s.mux.HandleFunc("GET /api/v1/blocking", s.requireAuth(s.handleBlockingGet))
-	s.mux.HandleFunc("POST /api/v1/blocking/pause", s.requireAuth(s.handlePause))
-	s.mux.HandleFunc("DELETE /api/v1/blocking/pause", s.requireAuth(s.handleResume))
+	s.route("GET /api/v1/settings", s.requireAuth(s.handleSettingsGet))
+	s.route("PUT /api/v1/settings", s.requireAuth(s.handleSettingsPut))
+	s.route("GET /api/v1/blocking", s.requireAuth(s.handleBlockingGet))
+	s.route("POST /api/v1/blocking/pause", s.requireAuth(s.handlePause))
+	s.route("DELETE /api/v1/blocking/pause", s.requireAuth(s.handleResume))
 }
 
 func (s *Server) handleSettingsGet(w http.ResponseWriter, r *http.Request) {

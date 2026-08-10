@@ -12,11 +12,11 @@ import (
 )
 
 func (s *Server) queriesRoutes() {
-	s.mux.HandleFunc("GET /api/v1/queries", s.requireAuth(s.handleQueriesSearch))
-	s.mux.HandleFunc("GET /api/v1/queries/tail", s.requireAuth(s.handleQueriesTail))
-	s.mux.HandleFunc("GET /api/v1/stats/overview", s.requireAuth(s.handleStatsOverview))
-	s.mux.HandleFunc("GET /api/v1/stats/timeline", s.requireAuth(s.handleStatsTimeline))
-	s.mux.HandleFunc("GET /api/v1/stats/top", s.requireAuth(s.handleStatsTop))
+	s.route("GET /api/v1/queries", s.requireAuth(s.handleQueriesSearch))
+	s.route("GET /api/v1/queries/tail", s.requireAuth(s.handleQueriesTail))
+	s.route("GET /api/v1/stats/overview", s.requireAuth(s.handleStatsOverview))
+	s.route("GET /api/v1/stats/timeline", s.requireAuth(s.handleStatsTimeline))
+	s.route("GET /api/v1/stats/top", s.requireAuth(s.handleStatsTop))
 }
 
 func qInt(r *http.Request, key string) int64 {

@@ -264,6 +264,11 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
+        "503":
+          description: storage unavailable
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
 
   /auth/login:
     post:
@@ -636,6 +641,11 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
+        "503":
+          description: storage unavailable
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
     post:
       tags: [Groups]
       summary: Create a client group
@@ -683,6 +693,16 @@ paths:
               schema: { $ref: "#/components/schemas/Error" }
         "403":
           $ref: "#/components/responses/ReadOnlyToken"
+        "409":
+          description: a group with that name already exists
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503":
+          description: storage unavailable
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
 
   /groups/{id}:
     parameters:
@@ -722,6 +742,16 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
+        "409":
+          description: a group with that name already exists
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503":
+          description: storage unavailable
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
     delete:
       tags: [Groups]
       summary: Delete a group
@@ -750,6 +780,11 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
+        "503":
+          description: storage unavailable
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
 
   /groups/{id}/lists:
     parameters:
@@ -775,6 +810,11 @@ paths:
               schema: { $ref: "#/components/schemas/Error" }
         "401":
           description: authentication required
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503":
+          description: storage unavailable
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -807,6 +847,11 @@ paths:
               schema: { $ref: "#/components/schemas/Error" }
         "403":
           $ref: "#/components/responses/ReadOnlyToken"
+        "503":
+          description: storage unavailable
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
 
   /groups/{id}/rules:
     parameters:
@@ -839,6 +884,11 @@ paths:
               schema: { $ref: "#/components/schemas/Error" }
         "401":
           description: authentication required
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503":
+          description: storage unavailable
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -881,6 +931,11 @@ paths:
               schema: { $ref: "#/components/schemas/Error" }
         "403":
           $ref: "#/components/responses/ReadOnlyToken"
+        "503":
+          description: storage unavailable
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
 
   /clients:
     get:
@@ -902,6 +957,11 @@ paths:
                     group_id: { type: integer, format: int64 }
         "401":
           description: authentication required
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503":
+          description: storage unavailable
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -940,6 +1000,18 @@ paths:
               schema: { $ref: "#/components/schemas/Error" }
         "403":
           $ref: "#/components/responses/ReadOnlyToken"
+        "409":
+          description: >
+            another client already matches <matcher> — the response message
+            includes the submitted matcher value
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503":
+          description: storage unavailable
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
 
   /clients/{id}:
     parameters:
@@ -981,6 +1053,18 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
+        "409":
+          description: >
+            another client already matches <matcher> — the response message
+            includes the submitted matcher value
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503":
+          description: storage unavailable
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
     delete:
       tags: [Clients]
       summary: Delete a client
@@ -1004,6 +1088,11 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
+        "503":
+          description: storage unavailable
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
 
   /filters/lists:
     get:
@@ -1019,6 +1108,11 @@ paths:
                 items: { $ref: "#/components/schemas/List" }
         "401":
           description: authentication required
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503":
+          description: storage unavailable
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -1080,6 +1174,11 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
+        "503":
+          description: storage unavailable
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
 
   /filters/lists/{id}:
     parameters:
@@ -1135,6 +1234,11 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
+        "503":
+          description: storage unavailable
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
     delete:
       tags: [Filters]
       summary: Delete a filter list
@@ -1155,6 +1259,11 @@ paths:
           $ref: "#/components/responses/ReadOnlyToken"
         "404":
           description: not found
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503":
+          description: storage unavailable
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -1185,6 +1294,11 @@ paths:
           $ref: "#/components/responses/ReadOnlyToken"
         "404":
           description: not found
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503":
+          description: storage unavailable
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -1968,6 +2082,11 @@ paths:
                     last_used: { type: integer, format: int64 }
         "401":
           description: authentication required
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503":
+          description: storage unavailable
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }

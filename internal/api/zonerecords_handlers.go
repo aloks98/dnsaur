@@ -11,10 +11,10 @@ import (
 )
 
 func (s *Server) zoneRecordsRoutes() {
-	s.mux.HandleFunc("GET /api/v1/zones/{id}/records", s.requireAuth(s.handleZoneRecordsList))
-	s.mux.HandleFunc("POST /api/v1/zones/{id}/records", s.requireAuth(s.handleZoneRecordCreate))
-	s.mux.HandleFunc("PUT /api/v1/zones/{id}/records/{rid}", s.requireAuth(s.handleZoneRecordUpdate))
-	s.mux.HandleFunc("DELETE /api/v1/zones/{id}/records/{rid}", s.requireAuth(s.handleZoneRecordDelete))
+	s.route("GET /api/v1/zones/{id}/records", s.requireAuth(s.handleZoneRecordsList))
+	s.route("POST /api/v1/zones/{id}/records", s.requireAuth(s.handleZoneRecordCreate))
+	s.route("PUT /api/v1/zones/{id}/records/{rid}", s.requireAuth(s.handleZoneRecordUpdate))
+	s.route("DELETE /api/v1/zones/{id}/records/{rid}", s.requireAuth(s.handleZoneRecordDelete))
 }
 
 // pathRID reads the {rid} path segment used by the record-scoped routes,

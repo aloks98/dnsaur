@@ -121,7 +121,7 @@ func TestUnknownRouteIs404JSON(t *testing.T) {
 // Task 14's brief): every other test in this package builds its Server via
 // testServer, which always leaves Deps.Static nil — so no committed test
 // ever exercised the SPA mount and the API routes together on the same
-// Server. That matters because Server.routes() registers the SPA's "/"
+// Server. That matters because Server.buildMux() registers the SPA's "/"
 // catch-all last, after the "/api/" JSON-404 catch-all; Go's ServeMux picks
 // the most specific pattern regardless of registration order, but a future
 // refactor that changed pattern specificity (e.g. widening an API pattern,
@@ -178,8 +178,10 @@ func TestStaticMountDoesNotShadowAPI(t *testing.T) {
 func TestAuthRequired(t *testing.T) {
 	srv, s, _ := testServer(t)
 	// /api/v1/auth/me is registered in Task 6; use a probe route registered
-	// behind requireAuth for this test:
-	srv.mux.HandleFunc("GET /api/v1/_probe", srv.requireAuth(func(w http.ResponseWriter, r *http.Request) {
+	// behind requireAuth for this test. route(), not srv.mux.HandleFunc: mux
+	// doesn't exist until Handler() is first called (see server.go), and
+	// route() is the only supported way to add one before then.
+	srv.route("GET /api/v1/_probe", srv.requireAuth(func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]string{"user": userFrom(r).Username})
 	}))
 	if w := doReq(t, srv.Handler(), "GET", "/api/v1/_probe", "", nil); w.Code != 401 {
@@ -205,8 +207,8 @@ func TestReadScopeToken(t *testing.T) {
 	probe := srv.requireAuth(func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]string{"user": userFrom(r).Username})
 	})
-	srv.mux.HandleFunc("GET /api/v1/_probe", probe)
-	srv.mux.HandleFunc("POST /api/v1/_probe", probe)
+	srv.route("GET /api/v1/_probe", probe)
+	srv.route("POST /api/v1/_probe", probe)
 
 	// login first so the admin user (id 1) exists before minting an API
 	// token for it, mirroring TestAuthRequired's ordering.

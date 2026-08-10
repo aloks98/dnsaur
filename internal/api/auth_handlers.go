@@ -9,11 +9,11 @@ import (
 )
 
 func (s *Server) authRoutes() {
-	s.mux.HandleFunc("GET /api/v1/setup", s.handleSetupState)
-	s.mux.HandleFunc("POST /api/v1/setup", s.handleSetup)
-	s.mux.HandleFunc("POST /api/v1/auth/login", s.handleLogin)
-	s.mux.HandleFunc("POST /api/v1/auth/logout", s.requireAuth(s.handleLogout))
-	s.mux.HandleFunc("GET /api/v1/auth/me", s.requireAuth(s.handleMe))
+	s.route("GET /api/v1/setup", s.handleSetupState)
+	s.route("POST /api/v1/setup", s.handleSetup)
+	s.route("POST /api/v1/auth/login", s.handleLogin)
+	s.route("POST /api/v1/auth/logout", s.requireAuth(s.handleLogout))
+	s.route("GET /api/v1/auth/me", s.requireAuth(s.handleMe))
 }
 
 func (s *Server) handleSetupState(w http.ResponseWriter, r *http.Request) {

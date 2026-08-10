@@ -12,11 +12,11 @@ import (
 )
 
 func (s *Server) zonesRoutes() {
-	s.mux.HandleFunc("GET /api/v1/zones", s.requireAuth(s.handleZonesList))
-	s.mux.HandleFunc("POST /api/v1/zones", s.requireAuth(s.handleZoneCreate))
-	s.mux.HandleFunc("GET /api/v1/zones/{id}", s.requireAuth(s.handleZoneGet))
-	s.mux.HandleFunc("PATCH /api/v1/zones/{id}", s.requireAuth(s.handleZonePatch))
-	s.mux.HandleFunc("DELETE /api/v1/zones/{id}", s.requireAuth(s.handleZoneDelete))
+	s.route("GET /api/v1/zones", s.requireAuth(s.handleZonesList))
+	s.route("POST /api/v1/zones", s.requireAuth(s.handleZoneCreate))
+	s.route("GET /api/v1/zones/{id}", s.requireAuth(s.handleZoneGet))
+	s.route("PATCH /api/v1/zones/{id}", s.requireAuth(s.handleZonePatch))
+	s.route("DELETE /api/v1/zones/{id}", s.requireAuth(s.handleZoneDelete))
 }
 
 // reloadZones is called after successful zone mutations; failures are
