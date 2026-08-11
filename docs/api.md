@@ -23,7 +23,9 @@ curl or any HTTP client.
 - JSON in, JSON out (`application/json`), except `GET /queries/tail`
   (`text/event-stream`) and `GET /openapi.yaml` (`application/yaml`).
 - Errors are always a flat envelope: `{"error": "<message>"}`, with a
-  matching HTTP status code.
+  matching HTTP status code. One endpoint, zone file import, has more than
+  one problem to report at once; it adds an `errors` list alongside the
+  same flat `error` — see Zone files below.
 - DNS resolution is never affected by API/DB problems — by design
   (`docs/architecture.md`'s "DNS must not die" principle), DB-dependent
   endpoints return `503` on storage errors rather than taking anything else
@@ -170,6 +172,38 @@ Full parameter/response detail lives in `internal/api/openapi.yaml`
   them, under the same check. This can bump the **SOA serial of a
   different zone** than the one in the request path — the reverse zone's,
   not just the forward zone's — since its contents just changed too.
+- **Zone files** — `GET /zones/{id}/file` renders the zone as a BIND
+  master file (RFC 1035 §5) and returns it as an attachment; disabled
+  records are omitted (a master file can't express "present but disabled"),
+  and a built-in zone exports like any other. `POST /zones/{id}/file`
+  (`{content, dry_run}`) replaces the zone's records and SOA from a master
+  file — the file is the zone, and anything the zone has that the file
+  doesn't is deleted. `dry_run` is required, not defaulted: a request that
+  omits it gets `400`, because Go's zero value for a bool is the committing
+  one, and the whole point of the flag is that a caller can't reach the
+  destructive branch by accident. `true` returns the diff (`add`, `change`,
+  `delete`) and writes nothing; `false` applies it and returns the same
+  shape. Records are validated exactly as `POST /zones/{id}/records`
+  validates a hand write, against the file's own records rather than the
+  zone's current ones; any failure rejects the whole file with `422` and no
+  writes. The `422` body carries `errors` — one message per problem, not
+  all in one shape: most name `line N` or the record's name/type/rdata (a
+  `$GENERATE` line expands to several with no line of their own), but a
+  few — a missing SOA, say — are about the file as a whole and name
+  neither. It comes alongside a flat `error` summary, so a client with one
+  error handler for the `{"error": "<message>"}` convention above still
+  finds what it expects. A file whose SOA carries no TTL is one such
+  problem and is always rejected: a zero SOA TTL would make every
+  negative answer from the zone uncacheable (RFC 2308 §4). On success
+  the SOA's NS, mbox and timers come from the file, but the serial becomes
+  `max(file, current) + 1` — never lower than what's already been served,
+  so a secondary that has seen the higher value doesn't ignore the zone
+  forever after. Import never writes PTR records, the one exception to
+  auto-PTR (see [`dashboard.md`](dashboard.md#auto-ptr)): a forward-zone
+  import never rewrites a reverse zone it didn't name, so a reverse zone's
+  PTRs come from importing that zone's own file. Import into a
+  `type: "internal"` zone is refused with `409`, like any other write to
+  one (see Zones above) — export is unaffected.
 - **Queries** — `GET /queries` (search the query log; filters: `from`,
   `to`, `client`, `q`, `decision`, `type`, `limit` [default 100, capped
   1000], `offset`), `GET /queries/tail` (live tail as Server-Sent Events,

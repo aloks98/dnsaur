@@ -23,6 +23,39 @@ if (typeof window.matchMedia !== "function") {
     }) as MediaQueryList;
 }
 
+// jsdom implements neither URL.createObjectURL nor its revoke half (they
+// belong to the file/blob layer it deliberately leaves out). lib/download.ts
+// needs both to hand a fetched zone file to the browser, so stub them to the
+// smallest thing that keeps the round trip honest: a real, unique URL string
+// per blob, and a revoke that forgets it. Tests assert createObjectURL was
+// handed a Blob (pages/zones/detail.test.tsx) — the point being that the
+// response body actually reaches the download, not that any particular URL
+// comes back.
+if (typeof URL.createObjectURL !== "function") {
+  let n = 0;
+  URL.createObjectURL = () => `blob:dnsaur/${++n}`;
+  URL.revokeObjectURL = () => {};
+}
+
+// jsdom implements no navigation and no downloads, so clicking the anchor
+// lib/download.ts builds raises "Not implemented: navigation to another
+// Document" on the virtual console for every export.
+//
+// Cancelling the event in the capture phase is what a real browser's own
+// behaviour amounts to here: an anchor carrying `download` saves the file
+// instead of navigating, so the one thing that must NOT happen on this click
+// is a navigation. Suppressing the activation behaviour rather than stubbing
+// HTMLAnchorElement.prototype.click keeps the click itself real — it still
+// dispatches, still bubbles, and a listener could still observe it.
+document.addEventListener(
+  "click",
+  (event) => {
+    const target = event.target as Element | null;
+    if (target?.closest?.("a[download]")) event.preventDefault();
+  },
+  true,
+);
+
 // jsdom does not implement ResizeObserver. rnui's InputOTP (via the
 // input-otp library) observes its container to size itself, so stub it out
 // under test.

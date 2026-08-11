@@ -335,3 +335,84 @@ harmless the moment this milestone seeds five.
 | **3596 §2.5** | `ip6.arpa` is 32 nibbles, reversed, dot-separated |
 | **1034** | PTR names a host; the rdata is a domain name, not an address |
 | **2317** | classless delegation of `in-addr.arpa` — noted, NOT implemented; a `/24`-aligned homelab does not need it |
+
+---
+
+## 8. Milestone C: zone file import and export
+
+Decided 2026-08-10.
+
+Milestone A stores `rdata` in DNS presentation format precisely so this
+milestone would be cheap: **the stored form already is master-file format**.
+Export is string assembly; import is `dns.ZoneParser`. Neither needs a second
+serializer that could disagree with the resolver.
+
+### Export
+
+A zone renders as a BIND master file: `$ORIGIN`, `$TTL`, the SOA reconstructed
+from the `zones` row, then every record in `zone_records`. Names stay relative
+— that is what they already are — so the file is portable to any other server.
+
+Disabled records are **omitted**. A zone file has no concept of a disabled
+record, and emitting one would silently enable it on whatever imports the file.
+
+Built-in (`internal`) zones export like any other. Reading them is allowed;
+only writing is not.
+
+### Import: the file is the zone
+
+**Replace, not merge.** A zone file is the zone, not a patch. Anything in the
+zone and not in the file is deleted. Every other DNS server treats a zone file
+this way, and merge semantics produce a result that is neither the file nor
+what was there before — with the specific trap that deleting a record from the
+file and re-importing does nothing.
+
+Because that is destructive, import is **two steps**: a dry run returning the
+adds, changes and deletes, then a commit. The diff is what makes the
+destruction visible before it happens.
+
+### Import applies the same validation as a hand write
+
+A zone file can legitimately contain what `buildZoneRecord` rejects — a CNAME
+beside another type, mismatched TTLs within one RRSet, a TTL above 2147483647,
+a CNAME at the apex.
+
+**The whole file is rejected, and the error names every offending line**, not
+just the first. Two reasons. Partial import leaves a zone matching neither the
+file nor any intent, and a report of what was skipped is easy to miss. And
+silently normalising — as the `local_records` migration did — edits the user's
+data without asking and means the zone will not round-trip back to the file
+they supplied.
+
+Import routes through `buildZoneRecord`, the same validator behind
+`POST /records`. Milestone B's recurring defect was an automatic path
+bypassing a rule the human path enforced; it happened three times. Import is a
+bulk write path and gets the same treatment, not its own copy of the rules.
+
+### Import does NOT trigger auto-PTR
+
+Import writes exactly what the file contains and nothing else. A 200-record
+import stays one predictable transaction, and a forward-zone import never
+silently rewrites a reverse zone the user did not name. PTRs arrive by
+importing the reverse zone's own file.
+
+This is a deliberate exception to "A/AAAA writes maintain the matching PTR"
+(§7) and is the only one.
+
+### Built-in zones cannot be imported into
+
+`type == "internal"` rejects import with the same 409 every other write gets.
+
+### RFC conformance added here
+
+| RFC | Rule |
+|---|---|
+| **1035 §5** | master file format: `$ORIGIN`, `$TTL`, `@`, parentheses for multi-line records, `;` comments, escaping |
+| **1034 §3.6.1** | the file's SOA is the zone's SOA |
+| **2308 §4** | `$TTL` is the default for records that omit one |
+
+**Serial handling on import.** The file's SOA carries a serial. Taking it
+verbatim can move the zone's serial *backwards*, which breaks any secondary
+that has already seen the higher value (§4 D). Import takes the file's SOA
+timers, NS and mbox, but the serial becomes `max(file, current) + 1` — never
+lower than what has already been served.

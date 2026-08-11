@@ -1,7 +1,7 @@
 import { http, HttpResponse } from "msw";
 import { toast } from "sonner";
 import { afterEach, expect, test, vi } from "vitest";
-import { screen, waitFor, within } from "@testing-library/react";
+import { fireEvent, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { Route, Routes } from "react-router";
 import { server } from "../../test/msw-server";
@@ -81,7 +81,30 @@ function renderZoneDetail({ zone: z, records = [] }: { zone: Zone; records?: Zon
   return renderDetail(`/zones/${z.id}`);
 }
 
-afterEach(() => vi.restoreAllMocks());
+/**
+ * Every path MSW served during the test, so a click can be proven to have
+ * actually reached the network.
+ *
+ * Export needs this specifically: its whole effect is a browser download, so
+ * there is nothing left in the DOM to assert on afterwards — the anchor is
+ * created, clicked and removed. Asserting on that anchor instead would pass
+ * just as happily if the request had never fired at all.
+ *
+ * Listeners are torn down in the afterEach below, alongside MSW's own
+ * per-test handler reset in test/setup.ts.
+ */
+function trackFetchedPaths(): string[] {
+  const paths: string[] = [];
+  server.events.on("request:start", ({ request }) => {
+    paths.push(new URL(request.url).pathname);
+  });
+  return paths;
+}
+
+afterEach(() => {
+  vi.restoreAllMocks();
+  server.events.removeAllListeners();
+});
 
 // Record `name` is zone-apex-relative — "@" is the literal, stored value
 // for the apex record, never the zone's own name. A row that quietly
@@ -580,5 +603,258 @@ test("a built-in zone offers no way to change it", async () => {
   expect(screen.queryByRole("button", { name: /delete zone/i })).not.toBeInTheDocument();
   expect(screen.queryByRole("button", { name: /disable zone/i })).not.toBeInTheDocument();
   // Its records are still listed — reading is the point of showing it at all.
-  expect(await screen.findByText("Built-in")).toBeInTheDocument();
+  expect(await screen.findByText(/built-in · read-only/i)).toBeInTheDocument();
+});
+
+// ── Zone file export and import ───────────────────────────────────────────
+
+const ZONE_FILE = "$ORIGIN e412.in.\n@ 300 IN A 192.168.150.2\n";
+
+function zoneFile(name = "e412.in.zone"): File {
+  return new File([ZONE_FILE], name, { type: "text/dns" });
+}
+
+/** Opens the import dialog the way a user does: press Import, then choose a
+ * file. The dialog opens on selection, before the dry run has answered, so
+ * callers still wait on whichever state they expect it to settle into. */
+async function chooseFile(user: ReturnType<typeof userEvent.setup>, file = zoneFile()) {
+  await user.click(await screen.findByRole("button", { name: /^import$/i }));
+  await user.upload(screen.getByLabelText("Zone file"), file);
+}
+
+// Named for what it observes, not for the whole feature: this reaches as far
+// as the response body arriving at the download path. What downloadBlob then
+// does with it — the anchor, its href and download attributes, and the click
+// that is the actual mechanism — is pinned in lib/download.test.ts.
+test("Export fetches the zone file and passes the response body to the download", async () => {
+  const user = userEvent.setup();
+  const fetchedPaths = trackFetchedPaths();
+  const objectUrl = vi.spyOn(URL, "createObjectURL");
+  server.use(
+    http.get(
+      "/api/v1/zones/1/file",
+      () =>
+        new HttpResponse(ZONE_FILE, {
+          headers: {
+            "Content-Type": "text/dns; charset=utf-8",
+            "Content-Disposition": 'attachment; filename="e412.in.zone"',
+          },
+        }),
+    ),
+  );
+
+  renderZoneDetail({ zone: zone({ id: 1, name: "e412.in" }) });
+  await user.click(await screen.findByRole("button", { name: /^export$/i }));
+
+  // The click must reach the endpoint — see trackFetchedPaths' own comment.
+  await waitFor(() => expect(fetchedPaths).toContain("/api/v1/zones/1/file"));
+  // …and the body it answered with must reach the download, rather than the
+  // request firing and its response being quietly dropped.
+  await waitFor(() => expect(objectUrl).toHaveBeenCalledWith(expect.any(Blob)));
+});
+
+test("Import shows the diff and writes nothing until Apply", async () => {
+  const user = userEvent.setup();
+  const posted: { content: string; dry_run: boolean }[] = [];
+  server.use(
+    http.post("/api/v1/zones/1/file", async ({ request }) => {
+      const body = (await request.json()) as { content: string; dry_run: boolean };
+      posted.push(body);
+      return HttpResponse.json({
+        add: [record({ id: 0, name: "grafana", rdata: "192.168.150.44" })],
+        change: [
+          {
+            from: record({ id: 2, name: "nas", ttl: 300 }),
+            to: record({ id: 2, name: "nas", ttl: 600 }),
+          },
+        ],
+        delete: [record({ id: 3, name: "printer", rdata: "192.168.150.31" })],
+        errors: [],
+      });
+    }),
+  );
+
+  renderZoneDetail({ zone: zone({ id: 1, name: "e412.in" }) });
+  await chooseFile(user);
+
+  const dialog = await screen.findByRole("dialog");
+  expect(within(dialog).getByText("+1 added")).toBeInTheDocument();
+  expect(within(dialog).getByText("~1 changed")).toBeInTheDocument();
+  expect(within(dialog).getByText("−1 deleted")).toBeInTheDocument();
+  // The destructive half of a whole-zone replace is the point of the dry
+  // run, so it is named in the footer rather than left to be inferred.
+  expect(within(dialog).getByText(/anything not in the file is deleted/i)).toBeInTheDocument();
+
+  // Nothing is written by looking: every request so far was a dry run.
+  expect(posted).toHaveLength(1);
+  expect(posted[0]).toEqual({ content: ZONE_FILE, dry_run: true });
+});
+
+test("Apply commits the same file with dry_run false", async () => {
+  const user = userEvent.setup();
+  const posted: { content: string; dry_run: boolean }[] = [];
+  server.use(
+    http.post("/api/v1/zones/1/file", async ({ request }) => {
+      const body = (await request.json()) as { content: string; dry_run: boolean };
+      posted.push(body);
+      return HttpResponse.json({
+        add: [record({ id: 0, name: "grafana", rdata: "192.168.150.44" })],
+        change: [],
+        delete: [],
+        errors: [],
+      });
+    }),
+  );
+  const success = vi.spyOn(toast, "success");
+
+  renderZoneDetail({ zone: zone({ id: 1, name: "e412.in" }) });
+  await chooseFile(user);
+  const dialog = await screen.findByRole("dialog");
+  await user.click(within(dialog).getByRole("button", { name: /^apply$/i }));
+
+  await waitFor(() => expect(posted).toHaveLength(2));
+  // The same bytes, committed — the server re-reads the file rather than
+  // being handed a diff to replay.
+  expect(posted[1]).toEqual({ content: ZONE_FILE, dry_run: false });
+  await waitFor(() => expect(success).toHaveBeenCalledWith(expect.stringMatching(/1 added/)));
+});
+
+test("a rejected import shows every problem the server named, verbatim", async () => {
+  const user = userEvent.setup();
+  let committed = false;
+  server.use(
+    http.post("/api/v1/zones/1/file", async ({ request }) => {
+      const body = (await request.json()) as { dry_run: boolean };
+      if (!body.dry_run) committed = true;
+      return HttpResponse.json(
+        {
+          add: [],
+          change: [],
+          delete: [],
+          errors: [
+            "line 5: records in the same RRSet must share one TTL",
+            "line 7: CNAME cannot coexist with another record at the same name",
+            // A file-wide problem: it names neither a line nor a record, so
+            // anything that parsed a "line N:" prefix off these would drop it.
+            "the file has no SOA record",
+          ],
+          error:
+            "the zone file was rejected; nothing was written. See errors for every problem found.",
+        },
+        { status: 422 },
+      );
+    }),
+  );
+
+  renderZoneDetail({ zone: zone({ id: 1, name: "e412.in" }) });
+  await chooseFile(user, zoneFile("bad.zone"));
+
+  expect(await screen.findByText(/file rejected — nothing was written/i)).toBeInTheDocument();
+  expect(
+    screen.getByText("line 5: records in the same RRSet must share one TTL"),
+  ).toBeInTheDocument();
+  expect(
+    screen.getByText("line 7: CNAME cannot coexist with another record at the same name"),
+  ).toBeInTheDocument();
+  expect(screen.getByText("the file has no SOA record")).toBeInTheDocument();
+  expect(committed).toBe(false);
+});
+
+// Re-importing a file that was just exported is the ordinary way to reach an
+// empty diff, and three empty groups under three zeroes would read as a
+// failure to load rather than as "nothing would change".
+test("a file identical to the zone says so instead of showing an empty diff", async () => {
+  const user = userEvent.setup();
+  server.use(
+    http.post("/api/v1/zones/1/file", () =>
+      HttpResponse.json({ add: [], change: [], delete: [], errors: [] }),
+    ),
+  );
+
+  renderZoneDetail({ zone: zone({ id: 1, name: "e412.in" }) });
+  await chooseFile(user);
+
+  expect(await screen.findByText(/this file matches the zone/i)).toBeInTheDocument();
+});
+
+// The dry run is not instant: the server re-parses and re-diffs the whole
+// file, which on a large zone is seconds of work (measured on a real build:
+// ~1s at 10k records, ~5.5s at 33k). Opening the dialog only once it answers
+// left the page looking frozen for that whole time, and the Import button
+// live enough to fire a second full-cost request on top of the first.
+test("a dry run still in flight shows progress and cannot be fired twice", async () => {
+  const user = userEvent.setup();
+  const posted: unknown[] = [];
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  server.use(
+    http.post("/api/v1/zones/1/file", async ({ request }) => {
+      posted.push(await request.json());
+      await held;
+      return HttpResponse.json({ add: [], change: [], delete: [], errors: [] });
+    }),
+  );
+
+  renderZoneDetail({ zone: zone({ id: 1, name: "e412.in" }) });
+  await chooseFile(user);
+
+  // The wait is on screen from the moment the file is chosen, rather than
+  // the page sitting inert until the answer arrives.
+  expect(await screen.findByText(/checking what this file would change/i)).toBeInTheDocument();
+  // `hidden: true` because the open dialog takes the rest of the page out of
+  // the accessibility tree — the button is still there, and still has to be
+  // disabled, or a second click buys a second full-cost parse of the file.
+  expect(screen.getByRole("button", { name: /^import$/i, hidden: true })).toBeDisabled();
+
+  // The button is only the visible affordance; the input is what actually
+  // starts the request, so that is where the guard has to hold. Fired with
+  // fireEvent rather than userEvent deliberately: it dispatches the change
+  // event straight at the input, ignoring the `disabled` attribute the way a
+  // programmatic .click() or a future change to the dialog's focus handling
+  // could. Exactly one request must ever leave.
+  // Exact, not /zone file/i: the open dialog is itself labelled "Import
+  // zone file", so a loose match now finds two elements.
+  const input = screen.getByLabelText("Zone file");
+  expect(input).toBeDisabled();
+  fireEvent.change(input, { target: { files: [zoneFile("second.zone")] } });
+  expect(posted).toHaveLength(1);
+
+  release();
+  expect(await screen.findByText(/this file matches the zone/i)).toBeInTheDocument();
+  expect(posted).toHaveLength(1);
+});
+
+// An over-cap body is a 413 carrying only the flat `{"error": …}` envelope —
+// no `errors` array to render — so this is the path where zoneFileErrors'
+// fallback to the summary is what keeps the dialog from coming up blank.
+// The message is the server's own (internal/api/zonefile_handlers.go).
+test("an oversize file is reported as too large, in the rejected state", async () => {
+  const user = userEvent.setup();
+  server.use(
+    http.post("/api/v1/zones/1/file", () =>
+      HttpResponse.json(
+        { error: "request body too large: the limit is 1048576 bytes" },
+        { status: 413 },
+      ),
+    ),
+  );
+
+  renderZoneDetail({ zone: zone({ id: 1, name: "e412.in" }) });
+  await chooseFile(user);
+
+  expect(await screen.findByText(/file rejected — nothing was written/i)).toBeInTheDocument();
+  expect(
+    screen.getByText("request body too large: the limit is 1048576 bytes"),
+  ).toBeInTheDocument();
+});
+
+test("a built-in zone offers no Import, but still exports", async () => {
+  renderZoneDetail({ zone: zone({ id: 1, name: "localhost", type: "internal" }) });
+  await screen.findByText("localhost");
+
+  expect(screen.queryByRole("button", { name: /^import$/i })).not.toBeInTheDocument();
+  // Export stays — the server refuses writes to a built-in zone, not reads.
+  expect(screen.getByRole("button", { name: /^export$/i })).toBeInTheDocument();
 });

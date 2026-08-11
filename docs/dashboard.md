@@ -260,6 +260,30 @@ The rules, and the ones that are easy to be surprised by:
   actually being written claim an address, never a bystander that
   happened to already be pointing there.
 
+### Export and import
+
+**Export** downloads a zone as a standard BIND master file — the format
+every other DNS server reads, so the file works unchanged if you move it
+there. Disabled records are left out: a master file has no way to mark one
+as disabled, and including it would silently turn it on wherever the file
+is read next.
+
+**Import replaces the zone.** The file becomes the zone: anything the zone
+has that the file doesn't is deleted. This is destructive and cannot be
+undone, which is why choosing a file to import shows a diff first — what
+would be added, changed, and deleted — and nothing is written until you
+apply it.
+
+An invalid file is rejected whole, with every problem it found named, not
+just the first — no partial import, and nothing changes.
+
+Import does not create PTR records the way adding an A record by hand does
+(see Auto-PTR above) — it writes only to the zone being imported into. A
+reverse zone gets its PTRs by importing its own file.
+
+Built-in zones (see above) export like any other zone but refuse import,
+the same `409` as any other write to one.
+
 ### Upgrading from Local DNS records
 
 Existing local records became zones automatically the first time this

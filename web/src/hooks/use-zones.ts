@@ -1,5 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { api } from "../api/client";
+import { api, ApiError } from "../api/client";
+import { downloadBlob, filenameFromDisposition } from "../lib/download";
 import type { Zone, ZoneRecord } from "../api/types";
 
 // Zones-domain hooks — authoritative DNS zones (Task 11) and the records
@@ -159,4 +160,104 @@ export function useDeleteZoneRecord() {
       api.del<void>(`/zones/${zoneId}/records/${id}`),
     onSuccess: (_data, { zoneId }) => invalidateZoneAndRecords(qc, zoneId),
   });
+}
+
+/** One record an import would replace in place. Both sides are carried
+ * because a dry run's whole job is making a destructive replace legible
+ * before it happens — "3 changed" with no values is not that.
+ *
+ * The server pairs the two by the RR itself (name, type and rdata together:
+ * `recordIdentity` in internal/api/zonefile_handlers.go), so `from` and `to`
+ * always agree on all three. What differs is the TTL or the enabled flag —
+ * anything else is a delete plus an add, not a change. */
+export interface ZoneRecordChange {
+  from: ZoneRecord;
+  to: ZoneRecord;
+}
+
+/** The three-way diff between a zone as it stands and the file that would
+ * replace it — the answer to both the dry run and the commit. `errors` is
+ * empty on success; on a rejection it carries one message per problem and
+ * the three lists are empty. */
+export interface ZoneFileDiff {
+  add: ZoneRecord[];
+  change: ZoneRecordChange[];
+  delete: ZoneRecord[];
+  errors: string[];
+  /** One-line summary, present only on a rejection. */
+  error?: string;
+}
+
+/**
+ * Downloads a zone as a BIND master file.
+ *
+ * Allowed on every zone, built-in ones included: the server refuses *writes*
+ * to an RFC 6303 zone, not reads, and there is no "internal" check on the
+ * export handler (internal/api/zonefile_handlers.go).
+ *
+ * The zone's own name is the fallback filename, used only if the response
+ * arrives without a Content-Disposition — the server always sends one.
+ */
+export function useExportZoneFile() {
+  return useMutation({
+    mutationFn: async ({ id, name }: { id: number; name: string }) => {
+      const { blob, disposition } = await api.file(`/zones/${id}/file`);
+      downloadBlob(blob, filenameFromDisposition(disposition, `${name}.zone`));
+    },
+  });
+}
+
+/**
+ * Replaces a zone's contents with a master file — or, with `dryRun`, reports
+ * what that would do and touches nothing.
+ *
+ * `dryRun` is a required parameter rather than an optional one with a
+ * default, mirroring the server: `dry_run` is a required field there and an
+ * omitted one is a 400, deliberately, because Go's zero value for the field
+ * is the committing branch (see zoneFileImport's own comment). Making it
+ * required here means the destructive choice has to be written at every call
+ * site instead of being what happens when nobody thought about it.
+ *
+ * Only a committed import invalidates: a dry run changed nothing, so
+ * refetching after one would be pure noise. A committed one goes through
+ * invalidateZoneAndRecords for the usual reason — it rewrote the record set
+ * and bumped the zone's serial.
+ */
+export function useImportZoneFile() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, content, dryRun }: { id: number; content: string; dryRun: boolean }) =>
+      api.post<ZoneFileDiff>(`/zones/${id}/file`, { content, dry_run: dryRun }),
+    onSuccess: (_data, { id, dryRun }) => {
+      if (!dryRun) invalidateZoneAndRecords(qc, id);
+    },
+  });
+}
+
+/**
+ * Every problem the server named when it refused a zone file.
+ *
+ * These live on the ApiError's `body`, not its `message`: the client reads
+ * only `.error` — the one-line summary — into the message (api/client.ts),
+ * and spec §8 requires naming every offending line, which one string cannot
+ * do. Falling back to the message keeps the dialog from rendering blank when
+ * the failure is not a 422 at all (a 409 on a built-in zone, say, or a 500).
+ *
+ * The strings are returned exactly as they arrived. Most name a line or the
+ * offending record, but a file-wide problem — a missing SOA — names neither,
+ * so there is no prefix here worth parsing and any attempt to would quietly
+ * drop that whole class of message.
+ */
+export function zoneFileErrors(err: unknown): string[] {
+  if (!(err instanceof ApiError)) return ["Couldn't read the zone file."];
+  try {
+    const parsed = JSON.parse(err.body ?? "") as { errors?: unknown };
+    if (Array.isArray(parsed.errors)) {
+      const messages = parsed.errors.filter((e): e is string => typeof e === "string");
+      if (messages.length > 0) return messages;
+    }
+  } catch {
+    /* not the JSON envelope — fall through to the summary below */
+  }
+  return [err.message];
 }

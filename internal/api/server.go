@@ -108,6 +108,7 @@ func (s *Server) registerRoutes() {
 	s.tokensRoutes()
 	s.zonesRoutes()
 	s.zoneRecordsRoutes()
+	s.zoneFileRoutes()
 	// Later tasks append their routes here.
 	//
 	// This catch-all is registered through route() like everything else —

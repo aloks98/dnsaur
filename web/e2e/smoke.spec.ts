@@ -149,6 +149,41 @@ test("first-run setup, login, create a zone and add a record, dark mode persists
   // Adding leaves the row empty and ready for the next record.
   await expect(page.getByLabel("Zone record name")).toHaveValue("");
 
+  // --- export the zone, then re-import the file it produced -------------
+  // A round trip, so the imported file is guaranteed to be one this
+  // server's own renderer emits rather than a fixture hand-written against
+  // a guess at the parser. It also puts a real download and a real
+  // multipart-free file read through Chromium, neither of which jsdom can
+  // do: the Vitest suite stubs URL.createObjectURL and suppresses the
+  // anchor's navigation, so this is the only place the download is real.
+  const [download] = await Promise.all([
+    page.waitForEvent("download"),
+    page.getByRole("button", { name: "Export" }).click(),
+  ]);
+  expect(download.suggestedFilename()).toBe("home.lan.zone");
+  const exported = await download.path();
+
+  await page.getByLabel("Zone file").setInputFiles(exported);
+  const importDialog = page.getByRole("dialog");
+  await expect(importDialog).toBeVisible();
+
+  // The file *is* the zone, so the diff is empty in all three buckets.
+  await expect(importDialog.getByText(/this file matches the zone/i)).toBeVisible();
+
+  // The dialog's width is the assertion jsdom structurally cannot make: the
+  // DOM is correct in both cases and only the computed cascade differs.
+  // rnui's base DialogContent carries `sm:max-w-sm`, which tailwind-merge
+  // cannot strip from a `cn()` override because it sits in a different
+  // variant scope — so without an `sm:`-scoped max-width of our own, this
+  // 900px panel silently renders at 384px on any viewport ≥640px, with the
+  // counts strip and the three diff groups crushed into a third of their
+  // designed width. Pinned here because every RTL test passes either way.
+  const panel = await importDialog.boundingBox();
+  expect(panel?.width).toBe(900);
+
+  await importDialog.getByRole("button", { name: "Cancel" }).click();
+  await expect(importDialog).toBeHidden();
+
   // --- dark mode toggles and persists across a reload -------------------
   // Also under System: the design's bar carries no standalone theme control.
   await expect(page.locator("html")).not.toHaveClass(/dark/);

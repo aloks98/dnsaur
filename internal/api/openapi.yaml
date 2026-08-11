@@ -176,6 +176,56 @@ components:
             domain name, RFC 1034 — not the address itself).
         enabled: { type: boolean }
         comment: { type: string }
+    ZoneFileImportResult:
+      type: object
+      description: >
+        The result of a zone file import: the three-way diff between the
+        zone as it is and the file as it would replace it, or — when the
+        file was rejected — one message per problem and three empty lists.
+
+        A dry run returns exactly what a commit of the same file would do.
+      required: [add, change, delete, errors]
+      properties:
+        add:
+          type: array
+          description: records in the file that the zone does not have.
+          items: { $ref: "#/components/schemas/ZoneRecord" }
+        change:
+          type: array
+          description: >
+            records the file keeps but alters. Records are matched by name,
+            type and rdata, so only ttl and enabled can differ; anything
+            else is a delete plus an add.
+          items:
+            type: object
+            required: [from, to]
+            properties:
+              from: { $ref: "#/components/schemas/ZoneRecord" }
+              to: { $ref: "#/components/schemas/ZoneRecord" }
+        delete:
+          type: array
+          description: >
+            records the zone has and the file does not. A zone file is the
+            zone, not a patch — anything absent from it goes, disabled
+            records included (a master file cannot express "present but
+            disabled", so export omits them and import cannot see them).
+          items: { $ref: "#/components/schemas/ZoneRecord" }
+        errors:
+          type: array
+          description: >
+            One message per problem, empty on success. Each names the
+            master-file line it is about ("line 12: ..."), except for a
+            record whose line cannot be attributed — every record of a file
+            using $GENERATE, which produces any number of records from one
+            line — which is named by its name, type and rdata instead.
+          items: { type: string }
+        error:
+          type: string
+          description: >
+            A one-line summary, present only when the file was rejected, so
+            that a rejection also satisfies the flat {"error": "..."}
+            envelope every other endpoint answers errors with. It does not
+            replace errors, which is where the per-problem detail is.
   responses:
     ReadOnlyToken:
       description: read-only token used for a write operation
@@ -1848,6 +1898,166 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
+        "503":
+          description: storage unavailable
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /zones/{id}/file:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: integer, format: int64, description: zone id }
+    get:
+      tags: [Zones]
+      summary: Export a zone as a BIND master file
+      description: >
+        Renders the zone's $ORIGIN/$TTL/SOA and every enabled record as a
+        standard BIND master file (RFC 1035 §5). Disabled records are
+        omitted: a master file has no way to represent "present but
+        disabled".
+
+
+        A zone of type internal — the RFC 6303 built-ins seeded at
+        migration, see the Zone schema's type field — is exportable like
+        any other zone; only writes are restricted for built-ins, not
+        reads.
+      responses:
+        "200":
+          description: OK
+          content:
+            text/dns:
+              schema: { type: string }
+        "400":
+          description: bad id
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401":
+          description: authentication required
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "404":
+          description: not found
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503":
+          description: storage unavailable
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+    post:
+      tags: [Zones]
+      summary: Replace a zone's contents from a BIND master file
+      description: >
+        A zone file is the zone, not a patch: anything in the zone and not
+        in the file is deleted. Because that is destructive, import is two
+        steps — send dry_run true to get the diff, then the same content
+        with dry_run false to apply it. Both return the same
+        ZoneFileImportResult.
+
+
+        Records are validated exactly as POST /zones/{id}/records validates
+        a hand write, against the file's own records rather than the zone's
+        current ones, since the file is what the zone is about to be. Any
+        failure rejects the whole file with 422 and no writes, and the
+        response names every offending line rather than only the first.
+
+
+        The zone's SOA is replaced from the file — its NS, mbox, timers and
+        its own TTL — with one exception: the serial becomes max(file,
+        current) + 1, so it can never move backwards past what a secondary
+        has already seen. A file whose SOA has no TTL (no $TTL directive
+        and no TTL on the SOA line, RFC 2308 §4) is rejected, because a
+        zone with a zero SOA TTL cannot have its negative answers cached
+        (RFC 2308 §5). The SOA replacement is unconditional and does not
+        appear in the diff, which covers records only.
+
+
+        Import does not maintain PTR records, the one exception to the rule
+        that A/AAAA writes do. It writes exactly what the file contains, so
+        a forward-zone import never rewrites a reverse zone that was not
+        named; import the reverse zone's own file to change its PTRs.
+
+
+        A zone of type internal — the RFC 6303 built-ins seeded at
+        migration — rejects import with 409, like every other write.
+
+
+        The request body is limited to 1 MiB — roughly 35,000 records. A
+        body over that is rejected with 413 and said to be too large; it
+        is never reported as malformed. The cap is not a formatting limit
+        but a cost one: each record is validated against every record
+        accepted before it, so a file at the cap already takes seconds.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [content, dry_run]
+              properties:
+                content:
+                  type: string
+                  description: the master file, RFC 1035 §5 format.
+                dry_run:
+                  type: boolean
+                  description: >
+                    true returns the diff and changes nothing; false applies
+                    it. Required, and enforced: a body that omits the field
+                    is rejected with 400 rather than defaulted either way.
+                    The two-step dry run is the safety mechanism for a
+                    destructive replace, so a field the client never sent
+                    must not be what selects the destructive branch.
+      responses:
+        "200":
+          description: >
+            the diff — applied, or, for a dry run, what applying it would do
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ZoneFileImportResult" }
+        "400":
+          description: >
+            bad id, a body that is not valid JSON, or a body with no dry_run
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401":
+          description: authentication required
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "403":
+          $ref: "#/components/responses/ReadOnlyToken"
+        "404":
+          description: not found
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "409":
+          description: built-in zones cannot be changed
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "413":
+          description: >
+            the request body is over the 1 MiB cap. Distinct from 400,
+            which means the body is malformed — a valid zone file that is
+            merely too big is never reported as bad JSON.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "422":
+          description: >
+            the file was rejected and nothing was written; errors names
+            every problem
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ZoneFileImportResult" }
         "503":
           description: storage unavailable
           content:

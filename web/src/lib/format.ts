@@ -15,6 +15,17 @@ export function relativeTime(epochMs: number): string {
   return `${diffDay}d ago`;
 }
 
+/** A file size as `812 B` / `4.1 KB` / `2.3 MB` — the size shown beside a
+ * chosen zone file's name in the import dialog. Binary units (1024), since
+ * the number describes bytes held in memory rather than anything a disk or a
+ * transfer rate reports. */
+export function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  const kb = bytes / 1024;
+  if (kb < 1024) return `${kb.toFixed(1)} KB`;
+  return `${(kb / 1024).toFixed(1)} MB`;
+}
+
 /** A duration in milliseconds as `m:ss` — the pause control's countdown to
  * `paused_until`. Never negative (clamps to `0:00` once the pause has
  * technically expired but the 30s status poll hasn't caught up yet). */
