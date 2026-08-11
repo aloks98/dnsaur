@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"errors"
+	"reflect"
 	"testing"
 )
 
@@ -222,4 +223,197 @@ func TestAllRecordsGroupsByZone(t *testing.T) {
 			t.Errorf("all[z2] = %+v, want the single record named c", all[z2])
 		}
 	})
+}
+
+// seedReplaceZone creates a zone holding the two records every
+// ReplaceRecords test works from — one that will be updated, one that will
+// be deleted — and returns their ids. Serial 7 is arbitrary but non-zero,
+// so a serial that fails to move and a serial that was never set apart.
+func seedReplaceZone(t *testing.T, s Store, name string) (zoneID, keepID, doomedID int64) {
+	t.Helper()
+	ctx := context.Background()
+	zoneID, err := s.Zones().AddZone(ctx, Zone{
+		Name: name, Type: "primary", Enabled: true,
+		SOANS: "ns." + name, SOAMbox: "hostadmin." + name,
+		SOASerial: 7, SOARefresh: 900, SOARetry: 300, SOAExpire: 604800,
+		SOAMinimum: 900, SOATTL: 900,
+	})
+	if err != nil {
+		t.Fatalf("AddZone: %v", err)
+	}
+	if keepID, err = s.Zones().AddRecord(ctx, ZoneRecord{
+		ZoneID: zoneID, Name: "www", Type: "A", TTL: 300, RData: "1.1.1.1", Enabled: true,
+	}); err != nil {
+		t.Fatalf("AddRecord(www): %v", err)
+	}
+	if doomedID, err = s.Zones().AddRecord(ctx, ZoneRecord{
+		ZoneID: zoneID, Name: "doomed", Type: "A", TTL: 300, RData: "9.9.9.9", Enabled: true,
+	}); err != nil {
+		t.Fatalf("AddRecord(doomed): %v", err)
+	}
+	return zoneID, keepID, doomedID
+}
+
+// zoneSnapshot reads a zone and its records the way every reader of this
+// store sees them, so "unchanged" is asserted against what a query would
+// actually return rather than against anything the writer kept.
+func zoneSnapshot(t *testing.T, s Store, zoneID int64) (Zone, []ZoneRecord) {
+	t.Helper()
+	ctx := context.Background()
+	z, err := s.Zones().Zone(ctx, zoneID)
+	if err != nil {
+		t.Fatalf("Zone: %v", err)
+	}
+	recs, err := s.Zones().Records(ctx, zoneID)
+	if err != nil {
+		t.Fatalf("Records: %v", err)
+	}
+	return z, recs
+}
+
+// TestReplaceRecordsAppliesTheWholeDiff is the success half: a replace has
+// to actually delete, update, insert and re-stamp the zone row. Without it
+// the rollback tests below would pass just as well against a ReplaceRecords
+// that wrote nothing at all and returned an error.
+func TestReplaceRecordsAppliesTheWholeDiff(t *testing.T) {
+	forEachDriver(t, func(t *testing.T, s Store) {
+		ctx := context.Background()
+		zid, keepID, doomedID := seedReplaceZone(t, s, testGroupName("replace-ok.test"))
+		before, _ := zoneSnapshot(t, s, zid)
+
+		next := before
+		next.SOASerial = 9
+		next.SOAMbox = "changed." + before.Name
+		next.ModifiedAt = 1785946876638
+
+		if err := s.Zones().ReplaceRecords(ctx, next,
+			[]int64{doomedID},
+			[]ZoneRecord{{ID: keepID, ZoneID: zid, Name: "www", Type: "A", TTL: 600, RData: "1.1.1.1", Enabled: true}},
+			[]ZoneRecord{{ZoneID: zid, Name: "new", Type: "A", TTL: 300, RData: "2.2.2.2", Enabled: true}},
+		); err != nil {
+			t.Fatalf("ReplaceRecords: %v", err)
+		}
+
+		gotZone, gotRecs := zoneSnapshot(t, s, zid)
+		if !reflect.DeepEqual(gotZone, next) {
+			t.Errorf("zone row after replace:\n got %+v\nwant %+v", gotZone, next)
+		}
+		byName := map[string]ZoneRecord{}
+		for _, r := range gotRecs {
+			byName[r.Name] = r
+		}
+		if len(gotRecs) != 2 {
+			t.Fatalf("records after replace = %+v, want www (updated) and new (added)", gotRecs)
+		}
+		if got := byName["www"]; got.ID != keepID || got.TTL != 600 {
+			t.Errorf("www = %+v, want row %d carrying the updated TTL 600", got, keepID)
+		}
+		if got := byName["new"]; got.RData != "2.2.2.2" || !got.Enabled {
+			t.Errorf("new = %+v, want the added record", got)
+		}
+		if _, still := byName["doomed"]; still {
+			t.Errorf("records after replace = %+v, want the deleted record gone", gotRecs)
+		}
+	})
+}
+
+// TestReplaceRecordsRollsBackEverythingOnFailure is the reason this method
+// exists. An import is a destructive whole-zone replace, and when it ran as
+// four separate writes a storage failure part-way through left the zone
+// matching neither the file nor what was there before.
+//
+// Both failure points are exercised, because they leave different wreckage:
+//
+//   - The zone row's write is the last one, so a failure there is the case
+//     that used to commit every record change and then fail to move the
+//     serial that describes them. That is the one inconsistency nothing
+//     downstream can detect — a secondary compares serials, sees the one it
+//     already has, and never asks for the new contents.
+//   - A record write failing mid-loop used to leave every earlier delete
+//     and update committed, with no record of where it stopped.
+//
+// Each asserts the zone is *exactly* as it was — row and records, by value,
+// ids included — rather than merely "still has some records".
+func TestReplaceRecordsRollsBackEverythingOnFailure(t *testing.T) {
+	forEachDriver(t, func(t *testing.T, s Store) {
+		ctx := context.Background()
+
+		// A second zone, whose name is what makes the zone row's write fail:
+		// zones.name is UNIQUE on both drivers (migration 0004), so renaming
+		// onto it is a genuine driver-level constraint violation raised
+		// part-way through the transaction — not an error the store code
+		// invented for the test's benefit.
+		occupied := testGroupName("replace-occupied.test")
+		if _, err := s.Zones().AddZone(ctx, Zone{Name: occupied, Type: "primary", Enabled: true, SOASerial: 1}); err != nil {
+			t.Fatalf("AddZone(occupied): %v", err)
+		}
+
+		t.Run("the zone row's write fails", func(t *testing.T) {
+			zid, keepID, doomedID := seedReplaceZone(t, s, testGroupName("replace-zonefail.test"))
+			wantZone, wantRecs := zoneSnapshot(t, s, zid)
+
+			doomedZone := wantZone
+			doomedZone.Name = occupied // UNIQUE violation on zones.name
+			doomedZone.SOASerial = wantZone.SOASerial + 1
+
+			err := s.Zones().ReplaceRecords(ctx, doomedZone,
+				[]int64{doomedID},
+				[]ZoneRecord{{ID: keepID, ZoneID: zid, Name: "www", Type: "A", TTL: 600, RData: "1.1.1.1", Enabled: true}},
+				[]ZoneRecord{{ZoneID: zid, Name: "new", Type: "A", TTL: 300, RData: "2.2.2.2", Enabled: true}},
+			)
+			if err == nil {
+				t.Fatal("ReplaceRecords succeeded with a colliding zone name")
+			}
+			// The sentinel has to survive the transaction path too, or the
+			// API answers 503 "storage unavailable" to what is a name
+			// collision (storeErrDup in internal/api/server.go).
+			if !errors.Is(err, ErrDuplicate) {
+				t.Errorf("err = %v, want ErrDuplicate", err)
+			}
+			assertZoneUnchanged(t, s, zid, wantZone, wantRecs)
+		})
+
+		t.Run("a record write fails", func(t *testing.T) {
+			zid, _, doomedID := seedReplaceZone(t, s, testGroupName("replace-recfail.test"))
+			wantZone, wantRecs := zoneSnapshot(t, s, zid)
+
+			nextZone := wantZone
+			nextZone.SOASerial = wantZone.SOASerial + 1
+
+			// The delete lands, then the update names a row that isn't there
+			// — the shape of a record deleted by another request between the
+			// diff and the write. The delete must not survive it.
+			err := s.Zones().ReplaceRecords(ctx, nextZone,
+				[]int64{doomedID},
+				[]ZoneRecord{{ID: 999999999, ZoneID: zid, Name: "www", Type: "A", TTL: 600, RData: "1.1.1.1", Enabled: true}},
+				[]ZoneRecord{{ZoneID: zid, Name: "new", Type: "A", TTL: 300, RData: "2.2.2.2", Enabled: true}},
+			)
+			if err == nil {
+				t.Fatal("ReplaceRecords succeeded with an update to a row that does not exist")
+			}
+			if !errors.Is(err, ErrNotFound) {
+				t.Errorf("err = %v, want ErrNotFound", err)
+			}
+			assertZoneUnchanged(t, s, zid, wantZone, wantRecs)
+		})
+	})
+}
+
+// assertZoneUnchanged fails unless the zone row and every record are
+// byte-for-byte what they were, ids included. "Exactly as it was" is the
+// whole claim a rollback makes: a zone left with the right *number* of
+// records but a moved serial, or the right serial and a churned row id, is
+// still a zone that matches neither the file nor what it was.
+func assertZoneUnchanged(t *testing.T, s Store, zoneID int64, wantZone Zone, wantRecs []ZoneRecord) {
+	t.Helper()
+	gotZone, gotRecs := zoneSnapshot(t, s, zoneID)
+	if !reflect.DeepEqual(gotZone, wantZone) {
+		t.Errorf("zone row changed despite the failure:\n got %+v\nwant %+v", gotZone, wantZone)
+	}
+	if gotZone.SOASerial != wantZone.SOASerial {
+		t.Errorf("SOA serial moved to %d despite the failure, want %d — records and serial must move together or not at all", gotZone.SOASerial, wantZone.SOASerial)
+	}
+	if !reflect.DeepEqual(gotRecs, wantRecs) {
+		t.Errorf("records changed despite the failure:\n got %+v\nwant %+v", gotRecs, wantRecs)
+	}
 }

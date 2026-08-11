@@ -37,6 +37,9 @@ func (f *fakeZoneStore) AddRecord(ctx context.Context, r store.ZoneRecord) (int6
 }
 func (f *fakeZoneStore) UpdateRecord(ctx context.Context, r store.ZoneRecord) error { return nil }
 func (f *fakeZoneStore) DeleteRecord(ctx context.Context, id int64) error           { return nil }
+func (f *fakeZoneStore) ReplaceRecords(ctx context.Context, z store.Zone, deleteIDs []int64, updates, adds []store.ZoneRecord) error {
+	return nil
+}
 
 // resolverWith builds a Resolver whose only zone is the enabled primary zone
 // e412.in, holding recs, reloaded once so its snapshot is populated.

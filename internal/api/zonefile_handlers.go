@@ -315,10 +315,12 @@ func (s *Server) handleZoneFileImport(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := s.applyZoneFile(r, zone, pz, result); err != nil {
-		// ZoneStore has no transaction, so a storage failure part-way
-		// through leaves the zone part-replaced. Reload anyway: whatever did
-		// commit is what the resolver must now be serving, and leaving the
-		// old snapshot up would answer from records the store no longer has.
+		// The replace is one transaction (store.ZoneStore.ReplaceRecords), so
+		// a failure part-way through leaves the zone exactly as it was and
+		// the snapshot already loaded is still right. Reload anyway: a
+		// failure *at commit* is the one case where what the store holds is
+		// not knowable from here, and re-reading is cheap next to answering
+		// from records the store may no longer have.
 		s.reloadZones(r)
 		storeErr(w, err)
 		return
@@ -390,9 +392,16 @@ func diffZoneRecords(zoneName string, existing, want []store.ZoneRecord, result 
 	return result
 }
 
-// applyZoneFile commits a diff and the file's SOA. It runs deletes first,
-// then changes, then adds, so a name that swaps which records live under
-// it never has both sets present at once.
+// applyZoneFile commits a diff and the file's SOA as a single transaction
+// (store.ZoneStore.ReplaceRecords): deletes first, then changes, then adds,
+// so a name that swaps which records live under it never has both sets
+// present at once — and then the zone row, so the new records and the
+// serial that describes them land together or not at all.
+//
+// The serial in particular is why one store call replaced four. A zone that
+// committed its new records but not its new serial answers with contents no
+// secondary has any reason to ask for again, and unlike a half-written set
+// of records, nothing downstream can tell that has happened.
 //
 // It deliberately does NOT call syncPTR. Import writes exactly what the
 // file contains and nothing else: a forward-zone import must not silently
@@ -408,22 +417,19 @@ func (s *Server) applyZoneFile(r *http.Request, zone store.Zone, pz zones.Parsed
 	// and more pressing here, since stopping part-way through leaves the zone
 	// neither the file nor what it was.
 	ctx := context.WithoutCancel(r.Context())
-	zs := s.deps.Store.Zones()
 
+	// The store deletes by row id and nothing else, so that is what it is
+	// handed: a whole record here would carry five other fields it must not
+	// act on.
+	deleteIDs := make([]int64, 0, len(diff.Delete))
 	for _, rec := range diff.Delete {
-		if err := zs.DeleteRecord(ctx, rec.ID); err != nil {
-			return err
-		}
+		deleteIDs = append(deleteIDs, rec.ID)
 	}
+	// Only the "to" side of each change is written. The "from" side exists
+	// for the caller's diff, not for the store.
+	updates := make([]store.ZoneRecord, 0, len(diff.Change))
 	for _, ch := range diff.Change {
-		if err := zs.UpdateRecord(ctx, ch.To); err != nil {
-			return err
-		}
-	}
-	for _, rec := range diff.Add {
-		if _, err := zs.AddRecord(ctx, rec); err != nil {
-			return err
-		}
+		updates = append(updates, ch.To)
 	}
 
 	// The file's SOA becomes the zone's (RFC 1034 §3.6.1) — its NS, mbox,
@@ -450,5 +456,6 @@ func (s *Server) applyZoneFile(r *http.Request, zone store.Zone, pz zones.Parsed
 	zone.SOATTL = pz.SOA.Hdr.Ttl
 	zone.SOASerial = max(pz.SOA.Serial, zone.SOASerial) + 1
 	zone.ModifiedAt = time.Now().UnixMilli()
-	return zs.UpdateZone(ctx, zone)
+
+	return s.deps.Store.Zones().ReplaceRecords(ctx, zone, deleteIDs, updates, diff.Add)
 }

@@ -291,6 +291,10 @@ apply it.
 An invalid file is rejected whole, with every problem it found named, not
 just the first — no partial import, and nothing changes.
 
+Applying an import is all-or-nothing too: if storage fails part-way
+through, the zone is left exactly as it was, and the same file can be
+imported again.
+
 Import does not create PTR records the way adding an A record by hand does
 (see Auto-PTR above) — it writes only to the zone being imported into. A
 reverse zone gets its PTRs by importing its own file.

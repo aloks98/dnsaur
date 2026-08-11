@@ -72,6 +72,29 @@ type ZoneStore interface {
 	AddRecord(ctx context.Context, r ZoneRecord) (int64, error)
 	UpdateRecord(ctx context.Context, r ZoneRecord) error
 	DeleteRecord(ctx context.Context, id int64) error
+	// ReplaceRecords rewrites a zone in one transaction: the rows named by
+	// deleteIDs go, updates are applied in place, adds are inserted, and z
+	// replaces the zone row itself — all of it or none of it.
+	//
+	// It exists because a zone-file import (and, from Milestone D, a zone
+	// transfer) is a destructive whole-zone replace, not a sequence of
+	// independent edits. Run as separate writes, a storage failure part-way
+	// through leaves the zone matching neither its new contents nor its old
+	// ones, with no record of where it stopped.
+	//
+	// The zone row is in the same transaction as the records, and that is
+	// the point of passing z at all rather than leaving the caller to follow
+	// with UpdateZone. The SOA serial is how every consumer of this zone —
+	// a secondary above all — decides whether it already has the current
+	// contents. Records that committed while the serial that describes them
+	// did not is the one inconsistency nothing downstream can detect: the
+	// zone answers with new data under an old serial, and a secondary that
+	// has already seen that serial will never ask again.
+	//
+	// The caller supplies z whole, serial included, because what the new
+	// serial should be is a question about DNS (RFC 1982 arithmetic, never
+	// going backwards), not about storage.
+	ReplaceRecords(ctx context.Context, z Zone, deleteIDs []int64, updates, adds []ZoneRecord) error
 }
 
 type zoneStore struct{ s *sqlStore }
@@ -119,9 +142,36 @@ func (z *zoneStore) AddZone(ctx context.Context, zn Zone) (int64, error) {
 		zn.Name, zn.Type, zn.Enabled, zn.SOANS, zn.SOAMbox, zn.SOASerial, zn.SOARefresh, zn.SOARetry, zn.SOAExpire, zn.SOAMinimum, zn.SOATTL, zn.Primaries, zn.TSIGKeyID, zn.ExpiresAt, zn.RefreshedAt, zn.CreatedAt, zn.ModifiedAt)
 }
 
+// The four write statements below are each written once and used twice:
+// on their own, through the sqlStore helpers that autocommit, and inside
+// ReplaceRecords' transaction. Sharing the text is what keeps the two
+// paths from drifting — a column added to the hand-write path and missed
+// on the import path would be a difference no test of either path alone
+// could see, and the zone would silently keep whatever the import didn't
+// write.
+const (
+	updateZoneSQL   = `UPDATE zones SET name = ?, type = ?, enabled = ?, soa_ns = ?, soa_mbox = ?, soa_serial = ?, soa_refresh = ?, soa_retry = ?, soa_expire = ?, soa_minimum = ?, soa_ttl = ?, primaries = ?, tsig_key_id = ?, expires_at = ?, refreshed_at = ?, modified_at = ? WHERE id = ?`
+	insertRecordSQL = `INSERT INTO zone_records (zone_id, name, type, ttl, rdata, enabled, comment) VALUES (?, ?, ?, ?, ?, ?, ?)`
+	// zone_id is deliberately not in the SET list: a record is deleted and
+	// recreated to move between zones, not updated in place.
+	updateRecordSQL = `UPDATE zone_records SET name = ?, type = ?, ttl = ?, rdata = ?, enabled = ?, comment = ? WHERE id = ?`
+	deleteRecordSQL = `DELETE FROM zone_records WHERE id = ?`
+)
+
+func updateZoneArgs(zn Zone) []any {
+	return []any{zn.Name, zn.Type, zn.Enabled, zn.SOANS, zn.SOAMbox, zn.SOASerial, zn.SOARefresh, zn.SOARetry, zn.SOAExpire, zn.SOAMinimum, zn.SOATTL, zn.Primaries, zn.TSIGKeyID, zn.ExpiresAt, zn.RefreshedAt, zn.ModifiedAt, zn.ID}
+}
+
+func insertRecordArgs(r ZoneRecord) []any {
+	return []any{r.ZoneID, r.Name, r.Type, r.TTL, r.RData, r.Enabled, r.Comment}
+}
+
+func updateRecordArgs(r ZoneRecord) []any {
+	return []any{r.Name, r.Type, r.TTL, r.RData, r.Enabled, r.Comment, r.ID}
+}
+
 func (z *zoneStore) UpdateZone(ctx context.Context, zn Zone) error {
-	return z.s.execOne(ctx, `UPDATE zones SET name = ?, type = ?, enabled = ?, soa_ns = ?, soa_mbox = ?, soa_serial = ?, soa_refresh = ?, soa_retry = ?, soa_expire = ?, soa_minimum = ?, soa_ttl = ?, primaries = ?, tsig_key_id = ?, expires_at = ?, refreshed_at = ?, modified_at = ? WHERE id = ?`,
-		zn.Name, zn.Type, zn.Enabled, zn.SOANS, zn.SOAMbox, zn.SOASerial, zn.SOARefresh, zn.SOARetry, zn.SOAExpire, zn.SOAMinimum, zn.SOATTL, zn.Primaries, zn.TSIGKeyID, zn.ExpiresAt, zn.RefreshedAt, zn.ModifiedAt, zn.ID)
+	return z.s.execOne(ctx, updateZoneSQL, updateZoneArgs(zn)...)
 }
 
 func (z *zoneStore) DeleteZone(ctx context.Context, id int64) error {
@@ -171,17 +221,68 @@ func (z *zoneStore) AllRecords(ctx context.Context) (map[int64][]ZoneRecord, err
 }
 
 func (z *zoneStore) AddRecord(ctx context.Context, r ZoneRecord) (int64, error) {
-	return z.s.insert(ctx, `INSERT INTO zone_records (zone_id, name, type, ttl, rdata, enabled, comment) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		r.ZoneID, r.Name, r.Type, r.TTL, r.RData, r.Enabled, r.Comment)
+	return z.s.insert(ctx, insertRecordSQL, insertRecordArgs(r)...)
 }
 
 func (z *zoneStore) UpdateRecord(ctx context.Context, r ZoneRecord) error {
-	// zone_id is deliberately not in the SET list: a record is deleted and
-	// recreated to move between zones, not updated in place.
-	return z.s.execOne(ctx, `UPDATE zone_records SET name = ?, type = ?, ttl = ?, rdata = ?, enabled = ?, comment = ? WHERE id = ?`,
-		r.Name, r.Type, r.TTL, r.RData, r.Enabled, r.Comment, r.ID)
+	return z.s.execOne(ctx, updateRecordSQL, updateRecordArgs(r)...)
 }
 
 func (z *zoneStore) DeleteRecord(ctx context.Context, id int64) error {
-	return z.s.execOne(ctx, `DELETE FROM zone_records WHERE id = ?`, id)
+	return z.s.execOne(ctx, deleteRecordSQL, id)
+}
+
+// ReplaceRecords runs the whole replace — records and the zone row — as one
+// transaction. See the interface for why the zone row is in it.
+//
+// The statements are the same ones the single-write methods above issue,
+// one per row rather than one batched DELETE ... IN / multi-row INSERT.
+// Round trips are not what a replace costs: this is one transaction and one
+// commit, where the same work previously cost one commit *per row*, so even
+// the largest import a zone file can express (the API caps a file at a
+// megabyte, roughly 35,000 records) is cheaper here than it was before.
+// Batching would buy the remaining round trips at the price of building
+// placeholder lists that differ per dialect and can exceed postgres's
+// parameter limit — a real correctness risk for a saving that isn't the
+// bottleneck.
+func (z *zoneStore) ReplaceRecords(ctx context.Context, zn Zone, deleteIDs []int64, updates, adds []ZoneRecord) error {
+	tx, err := z.s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	// Undoes every statement below unless Commit ran, in which case it is a
+	// no-op. Same shape as clientStore.DeleteGroup (crud.go).
+	defer tx.Rollback()
+
+	// Deletes, then updates, then adds — the order the API's import applied
+	// them in when these were separate writes, kept so the sequence of
+	// statements a replace issues is the one already in use rather than a
+	// new one whose interaction with a future constraint on zone_records
+	// nobody has thought about.
+	for _, id := range deleteIDs {
+		if err := execOneTx(ctx, tx, z.s.dialect, deleteRecordSQL, id); err != nil {
+			return wrapDBErr(err)
+		}
+	}
+	for _, r := range updates {
+		if err := execOneTx(ctx, tx, z.s.dialect, updateRecordSQL, updateRecordArgs(r)...); err != nil {
+			return wrapDBErr(err)
+		}
+	}
+	for _, r := range adds {
+		// Plain Exec rather than the insert helper: a replace has no use for
+		// the new row ids, and skipping them is what lets one statement run
+		// unchanged on both drivers — postgres needs RETURNING to report an
+		// id, sqlite needs LastInsertId.
+		if _, err := tx.ExecContext(ctx, z.s.q(insertRecordSQL), insertRecordArgs(r)...); err != nil {
+			return wrapDBErr(err)
+		}
+	}
+	// Last, and inside the same transaction: this is the write that carries
+	// the new SOA serial, and the failure this method exists to prevent is
+	// exactly this statement failing after the records committed.
+	if err := execOneTx(ctx, tx, z.s.dialect, updateZoneSQL, updateZoneArgs(zn)...); err != nil {
+		return wrapDBErr(err)
+	}
+	return tx.Commit()
 }

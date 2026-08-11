@@ -194,7 +194,10 @@ Full parameter/response detail lives in `internal/api/openapi.yaml`
   shape. Records are validated exactly as `POST /zones/{id}/records`
   validates a hand write, against the file's own records rather than the
   zone's current ones; any failure rejects the whole file with `422` and no
-  writes. The `422` body carries `errors` — one message per problem, not
+  writes. A committed import is applied as one database transaction — every
+  delete, change and add plus the new SOA serial land together or not at
+  all — so a `503` from a storage failure leaves the zone exactly as it
+  was, and the same file can simply be posted again. The `422` body carries `errors` — one message per problem, not
   all in one shape: most name `line N` or the record's name/type/rdata (a
   `$GENERATE` line expands to several with no line of their own), but a
   few — a missing SOA, say — are about the file as a whole and name
