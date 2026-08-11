@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+
+	"github.com/aloks98/dnsaur/internal/zones"
 )
 
 func TestZoneFileExport(t *testing.T) {
@@ -267,17 +269,28 @@ host1 600 IN A 10.0.0.9
 // Export then import is the round trip the whole milestone rests on: a
 // zone handed back its own file must come out as no change at all. It is
 // also the only test that catches the two sides disagreeing about how one
-// RR is spelled — a record stored exactly as it was typed ("hello") and
-// the same record read back from a master file ("\"hello\"") are one RR,
-// and comparing the strings rather than the RRs would report a delete and
-// an add of every such record on every import forever.
+// RR is spelled — a bare `hello` and a quoted `"hello"` are one RR written
+// two ways, and comparing the strings rather than the RRs would report a
+// delete and an add of every such record on every import forever.
+//
+// Since buildZoneRecord normalises rdata, a hand write no longer produces
+// the unquoted spelling in the first place, so the TXT record below is
+// asserted to have been stored quoted rather than merely assumed to have
+// been. What still reaches identify()'s normalisation is a row written
+// before that fix — no migration rewrote them — which this test cannot
+// produce through the API and so does not cover.
 func TestZoneFileImportRoundTripsAnExportedZone(t *testing.T) {
 	srv := newTestServer(t)
 	zid := srv.createZone(t, "e412.in")
 	srv.createRecord(t, zid, `{"name":"bifrost","type":"A","ttl":300,"rdata":"57.129.69.158"}`)
 	srv.createRecord(t, zid, `{"name":"@","type":"MX","ttl":3600,"rdata":"10 mail.e412.in."}`)
-	// Unquoted on the way in, quoted on the way back out of a master file.
+	// Unquoted on the way in, and stored — like a master file writes it —
+	// quoted.
 	srv.createRecord(t, zid, `{"name":"@","type":"TXT","ttl":300,"rdata":"hello"}`)
+	txt := srv.recordsByType(t, zid, "TXT")
+	if len(txt) != 1 || txt[0].RData != `"hello"` {
+		t.Fatalf("stored TXT = %+v, want rdata \"hello\" with its quotes", txt)
+	}
 
 	export := srv.do(t, "GET", fmt.Sprintf("/api/v1/zones/%d/file", zid), "")
 	if export.Code != http.StatusOK {
@@ -527,5 +540,60 @@ func TestZoneFileImportAcceptsABodyAtExactlyTheCap(t *testing.T) {
 	}
 	if got := len(srv.records(t, zid)); got != 2 {
 		t.Fatalf("records = %d, want the file's 2", got)
+	}
+}
+
+// buildZoneRecord validates the import path as well as the hand-write path
+// (spec §8: one validator, not two) and it normalises rdata. Here that has
+// to be a no-op: zones.Parse already derives ParsedRecord.RData through the
+// same call (classify), so a record read out of a file arrives normalised
+// and there is nothing left to rewrite. If it were not a no-op, import would
+// be editing the file's own records on the way in — the thing spec §8
+// objects to, and the thing that would stop a zone round-tripping back to
+// the file its author supplied.
+//
+// The fixture is deliberately every spelling normalisation touches: a bare
+// relative target, a fully qualified one, an expanded IPv6 address, an
+// unquoted TXT and a relative MX exchange.
+func TestZoneFileImportStoresExactlyWhatTheFileParsedTo(t *testing.T) {
+	const file = `$ORIGIN e412.in.
+$TTL 300
+@ IN SOA ns.e412.in. hostadmin.e412.in. ( 5 900 300 604800 900 )
+@ IN NS ns.e412.in.
+git 300 IN CNAME nas
+vcs 300 IN CNAME nas.e412.in.
+host 300 IN A 192.168.1.9
+host6 300 IN AAAA 2001:0db8:0000:0000:0000:0000:0000:0001
+note 300 IN TXT hello
+@ 3600 IN MX 10 mail
+`
+	pz, errs := zones.Parse(file, "e412.in")
+	if len(errs) > 0 {
+		t.Fatalf("fixture does not parse: %v", errs)
+	}
+	want := map[string]string{}
+	for _, r := range pz.Records {
+		want[r.Name+" "+r.Type] = r.RData
+	}
+
+	srv, zid := newTestServerWithZone(t, "e412.in")
+	if rec := srv.do(t, "POST", fmt.Sprintf("/api/v1/zones/%d/file", zid), importBody(t, file, false)); rec.Code != http.StatusOK {
+		t.Fatalf("import status = %d body = %s", rec.Code, rec.Body)
+	}
+
+	stored := srv.records(t, zid)
+	if len(stored) != len(want) {
+		t.Fatalf("stored %d records, the file has %d", len(stored), len(want))
+	}
+	for _, got := range stored {
+		key := got.Name + " " + got.Type
+		w, ok := want[key]
+		if !ok {
+			t.Errorf("stored a record the file has no line for: %s %q", key, got.RData)
+			continue
+		}
+		if got.RData != w {
+			t.Errorf("%s: stored %q but the file parsed to %q — import rewrote the file's own rdata", key, got.RData, w)
+		}
 	}
 }

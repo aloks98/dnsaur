@@ -383,6 +383,14 @@ the apex is stripped):
 `"<name> <ttl> IN <type> <rdata>"` to `dns.NewRR` — the same parser that
 builds the RR the resolver actually serves — so an accepted record is by
 construction servable, and a `400` carries that parser's own error text.
+
+What comes back from a subsequent `GET` is that parser's spelling of the
+value rather than the text that was sent: `nas.example.com` reads back
+`nas.example.com.`, `hello` reads back `"hello"`, `2001:0db8::0001` reads
+back `2001:db8::1`. A form that echoes the value it just submitted will
+show it changed — refetch after a write rather than assuming the field
+round-trips.
+
 Real capture, an unparseable A record:
 
 ```json
@@ -1221,6 +1229,16 @@ Collected because each one has already caused, or would cause, a wrong UI.
     serving them, not at the failed attempt.
 15. **A list's `name` is derived unless the admin set one**, so it is not a
     stable identifier — key on `id`, and keep the `url` visible next to it.
+16. **A zone record's `name` is relative but its `rdata` is absolute.** `name`
+    is resolved against the zone apex (§3.7), while `rdata` is parsed by
+    `dns.NewRR` under *no* `$ORIGIN` (`zones.ToRR`), so a dotless CNAME/MX/NS/
+    PTR/SRV target is already fully qualified — `nas` is the name `nas.`, not
+    `nas.<zone>`. Both spellings are valid records, so this is not something to
+    validate; it is something to *say*. Cloudflare and Route 53 resolve the
+    dotless form against the zone, so that is the habit users arrive with, and
+    a silently-wrong record is the result. The zone detail row (`/zones/{id}`)
+    labels both columns for this reason: the apex sits in a chip beside Name,
+    and the name-valued types get a `FULL NAME` chip beside Data.
 
 ---
 

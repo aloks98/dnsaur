@@ -134,9 +134,11 @@ test("first-run setup, login, create a zone and add a record, dark mode persists
   const zoneEntry = zoneName.locator("xpath=..");
   await expect(zoneEntry.getByText("Enabled", { exact: true })).toBeVisible();
 
-  // The add form is the records grid's own first row, not a dialog: fill it
-  // in place and submit. Data is one text input regardless of record type —
-  // the DNS parser validates it server-side, there is no per-type form.
+  // The add form is the records grid's own row, not a dialog — but it is
+  // closed until Add record opens it, so that comes first. Data is one text
+  // input regardless of record type — the DNS parser validates it
+  // server-side, there is no per-type form.
+  await page.getByRole("button", { name: "Add record" }).click();
   await page.getByLabel("Zone record name").fill("bifrost");
   await page.getByLabel("Data", { exact: true }).fill("10.0.0.9");
   await page.getByRole("button", { name: "Add", exact: true }).click();

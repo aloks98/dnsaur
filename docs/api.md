@@ -154,7 +154,15 @@ Full parameter/response detail lives in `internal/api/openapi.yaml`
   `*.nexus`; a fully-qualified name has the apex stripped automatically).
   `rdata` is DNS presentation format, validated by handing it to the same
   DNS parser (`miekg/dns`) that builds the record dnsaur serves, so a `400`
-  carries that parser's own error text. `PTR` is a normal record type here
+  carries that parser's own error text. **What is stored is that parser's
+  own spelling of the value, not the text you sent**, so a later `GET` can
+  return a string that differs from the one you wrote: `nas.example.com`
+  comes back `nas.example.com.`, `hello` comes back `"hello"`,
+  `2001:0db8::0001` comes back `2001:db8::1`. The record answers exactly
+  the same either way — a name in rdata without a trailing dot is read as
+  absolute, not relative to the zone — but only the stored spelling still
+  means that when the zone is exported to a file, where a dotless name
+  *is* relative. `PTR` is a normal record type here
   like any other — its `rdata` is a domain name, not an address (RFC
   1034); the address is encoded in the record's `name` instead. Three
   write conflicts return `409`: a CNAME beside another record at the same

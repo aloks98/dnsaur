@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useEffect, useId, useMemo, useRef, useState, type ReactNode } from "react";
 import { Link, useNavigate, useParams } from "react-router";
 import {
   AlertCircle,
@@ -110,6 +110,76 @@ const DATA_PLACEHOLDER: Record<RecordType, string> = {
   PTR: "bifrost.e412.in.",
 };
 
+/**
+ * The types whose rdata is a domain name, and so the ones whose Data field
+ * carries the FULL NAME chip — exactly the artboard's set.
+ *
+ * The two columns read their names under different origins, and nothing on
+ * screen used to say so. Name is relative to the zone ("bifrost" under
+ * e412.in is bifrost.e412.in), but rdata is parsed by ToRR under *no*
+ * origin (see buildZoneRecord in internal/api/zonerecords_handlers.go), so
+ * a dotless target there is already absolute — "nas" is the name `nas.`,
+ * not nas.e412.in. Cloudflare and Route 53 accept the dotless spelling and
+ * resolve it against the zone, so that is the habit users arrive with.
+ *
+ * The chip is a label, not a rule: the server stores whatever either
+ * spelling parses to, and both are valid records. Nothing here validates.
+ */
+const NAME_VALUED_TYPES = new Set<RecordType>(["CNAME", "MX", "NS", "PTR", "SRV"]);
+
+/**
+ * How much of the zone apex the Name field's suffix chip keeps when it
+ * doesn't fit, per the artboard's own clip.
+ *
+ * The chip keeps the *head* and drops the tail: `.150.168.192…` rather than
+ * `.…in-addr.arpa`. A chip is only useful if what survives it is the part
+ * that says which zone this is, and for the apexes long enough to need
+ * clipping at all — the IPv4 reverse zones — the tail is exactly the part
+ * they all share. `in-addr.arpa` distinguishes nothing; the leading octets
+ * are the whole of the zone's identity. The full apex stays reachable
+ * either way: `title` for a pointer, and the field's accessible description
+ * for everyone else (see the chip's own comment below).
+ *
+ * A character clip rather than CSS truncation because the string is joined
+ * to a leading dot and the two have to be measured together; `max-w` on the
+ * chip is still there as a backstop.
+ */
+const SUFFIX_VISIBLE_CHARS = 12;
+
+function clipApex(apex: string): string {
+  // At exactly one character over, the ellipsis costs as much as it saves.
+  if (apex.length <= SUFFIX_VISIBLE_CHARS + 1) return apex;
+  // A dot immediately before the ellipsis reads as a fourth, empty octet —
+  // `.150.168.192.…` — so the cut moves back onto the label it lands after.
+  return `${apex.slice(0, SUFFIX_VISIBLE_CHARS).replace(/\.$/, "")}…`;
+}
+
+/**
+ * The create/edit row's two composite fields: a borderless input plus a
+ * fixed chip, sharing one border and one focus ring so the pair reads as a
+ * single control. The shell carries the box rnui's Input would normally
+ * draw itself, which is why the input inside has to give its own back.
+ */
+const FIELD_SHELL = cn(
+  "flex h-8 min-w-0 items-stretch rounded-lg border border-input bg-transparent transition-colors",
+  "focus-within:border-ring focus-within:ring-3 focus-within:ring-ring/50 dark:bg-input/30",
+);
+
+/** The invalid state moves to the shell with the border — same tones rnui's
+ * Input uses for `aria-invalid`, so an errored Data field looks unchanged. */
+const FIELD_SHELL_INVALID =
+  "border-destructive ring-3 ring-destructive/20 dark:border-destructive/50 dark:ring-destructive/40";
+
+/** Strips the box off the input so the shell above can draw it once. */
+const FIELD_INPUT = cn(
+  "h-full flex-1 rounded-none border-0 bg-transparent font-mono shadow-none dark:bg-transparent",
+  "focus-visible:ring-0 aria-invalid:ring-0",
+);
+
+/** The muted chip both fields end in, divided from the input by a rule. */
+const FIELD_CHIP =
+  "flex shrink-0 items-center border-l border-input bg-muted px-2 font-mono whitespace-nowrap text-muted-foreground";
+
 /** A category tag, not a verdict — exact mapping from the artboard. */
 const RECORD_TYPE_VARIANT: Record<RecordType, NonNullable<BadgeProps["variant"]>> = {
   A: "primary-light",
@@ -190,25 +260,42 @@ function RecordName({ name }: { name: string }) {
 }
 
 /**
- * The create/edit row: one persistent band, not a dialog — mirroring
- * dns.tsx's RecordFormRow. `editing` binds it to an existing record (Save,
- * PUT); `null` is the add case (Add, POST, and the row re-clears itself for
- * the next one — adding one record is often adding several).
+ * The record form — one control row on the records grid, in one of two
+ * placements, and `editing` is what tells them apart.
  *
- * `focusCue` is a bump-to-refocus signal: the header's "Add record" button
- * needs to both cancel any in-progress edit *and* focus Name even when the
- * row is already in add mode (where `editing` alone wouldn't change and so
- * wouldn't retrigger the effect below).
+ * `null` is the add case (Add, POST): a new record has no row of its own to
+ * become, so the form sits as a band between the grid header and the list.
+ * Bound to a record it *is* that record's row (Save, PUT), rendered inside
+ * the scrolling list in the row's own place — so the record is never on
+ * screen twice, which is exactly what a band above the list made it.
+ *
+ * Only ever one instance is mounted; the call site enforces that (see
+ * `addOpen`'s comment in ZoneDetail).
+ *
+ * Every mount is bound to one target for its whole life — the edit row is
+ * keyed by record id, the add band by a counter the header's button bumps —
+ * so no live form ever has to re-seed itself from a different record.
+ * Mounting is also what drops a previous attempt's server error.
+ *
+ * The X closes the form in both placements — `onDone` does that at the call
+ * site. A successful *edit* has nothing left to keep it open for, so it
+ * closes the same way (`onDone` again). A successful *add* is the one
+ * exception: the band re-clears itself and stays open instead of closing,
+ * because adding one record is usually adding several, and forcing a
+ * re-open for each one would make the common case the annoying one.
  */
 function RecordFormRow({
   zoneId,
+  apex,
   editing,
-  focusCue,
   onDone,
 }: {
   zoneId: number;
+  /** The zone's own name, shown beside Name so the field reads as the
+   * subdomain it actually is. Passed in rather than re-fetched: the row is
+   * only ever mounted from a loaded zone. */
+  apex: string;
   editing: ZoneRecord | null;
-  focusCue: number;
   onDone: () => void;
 }) {
   const createRecord = useCreateZoneRecord();
@@ -220,16 +307,32 @@ function RecordFormRow({
   const isEdit = editing !== null;
   const busy = createRecord.isPending || updateRecord.isPending;
 
-  // Re-seed whenever the target or the header's focus cue changes —
-  // `form.reset` also clears any server-error set on rdata by a previous
-  // attempt, so switching context never carries a stale parser message.
+  // Focus Name on mount. Seeding is `defaultValues` above rather than a
+  // reset here, because a mount is bound to one target for its whole life
+  // (see this component's own comment) — there is no "the target changed
+  // underneath me" case left to handle.
+  //
+  // The focus is also what keeps an edited row on screen: it lives in the
+  // scrolling list now, so the browser scrolls it into view the moment it
+  // opens. See ZoneDetail's `editingId` comment.
   useEffect(() => {
-    const defaults = recordFormDefaults(editing);
-    form.reset(defaults);
     form.setFocus("name");
-  }, [editing, focusCue, form]);
+  }, [form]);
 
   const type = form.watch("type");
+
+  // At "@" the zone *is* the name, so the chip carries the apex whole and
+  // the typed text goes muted — the field is saying "there is nothing left
+  // for you to add". Anywhere else it carries the apex with its joining
+  // dot, and what's typed reads as the subdomain in front of it. A wildcard
+  // ("*", "*.nexus") is an ordinary relative name and gets no special case.
+  const atApex = form.watch("name").trim() === "@";
+  const suffixFull = atApex ? apex : `.${apex}`;
+  const suffixShown = atApex ? clipApex(apex) : `.${clipApex(apex)}`;
+  const dataIsName = NAME_VALUED_TYPES.has(type);
+  const fieldId = useId();
+  const nameSuffixId = `${fieldId}-name-suffix`;
+  const dataSuffixId = `${fieldId}-data-suffix`;
 
   function onSubmit(values: RecordFormValues) {
     const payload = {
@@ -293,10 +396,12 @@ function RecordFormRow({
         noValidate
         data-slot="zone-record-form-row"
         data-testid="record-form-row"
-        className={cn(
-          "shrink-0 border-b border-border bg-card shadow-[inset_3px_0_0_var(--primary)]",
-          isEdit && "bg-primary/5",
-        )}
+        // One treatment for both placements, because it is one control: the
+        // card background, the 3px primary edge and a full-strength bottom
+        // border. In the list — where the neighbouring rows are transparent
+        // and ruled with border-muted — those three are what mark the row
+        // out as the one being written.
+        className="shrink-0 border-b border-border bg-card shadow-[inset_3px_0_0_var(--primary)]"
       >
         <div className={cn(GRID, "py-2.5")}>
           <FormField
@@ -304,15 +409,42 @@ function RecordFormRow({
             name="name"
             render={({ field }) => (
               <FormItem>
-                <FormControl>
-                  <Input
-                    {...field}
-                    aria-label="Zone record name"
-                    placeholder="@ or bifrost"
-                    autoComplete="off"
-                    className="font-mono"
-                  />
-                </FormControl>
+                {/* The shell sits inside FormItem rather than replacing it,
+                    so FormControl still slots onto the input itself — the
+                    id, the label association and aria-invalid all stay
+                    where a form control's belong. */}
+                <div className={FIELD_SHELL}>
+                  <FormControl>
+                    <Input
+                      {...field}
+                      aria-label="Zone record name"
+                      // The suffix is context, not part of the value being
+                      // typed, so it reaches assistive tech as this field's
+                      // *description* — the accessible name is untouched.
+                      // This replaces FormControl's own describedby, which
+                      // points at a FormDescription this row never renders.
+                      aria-describedby={nameSuffixId}
+                      placeholder="@ or bifrost"
+                      autoComplete="off"
+                      className={cn(FIELD_INPUT, atApex && "text-muted-foreground")}
+                    />
+                  </FormControl>
+                  {/* Hidden from assistive tech because what it shows may be
+                      clipped; the unclipped apex is next to it, and that is
+                      what gets announced. `title` is the pointer's copy of
+                      the same thing. */}
+                  <span
+                    data-testid="zone-name-suffix"
+                    aria-hidden="true"
+                    title={suffixFull}
+                    className={cn(FIELD_CHIP, "max-w-[126px] overflow-hidden text-xs")}
+                  >
+                    {suffixShown}
+                  </span>
+                  <span id={nameSuffixId} className="sr-only">
+                    {suffixFull}
+                  </span>
+                </div>
               </FormItem>
             )}
           />
@@ -349,21 +481,37 @@ function RecordFormRow({
             name="rdata"
             render={({ field }) => (
               <FormItem>
-                <FormControl>
-                  <Input
-                    {...field}
-                    onChange={(e) => {
-                      field.onChange(e);
-                      // A fresh attempt deserves a fresh read of the parser,
-                      // not last submit's stale rejection sitting under it.
-                      if (form.formState.errors.rdata) form.clearErrors("rdata");
-                    }}
-                    aria-label="Data"
-                    placeholder={DATA_PLACEHOLDER[type]}
-                    autoComplete="off"
-                    className="font-mono"
-                  />
-                </FormControl>
+                <div className={cn(FIELD_SHELL, rdataError && FIELD_SHELL_INVALID)}>
+                  <FormControl>
+                    <Input
+                      {...field}
+                      onChange={(e) => {
+                        field.onChange(e);
+                        // A fresh attempt deserves a fresh read of the parser,
+                        // not last submit's stale rejection sitting under it.
+                        if (form.formState.errors.rdata) form.clearErrors("rdata");
+                      }}
+                      aria-label="Data"
+                      // Described by the chip itself, not a hidden twin: this
+                      // one is never clipped, so its own text is the whole of
+                      // what it says. Types without the chip fall back to no
+                      // description at all.
+                      aria-describedby={dataIsName ? dataSuffixId : undefined}
+                      placeholder={DATA_PLACEHOLDER[type]}
+                      autoComplete="off"
+                      className={FIELD_INPUT}
+                    />
+                  </FormControl>
+                  {dataIsName && (
+                    <span
+                      id={dataSuffixId}
+                      data-testid="record-data-suffix"
+                      className={cn(FIELD_CHIP, "text-xs tracking-widest uppercase")}
+                    >
+                      Full name
+                    </span>
+                  )}
+                </div>
               </FormItem>
             )}
           />
@@ -375,7 +523,7 @@ function RecordFormRow({
               type="button"
               size="icon-sm"
               variant="ghost"
-              aria-label={isEdit ? "Cancel editing" : "Clear the form"}
+              aria-label={isEdit ? "Cancel editing" : "Close"}
               onClick={() => {
                 form.reset(recordFormDefaults(null));
                 onDone();
@@ -395,9 +543,22 @@ function RecordFormRow({
             to land somewhere, or the Add/Save button just looks dead. */}
         {hasRowError && (
           <div className={cn(GRID, "items-start pb-2.5 text-xs text-pretty")}>
-            <FormField control={form.control} name="name" render={() => <FormMessage />} />
-            <FormField control={form.control} name="type" render={() => <FormMessage />} />
-            <FormField control={form.control} name="ttl" render={() => <FormMessage />} />
+            {/* Each cell is a real element even when its column has nothing
+                to say, because FormMessage renders *null* when there is no
+                error. Left bare, the three quiet columns would contribute no
+                grid children at all and auto-placement would slide Data's
+                error left into the Name column — which is where it used to
+                land, the common case being a rejected Data value and nothing
+                else. The span is what holds the column open. */}
+            <span>
+              <FormField control={form.control} name="name" render={() => <FormMessage />} />
+            </span>
+            <span>
+              <FormField control={form.control} name="type" render={() => <FormMessage />} />
+            </span>
+            <span>
+              <FormField control={form.control} name="ttl" render={() => <FormMessage />} />
+            </span>
             {/* Data's error is the DNS parser's own output (or the server's
                 RFC-conflict text) — rendered distinctly, mono with an
                 alert-circle icon, rather than as a plain FormMessage; see
@@ -421,11 +582,16 @@ function RecordFormRow({
 function RecordRow({
   record,
   readOnly,
+  actionsInert,
   onEdit,
   onDelete,
 }: {
   record: ZoneRecord;
   readOnly: boolean;
+  /** Some other row is being edited. One row is written at a time, so this
+   * row's actions stay where they are — pulling them out would make the
+   * whole list jump — but recede and stop working. */
+  actionsInert: boolean;
   onEdit: () => void;
   onDelete: () => void;
 }) {
@@ -447,12 +613,21 @@ function RecordRow({
           server 409s every write to one (see ZoneDetail's own comment), so
           these icons are omitted rather than left to fail on click. */}
       {!readOnly && (
+        /* While another row is being edited, the artboard fades these to 0.3
+           and turns pointer events off. Real `disabled` is what actually
+           delivers that: pointer-events alone still lets a keyboard press
+           activate a focused button, and tells assistive tech nothing.
+           `disabled:opacity-30` is the artboard's own fade, in place of
+           rnui's default 0.5 — the base class already brings
+           `disabled:pointer-events-none` with it. */
         <div className="flex items-center justify-end gap-1">
           <Button
             type="button"
             size="icon-sm"
             variant="ghost"
             aria-label={`Edit ${label}`}
+            className="disabled:opacity-30"
+            disabled={actionsInert}
             onClick={onEdit}
           >
             <Pencil />
@@ -462,6 +637,8 @@ function RecordRow({
             size="icon-sm"
             variant="ghost"
             aria-label={`Delete ${label}`}
+            className="disabled:opacity-30"
+            disabled={actionsInert}
             onClick={onDelete}
           >
             <Trash2 />
@@ -1286,12 +1463,48 @@ export function ZoneDetail() {
 
   const [nameFilter, setNameFilter] = useState("");
   const [typeFilter, setTypeFilter] = useState<"" | RecordType>("");
-  const [editing, setEditing] = useState<ZoneRecord | null>(null);
-  const [focusCue, setFocusCue] = useState(0);
+  /**
+   * The record whose own row in the list has become the form. Null means no
+   * row is being edited.
+   *
+   * Not "the form is open, bound to a record": in the edit case the form has
+   * no position of its own, it takes the record's. Nothing scrolls or jumps,
+   * and the record is not on screen twice. The Save button therefore rides
+   * with the row — it goes wherever the row is, including out of the
+   * viewport if the list is scrolled. Opening an edit focuses Name, which
+   * scrolls the row into view; nothing pins Save after that, and no sticky
+   * action bar was added, because the artboard has no such element and the
+   * row is where the record's own context is.
+   *
+   * An id rather than the record, because the record itself is read from the
+   * list at render time — always the freshest copy, and one place for it to
+   * live rather than two.
+   */
+  const [editingId, setEditingId] = useState<number | null>(null);
+  /**
+   * Whether the add band — the form in its other placement, above the list
+   * — is mounted. Closed on load, so nothing is on screen until Add record
+   * opens it.
+   *
+   * This and `editingId` are two different things and must stay so: one is a
+   * band at the top, the other is a row in the list. They are also mutually
+   * exclusive, because two live forms would put two "Zone record name"
+   * fields in the document. `openAdd` and `openEdit` below are the only two
+   * ways in, and each closes the other.
+   */
+  const [addOpen, setAddOpen] = useState(false);
+  /** The add band's React key, bumped on every Add record press. Pressing
+   * the button while the band is already open has to clear it, refocus Name
+   * and drop any server error — a remount is all three at once, and a
+   * still-mounted form would do none of them on its own. */
+  const [addCue, setAddCue] = useState(0);
   const [deleteZoneOpen, setDeleteZoneOpen] = useState(false);
   const [deleteRecordTarget, setDeleteRecordTarget] = useState<ZoneRecord | null>(null);
 
   const allRecords = useMemo(() => records.data ?? [], [records.data]);
+  // The edited row filters like any other row — there is no carve-out
+  // keeping it listed, because touching a filter closes the edit outright
+  // (see onFiltersTouched below).
   const shownRecords = useMemo(() => {
     const q = nameFilter.trim().toLowerCase();
     return allRecords.filter(
@@ -1300,6 +1513,46 @@ export function ZoneDetail() {
         (q === "" || r.name.toLowerCase().includes(q)),
     );
   }, [allRecords, nameFilter, typeFilter]);
+  /**
+   * The record `editingId` names, or null if it names none.
+   *
+   * Derived rather than stored, and derived from the *shown* records, so the
+   * edit self-heals: an id can outlive its row — another session deleting
+   * the record, a refetch renaming it out of the current filter — and an
+   * edit with no row on screen is no edit at all. Stored, that would leave
+   * every other row inert around a form rendered nowhere, with no way out.
+   */
+  const editingRecord = shownRecords.find((r) => r.id === editingId) ?? null;
+
+  /** One form at a time — see `addOpen`'s comment. */
+  function openAdd() {
+    setEditingId(null);
+    setAddOpen(true);
+    setAddCue((c) => c + 1);
+  }
+
+  function openEdit(target: ZoneRecord) {
+    setAddOpen(false);
+    setEditingId(target.id);
+  }
+
+  /**
+   * Either filter changing closes an in-progress edit, discarding it.
+   *
+   * Unconditional on purpose — not "closes it if the edited row stops
+   * matching". A rule that depended on whether your own row survived the
+   * filter would make you work out which case you were in before knowing
+   * whether your typing did; "touch a filter, the edit closes" needs no
+   * reasoning. The discard is silent: the row was on screen, and a confirm
+   * prompt fired by a keystroke in a filter box would be worse than the
+   * thing it guards against.
+   *
+   * The add band is deliberately left alone. It is not a record and has
+   * nothing to match, so narrowing a list of records says nothing about it.
+   */
+  function onFiltersTouched() {
+    setEditingId(null);
+  }
 
   function onConfirmDeleteZone() {
     if (!zone.data) return;
@@ -1337,7 +1590,7 @@ export function ZoneDetail() {
       {
         onSuccess: () => {
           toast.success("Record deleted");
-          if (editing?.id === target.id) setEditing(null);
+          if (editingId === target.id) setEditingId(null);
           setDeleteRecordTarget(null);
         },
         onError: () => toast.error(`Couldn't delete ${target.name}`),
@@ -1402,15 +1655,30 @@ export function ZoneDetail() {
       </p>
     );
   } else {
-    body = shownRecords.map((record) => (
-      <RecordRow
-        key={record.id}
-        record={record}
-        readOnly={isInternal}
-        onEdit={() => setEditing(record)}
-        onDelete={() => setDeleteRecordTarget(record)}
-      />
-    ));
+    body = shownRecords.map((record) =>
+      // The edited record's own row *is* the form: it replaces the row
+      // rather than appearing above it, which is what stopped the record
+      // reading as a duplicate of itself. Keyed by id, so switching the
+      // edit to another row is a fresh mount bound to that record.
+      record.id === editingRecord?.id ? (
+        <RecordFormRow
+          key={record.id}
+          zoneId={z.id}
+          apex={z.name}
+          editing={record}
+          onDone={() => setEditingId(null)}
+        />
+      ) : (
+        <RecordRow
+          key={record.id}
+          record={record}
+          readOnly={isInternal}
+          actionsInert={editingRecord !== null}
+          onEdit={() => openEdit(record)}
+          onDelete={() => setDeleteRecordTarget(record)}
+        />
+      ),
+    );
   }
 
   return (
@@ -1444,14 +1712,7 @@ export function ZoneDetail() {
         )}
         <div className="ml-auto flex shrink-0 items-center gap-2">
           {!isInternal && (
-            <Button
-              type="button"
-              size="sm"
-              onClick={() => {
-                setEditing(null);
-                setFocusCue((c) => c + 1);
-              }}
-            >
+            <Button type="button" size="sm" onClick={openAdd}>
               <Plus />
               Add record
             </Button>
@@ -1492,7 +1753,10 @@ export function ZoneDetail() {
       <div className="flex shrink-0 items-center gap-3 border-b border-border px-4 py-2.5">
         <Input
           value={nameFilter}
-          onChange={(e) => setNameFilter(e.target.value)}
+          onChange={(e) => {
+            setNameFilter(e.target.value);
+            onFiltersTouched();
+          }}
           placeholder="filter by name…"
           aria-label="Filter by name"
           className="w-[236px] shrink-0 grow-0 font-mono"
@@ -1503,7 +1767,10 @@ export function ZoneDetail() {
           </span>
           <NativeSelect
             value={typeFilter}
-            onChange={(e) => setTypeFilter(e.target.value as "" | RecordType)}
+            onChange={(e) => {
+              setTypeFilter(e.target.value as "" | RecordType);
+              onFiltersTouched();
+            }}
             aria-label="Filter by record type"
           >
             <NativeSelectOption value="">All types</NativeSelectOption>
@@ -1546,18 +1813,25 @@ export function ZoneDetail() {
         <span className="text-right">Actions</span>
       </div>
 
-      {/* Create/edit row — omitted for a built-in zone; see isInternal's
-          own comment. */}
-      {!isInternal && (
+      {/* The add band — the one placement that is still a band, because a
+          record that doesn't exist yet has no row to become. Omitted for a
+          built-in zone (see isInternal's own comment), and, for a writable
+          one, until Add record opens it: closed is the loaded state, not
+          just a visual one — see addOpen's own comment above. Editing does
+          not come through here; it happens in the record's own row below. */}
+      {!isInternal && addOpen && (
         <RecordFormRow
+          key={addCue}
           zoneId={z.id}
-          editing={editing}
-          focusCue={focusCue}
-          onDone={() => setEditing(null)}
+          apex={z.name}
+          editing={null}
+          onDone={() => setAddOpen(false)}
         />
       )}
 
-      <div className="min-h-0 flex-1 overflow-y-auto">{body}</div>
+      <div data-testid="zone-record-list" className="min-h-0 flex-1 overflow-y-auto">
+        {body}
+      </div>
 
       <AlertDialog open={deleteZoneOpen} onOpenChange={setDeleteZoneOpen}>
         <AlertDialogContent>

@@ -4,10 +4,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/aloks98/dnsaur/internal/store"
+	"github.com/aloks98/dnsaur/internal/zones"
 )
 
 // newTestServerWithZone builds a zoneTestServer (server_test.go/
@@ -260,5 +262,195 @@ func TestRecordDeleteRemovesRecord(t *testing.T) {
 	}
 	if recs := srv.records(t, zid); len(recs) != 0 {
 		t.Fatalf("record survived delete: %+v", recs)
+	}
+}
+
+// recordBody builds a POST/PUT body without hand-escaping rdata — several
+// of the cases below carry quotes and newlines, which is the whole point of
+// them.
+func recordBody(t *testing.T, name, recType string, ttl uint32, rdata string) string {
+	t.Helper()
+	b, err := json.Marshal(zoneRecordWrite{Name: name, Type: recType, TTL: ttl, RData: rdata})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
+}
+
+// reimport runs the Render -> Parse round trip an operator performs by
+// downloading a zone and loading it into another server: the real export
+// endpoint, then zones.Parse. It returns the reimported rdata keyed by
+// "<name> <TYPE>".
+func (ts *zoneTestServer) reimport(t *testing.T, zid int64, zoneName string) map[string]string {
+	t.Helper()
+	export := ts.do(t, "GET", fmt.Sprintf("/api/v1/zones/%d/file", zid), "")
+	if export.Code != http.StatusOK {
+		t.Fatalf("export status = %d body = %s", export.Code, export.Body)
+	}
+	pz, errs := zones.Parse(export.Body.String(), zoneName)
+	if len(errs) > 0 {
+		t.Fatalf("reimporting the zone's own export failed: %v\n%s", errs, export.Body)
+	}
+	out := map[string]string{}
+	for _, r := range pz.Records {
+		out[r.Name+" "+r.Type] = r.RData
+	}
+	return out
+}
+
+// A record's rdata is stored once and then read in two places that do not
+// agree about what the same text means. zones.ToRR reads it under no origin,
+// where "nas.e412.in" is already absolute; zones.Render writes it into a
+// master file under "$ORIGIN e412.in.", where that identical text is
+// *relative* and resolves to nas.e412.in.e412.in. Storing the request body
+// verbatim let those two readings disagree, so a record was served at one
+// target and exported pointing at another — silently, and only visible after
+// a round trip through a file.
+//
+// It is the common spelling, not an exotic one: Cloudflare and Route 53 both
+// accept a dotless absolute target, so users are trained to omit the trailing
+// dot, and dnsaur's form accepts it too.
+//
+// The fix stores the rdata zones.ToRR itself printed, so every case asserts
+// the three things that buys:
+//
+//   - the stored spelling is the one the server uses for the RR it parsed;
+//   - the RR served from the stored value is byte-identical to the RR served
+//     from the raw text, so normalising never changes an answer — it only
+//     changes how the answer is written down;
+//   - Render -> Parse hands the stored value back unchanged, so the text has
+//     exactly one meaning in every context it is read in.
+func TestRecordWriteStoresRDataWithOneMeaningEverywhere(t *testing.T) {
+	cases := []struct {
+		what, name, recType, raw, want string
+	}{
+		// The reported bug, in the shape it was reported: a dotless absolute
+		// CNAME target. Served as nas.e412.in.; exported, it used to reimport
+		// as nas.e412.in.e412.in.
+		{"dotless absolute CNAME target", "git", "CNAME", "nas.e412.in", "nas.e412.in."},
+		// Already unambiguous, and must survive untouched.
+		{"fully qualified CNAME target", "vcs", "CNAME", "nas.e412.in.", "nas.e412.in."},
+		// A bare label. dnsaur reads rdata under no origin (zones.ToRR), so
+		// what this record *serves* is the root-level name nas. — not
+		// nas.e412.in., which is what the same token would mean inside a
+		// master file. Storing "nas." is what makes the stored text say the
+		// thing that is actually served, and it makes the mismatch visible in
+		// the UI instead of leaving it to be discovered after an export. What
+		// it is emphatically not is a change to the answer: the RR assertion
+		// below pins that this record resolves exactly where it did before.
+		{"bare relative CNAME target", "www", "CNAME", "nas", "nas."},
+		{"dotless MX exchange", "@", "MX", "10 mail.e412.in", "10 mail.e412.in."},
+		{"dotless SRV target", "_sip._tcp", "SRV", "10 20 5060 sip.e412.in", "10 20 5060 sip.e412.in."},
+		// Types with no name in their rdata carry no origin ambiguity at all,
+		// and are normalised anyway — see the test below for the reason the
+		// scope is every type rather than the name-valued ones.
+		{"A address", "host", "A", "192.168.1.9", "192.168.1.9"},
+		{"long-form AAAA address", "host6", "AAAA", "2001:0db8:0000:0000:0000:0000:0000:0001", "2001:db8::1"},
+		{"unquoted TXT", "note", "TXT", "hello", `"hello"`},
+		{"quoted TXT", "spf", "TXT", `"v=spf1 -all"`, `"v=spf1 -all"`},
+	}
+
+	for _, c := range cases {
+		t.Run(c.what, func(t *testing.T) {
+			srv, zid := newTestServerWithZone(t, "e412.in")
+			body := recordBody(t, c.name, c.recType, 300, c.raw)
+			if rec := srv.do(t, "POST", fmt.Sprintf("/api/v1/zones/%d/records", zid), body); rec.Code != http.StatusCreated {
+				t.Fatalf("status = %d body = %s, want 201", rec.Code, rec.Body)
+			}
+			recs := srv.recordsByType(t, zid, c.recType)
+			if len(recs) != 1 {
+				t.Fatalf("records = %+v, want one %s", recs, c.recType)
+			}
+			stored := recs[0]
+			if stored.RData != c.want {
+				t.Errorf("stored rdata = %q, want %q", stored.RData, c.want)
+			}
+
+			// Normalising must never change what the resolver answers. Both
+			// sides go through zones.ToRR, the same call answer.go builds its
+			// RR with, so this compares the served records themselves rather
+			// than their spellings.
+			raw := stored
+			raw.RData = c.raw
+			fqdn := absoluteRecordName("e412.in", stored.Name)
+			fromStored, err := zones.ToRR(fqdn, stored)
+			if err != nil {
+				t.Fatalf("stored rdata %q no longer parses: %v", stored.RData, err)
+			}
+			fromRaw, err := zones.ToRR(fqdn, raw)
+			if err != nil {
+				t.Fatalf("raw rdata %q does not parse: %v", c.raw, err)
+			}
+			if fromStored.String() != fromRaw.String() {
+				t.Errorf("normalising changed the served record:\n raw -> %s\nstored -> %s", fromRaw, fromStored)
+			}
+
+			// And the round trip the whole thing is about.
+			key := c.name + " " + c.recType
+			if got := srv.reimport(t, zid, "e412.in")[key]; got != c.want {
+				t.Errorf("Render -> Parse gave %q for %s, want %q — the exported record is not the stored one", got, key, c.want)
+			}
+		})
+	}
+}
+
+// The same defect with a different trigger, and the reason the fix normalises
+// every type rather than only the ones whose rdata embeds a domain name.
+//
+// dns.NewRR reads one RR and silently ignores whatever follows it, so
+// "1.2.3.4\nevil.e412.in. 300 IN A 6.6.6.6" validates, and is served as
+// nothing but 1.2.3.4. Stored verbatim, zones.Render then writes all of it
+// into the master file — and the trailing line is a second, entirely
+// unrelated record that the zone never held and that no page in the UI shows.
+// An A record's rdata carries no name and no origin ambiguity, so a fix
+// scoped to name-valued types would leave this standing.
+func TestRecordCreateRDataCannotSmuggleARecordIntoTheExport(t *testing.T) {
+	srv, zid := newTestServerWithZone(t, "e412.in")
+	body := recordBody(t, "host", "A", 300, "1.2.3.4\nevil.e412.in. 300 IN A 6.6.6.6")
+	if rec := srv.do(t, "POST", fmt.Sprintf("/api/v1/zones/%d/records", zid), body); rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d body = %s, want 201", rec.Code, rec.Body)
+	}
+	recs := srv.recordsByType(t, zid, "A")
+	if len(recs) != 1 || recs[0].RData != "1.2.3.4" {
+		t.Fatalf("stored = %+v, want a single A of exactly 1.2.3.4", recs)
+	}
+	export := srv.do(t, "GET", fmt.Sprintf("/api/v1/zones/%d/file", zid), "")
+	if strings.Contains(export.Body.String(), "evil") || strings.Contains(export.Body.String(), "6.6.6.6") {
+		t.Errorf("the export carries a record the zone does not hold:\n%s", export.Body)
+	}
+}
+
+// PUT goes through buildZoneRecord too, so it normalises on the same terms —
+// otherwise editing a record would be the way to put a raw value back.
+func TestRecordUpdateNormalizesRData(t *testing.T) {
+	srv, zid := newTestServerWithZone(t, "e412.in")
+	id := srv.createRecord(t, zid, `{"name":"git","type":"CNAME","ttl":300,"rdata":"nas.e412.in."}`)
+
+	path := fmt.Sprintf("/api/v1/zones/%d/records/%d", zid, id)
+	if r := srv.do(t, "PUT", path, recordBody(t, "git", "CNAME", 300, "other.e412.in")); r.Code != http.StatusNoContent {
+		t.Fatalf("put status = %d body = %s, want 204", r.Code, r.Body)
+	}
+	recs := srv.recordsByType(t, zid, "CNAME")
+	if len(recs) != 1 || recs[0].RData != "other.e412.in." {
+		t.Fatalf("stored = %+v, want rdata other.e412.in.", recs)
+	}
+}
+
+// dns.NewRR does not treat a value that is entirely a ';' comment as an
+// error — the comment is simply not part of the line, so it hands back a
+// TXT whose rdata is absent and reports nothing. Stored, that record
+// renders as "note 300 IN TXT " with nothing after the type, and the zone
+// exports to a file that will not reimport.
+func TestRecordCreateRejectsRDataThatParsesToNothing(t *testing.T) {
+	for _, raw := range []string{"; just a comment", "   ", ""} {
+		srv, zid := newTestServerWithZone(t, "e412.in")
+		body := recordBody(t, "note", "TXT", 300, raw)
+		rec := srv.do(t, "POST", fmt.Sprintf("/api/v1/zones/%d/records", zid), body)
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("rdata %q: status = %d body = %s, want 400", raw, rec.Code, rec.Body)
+		}
+		if recs := srv.records(t, zid); len(recs) != 0 {
+			t.Errorf("rdata %q: stored an unexportable record: %+v", raw, recs)
+		}
 	}
 }

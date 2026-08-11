@@ -93,6 +93,21 @@ func ToRR(fqdn string, rec store.ZoneRecord) (dns.RR, error) {
 	return dns.NewRR(fmt.Sprintf("%s %d IN %s %s", dns.Fqdn(fqdn), rec.TTL, rec.Type, rec.RData))
 }
 
+// RDataOf returns rr's rdata in presentation format: the record as
+// miekg/dns prints it, with its own header removed. It is the spelling
+// zone_records.rdata stores, and the one Render writes back into a master
+// file.
+//
+// This is the derivation Parse has always used to fill ParsedRecord.RData
+// (see classify), lifted out so the hand-write path can reach it too. Both
+// paths arriving at rdata by the same route is what makes a record typed
+// into the form and the same record read out of a zone file store as one
+// string rather than two — a property the import diff depends on, and one
+// that would be quietly untrue if either side spelled the RR itself.
+func RDataOf(rr dns.RR) string {
+	return strings.TrimPrefix(rr.String(), rr.Header().String())
+}
+
 // Index is a snapshot of the zones this server is authoritative for, built
 // fresh on every store reload.
 type Index struct {

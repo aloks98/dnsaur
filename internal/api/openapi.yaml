@@ -174,6 +174,13 @@ components:
             for A, "10 mail.example.com." for MX, "0 issue
             \"letsencrypt.org\"" for CAA, "host.example.com." for PTR (a
             domain name, RFC 1034 — not the address itself).
+
+
+            On read this is the DNS parser's own spelling of the value,
+            which is not necessarily the string that was written: a name
+            gains its trailing dot, a bare TXT value gains its quotes, an
+            IPv6 address contracts. See the rdata note on POST
+            /zones/{id}/records.
         enabled: { type: boolean }
         comment: { type: string }
     ZoneFileImportResult:
@@ -1666,6 +1673,17 @@ paths:
         carries that parser's own error text, not a generic message — any
         type it can parse is accepted without an API change, and an
         accepted record is by construction a servable one.
+
+
+        What is stored is that parser's own spelling of the value, not the
+        submitted text, so a later GET may return a different string:
+        "nas.example.com" reads back "nas.example.com.", "hello" reads back
+        "\"hello\"", "2001:0db8::0001" reads back "2001:db8::1". The record
+        answers identically either way. It is stored this way because rdata
+        is read in two places that disagree about the same text: a name in
+        rdata is absolute here, but a name without a trailing dot in an
+        exported zone file is relative to the zone, so only the parser's
+        spelling means one thing in both.
 
 
         name is zone-relative ("@", "bifrost", "*", "*.nexus"); omitted or

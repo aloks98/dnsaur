@@ -166,10 +166,24 @@ same DNS parser that builds the record dnsaur serves, so a rejected value
 comes back with that parser's own error text rather than a made-up message —
 and any type the parser understands works without dnsaur itself changing.
 
+**A saved value is rewritten to the server's own spelling.** dnsaur stores
+the record the DNS parser produced, not the characters that were typed, so
+the value shown after saving may not be the one entered: `nas.home.lan`
+becomes `nas.home.lan.`, `hello` becomes `"hello"`, `2001:0db8::0001`
+becomes `2001:db8::1`. The record answers the same either way. The reason
+to store it this way is export: a name in rdata is read as absolute here,
+but a name without a trailing dot in a zone file is *relative*, so only the
+rewritten spelling still points where it did once the zone is exported and
+loaded somewhere else.
+
+The upshot is that the saved value is worth reading back — it is what the
+record actually is.
+
 **Quote TXT values.** Presentation format is not a free-text field: spaces
 separate values and `;` starts a comment. Pasted raw, `v=spf1 -all` is
-stored as two strings and `v=DKIM1; k=rsa; p=...` is truncated at the
-semicolon without any error. Wrapped in quotes — `"v=spf1 -all"` — the
+stored as two strings — it reads back `"v=spf1" "-all"` — and
+`v=DKIM1; k=rsa; p=...` is truncated at the semicolon without any error,
+reading back as just `"v=DKIM1"`. Wrapped in quotes — `"v=spf1 -all"` — the
 whole thing is one value, which is what a TXT record almost always means.
 Anything over 255 bytes, like a 2048-bit DKIM key, is written as adjacent
 quoted strings that the reader joins back together: `"part one" "part two"`.

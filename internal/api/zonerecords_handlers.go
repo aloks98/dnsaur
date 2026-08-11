@@ -110,8 +110,52 @@ func buildZoneRecord(zone store.Zone, body zoneRecordWrite, existing []store.Zon
 	// build the RR it serves. One validator, so an accepted record is by
 	// construction a servable one — there is no second copy to drift from
 	// the parser.
-	if _, err := zones.ToRR(absoluteRecordName(zone.Name, name), rec); err != nil {
+	rr, err := zones.ToRR(absoluteRecordName(zone.Name, name), rec)
+	if err != nil {
 		return store.ZoneRecord{}, http.StatusBadRequest, err.Error(), false
+	}
+
+	// What gets stored is the rdata that parse produced, not the text that
+	// was typed. The two are not interchangeable, because rdata is read back
+	// in two places that do not agree about what a given string means:
+	// ToRR reads it under no origin, where "nas.e412.in" is already
+	// absolute, and Render writes it into a master file under
+	// "$ORIGIN <zone>.", where that identical text is *relative* and means
+	// nas.e412.in.<zone>. Keeping the raw text let one record be served at
+	// one target and exported pointing at another — and a dotless absolute
+	// target is the spelling users arrive with, since Cloudflare and Route
+	// 53 both accept it.
+	//
+	// Every type is normalised, not just the ones whose rdata embeds a
+	// domain name, because origin ambiguity is not the only way raw text
+	// says more than the RR does: dns.NewRR reads one RR and silently
+	// discards whatever follows it, so an A record's rdata can carry a
+	// trailing newline and a second record's worth of text that validates,
+	// serves as nothing, and lands verbatim in the exported file. Scoping
+	// this to name-valued types would leave that standing, and would need a
+	// type list that goes stale as miekg/dns gains types. The cost is that
+	// a spelling with no ambiguity in it is still rewritten to the server's
+	// own ("hello" gains its quotes, an expanded IPv6 address contracts) —
+	// a change to how the value is written down, never to what it answers.
+	//
+	// This is a no-op on the import path. zones.Parse already derives
+	// ParsedRecord.RData through exactly this call (classify), so a record
+	// arriving from a zone file is normalised before it gets here, and
+	// spec §8's objection to normalising an imported file does not reach
+	// it — there is nothing left to normalise.
+	rec.RData = zones.RDataOf(rr)
+
+	// An rdata that parses to nothing is not a record. It gets this far
+	// because a value that is entirely a ';' comment, or only whitespace,
+	// is not a parse error for every type — dns.NewRR reads "TXT ; note" as
+	// a TXT whose rdata is simply absent, and says nothing. Stored, that row
+	// renders as "note 300 IN TXT " with nothing after the type, which no
+	// parser reads back, so the zone would export to a file it cannot
+	// reimport — the round trip spec §8 rests on. Still part of "the parser
+	// decides", just the half of its answer that is carried in the rdata it
+	// produced rather than in an error.
+	if rec.RData == "" {
+		return store.ZoneRecord{}, http.StatusBadRequest, "rdata is empty: it must carry the record's value, not only a comment", false
 	}
 
 	// RFC 2181 §8: reject a TTL a resolver would not read back as typed.

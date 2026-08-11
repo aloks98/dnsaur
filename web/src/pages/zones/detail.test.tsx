@@ -71,6 +71,30 @@ function recordRows(): HTMLElement[] {
   return Array.from(document.querySelectorAll<HTMLElement>('[data-testid="zone-record-row"]'));
 }
 
+/**
+ * The scrolling list's children in DOM order, each named by the slot it
+ * carries: a plain record row, or the form that has taken one row's place.
+ *
+ * Order is the assertion these enable — an edited record's form has to sit
+ * where its own row was, not above the list. The add band is deliberately
+ * outside this container, so it never shows up here.
+ */
+function listSlots(): string[] {
+  const list = screen.getByTestId("zone-record-list");
+  return Array.from(
+    list.querySelectorAll<HTMLElement>(
+      '[data-testid="zone-record-row"], [data-testid="record-form-row"]',
+    ),
+  ).map((el) => el.dataset.testid ?? "");
+}
+
+/** Opens the create/edit row in add mode the way a user does — the row is
+ * closed until the header's "Add record" button is clicked. */
+async function openAddRow(user: ReturnType<typeof userEvent.setup>) {
+  await user.click(await screen.findByRole("button", { name: /^add record$/i }));
+  await screen.findByLabelText(/zone record name/i);
+}
+
 /** Mocks both the zone and its records fetch and renders the detail page for
  * it — used by tests that only care about the zone itself (its type) rather
  * than a specific record set, so they don't have to call mockZone/mockRecords
@@ -125,6 +149,49 @@ test("the apex row shows @ rather than the zone name", async () => {
   expect(within(row).queryByText("example.com")).not.toBeInTheDocument();
 });
 
+// The row is closed on load — no add/edit band until something opens it —
+// and cannot be dismissed once open unless the X actually closes it. These
+// three pin the bug directly, each a state the row-is-always-visible defect
+// made impossible to reach.
+test("the create/edit row is not in the document on load", async () => {
+  mockZone(zone({ id: 1 }));
+  mockRecords(1, [record({ id: 1, name: "bifrost" })]);
+
+  renderDetail();
+  await screen.findByText("bifrost");
+
+  expect(screen.queryByTestId("record-form-row")).not.toBeInTheDocument();
+});
+
+test("Add record opens the row, empty and in add mode", async () => {
+  const user = userEvent.setup();
+  mockZone(zone({ id: 1 }));
+  mockRecords(1, []);
+
+  renderDetail();
+  expect(screen.queryByTestId("record-form-row")).not.toBeInTheDocument();
+
+  await openAddRow(user);
+
+  expect(screen.getByTestId("record-form-row")).toBeInTheDocument();
+  expect(screen.getByLabelText(/zone record name/i)).toHaveValue("");
+  expect(screen.getByRole("button", { name: /^add$/i })).toBeInTheDocument();
+});
+
+test("the X closes the row", async () => {
+  const user = userEvent.setup();
+  mockZone(zone({ id: 1 }));
+  mockRecords(1, []);
+
+  renderDetail();
+  await openAddRow(user);
+  expect(screen.getByTestId("record-form-row")).toBeInTheDocument();
+
+  await user.click(screen.getByRole("button", { name: /^close$/i }));
+
+  expect(screen.queryByTestId("record-form-row")).not.toBeInTheDocument();
+});
+
 // The API validates rdata with dns.NewRR, so its 400 message *is* the
 // parser's own text. The brief is explicit that this must reach the admin
 // verbatim rather than get replaced with generic copy — this test pins the
@@ -140,7 +207,7 @@ test("a parser error from the API lands on the data field", async () => {
   );
 
   renderDetail();
-  await screen.findByLabelText(/zone record name/i);
+  await openAddRow(user);
 
   await user.selectOptions(screen.getByLabelText(/^record type$/i), "MX");
   await user.type(screen.getByLabelText(/^data$/i), "Mx");
@@ -150,6 +217,15 @@ test("a parser error from the API lands on the data field", async () => {
   // The parser's own text, rendered mono — not rewritten into friendly prose.
   expect(message).toHaveClass("font-mono");
   expect(screen.getByLabelText(/^data$/i)).toHaveAttribute("aria-invalid", "true");
+
+  // …and it renders *under Data*, which takes holding the three quiet
+  // columns open: FormMessage renders null when its field has no error, so
+  // without a cell of their own the row would have two children and grid
+  // auto-placement would slide this message left under Name.
+  const cell = message.parentElement;
+  const errorRow = cell?.parentElement;
+  expect(errorRow?.children).toHaveLength(5);
+  expect(Array.from(errorRow?.children ?? []).indexOf(cell as Element)).toBe(3);
 });
 
 // One text input serves nine record types; the DNS parser (not a per-type
@@ -161,7 +237,7 @@ test("the placeholder follows the selected type", async () => {
   mockRecords(1, []);
 
   renderDetail();
-  await screen.findByLabelText(/zone record name/i);
+  await openAddRow(user);
 
   expect(screen.getByPlaceholderText("192.168.150.28")).toBeInTheDocument();
 
@@ -170,6 +246,98 @@ test("the placeholder follows the selected type", async () => {
 
   await user.selectOptions(screen.getByLabelText(/^record type$/i), "CAA");
   expect(screen.getByPlaceholderText('0 issue "letsencrypt.org"')).toBeInTheDocument();
+});
+
+// ── The Name and Data fields' suffix chips ────────────────────────────────
+// Names are relative in the Name column and absolute in Data, and nothing
+// on screen said so: a dotless CNAME target (the Cloudflare habit) is a
+// valid record pointing somewhere else entirely. These chips are the whole
+// fix — labels, not validation, so nothing below asserts on a warning.
+
+test("the name field carries the zone's apex beside what's typed", async () => {
+  const user = userEvent.setup();
+  renderZoneDetail({ zone: zone({ id: 1, name: "e412.in" }) });
+  await openAddRow(user);
+
+  expect(screen.getByTestId("zone-name-suffix").textContent).toBe(".e412.in");
+  // Informative, not part of the value — so it lands on the field's
+  // description and leaves "Zone record name" as the accessible name.
+  const field = screen.getByLabelText(/zone record name/i);
+  expect(field).toHaveAccessibleName("Zone record name");
+  expect(field).toHaveAccessibleDescription(".e412.in");
+});
+
+test("at @ the suffix drops its dot and the typed name goes muted", async () => {
+  const user = userEvent.setup();
+  renderZoneDetail({ zone: zone({ id: 1, name: "e412.in" }) });
+  await openAddRow(user);
+
+  const field = screen.getByLabelText(/zone record name/i);
+  await user.type(field, "bifrost");
+  expect(screen.getByTestId("zone-name-suffix").textContent).toBe(".e412.in");
+  expect(field).not.toHaveClass("text-muted-foreground");
+
+  // "@" is not a subdomain of the zone, it *is* the zone — so the joining
+  // dot goes, and the typed text recedes behind the apex.
+  await user.clear(field);
+  await user.type(field, "@");
+  expect(screen.getByTestId("zone-name-suffix").textContent).toBe("e412.in");
+  expect(field).toHaveClass("text-muted-foreground");
+  expect(field).toHaveAccessibleDescription("e412.in");
+});
+
+test("a long apex keeps its head and clips the tail, whole apex still reachable", async () => {
+  const user = userEvent.setup();
+  renderZoneDetail({ zone: zone({ id: 1, name: "150.168.192.in-addr.arpa" }) });
+  await openAddRow(user);
+
+  // Every IPv4 reverse zone ends in in-addr.arpa, so the tail is the shared
+  // part and the leading octets are what say *which* zone this is. The clip
+  // therefore keeps the head — the reverse of what CSS truncation does.
+  const suffix = screen.getByTestId("zone-name-suffix");
+  expect(suffix.textContent).toBe(".150.168.192…");
+  expect(suffix.textContent).not.toContain("in-addr");
+  // The 12-character cut lands exactly on a label boundary here, and a dot
+  // sitting immediately before the ellipsis reads as a fourth, empty octet.
+  expect(suffix.textContent).not.toContain(".…");
+  // Clipped on screen, never lost: pointer gets `title`, everyone else gets
+  // the field's description.
+  expect(suffix).toHaveAttribute("title", ".150.168.192.in-addr.arpa");
+  expect(screen.getByLabelText(/zone record name/i)).toHaveAccessibleDescription(
+    ".150.168.192.in-addr.arpa",
+  );
+});
+
+test("the data field is marked FULL NAME for a name-valued type only", async () => {
+  const user = userEvent.setup();
+  renderZoneDetail({ zone: zone({ id: 1, name: "e412.in" }) });
+  await openAddRow(user);
+
+  // A defaults to A: an address, so no chip.
+  expect(screen.queryByTestId("record-data-suffix")).not.toBeInTheDocument();
+
+  await user.selectOptions(screen.getByLabelText(/^record type$/i), "CNAME");
+  expect(screen.getByTestId("record-data-suffix")).toHaveTextContent(/full name/i);
+  expect(screen.getByLabelText(/^data$/i)).toHaveAccessibleDescription(/full name/i);
+
+  await user.selectOptions(screen.getByLabelText(/^record type$/i), "TXT");
+  expect(screen.queryByTestId("record-data-suffix")).not.toBeInTheDocument();
+});
+
+// Edit mode is the same band as add mode, so it gets the same chips —
+// worth pinning because the row is bound to a record here, not blank.
+test("editing a record shows the same suffix chips as adding one", async () => {
+  const user = userEvent.setup();
+  renderZoneDetail({
+    zone: zone({ id: 1, name: "e412.in" }),
+    records: [record({ id: 7, name: "git", type: "CNAME", rdata: "nas.e412.in." })],
+  });
+
+  await user.click(await screen.findByRole("button", { name: /^edit git cname/i }));
+  await waitFor(() => expect(screen.getByLabelText(/zone record name/i)).toHaveValue("git"));
+
+  expect(screen.getByTestId("zone-name-suffix").textContent).toBe(".e412.in");
+  expect(screen.getByTestId("record-data-suffix")).toHaveTextContent(/full name/i);
 });
 
 test("TTL renders right-aligned and thousands-grouped", async () => {
@@ -245,7 +413,7 @@ test("creating a record posts the zone-relative name and the row appears", async
   );
 
   renderDetail();
-  await screen.findByLabelText(/zone record name/i);
+  await openAddRow(user);
 
   await user.type(screen.getByLabelText(/zone record name/i), "bifrost");
   await user.clear(screen.getByLabelText(/^ttl$/i));
@@ -276,7 +444,7 @@ test("a non-numeric TTL shows its validation message and never posts", async () 
   );
 
   renderDetail();
-  await screen.findByLabelText(/zone record name/i);
+  await openAddRow(user);
 
   await user.clear(screen.getByLabelText(/^ttl$/i));
   await user.type(screen.getByLabelText(/^ttl$/i), "abc");
@@ -319,10 +487,111 @@ test("editing a record seeds the row and PUTs the update", async () => {
   expect(requestUrl).toMatch(/\/api\/v1\/zones\/1\/records\/7$/);
 });
 
-// Fix round 1, Finding 4: the header's "Add record" button is inferred
-// behaviour (the row is always visible, so the button has to do *something*
-// beyond opening it) — cancel any in-progress edit and return to add mode.
-// Exactly the interaction that regresses silently if it's ever wired wrong.
+// ── Editing happens in the record's own row ───────────────────────────────
+// The pencil used to open the form as a band above the list, which left the
+// record on screen twice — once in the band, once in its own row — and read
+// as a duplicate. The row *is* the form now. Adding is unchanged: a new
+// record has no row to become, so it stays a band at the top.
+
+test("editing puts the form in the record's own row, and the record is not also listed", async () => {
+  const user = userEvent.setup();
+  mockZone(zone({ id: 1, name: "e412.in" }));
+  mockRecords(1, [
+    record({ id: 5, name: "alpha", type: "A", rdata: "10.0.0.1" }),
+    record({ id: 7, name: "git", type: "CNAME", rdata: "nas.e412.in." }),
+    record({ id: 9, name: "zulu", type: "A", rdata: "10.0.0.3" }),
+  ]);
+
+  renderDetail();
+  await waitFor(() => expect(recordRows()).toHaveLength(3));
+
+  await user.click(screen.getByRole("button", { name: /^edit git cname/i }));
+  await waitFor(() => expect(screen.getByLabelText(/zone record name/i)).toHaveValue("git"));
+
+  // In its own position, between the two rows that were its neighbours —
+  // not above them, and not appended.
+  expect(listSlots()).toEqual(["zone-record-row", "record-form-row", "zone-record-row"]);
+  // …and exactly once. This is the reported bug: the record must not be both
+  // the form and a plain row beneath it.
+  expect(recordRows()).toHaveLength(2);
+  for (const row of recordRows()) {
+    expect(within(row).queryByText("git")).not.toBeInTheDocument();
+  }
+});
+
+test("Save returns the edited row to a plain row", async () => {
+  const user = userEvent.setup();
+  mockZone(zone({ id: 1, name: "e412.in" }));
+  mockRecords(1, [record({ id: 7, name: "git", type: "CNAME", rdata: "nas.e412.in." })]);
+  server.use(http.put("/api/v1/zones/1/records/7", () => new HttpResponse(null, { status: 204 })));
+
+  renderDetail();
+  await waitFor(() => expect(recordRows()).toHaveLength(1));
+
+  await user.click(screen.getByRole("button", { name: /^edit git cname/i }));
+  await waitFor(() => expect(listSlots()).toEqual(["record-form-row"]));
+
+  await user.click(screen.getByRole("button", { name: /^save$/i }));
+
+  await waitFor(() => expect(listSlots()).toEqual(["zone-record-row"]));
+  expect(screen.queryByTestId("record-form-row")).not.toBeInTheDocument();
+});
+
+test("Cancel returns the edited row to a plain row and writes nothing", async () => {
+  const user = userEvent.setup();
+  let put = false;
+  mockZone(zone({ id: 1, name: "e412.in" }));
+  mockRecords(1, [record({ id: 7, name: "git", type: "CNAME", rdata: "nas.e412.in." })]);
+  server.use(
+    http.put("/api/v1/zones/1/records/7", () => {
+      put = true;
+      return new HttpResponse(null, { status: 204 });
+    }),
+  );
+
+  renderDetail();
+  await waitFor(() => expect(recordRows()).toHaveLength(1));
+
+  await user.click(screen.getByRole("button", { name: /^edit git cname/i }));
+  await waitFor(() => expect(listSlots()).toEqual(["record-form-row"]));
+  await user.type(screen.getByLabelText(/^data$/i), "typed-but-abandoned");
+
+  await user.click(screen.getByRole("button", { name: /^cancel editing$/i }));
+
+  expect(listSlots()).toEqual(["zone-record-row"]);
+  expect(screen.queryByTestId("record-form-row")).not.toBeInTheDocument();
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  expect(put).toBe(false);
+});
+
+// Two live forms would put two "Zone record name" fields in the document,
+// which breaks every selector that reaches for one and is incoherent besides
+// — there is one row being written at a time.
+test("opening an edit closes the add band", async () => {
+  const user = userEvent.setup();
+  mockZone(zone({ id: 1, name: "e412.in" }));
+  mockRecords(1, [record({ id: 7, name: "git", type: "CNAME", rdata: "nas.e412.in." })]);
+
+  renderDetail();
+  await waitFor(() => expect(recordRows()).toHaveLength(1));
+  await openAddRow(user);
+  await user.type(screen.getByLabelText(/zone record name/i), "draft");
+
+  await user.click(screen.getByRole("button", { name: /^edit git cname/i }));
+
+  expect(screen.getAllByTestId("record-form-row")).toHaveLength(1);
+  expect(screen.getAllByLabelText(/zone record name/i)).toHaveLength(1);
+  // The one that survives is the row's, seeded from the record.
+  expect(listSlots()).toEqual(["record-form-row"]);
+  await waitFor(() => expect(screen.getByLabelText(/zone record name/i)).toHaveValue("git"));
+});
+
+// Fix round 1, Finding 4: opening the row is the header's "Add record"
+// button's obvious job now, but this pins the case that's still easy to get
+// wrong — clicking it while a record is being edited must return to add mode
+// (blank, focused on Name), not leave the in-progress edit sitting there
+// under an "Add record" label. The edit now lives in the record's own row
+// rather than a band, so that row also has to go back to being a plain row.
 test("the header's Add record button returns an in-progress edit to add mode", async () => {
   const user = userEvent.setup();
   mockZone(zone({ id: 1 }));
@@ -340,6 +609,110 @@ test("the header's Add record button returns an in-progress edit to add mode", a
   await waitFor(() => expect(screen.getByLabelText(/zone record name/i)).toHaveValue(""));
   expect(screen.getByRole("button", { name: /^add$/i })).toBeInTheDocument();
   expect(screen.queryByRole("button", { name: /^save$/i })).not.toBeInTheDocument();
+  // Still exactly one form, and the record is a plain row again.
+  expect(screen.getAllByTestId("record-form-row")).toHaveLength(1);
+  expect(listSlots()).toEqual(["zone-record-row"]);
+});
+
+// One row at a time. The other rows keep their pencil and trash on screen —
+// removing them would make the list jump — but they are genuinely inert, not
+// just faded: `disabled` rather than pointer-events alone, so a keyboard
+// press cannot reach them either.
+test("while a record is being edited the other rows' actions are inert", async () => {
+  const user = userEvent.setup();
+  mockZone(zone({ id: 1, name: "e412.in" }));
+  mockRecords(1, [
+    record({ id: 7, name: "git", type: "CNAME", rdata: "nas.e412.in." }),
+    record({ id: 9, name: "zulu", type: "A", rdata: "10.0.0.3" }),
+  ]);
+
+  renderDetail();
+  await waitFor(() => expect(recordRows()).toHaveLength(2));
+  expect(screen.getByRole("button", { name: /^edit zulu a/i })).not.toBeDisabled();
+
+  await user.click(screen.getByRole("button", { name: /^edit git cname/i }));
+  await waitFor(() => expect(listSlots()).toEqual(["record-form-row", "zone-record-row"]));
+
+  expect(screen.getByRole("button", { name: /^edit zulu a/i })).toBeDisabled();
+  expect(screen.getByRole("button", { name: /^delete zulu a/i })).toBeDisabled();
+});
+
+// ── Touching a filter closes an in-progress edit ──────────────────────────
+// Unconditionally, and whichever filter it is. A rule that closed the edit
+// only when the edited row stopped matching would make an admin work out
+// which case they were in before knowing whether their typing survived;
+// "touch a filter, the edit closes" needs no reasoning. The discard is
+// silent — the row was right there, and a confirm on a keystroke would be
+// worse than the thing it guards.
+
+test("typing in the name filter closes an in-progress edit, even when the row still matches", async () => {
+  const user = userEvent.setup();
+  mockZone(zone({ id: 1, name: "e412.in" }));
+  mockRecords(1, [
+    record({ id: 7, name: "git", type: "CNAME", rdata: "nas.e412.in." }),
+    record({ id: 9, name: "zulu", type: "A", rdata: "10.0.0.3" }),
+  ]);
+
+  renderDetail();
+  await waitFor(() => expect(recordRows()).toHaveLength(2));
+
+  await user.click(screen.getByRole("button", { name: /^edit git cname/i }));
+  await waitFor(() => expect(listSlots()).toEqual(["record-form-row", "zone-record-row"]));
+  await user.type(screen.getByLabelText(/^data$/i), "typed-but-abandoned");
+
+  // "g" still matches "git" — this is the half that distinguishes the rule
+  // from "close it if the row stops matching". The edit closes anyway.
+  await user.type(screen.getByPlaceholderText("filter by name…"), "g");
+
+  await waitFor(() => expect(screen.queryByTestId("record-form-row")).not.toBeInTheDocument());
+  // The row is still listed, as a plain row: it matched the filter all along.
+  expect(listSlots()).toEqual(["zone-record-row"]);
+  expect(screen.getByText("1 record")).toBeInTheDocument();
+  expect(screen.getByText("git")).toBeInTheDocument();
+});
+
+test("changing the type filter closes an in-progress edit", async () => {
+  const user = userEvent.setup();
+  mockZone(zone({ id: 1, name: "e412.in" }));
+  mockRecords(1, [
+    record({ id: 7, name: "git", type: "CNAME", rdata: "nas.e412.in." }),
+    record({ id: 9, name: "zulu", type: "A", rdata: "10.0.0.3" }),
+  ]);
+
+  renderDetail();
+  await waitFor(() => expect(recordRows()).toHaveLength(2));
+
+  await user.click(screen.getByRole("button", { name: /^edit git cname/i }));
+  await waitFor(() => expect(listSlots()).toEqual(["record-form-row", "zone-record-row"]));
+
+  // git is a CNAME, so its row survives this filter. The edit does not.
+  await user.selectOptions(screen.getByLabelText(/filter by record type/i), "CNAME");
+
+  await waitFor(() => expect(screen.queryByTestId("record-form-row")).not.toBeInTheDocument());
+  expect(listSlots()).toEqual(["zone-record-row"]);
+});
+
+// The other half of the rule: the add band is not a record and has nothing
+// to match, so filtering a list of records says nothing about it. It stays,
+// and keeps what has been typed into it.
+test("a filter change leaves the add band open and untouched", async () => {
+  const user = userEvent.setup();
+  mockZone(zone({ id: 1, name: "e412.in" }));
+  mockRecords(1, [
+    record({ id: 7, name: "git", type: "CNAME", rdata: "nas.e412.in." }),
+    record({ id: 9, name: "zulu", type: "A", rdata: "10.0.0.3" }),
+  ]);
+
+  renderDetail();
+  await waitFor(() => expect(recordRows()).toHaveLength(2));
+  await openAddRow(user);
+  await user.type(screen.getByLabelText(/zone record name/i), "draft");
+
+  await user.type(screen.getByPlaceholderText("filter by name…"), "zulu");
+  await waitFor(() => expect(listSlots()).toEqual(["zone-record-row"]));
+
+  expect(screen.getByTestId("record-form-row")).toBeInTheDocument();
+  expect(screen.getByLabelText(/zone record name/i)).toHaveValue("draft");
 });
 
 test("a 409 conflict from the API surfaces the server's message verbatim", async () => {
@@ -357,6 +730,7 @@ test("a 409 conflict from the API surfaces the server's message verbatim", async
 
   renderDetail();
   await waitFor(() => expect(recordRows()).toHaveLength(1));
+  await openAddRow(user);
 
   await user.type(screen.getByLabelText(/zone record name/i), "@");
   await user.selectOptions(screen.getByLabelText(/^record type$/i), "CNAME");
@@ -589,7 +963,8 @@ test("an empty zone explains there are no records yet", async () => {
 test("PTR is offered as a record type and its placeholder is a name", async () => {
   const user = userEvent.setup();
   renderZoneDetail({ zone: zone({ id: 1, name: "150.168.192.in-addr.arpa" }) });
-  const row = await screen.findByTestId("record-form-row");
+  await openAddRow(user);
+  const row = screen.getByTestId("record-form-row");
   await user.selectOptions(within(row).getByLabelText(/type/i), "PTR");
   // PTR rdata is a domain name, not an address (RFC 1034) — a placeholder
   // showing an IP would teach exactly the wrong thing.

@@ -130,14 +130,15 @@ func newZoneFileImportResult() zoneFileImportResult {
 type recordIdentity struct{ name, recType, rdata string }
 
 // identify keys rec by its canonical RR. The rdata is normalized through
-// zones.ToRR — the same round trip zones.Parse's records have already been
-// through (classify emits rr.String() minus the header) — because the two
-// sides of this diff reach it by different routes and a record written by
-// hand is stored exactly as it was typed. "ns.e412.in" and "ns.e412.in.",
-// or a bare `hello` and a quoted `"hello"`, are one RR spelled two ways;
-// compared literally they would come out as a delete and an add of the
-// same record on every single import, churning row ids and burying the one
-// real change in a page of noise.
+// zones.ToRR — the same round trip zones.Parse's records have been through
+// (classify), and, since the rdata-normalisation fix, the one every new
+// write is stored in too. It is still done here rather than assumed,
+// because the store holds rows written before that fix and no migration
+// rewrote them: "ns.e412.in" and "ns.e412.in.", or a bare `hello` and a
+// quoted `"hello"`, are one RR spelled two ways, and compared literally
+// they would come out as a delete and an add of the same record on every
+// single import, churning row ids and burying the one real change in a
+// page of noise.
 //
 // A row ToRR cannot parse falls back to its literal rdata rather than
 // failing the import: it can only mean a record already in the store is
@@ -146,7 +147,7 @@ type recordIdentity struct{ name, recType, rdata string }
 func identify(zoneName string, rec store.ZoneRecord) recordIdentity {
 	rdata := rec.RData
 	if rr, err := zones.ToRR(absoluteRecordName(zoneName, rec.Name), rec); err == nil {
-		rdata = strings.TrimPrefix(rr.String(), rr.Header().String())
+		rdata = zones.RDataOf(rr)
 	}
 	return recordIdentity{name: rec.Name, recType: rec.Type, rdata: rdata}
 }
