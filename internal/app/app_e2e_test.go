@@ -2,8 +2,11 @@ package app
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"net"
 	"net/http"
+	"net/http/cookiejar"
 	"net/http/httptest"
 	"sync/atomic"
 	"testing"
@@ -137,5 +140,102 @@ func TestEndToEnd(t *testing.T) {
 			t.Fatalf("blocking mode change did not take effect: rcode=%v answer=%v", r.Rcode, r.Answer)
 		}
 		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// The seam the TSIG milestone is made of, and the one place it can be seen:
+// the key the REST API writes has to be the key the DNS server's provider
+// finds. Both sides are covered on their own -- internal/api against a store,
+// internal/dnssrv against a fake key store -- and a pair of layers that each
+// pass against their own stub still prove nothing about whether they agree.
+// internal/app/app.go is where a real store.TSIGKeyStore meets the provider,
+// so this is where that agreement is testable.
+//
+// The key is created over the API in a form that is neither lowercase nor
+// fully qualified, then used to sign a real query against the live listener
+// with nothing restarted in between: canonicalisation on write and
+// canonicalisation on lookup have to mean the same thing, or the lookup misses
+// and the reply comes back unsigned.
+func TestTSIGKeyFromAPIVerifiesOnTheDNSServer(t *testing.T) {
+	ctx := t.Context()
+	var upstreamHits atomic.Int64
+	upAddr := mockUpstream(t, &upstreamHits)
+
+	dir := t.TempDir()
+	a, err := New(ctx, testConfig(dir), "e2e")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Store().Settings().SetInternal(ctx, "upstreams", upAddr); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = a.Shutdown(context.Background()) }()
+	a.WaitReady(5 * time.Second)
+
+	jar, _ := cookiejar.New(nil)
+	c := &http.Client{Jar: jar}
+	resp := postJSON(t, c, apiURL(a, "/api/v1/setup"), `{"username":"admin","password":"password123"}`)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("setup: %d", resp.StatusCode)
+	}
+	resp = postJSON(t, c, apiURL(a, "/api/v1/auth/login"), `{"username":"admin","password":"password123"}`)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("login: %d", resp.StatusCode)
+	}
+
+	const secret = "c2VjcmV0LXNlY3JldC1zZWNyZXQ="
+	resp = postJSON(t, c, apiURL(a, "/api/v1/tsig-keys"),
+		`{"name":"XFER.E412.IN","algorithm":"hmac-sha256.","secret":"`+secret+`"}`)
+	var created struct {
+		ID int64 `json:"id"`
+	}
+	derr := json.NewDecoder(resp.Body).Decode(&created)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated || derr != nil {
+		t.Fatalf("tsig key create: status=%d decode=%v", resp.StatusCode, derr)
+	}
+
+	// The peer signs under the canonical name, which is what the API was
+	// given a non-canonical spelling of.
+	sign := func() *dns.Msg {
+		t.Helper()
+		dc := new(dns.Client)
+		dc.TsigSecret = map[string]string{"xfer.e412.in.": secret}
+		m := new(dns.Msg)
+		m.SetQuestion("bifrost.e412.test.", dns.TypeA)
+		m.SetTsig("xfer.e412.in.", dns.HmacSHA256, 300, time.Now().Unix())
+		// dns.Client verifies the reply's MAC with this same secret, so a
+		// signed answer here also proves the server signed it correctly.
+		r, _, err := dc.Exchange(m, a.DNSAddr())
+		if err != nil {
+			t.Fatalf("signed exchange: %v", err)
+		}
+		return r
+	}
+
+	if sign().IsTsig() == nil {
+		t.Fatal("reply carried no TSIG: the key the API stored is not the key the DNS server found")
+	}
+
+	// Revocation travels the same path on the same terms.
+	req, err := http.NewRequest(http.MethodDelete, apiURL(a, fmt.Sprintf("/api/v1/tsig-keys/%d", created.ID)), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dresp, err := c.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = dresp.Body.Close()
+	if dresp.StatusCode != http.StatusNoContent {
+		t.Fatalf("tsig key delete: %d", dresp.StatusCode)
+	}
+	if sign().IsTsig() != nil {
+		t.Fatal("reply still signed after the key was deleted through the API")
 	}
 }

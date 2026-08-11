@@ -56,6 +56,7 @@ type Store interface {
 	Users() UserStore
 	Tokens() TokenStore
 	Zones() ZoneStore
+	TSIGKeys() TSIGKeyStore
 	Close() error
 }
 

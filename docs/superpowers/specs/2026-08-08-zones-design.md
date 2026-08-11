@@ -185,10 +185,14 @@ BIND master-file format both directions via `dns.ZoneParser` and string assembly
 Import is transactional with a dry-run diff. Export is a plain download.
 
 ### D — Secondary zones and transfers
-Outbound: AXFR/IXFR client honouring SOA refresh/retry/expire, `expires_at`
-enforcement. Inbound: serving AXFR/IXFR to secondaries behind an allow-transfer
+Outbound: AXFR client honouring SOA refresh/retry/expire, `expires_at`
+enforcement. Inbound: serving AXFR to secondaries behind an allow-transfer
 ACL. NOTIFY in both directions. TSIG keys as a first-class resource, since
 transfers without them are unauthenticated.
+
+**Split into D1-D6 and IXFR deferred — see §9**, written once the work was
+costed against the code. IXFR is an optimisation over a complete AXFR
+implementation, and RFC 1995 §2 permits answering it with a full AXFR.
 
 ### E — DNSSEC
 Online signing: KSK/ZSK generation and storage, DNSKEY/RRSIG/DS, NSEC or NSEC3
@@ -416,3 +420,162 @@ verbatim can move the zone's serial *backwards*, which breaks any secondary
 that has already seen the higher value (§4 D). Import takes the file's SOA
 timers, NS and mbox, but the serial becomes `max(file, current) + 1` — never
 lower than what has already been served.
+
+---
+
+## 9. Milestone D: secondary zones and transfers
+
+Drafted 2026-08-11, from §4 D. Every claim below was established against the
+code before it was written; the constraining findings are named inline.
+
+### 9.1 Why this is not another middleware
+
+Milestones A–C all hung off the query chain. This one cannot.
+
+`dnssrv.Handler` returns exactly one `*Response` (`pipeline.go:58`) and `serve`
+writes exactly one message (`server.go:121`). The real `dns.ResponseWriter`
+exists only inside `serve` (`server.go:85`) and is never passed on. An AXFR
+answer is a *sequence* of messages on one connection, so it cannot be expressed
+as a `*Response` at all.
+
+**So transfers branch at `dnssrv/server.go:85`, ahead of the chain**, on
+qtype AXFR/IXFR and on opcode NOTIFY. This is an intercept, not a link. It is
+also correct on the merits: a transfer must not pass through qlog's per-query
+accounting, the filter, the cache, or the upstream forwarder — none of which
+have any meaning for it.
+
+Two consequences the intercept must handle, both measured:
+
+- the 5s handler context (`server.go:86`) would abort a large transfer; the
+  transfer path needs its own deadline
+- `server.go:104` force-adds OPT to any OPT-less reply to an EDNS query, which
+  would stamp OPT onto every AXFR envelope
+
+### 9.2 Storage: three tables that do not exist
+
+`zones` already carries `primaries`, `tsig_key_id`, `expires_at` and
+`refreshed_at`, all unused and all without defined semantics. This milestone
+gives them meaning and adds:
+
+**`tsig_keys`** — name, algorithm, secret. Unlike API tokens (sha256 hash,
+`auth/token.go:19`) a TSIG key must be **recoverable to sign with**, so it
+follows the TOTP precedent (`store/userstore.go:112`): stored as retrievable
+plaintext. Nothing in this codebase is encrypted at rest today, and inventing
+key management here would be a larger and worse-tested change than the feature.
+Stated plainly rather than implied: **the DB holds signing secrets in the
+clear, so the DB file is now credential material.**
+
+**`zone_acl`** — which peers may transfer which zone. No ACL concept exists
+anywhere today. Default deny.
+
+**`zone_journal`** — IXFR deltas: per zone, per serial, the RRs added and
+removed. Greenfield; miekg gives no journal, no delta computation and no serial
+history, and `BumpSerial` (`store/zones.go:183`) increments while recording
+nothing. See 9.6 for whether this is in scope at all.
+
+**`primaries` format** must be defined, having shipped with none: a
+comma-separated list of `host[:port]`, port defaulting to 53, resolved at
+transfer time rather than at write.
+
+### 9.3 TSIG (RFC 8945)
+
+Algorithms are library-complete (hmac-sha1 through hmac-sha512, `tsig.go:18`;
+MD5 removed). Three things are ours:
+
+- **Verification is automatic but non-enforcing.** miekg sets a status
+  (`server.go:673`); an unsigned request sails through unless the handler
+  checks `w.TsigStatus()`. Every transfer path checks it explicitly.
+- **Hot reload.** `srv.tsigProvider()` is read per connection
+  (`server.go:260`), so a dynamic `TsigProvider` backed by the store is what
+  lets a key be added without a restart. A static `TsigSecret` map would not.
+- Keys are a first-class resource with their own CRUD, because a transfer
+  without one is unauthenticated.
+
+### 9.4 Outbound: dnsaur as secondary
+
+`dns.Transfer.In` does the framing. The work is scheduling and installation.
+
+**Installation is already solved and must be reused**: `ReplaceRecords`
+(`store/zones.go:248`) applies deletes, updates, adds and the zone row — serial
+included — in one transaction. A received zone installs as one atomic replace,
+exactly like an import. Received RRs convert to relative-name rows through the
+**same validation the API enforces** (`buildZoneRecord`), for the reason
+Milestone B and C both had to learn: an automatic path that skips a rule the
+human path enforces is this project's most repeated defect.
+
+**Scheduling** honours the SOA: refresh, retry on failure, and `expires_at` as
+a hard stop — a secondary past expiry must stop answering rather than serve
+data it can no longer confirm.
+
+**Per-zone reload is new work.** `Resolver.Reload` (`resolver.go:34`) rebuilds
+every zone from the whole store and swaps one atomic `Index`. Transfers call it
+far more often than a human writes a record, so this milestone adds a per-zone
+path or accepts a measured cost — decide with a benchmark, not by assertion.
+
+### 9.5 Inbound: dnsaur as primary
+
+The hardest item, and entirely greenfield.
+
+- The intercept of 9.1 is what gives `Transfer.Out` the raw writer.
+- **Envelope batching is ours.** `xfr.go:229` reads "assume it fits
+  TODO(miek): fix" — the library does not split a zone into messages that fit.
+- The allow-transfer ACL gates it, default deny, TSIG-or-address.
+
+### 9.6 IXFR, and whether it belongs here
+
+§4 D commits to IXFR. Having now costed it, it is the largest single piece of
+this milestone — a journal table, a retention policy, delta computation, and
+RFC 1982 serial arithmetic — and it is an **optimisation**: AXFR alone is a
+complete, correct transfer mechanism. RFC 1995 §2 permits a primary to answer
+IXFR with a full AXFR, which is a conforming implementation and what dnsaur
+would do until the journal exists.
+
+For homelab zones of tens to hundreds of records the bandwidth saved is
+negligible. The honest recommendation is **AXFR first, IXFR as its own
+milestone**, and the spec should say so rather than carrying a commitment made
+before the cost was known.
+
+### 9.7 `forwarder` zone type
+
+Shares nothing with transfers but the type enum, and is the most
+groundwork-complete of the six items: `answer.go:35` already falls through for
+`forwarder`/`stub`, and `upstream.Config.Conditional` works — nothing populates
+it.
+
+The catch: the fall-through hands the query to the **global** forwarder, which
+`applySettings` rebuilds from settings alone (`app.go:215`). Per-zone upstreams
+need a second input to forwarder construction. That is a change to the upstream
+package, not the zones package, and it is why this belongs on its own rather
+than inside a transfers milestone.
+
+### 9.8 Sub-milestones
+
+D is too large to land as one plan. Each of these ships something that works:
+
+| | Scope | Depends on |
+|---|---|---|
+| **D1** | TSIG keys: table, CRUD, dynamic provider, and the `TsigStatus` helper transfers call | — |
+| **D2** | Outbound AXFR: `primaries` format, scheduling, expiry, atomic install, per-zone reload, **and ownership of `zones.tsig_key_id`** — the column, its foreign key, and the guard against deleting a key a zone still references | D1 |
+| **D3** | Inbound AXFR: the `dnssrv` intercept, ACL, envelope batching | D1 |
+| **D4** | NOTIFY both directions | D2, D3 |
+| **D5** | IXFR: journal, deltas, serial arithmetic | D2, D3 |
+| **D6** | `forwarder` zone type and the `Conditional` migration | — |
+
+D1 is the foundation both directions need. D6 is independent of all of it.
+
+**Enforcement is deliberately not D1's.** D1 ships the mechanism — a provider
+that verifies, and a helper that reports the result — but nothing in D1 rejects
+an unsigned message, because nothing in D1 requires a signature. D2 and D3 are
+where a transfer path calls it. A reader who assumes D1 made TSIG mandatory will
+be wrong.
+
+### 9.9 RFC conformance added here
+
+| RFC | Rule |
+|---|---|
+| **5936** | AXFR is TCP-only; SOA first and last; the transfer is a sequence of messages |
+| **1995** | IXFR falls back to a full AXFR when no delta is available (§2) |
+| **1996** | NOTIFY is a hint, not an instruction — the secondary still checks the SOA before transferring |
+| **8945** | TSIG: signed request, signed reply, time-window enforcement, and an unsigned request rejected rather than ignored |
+| **1982** | Serial arithmetic is circular — comparison is not `<` |
+| **1034 §4.3.5** | A secondary past its SOA expire must stop answering for the zone |

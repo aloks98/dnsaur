@@ -274,7 +274,9 @@ func (a *App) Start(ctx context.Context) error {
 		dnsCache.Middleware(),
 	)
 	for _, addr := range a.cfg.DNSListen {
-		s := dnssrv.NewServer(addr, handler)
+		// The key store, not a snapshot of it: a key created through the API
+		// is live on the next signed message rather than the next restart.
+		s := dnssrv.NewServer(addr, handler, dnssrv.WithTSIGKeys(a.st.TSIGKeys()))
 		if err := s.Start(); err != nil {
 			return err
 		}

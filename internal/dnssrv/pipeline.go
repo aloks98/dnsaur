@@ -31,6 +31,10 @@ type Request struct {
 	Msg      *dns.Msg
 	ClientIP netip.Addr
 	Client   ClientInfo
+	// tsig is what TSIG verification concluded about this message, filled in
+	// by Server.serve. Unexported and read through RequireTSIG so a handler
+	// cannot mistake "nobody checked" for "checked and fine"; see tsig.go.
+	tsig *tsigState
 }
 
 func (r *Request) QName() string {

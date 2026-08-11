@@ -74,7 +74,7 @@ stages are purely additive — no rewiring of existing ones.
 | `cmd/dnsaur` | Entry point: flag/config parsing, wiring, graceful shutdown |
 | `internal/app` | Top-level app object: builds the pipeline, owns settings hot-reload and background jobs |
 | `internal/config` | Bootstrap YAML + env config loading and validation |
-| `internal/dnssrv` | DNS listeners, the `Handler`/`Middleware` pipeline abstraction, panic recovery |
+| `internal/dnssrv` | DNS listeners, the `Handler`/`Middleware` pipeline abstraction, panic recovery, and TSIG (RFC 8945): a `dns.TsigProvider` that verifies signed messages against the stored keys on every message, plus `RequireTSIG` for the paths that must refuse an unsigned one |
 | `internal/clients` | Client registry: IP/CIDR matching to client + group |
 | `internal/filter` | Blocklist/allowlist engine, list parsing, per-client-group rules, background refresh |
 | `internal/zones` | Authoritative zones: zone cut and deepest-match lookup, apex-relative names, RR construction from stored presentation-format rdata, and the NODATA/NXDOMAIN/wildcard/CNAME/referral answering rules |

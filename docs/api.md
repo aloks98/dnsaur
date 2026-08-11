@@ -215,6 +215,35 @@ Full parameter/response detail lives in `internal/api/openapi.yaml`
   PTRs come from importing that zone's own file. Import into a
   `type: "internal"` zone is refused with `409`, like any other write to
   one (see Zones above) — export is unaffected.
+- **TSIG keys** — `GET /tsig-keys`, `POST /tsig-keys`, `GET /tsig-keys/{id}`,
+  `PUT /tsig-keys/{id}` (full replace — `name`, `algorithm` and `secret` are
+  all required, same as create), `DELETE /tsig-keys/{id}`. A TSIG key (RFC
+  8945) authenticates a zone transfer between dnsaur and a peer. Changes take
+  effect on the next signed message: the DNS server reads keys from the store
+  per message, so a create, edit or delete needs no restart. `name` is
+  normalised to canonical form (lowercase, trailing dot) on every write, so
+  it can't miss the key a signed message names on case or a missing dot.
+  `algorithm` must be one of `hmac-sha1.`, `hmac-sha224.`, `hmac-sha256.`,
+  `hmac-sha384.`, `hmac-sha512.` — `hmac-md5.sig-alg.reg.int.` is a real RFC
+  8945 name but is rejected, because `miekg/dns` removed MD5 support from
+  its signer and a key created with it could never sign. `secret` is base64
+  and is validated as such at write time, since that's what gets decoded at
+  sign time. **Unlike an API token, the secret is returned on every read**
+  (list and get) rather than shown once: it has to be pasted, unchanged,
+  into the matching key on the peer (BIND's `key{}` clause, Technitium's
+  transfer settings), so hiding it after creation would make the feature
+  unusable without direct database access. For the same reason `secret` is
+  stored in the database as plaintext, not hashed — a signing key has to be
+  recoverable to sign with, unlike a password or a token. Nothing else in
+  dnsaur is encrypted at rest either, but nothing else has to be recoverable,
+  so this table specifically makes the database file credential material.
+  Verification has two limits inherited from `miekg/dns`, both fail-closed:
+  a truncated MAC is rejected — RFC 8945 §5.2.2.1 permits one, but the
+  library's comparison, mirrored here, is against the full MAC — and a
+  message must be signed with the algorithm the key was created with; one
+  signed with a different algorithm is rejected rather than verified under
+  the algorithm it names, so a peer-side algorithm upgrade needs the key
+  updated here too.
 - **Queries** — `GET /queries` (search the query log; filters: `from`,
   `to`, `client`, `q`, `decision`, `type`, `limit` [default 100, capped
   1000], `offset`), `GET /queries/tail` (live tail as Server-Sent Events,

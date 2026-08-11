@@ -22,6 +22,7 @@ func (s *sqlStore) Stats() StatsStore       { return &statsStore{s: s} }
 func (s *sqlStore) Users() UserStore        { return &userStore{s} }
 func (s *sqlStore) Tokens() TokenStore      { return &tokenStore{s} }
 func (s *sqlStore) Zones() ZoneStore        { return &zoneStore{s} }
+func (s *sqlStore) TSIGKeys() TSIGKeyStore  { return &tsigKeyStore{s} }
 
 func (s *sqlStore) q(q string) string { return rebind(s.dialect, q) }
 

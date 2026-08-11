@@ -32,6 +32,7 @@ tags:
   - name: Queries
   - name: Stats
   - name: Tokens
+  - name: TSIG Keys
 components:
   securitySchemes:
     cookieAuth:
@@ -233,6 +234,44 @@ components:
             that a rejection also satisfies the flat {"error": "..."}
             envelope every other endpoint answers errors with. It does not
             replace errors, which is where the per-problem detail is.
+    TSIGKey:
+      type: object
+      description: >
+        A TSIG key (RFC 8945) authenticates a zone transfer between this
+        server and a peer -- the credential a secondary presents to pull a
+        zone, or this server presents when it is the one transferring.
+      properties:
+        id: { type: integer, format: int64 }
+        name:
+          type: string
+          description: >
+            The TSIG RR's owner name, canonical form (lowercase, trailing
+            dot) -- e.g. "xfer.e412.in.". Normalised with the same rule on
+            every write, so a signed message's owner name can never miss the
+            key it names on case or a missing dot. Must be unique: it is the
+            only thing a signed message carries to say which key signed it.
+        algorithm:
+          type: string
+          enum: [hmac-sha1., hmac-sha224., hmac-sha256., hmac-sha384., hmac-sha512.]
+          description: >
+            miekg/dns's own algorithm names, trailing dot included.
+            hmac-md5.sig-alg.reg.int. is a real RFC 8945 registry name but is
+            rejected here: the library removed MD5 support from its signer,
+            so a key created with it would parse and store fine and then
+            fail to sign the first transfer it was needed for.
+        secret:
+          type: string
+          description: >
+            Base64, and returned in the clear on every read -- not hidden
+            the way a freshly minted API token is. An API token only ever
+            needs to be shown once, because only the holder who requested it
+            uses it again. A TSIG secret is different: the same value has to
+            be configured identically on the peer (BIND's key{} clause,
+            Technitium's transfer settings), so a caller must be able to
+            come back and read it whenever that peer needs re-pairing.
+            Hiding it after creation would make the feature unusable without
+            direct database access.
+        created_at: { type: integer, format: int64, description: unix ms }
   responses:
     ReadOnlyToken:
       description: read-only token used for a write operation
@@ -2076,6 +2115,198 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ZoneFileImportResult" }
+        "503":
+          description: storage unavailable
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /tsig-keys:
+    get:
+      tags: [TSIG Keys]
+      summary: List TSIG keys
+      description: >
+        Includes each key's secret -- see the TSIGKey schema's secret field
+        for why.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/TSIGKey" }
+        "401":
+          description: authentication required
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503":
+          description: storage unavailable
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+    post:
+      tags: [TSIG Keys]
+      summary: Create a TSIG key
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, algorithm, secret]
+              properties:
+                name: { type: string }
+                algorithm:
+                  type: string
+                  enum: [hmac-sha1., hmac-sha224., hmac-sha256., hmac-sha384., hmac-sha512.]
+                secret: { type: string, description: base64 }
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: { type: integer, format: int64 }
+        "400":
+          description: >
+            name is not a valid domain name, algorithm is not one of the
+            five miekg/dns can sign with, or secret is not valid base64
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401":
+          description: authentication required
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "403":
+          $ref: "#/components/responses/ReadOnlyToken"
+        "409":
+          description: a TSIG key with that name already exists
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503":
+          description: storage unavailable
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /tsig-keys/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: integer, format: int64 }
+    get:
+      tags: [TSIG Keys]
+      summary: Get a TSIG key
+      description: >
+        Includes the secret -- see the TSIGKey schema's secret field for why.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TSIGKey" }
+        "400":
+          description: bad id
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401":
+          description: authentication required
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "404":
+          description: not found
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503":
+          description: storage unavailable
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+    put:
+      tags: [TSIG Keys]
+      summary: Replace a TSIG key
+      description: >
+        Full replacement, not a partial patch -- name, algorithm and secret
+        are all required, the same as create.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, algorithm, secret]
+              properties:
+                name: { type: string }
+                algorithm:
+                  type: string
+                  enum: [hmac-sha1., hmac-sha224., hmac-sha256., hmac-sha384., hmac-sha512.]
+                secret: { type: string, description: base64 }
+      responses:
+        "204":
+          description: No Content
+        "400":
+          description: >
+            bad id, name is not a valid domain name, algorithm is not one of
+            the five miekg/dns can sign with, or secret is not valid base64
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401":
+          description: authentication required
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "403":
+          $ref: "#/components/responses/ReadOnlyToken"
+        "404":
+          description: not found
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "409":
+          description: a TSIG key with that name already exists
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503":
+          description: storage unavailable
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+    delete:
+      tags: [TSIG Keys]
+      summary: Delete a TSIG key
+      responses:
+        "204":
+          description: No Content
+        "400":
+          description: bad id
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401":
+          description: authentication required
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "403":
+          $ref: "#/components/responses/ReadOnlyToken"
+        "404":
+          description: not found
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
         "503":
           description: storage unavailable
           content:
