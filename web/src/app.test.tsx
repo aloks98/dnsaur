@@ -48,7 +48,15 @@ test("authenticated user gets the two-row shell: nav groups above, the active gr
 // a time; Account was the last padded one, and once it went the branch
 // always took the same side.
 test("the shell gives every route the full viewport, and never scrolls itself", async () => {
-  for (const route of ["/", "/queries", "/filtering/lists", "/zones", "/settings", "/account"]) {
+  for (const route of [
+    "/",
+    "/queries",
+    "/filtering/lists",
+    "/zones",
+    "/settings",
+    "/tsig-keys",
+    "/account",
+  ]) {
     const view = renderWithProviders(<App />, { route });
     await screen.findByRole("navigation", { name: "Primary" });
 
@@ -100,6 +108,25 @@ test("a deep-linked panel opens directly, instead of resetting to the first tab"
     "aria-current",
     "page",
   );
+});
+
+// The route loop above asserts only <main>'s classes, which the not-found
+// screen satisfies just as well — so it would stay green if /tsig-keys were
+// never wired to a page at all. Both halves of the wiring are pinned here:
+// the chrome marking System's second tab, and something only the page
+// itself renders.
+test("/tsig-keys renders the TSIG keys screen under System, not the not-found page", async () => {
+  renderWithProviders(<App />, { route: "/tsig-keys" });
+
+  const systemTabs = await screen.findByRole("navigation", { name: "System" });
+  expect(within(systemTabs).getByRole("link", { name: "TSIG keys" })).toHaveAttribute(
+    "aria-current",
+    "page",
+  );
+  // The page's own header strip: a count of what came back from
+  // /api/v1/tsig-keys (one key, per the default handler) and its CTA.
+  expect(await screen.findByText("1 key")).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: /new key/i })).toBeInTheDocument();
 });
 
 test("unauthenticated + setup-required shows setup", async () => {

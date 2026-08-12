@@ -592,6 +592,53 @@ another user's token *and* any underlying storage failure.
 
 ---
 
+### 2.10 TSIG keys
+
+| Endpoint | Success | Notes |
+|---|---|---|
+| `GET /tsig-keys` | 200 array | `[]` when empty, never `null` |
+| `POST /tsig-keys` | 201 `{"id"}` | |
+| `GET /tsig-keys/{id}` | 200 object | |
+| `PUT /tsig-keys/{id}` | 204 | full replace — all three fields required, same as create |
+| `DELETE /tsig-keys/{id}` | 204 | succeeds even for an id that never existed |
+
+```json
+[{"id":1,"name":"xfer.e412.in.","algorithm":"hmac-sha256.",
+  "secret":"Sh5ZuulpjcmcJuN6VwMQCVEhTJyUmlPTSHexvePtaWo=",
+  "created_at":1786000000000}]
+```
+
+Three things about this shape are easy to get wrong:
+
+- **`algorithm` carries a trailing dot.** The accepted set is
+  `hmac-sha1.`, `hmac-sha224.`, `hmac-sha256.`, `hmac-sha384.`,
+  `hmac-sha512.` — `miekg/dns`'s own constants, dot included. The dashboard
+  shows them **without** it, so the TSIG keys screen keeps an explicit
+  display↔wire mapping (`web/src/lib/tsig.ts`): select options are *valued*
+  with the wire string and only *labelled* without the dot. Sending the
+  displayed form is a `400`.
+- **`name` is canonicalised on every write** (lowercase, fully qualified), so
+  what comes back is not what was sent: `XFER.e412.IN` reads back as
+  `xfer.e412.in.`.
+- **`secret` is returned on every read** — the deliberate opposite of an API
+  token. It is base64, stored in plaintext, and has to be pasted unchanged
+  into the peer's config, so the screen's masking is a display choice about
+  what sits on screen rather than a boundary of any kind.
+
+Errors: 400 `name must be a valid domain name`, 400 `algorithm must be one of
+hmac-sha1., hmac-sha224., hmac-sha256., hmac-sha384., hmac-sha512.`, 400
+`secret must be base64-encoded`, 400 `invalid json` / `bad id`, 404 `not found`
+(get only), 409 `a TSIG key with that name already exists` (create and
+update).
+
+> **Nothing references a key.** `zones.tsig_key_id` exists in the schema and
+> is serialized on every zone (§3.6), but no zone endpoint accepts it, no
+> transfer runs against a key, and `DELETE /tsig-keys/{id}` succeeds silently
+> whatever points at it. The screen therefore has no "used by" column and no
+> in-use delete guard — both arrive with zone transfers.
+
+---
+
 ## 3. Entities
 
 ### 3.1 Query log row
@@ -1121,6 +1168,7 @@ typing in an input.
 | Zones | `/zones` |
 | Zone detail | `/zones/{id}` |
 | Settings | `/settings` |
+| TSIG keys | `/tsig-keys` |
 | Account & security | `/account` |
 | Login | pre-shell |
 | Setup wizard | pre-shell |
@@ -1134,7 +1182,7 @@ typing in an input.
 | **Dashboard health** | Reduced to the shell's two row-1 readouts (blocking state, and `DNS OK`/`DNS down` from `GET /health`). Filter-list freshness moved off the dashboard with the redesign and now lives only on Filtering → Lists. The spec's "upstreams healthy" signal **has no code at all** — there is no upstream-health endpoint. |
 | **Settings** | 11 keys work. The spec's "storage (read-only info)" section is absent, with a code comment noting no endpoint exists to source it. |
 | **Account** | TOTP and tokens are complete. **Change password is not implemented**; the page says so: *"Password changes aren't available yet — that's planned for a future update."* |
-| **Command palette** | Navigates to the 8 leaf pages only, grouped by nav section. The spec's "quick actions (pause, block a domain)" don't exist. |
+| **Command palette** | Navigates to the 9 leaf pages only, grouped by nav section. The spec's "quick actions (pause, block a domain)" don't exist. |
 
 ### Not started
 
@@ -1146,10 +1194,10 @@ typing in an input.
 | **Zone transfers (secondary/stub/forwarder), DNSSEC** | schema and UI badges exist for the non-`primary` zone types (§3.6), but create/patch reject anything but `primary` with `400`; no transfer client/server, no signing — Milestones D–E. **Reverse zones are no longer on this list**: `PTR` is a normal record type, a reverse zone is an ordinary `primary` zone ending in `.arpa`, the RFC 6303 §4 built-ins (`internal/store/builtins.go`'s `BuiltinZones`) are seeded as `type: internal` (read-only, `409` on any write), and an A/AAAA write maintains the matching PTR server-side in the same request |
 | **HA / cluster UI** | no code; the spec anticipated a health-strip stub, which does not exist |
 
-The nav contains exactly the eight implemented leaf routes, in four groups
+The nav contains exactly the nine implemented leaf routes, in four groups
 (Monitor: Dashboard, Query Log · Filtering: Lists, Rules, Groups & Clients ·
-Zones: Zones · System: Settings, Account) — there are no dead nav entries
-pointing at unbuilt screens. The group holding Zones is internally still
+Zones: Zones · System: Settings, TSIG keys, Account) — there are no dead nav
+entries pointing at unbuilt screens. The group holding Zones is internally still
 named `network` (a stable id for keys/tests), but its label and only child
 are both "Zones" — it replaced the flat Local DNS override table, not just
 its own nav entry. Theme and log out live under System too; the shell has

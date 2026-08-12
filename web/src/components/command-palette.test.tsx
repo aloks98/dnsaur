@@ -34,6 +34,7 @@ test("opening the palette lists every page, grouped by nav section", async () =>
     "Groups & Clients",
     "Zones",
     "Settings",
+    "TSIG keys",
     "Account",
   ]) {
     expect(screen.getByRole("option", { name: label })).toBeInTheDocument();

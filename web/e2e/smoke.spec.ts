@@ -3,15 +3,17 @@ import { expect, test } from "@playwright/test";
 // One end-to-end path through the real embedded build (see
 // ../playwright.config.ts's webServer): first-run setup creates the admin
 // account, then a real login (not just the wizard's own silent sign-in),
-// then a concrete CRUD action (create a zone and add a record to it) and a
-// persisted preference (dark mode surviving a reload). Deliberately a
-// single spec, not a suite — this is a ship gate ("does the real build
-// actually work end to end"), not page-by-page coverage; that's what the
-// Vitest component tests are for.
+// then a concrete CRUD action (create a zone and add a record to it), a
+// persisted preference (dark mode surviving a reload) and a write whose
+// wire format only the real server can judge (a TSIG key, whose algorithm
+// values differ between what the API accepts and what the screen shows).
+// Deliberately a single spec, not a suite — this is a ship gate ("does the
+// real build actually work end to end"), not page-by-page coverage; that's
+// what the Vitest component tests are for.
 const USERNAME = "e2e-admin";
 const PASSWORD = "correct horse battery staple";
 
-test("first-run setup, login, create a zone and add a record, dark mode persists across reload", async ({
+test("first-run setup, login, create a zone and add a record, dark mode persists across reload, create a TSIG key", async ({
   page,
 }) => {
   // --- first-run setup: create the admin account -----------------------
@@ -200,4 +202,50 @@ test("first-run setup, login, create a zone and add a record, dark mode persists
   ).toHaveAttribute("aria-current", "page");
   await expect(page.locator("html")).toHaveClass(/dark/);
   await expect(row).toBeVisible(); // the record survived the reload too
+
+  // --- create a TSIG key against the real handler -----------------------
+  // Last, because it navigates away from the zone the assertions above are
+  // about. This is the one thing about that screen jsdom structurally
+  // cannot check: whether the algorithm the select submits is a value the
+  // *server* accepts. The API's values are miekg's constants and carry a
+  // trailing dot ("hmac-sha256.") while the design shows them without one,
+  // and a mocked POST would accept either — the real handler validates
+  // against its own set and 400s anything else. The name is the same story:
+  // what comes back is canonical, not what was typed.
+  await systemMenu.click();
+  await page.getByRole("menuitem", { name: "TSIG keys" }).click();
+  await expect(
+    topNav.getByRole("navigation", { name: "System" }).getByRole("link", { name: "TSIG keys" }),
+  ).toHaveAttribute("aria-current", "page");
+
+  // No keys on a fresh instance, so "New key" is offered twice (the header
+  // and the empty state); `.first()` picks either.
+  await page.getByRole("button", { name: "New key" }).first().click();
+  // Generated, not typed — the field opens pre-filled from
+  // crypto.getRandomValues (see src/lib/tsig.ts).
+  const generatedSecret = await page.getByLabel("Secret", { exact: true }).inputValue();
+  expect(generatedSecret).toMatch(/^[A-Za-z0-9+/]{43}=$/);
+  await page.getByLabel("Key name").fill("XFER.e412.IN");
+  await expect(page.getByText("Saved as xfer.e412.in.")).toBeVisible();
+  // Picked **by label** — by what the design shows — so what reaches the
+  // server is whatever the option was valued with. This is what makes the
+  // segment a test of the mapping rather than of the default constant:
+  // leaving the select untouched submits DEFAULT_TSIG_ALGORITHM whatever the
+  // DOM says, so dotless option values would sail through. (The default's own
+  // dotted form is held by the type system — DEFAULT_TSIG_ALGORITHM is a
+  // TSIGAlgorithm, so a dotless literal doesn't compile — and asserted on the
+  // POST body in pages/tsig-keys.test.tsx.) A non-default algorithm also
+  // proves the row sends what was chosen rather than the default.
+  await page.getByLabel("Algorithm").selectOption({ label: "hmac-sha512" });
+  await page.getByRole("button", { name: "Add", exact: true }).click();
+
+  const keyRow = page.locator('[data-testid="tsig-key-row"]', { hasText: "xfer.e412.in." });
+  await expect(keyRow).toBeVisible();
+  await expect(keyRow.getByText("hmac-sha512", { exact: true })).toBeVisible();
+  // Masked at rest; the eye is what puts it on screen, and what it puts
+  // there is byte-for-byte what the create row generated and the server
+  // stored.
+  await expect(keyRow.getByText("•".repeat(24))).toBeVisible();
+  await keyRow.getByRole("button", { name: "Show the secret for xfer.e412.in." }).click();
+  await expect(keyRow.getByText(generatedSecret, { exact: true })).toBeVisible();
 });

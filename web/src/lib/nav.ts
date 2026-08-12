@@ -2,6 +2,7 @@ import type { LucideIcon } from "lucide-react";
 import {
   CircleUserRound,
   Globe,
+  KeyRound,
   LayoutDashboard,
   ListFilter,
   ScrollText,
@@ -99,6 +100,10 @@ export const NAV_GROUPS: NavGroup[] = [
     label: "System",
     items: [
       { to: "/settings", label: "Settings", icon: Settings },
+      // A tab of its own rather than a section inside Settings: a TSIG key
+      // is a credential that another server holds a copy of, not a
+      // preference of this one, and it has its own CRUD screen.
+      { to: "/tsig-keys", label: "TSIG keys", icon: KeyRound },
       { to: "/account", label: "Account", icon: CircleUserRound },
     ],
   },

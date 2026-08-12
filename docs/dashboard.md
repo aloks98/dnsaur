@@ -395,6 +395,54 @@ the process restarts.
 
 ---
 
+## TSIG keys
+
+A TSIG key (RFC 8945) authenticates a zone transfer: both ends hold the same
+named key and sign every transfer message with it. Its own tab under System,
+beside Settings and Account.
+
+Each key is a name, an algorithm and a base64 secret.
+
+**The name is canonicalised on save** — lowercased and given a trailing dot,
+so `XFER.e412.IN` is stored as `xfer.e412.in.`. The create row says what it
+will be saved as while you type it. That form has to match the name the peer
+signs with, which is why the list shows canonical names rather than what was
+typed.
+
+**The algorithm** is one of `hmac-sha1`, `hmac-sha224`, `hmac-sha256`,
+`hmac-sha384` or `hmac-sha512`. `hmac-md5` is a real RFC 8945 name but isn't
+offered: the library dnsaur signs with dropped MD5, so a key made with it
+could never sign anything.
+
+**Generating the secret is the default** and the create row opens with one
+already filled in — 32 bytes of browser CSPRNG output, base64-encoded. The
+server can check that a secret is base64; it cannot tell a strong one from a
+weak one, so a hand-typed secret is the risky path. "Paste an existing
+secret" is there for the case that matters: the peer already holds a key and
+dnsaur is the side being configured to match.
+
+**Secrets are shown, not hidden.** Unlike an API token, a TSIG key's secret
+is returned on every read and stored in plaintext — it has to be pasted
+unchanged into the matching key on the other server (BIND's `key{}` clause,
+Technitium's transfer settings), so a write-only secret would make the
+feature unusable. The list masks them anyway, so four secrets aren't sitting
+in the open during a screen share: the eye reveals one row at a time, and
+Copy puts the real secret on the clipboard without revealing anything. That
+is a display choice, not a security boundary — anyone who can reach this
+screen can read every secret on it, and anyone who can read the database
+file can too.
+
+Changes take effect on the next signed message; nothing here needs a
+restart.
+
+Nothing references a key yet. Zones carry a `tsig_key_id` field, but no zone
+can be pointed at a key and no transfer runs against one — that arrives with
+zone transfers, along with the "in use by N zones" column and the guard that
+stops you deleting a key some zone still depends on. Today, deleting a key
+just deletes it.
+
+---
+
 ## Account & security
 
 ### Password

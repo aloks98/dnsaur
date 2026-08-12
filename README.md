@@ -38,8 +38,8 @@ the database or shell out to curl for everyday admin: a React dashboard
 (`web/`, embedded into the `dnsaur` binary and served alongside the API —
 see [`docs/architecture.md`](docs/architecture.md)) covers first-run setup,
 live query monitoring, per-client blocklists/allowlists/rules, authoritative
-zones, and settings — [`docs/dashboard.md`](docs/dashboard.md) walks
-through it screen by screen. The REST API under `/api/v1` (see
+zones, TSIG keys, and settings — [`docs/dashboard.md`](docs/dashboard.md)
+walks through it screen by screen. The REST API under `/api/v1` (see
 [`docs/api.md`](docs/api.md)) is still there underneath it — settings,
 client groups, filter lists, zones, and more are all scriptable over HTTP
 (curl or any HTTP client) too, dashboard or not.

@@ -16,6 +16,7 @@ import { NotFound } from "./pages/not-found";
 import { QueryLog } from "./pages/queries";
 import { SettingsPage } from "./pages/settings";
 import { Setup } from "./pages/setup";
+import { TSIGKeys } from "./pages/tsig-keys";
 import { ZoneDetail } from "./pages/zones/detail";
 import { ZonesList } from "./pages/zones/list";
 
@@ -90,6 +91,9 @@ export function App() {
                 <Route path=":id" element={<ZoneDetail />} />
               </Route>
               <Route path="settings" element={<SettingsPage />} />
+              {/* System's second tab (see lib/nav.ts): the keys that
+                  authenticate zone transfers, not a Settings section. */}
+              <Route path="tsig-keys" element={<TSIGKeys />} />
               <Route path="account" element={<Account />} />
               {/* A real screen, not a redirect. Silently rewriting an
                   unknown URL to `/` meant a broken link and a working one

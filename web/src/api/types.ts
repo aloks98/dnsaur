@@ -173,4 +173,32 @@ export interface ApiToken {
   last_used: number;
 }
 
+/**
+ * A TSIG key (RFC 8945): the shared secret that authenticates a zone
+ * transfer. Both ends hold the same named key and sign every transfer
+ * message with it (Go: store.TSIGKey).
+ *
+ * The deliberate opposite of ApiToken above, in the one way that matters:
+ * `secret` is returned on **every** read, not shown once at creation. It has
+ * to be pasted unchanged into the matching key on the peer (BIND's `key{}`
+ * clause, Technitium's transfer settings), so it is stored as plaintext and
+ * handed back on list and get — see docs/api.md's TSIG keys section. That is
+ * why the screen's masking (pages/tsig-keys.tsx) is a display choice about
+ * what sits on screen, not a security boundary.
+ */
+export interface TSIGKey {
+  id: number;
+  /** Canonical owner name: lowercase, fully qualified — "xfer.e412.in." */
+  name: string;
+  /**
+   * miekg/dns's own constant, **with** the trailing dot: "hmac-sha256.".
+   * The screen shows these without it — see lib/tsig.ts for the one place
+   * that translates between the two.
+   */
+  algorithm: string;
+  /** base64, exactly as the peer's config wants it. */
+  secret: string;
+  created_at: number;
+}
+
 export type Settings = Record<string, string>;

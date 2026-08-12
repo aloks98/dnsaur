@@ -12,6 +12,7 @@ import type {
   StatsOverview,
   TimelineBucket,
   TopEntry,
+  TSIGKey,
   Zone,
   ZoneRecord,
 } from "../api/types";
@@ -124,6 +125,26 @@ function defaultZoneRecords(zoneId: number): ZoneRecord[] {
       rdata: "bifrost.example.com.",
       enabled: true,
       comment: "wildcard for the nexus subdomain",
+    },
+  ];
+}
+
+/**
+ * One TSIG key (Milestone D1). `algorithm` carries the trailing dot exactly
+ * as the API emits it — these are miekg's own constants — and `secret` is
+ * real base64, because the server decodes it at write time and the screen
+ * hands it to the clipboard verbatim. The secret being present at all is the
+ * point: unlike an API token, a TSIG key's secret is returned on every read
+ * (see api/types.ts's TSIGKey).
+ */
+function defaultTSIGKeys(): TSIGKey[] {
+  return [
+    {
+      id: 1,
+      name: "xfer.example.com.",
+      algorithm: "hmac-sha256.",
+      secret: "Sh5ZuulpjcmcJuN6VwMQCVEhTJyUmlPTSHexvePtaWo=",
+      created_at: Date.now() - 7 * 24 * 60 * 60 * 1000,
     },
   ];
 }
@@ -253,6 +274,10 @@ export const handlers = [
     }
     return HttpResponse.json(defaultZoneRecords(id));
   }),
+
+  // TSIG keys (Milestone D1), GET-only like zones above: the mutation
+  // endpoints are registered per-test via server.use().
+  http.get("/api/v1/tsig-keys", () => HttpResponse.json(defaultTSIGKeys())),
 
   blockingHandler(),
 ];
