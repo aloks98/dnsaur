@@ -3,6 +3,8 @@ package dnssrv
 import (
 	"context"
 	"errors"
+	"net"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -370,6 +372,499 @@ func TestTsigAlgorithmMismatchFailsVerification(t *testing.T) {
 	}
 	if got := mustSee(t, seen); got.err == nil {
 		t.Fatal("a message signed with an algorithm the key is not configured for verified")
+	}
+}
+
+// ----------------------------------------------------------------------------
+// UDP size: a signed reply must still fit what the client can receive.
+// ----------------------------------------------------------------------------
+
+// sizeQName is the question the size tests ask. Its wire form is 17 bytes, so
+// the sizes named below are reproducible arithmetic rather than magic numbers.
+const sizeQName = "bifrost.e412.in."
+
+// answerOfLen builds an answer section for a reply to qname whose whole
+// uncompressed message comes to exactly want bytes. Bulk is A records; a
+// trailing TXT is padded to land on the byte. Sizing the reply rather than
+// counting records is what lets a test say "479 bytes" -- the number the
+// reviewer measured -- instead of "fifteen-ish records".
+func answerOfLen(t *testing.T, qname string, want int) []dns.RR {
+	t.Helper()
+	m := new(dns.Msg)
+	m.SetQuestion(qname, dns.TypeA)
+	a, err := dns.NewRR(qname + " 300 IN A 1.2.3.4")
+	if err != nil {
+		t.Fatalf("building filler record: %v", err)
+	}
+	txt := &dns.TXT{
+		Hdr: dns.RR_Header{Name: qname, Rrtype: dns.TypeTXT, Class: dns.ClassINET, Ttl: 300},
+		Txt: []string{""},
+	}
+	for m.Len()+dns.Len(a)+dns.Len(txt) <= want {
+		m.Answer = append(m.Answer, dns.Copy(a))
+	}
+	pad := want - m.Len() - dns.Len(txt)
+	if pad < 0 {
+		t.Fatalf("cannot build a %d-byte reply for %s: the smallest one is %d bytes",
+			want, qname, m.Len()+dns.Len(txt))
+	}
+	txt.Txt = []string{strings.Repeat("x", pad)}
+	return append(m.Answer, txt)
+}
+
+// tsigServerAnswering brings up a signing server that answers every question
+// with the same records, so a test controls the size of the reply.
+func tsigServerAnswering(t *testing.T, keys TSIGKeys, answer []dns.RR) string {
+	t.Helper()
+	return tsigServerShaping(t, keys, func(m *dns.Msg) {
+		m.Answer = append(m.Answer, answer...)
+	})
+}
+
+// tsigServerShaping is tsigServerAnswering for a reply that is not just an
+// answer section -- a negative answer or a delegation, which put their records
+// in the authority section instead.
+func tsigServerShaping(t *testing.T, keys TSIGKeys, shape func(*dns.Msg)) string {
+	t.Helper()
+	h := HandlerFunc(func(_ context.Context, req *Request) (*Response, error) {
+		m := new(dns.Msg)
+		m.SetReply(req.Msg)
+		shape(m)
+		return &Response{Msg: m, Decision: DecisionAuthoritative}, nil
+	})
+	s := NewServer("127.0.0.1:0", h, WithTSIGKeys(keys))
+	if err := s.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := s.Shutdown(context.Background()); err != nil {
+			t.Logf("shutdown error: %v", err)
+		}
+	})
+	return s.Addr()
+}
+
+// rawUDPExchange sends q over a plain UDP socket and returns the reply exactly
+// as it arrived, in bytes.
+//
+// dns.Client cannot measure this. It reads a UDP reply into a buffer of its own
+// UDPSize -- 512 by default -- so an over-size answer comes back as an unpack
+// error rather than as a number, which is precisely the "malformed response"
+// the bug looked like from the outside. The read buffer here is deliberately
+// large enough to catch a server that overshoots.
+func rawUDPExchange(t *testing.T, addr string, q []byte) []byte {
+	t.Helper()
+	c, err := net.Dial("udp", addr)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer func() { _ = c.Close() }()
+	if err := c.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatalf("deadline: %v", err)
+	}
+	if _, err := c.Write(q); err != nil {
+		t.Fatalf("write query: %v", err)
+	}
+	buf := make([]byte, dns.MaxMsgSize)
+	n, err := c.Read(buf)
+	if err != nil {
+		t.Fatalf("read reply: %v", err)
+	}
+	return buf[:n]
+}
+
+// signedQueryBytes packs a query the way a client puts it on the wire and
+// returns the request's MAC alongside, which a reply's MAC is computed over
+// (RFC 8945 §5.3 lists the request MAC first among an answer's digest
+// components) and which a test therefore needs to verify the answer.
+//
+// udpSize == 0 leaves the query non-EDNS. That is the case the bug lives in: a
+// client that advertises nothing has a bare 512-byte budget.
+func signedQueryBytes(t *testing.T, qname string, udpSize uint16) (query []byte, requestMAC string) {
+	t.Helper()
+	m := new(dns.Msg)
+	m.SetQuestion(qname, dns.TypeA)
+	if udpSize > 0 {
+		m.SetEdns0(udpSize, false)
+	}
+	m.SetTsig("xfer.e412.in.", dns.HmacSHA256, 300, time.Now().Unix())
+	buf, mac, err := dns.TsigGenerate(m, goodSecret, "", false)
+	if err != nil {
+		t.Fatalf("signing query: %v", err)
+	}
+	return buf, mac
+}
+
+// unpackReply turns raw wire bytes into a message, failing the test if they are
+// not a message at all.
+func unpackReply(t *testing.T, raw []byte) *dns.Msg {
+	t.Helper()
+	m := new(dns.Msg)
+	if err := m.Unpack(raw); err != nil {
+		t.Fatalf("reply of %d bytes did not unpack: %v", len(raw), err)
+	}
+	return m
+}
+
+// verifyReplyMAC checks the signature on a reply as the requesting client
+// would. dns.stripTsig decrements ARCOUNT in the buffer it is given, so this
+// works on a copy and callers can keep using raw afterwards.
+func verifyReplyMAC(t *testing.T, raw []byte, requestMAC string) {
+	t.Helper()
+	if err := dns.TsigVerify(append([]byte(nil), raw...), goodSecret, requestMAC, false); err != nil {
+		t.Fatalf("reply MAC did not verify: %v", err)
+	}
+}
+
+func sizeKeys(t *testing.T) *fakeKeys {
+	t.Helper()
+	return newFakeKeys(store.TSIGKey{
+		Name: "xfer.e412.in.", Algorithm: dns.HmacSHA256, Secret: goodSecret,
+	})
+}
+
+// The bug this task exists for.
+//
+// A non-EDNS client advertises nothing, so RFC 6891 §6.2.3 gives it a bare
+// 512-byte budget. Msg.Truncate refuses outright to touch a message that
+// already carries a TSIG (msg_truncate.go:30, "to simplify this
+// implementation") and floors any size below 512 back up to 512
+// (msg_truncate.go:40) -- so truncating to 512 and *then* attaching the
+// signature put a 479-byte answer on the wire at 564 bytes with no TC bit: an
+// over-size packet, and no instruction to retry over TCP.
+//
+// 479 + 53 (the TSIG RR for xfer.e412.in. under hmac-sha256, MAC-less) + 32
+// (the MAC) = 564, which is the number the reviewer measured.
+func TestTsigSignedReplyToNonEDNSClientFitsIn512(t *testing.T) {
+	keys := sizeKeys(t)
+	addr := tsigServerAnswering(t, keys, answerOfLen(t, sizeQName, 479))
+
+	// The unsigned baseline, from the same server: 479 bytes, comfortably
+	// inside 512, nothing truncated. This is the "479" half of the pair.
+	unsignedQ := new(dns.Msg)
+	unsignedQ.SetQuestion(sizeQName, dns.TypeA)
+	packed, err := unsignedQ.Pack()
+	if err != nil {
+		t.Fatalf("packing unsigned query: %v", err)
+	}
+	if got := len(rawUDPExchange(t, addr, packed)); got != 479 {
+		t.Fatalf("unsigned baseline was %d bytes, want 479; the test fixture no longer builds the size it claims", got)
+	}
+
+	answer := answerOfLen(t, sizeQName, 479)
+	q, requestMAC := signedQueryBytes(t, sizeQName, 0)
+	raw := rawUDPExchange(t, addr, q)
+
+	if len(raw) > dns.MinMsgSize {
+		t.Fatalf("signed reply to a non-EDNS client was %d bytes; a 512-byte client cannot receive it", len(raw))
+	}
+	reply := unpackReply(t, raw)
+	// 479 bytes uncompressed is 269 compressed, which still fits the 395 left
+	// after the signature is reserved -- so the right answer here is the whole
+	// answer, not a trip to TCP. Reserving room must not cost records that fit.
+	if reply.Truncated {
+		t.Fatal("TC was set on an answer that still fits once compressed; the reservation is over-charging the reply")
+	}
+	if len(reply.Answer) != len(answer) {
+		t.Fatalf("reply carried %d of %d records", len(reply.Answer), len(answer))
+	}
+	if reply.IsTsig() == nil {
+		t.Fatal("reply carried no TSIG")
+	}
+	verifyReplyMAC(t, raw, requestMAC)
+}
+
+// The other half of the non-EDNS case: an answer that does not fit even
+// compressed, once the signature's bytes are reserved out of a bare 512.
+//
+// RFC 8945 §5.3 mandates the shape -- "This response contains only the question
+// and a TSIG record, has the TC bit set, and has an RCODE of 0 (NOERROR)" --
+// and RFC 2181 §9 is why an empty body costs the client nothing: on a TC reply
+// it "should ignore that response, and query again" over TCP for the whole
+// thing, so salvaged records would be bytes it discards.
+func TestTsigSignedReplyTooLargeForNonEDNSClientIsEmptyTC(t *testing.T) {
+	keys := sizeKeys(t)
+	addr := tsigServerAnswering(t, keys, answerOfLen(t, sizeQName, 1200))
+
+	q, requestMAC := signedQueryBytes(t, sizeQName, 0)
+	raw := rawUDPExchange(t, addr, q)
+
+	if len(raw) > dns.MinMsgSize {
+		t.Fatalf("signed reply to a non-EDNS client was %d bytes; a 512-byte client cannot receive it", len(raw))
+	}
+	reply := unpackReply(t, raw)
+	if !reply.Truncated {
+		t.Fatal("records were dropped but TC was not set; the client is given no reason to retry over TCP")
+	}
+	if len(reply.Answer) != 0 || len(reply.Ns) != 0 {
+		t.Fatalf("reply carried %d answer and %d authority records; this case answers TC with an empty body",
+			len(reply.Answer), len(reply.Ns))
+	}
+	if reply.IsTsig() == nil {
+		t.Fatal("the TC reply was not signed; a peer that requires TSIG cannot trust an unsigned instruction to switch transports")
+	}
+	verifyReplyMAC(t, raw, requestMAC)
+}
+
+// An EDNS client that advertised room keeps miekg's ordinary partial
+// truncation. The empty-body rule above is confined to budgets too small for
+// Truncate to work in at all, and must not spread to clients that gave the
+// server space.
+func TestTsigSignedReplyToEDNSClientUsesAdvertisedBudget(t *testing.T) {
+	keys := sizeKeys(t)
+	addr := tsigServerAnswering(t, keys, answerOfLen(t, sizeQName, 6000))
+
+	q, requestMAC := signedQueryBytes(t, sizeQName, 1232)
+	raw := rawUDPExchange(t, addr, q)
+
+	if len(raw) > 1232 {
+		t.Fatalf("signed reply was %d bytes against an advertised 1232", len(raw))
+	}
+	reply := unpackReply(t, raw)
+	if !reply.Truncated {
+		t.Fatal("a 6000-byte answer was cut to fit 1232 but TC was not set")
+	}
+	if len(reply.Answer) == 0 {
+		t.Fatal("an EDNS client with room to spare got no records at all; partial truncation is still miekg's job above 512")
+	}
+	if reply.IsTsig() == nil {
+		t.Fatal("reply carried no TSIG")
+	}
+	verifyReplyMAC(t, raw, requestMAC)
+}
+
+// A signed reply that fits gets no TC and loses no records. The reservation is
+// a ceiling, not a tax: reserving the signature's bytes must not cost a small
+// answer any of its own.
+func TestTsigSignedReplyThatFitsIsNotTruncated(t *testing.T) {
+	keys := sizeKeys(t)
+	answer := answerOfLen(t, sizeQName, 200)
+	addr := tsigServerAnswering(t, keys, answer)
+
+	q, requestMAC := signedQueryBytes(t, sizeQName, 0)
+	raw := rawUDPExchange(t, addr, q)
+
+	if len(raw) > dns.MinMsgSize {
+		t.Fatalf("signed reply to a non-EDNS client was %d bytes", len(raw))
+	}
+	reply := unpackReply(t, raw)
+	if reply.Truncated {
+		t.Fatal("TC was set on a reply that fits; the client is sent to TCP for nothing")
+	}
+	if len(reply.Answer) != len(answer) {
+		t.Fatalf("reply carried %d of %d records; nothing needed dropping", len(reply.Answer), len(answer))
+	}
+	verifyReplyMAC(t, raw, requestMAC)
+}
+
+// An EDNS client can advertise a budget that is still too small to truncate
+// into once the signature is reserved. It gets the same empty-body TC -- but it
+// keeps its OPT record.
+//
+// That is a resolved conflict, not a free choice: RFC 8945 §5.3 says the reply
+// "contains only the question and a TSIG record", while RFC 6891 §6.1.1 says a
+// compliant responder MUST include an OPT in its response to a request that
+// carried one. See ednsOnly in server.go for why the OPT wins. The test exists
+// so the resolution cannot be reversed by accident.
+func TestTsigSignedReplyKeepsOPTWhenTruncatedToNothing(t *testing.T) {
+	keys := sizeKeys(t)
+	addr := tsigServerAnswering(t, keys, answerOfLen(t, sizeQName, 1200))
+
+	q, requestMAC := signedQueryBytes(t, sizeQName, 512)
+	raw := rawUDPExchange(t, addr, q)
+
+	if len(raw) > dns.MinMsgSize {
+		t.Fatalf("signed reply was %d bytes against an advertised 512", len(raw))
+	}
+	reply := unpackReply(t, raw)
+	if !reply.Truncated {
+		t.Fatal("TC was not set")
+	}
+	if len(reply.Answer) != 0 {
+		t.Fatalf("reply carried %d records", len(reply.Answer))
+	}
+	if reply.IsEdns0() == nil {
+		t.Fatal("the OPT record was dropped along with the answer; an EDNS query must get an EDNS reply")
+	}
+	verifyReplyMAC(t, raw, requestMAC)
+}
+
+// bigAuthority is the shape a negative answer or a delegation has: nothing in
+// the answer section, a large authority section. It overshoots exactly as an
+// answer section does, so clearing only reply.Answer is not enough -- with
+// reply.Ns left in place this reply goes out at over 700 bytes.
+func bigAuthority(t *testing.T, rcode int) func(*dns.Msg) {
+	t.Helper()
+	ns := answerOfLen(t, sizeQName, 1200)
+	return func(m *dns.Msg) {
+		m.Rcode = rcode
+		m.Ns = append(m.Ns, ns...)
+	}
+}
+
+// The authority section is dropped too. RFC 8945 §5.3 leaves "only the question
+// and a TSIG record", and a large authority section breaks the 512-byte budget
+// just as an answer section does.
+func TestTsigSignedReplyDropsTheAuthoritySectionToo(t *testing.T) {
+	keys := sizeKeys(t)
+	addr := tsigServerShaping(t, keys, bigAuthority(t, dns.RcodeSuccess))
+
+	q, requestMAC := signedQueryBytes(t, sizeQName, 0)
+	raw := rawUDPExchange(t, addr, q)
+
+	if len(raw) > dns.MinMsgSize {
+		t.Fatalf("signed reply with a large authority section was %d bytes; a 512-byte client cannot receive it", len(raw))
+	}
+	reply := unpackReply(t, raw)
+	if !reply.Truncated {
+		t.Fatal("authority records were dropped but TC was not set")
+	}
+	if len(reply.Ns) != 0 {
+		t.Fatalf("reply carried %d authority records; the emptying must cover every section, not just the answer", len(reply.Ns))
+	}
+	verifyReplyMAC(t, raw, requestMAC)
+}
+
+// RFC 8945 §5.3: the reply that fits "has an RCODE of 0 (NOERROR)". An NXDOMAIN
+// whose authority section overflows must not go out as a 118-byte TC still
+// claiming NXDOMAIN -- the reply that had to drop its records makes no claim it
+// cannot carry the records for. The client learns the real rcode over TCP.
+func TestTsigSignedReplyTruncatedToNothingIsNOERROR(t *testing.T) {
+	keys := sizeKeys(t)
+	addr := tsigServerShaping(t, keys, bigAuthority(t, dns.RcodeNameError))
+
+	q, requestMAC := signedQueryBytes(t, sizeQName, 0)
+	raw := rawUDPExchange(t, addr, q)
+
+	reply := unpackReply(t, raw)
+	if !reply.Truncated {
+		t.Fatal("TC was not set")
+	}
+	if reply.Rcode != dns.RcodeSuccess {
+		t.Fatalf("truncated-to-nothing reply carried rcode %s; RFC 8945 §5.3 requires NOERROR",
+			dns.RcodeToString[reply.Rcode])
+	}
+	verifyReplyMAC(t, raw, requestMAC)
+}
+
+// The NOERROR above has to hold for an extended rcode as well, and that one
+// does not live in the header: it is the top byte of the OPT's TTL, which
+// Msg.Unpack ORs back into Rcode (msg.go:871). An upstream response carrying
+// one arrives at the pipeline with the bits already set in the record, so
+// clearing Msg.Rcode alone would leave a reply that reads as NOERROR here and
+// as BADVERS at the client.
+//
+// It holds because Msg.Pack rewrites that field from Rcode whenever an OPT is
+// present, not only for rcodes above 15 (msg.go:744-747). This is pinned rather
+// than trusted: the guarantee belongs to the library, an explicit reset here
+// was tried and was dead code, and a library that narrowed that branch would
+// otherwise break this silently.
+func TestTsigSignedReplyTruncatedToNothingClearsTheExtendedRcode(t *testing.T) {
+	keys := sizeKeys(t)
+	ns := answerOfLen(t, sizeQName, 1200)
+	addr := tsigServerShaping(t, keys, func(m *dns.Msg) {
+		m.SetEdns0(1232, false)
+		m.IsEdns0().SetExtendedRcode(dns.RcodeBadVers)
+		m.Rcode = dns.RcodeBadVers
+		m.Ns = append(m.Ns, ns...)
+	})
+
+	q, requestMAC := signedQueryBytes(t, sizeQName, 512)
+	raw := rawUDPExchange(t, addr, q)
+
+	reply := unpackReply(t, raw)
+	if !reply.Truncated {
+		t.Fatal("TC was not set")
+	}
+	if reply.Rcode != dns.RcodeSuccess {
+		// Printed as a number as well: miekg maps 16 to "BADSIG", since RFC
+		// 8945's BADSIG and RFC 6891's BADVERS share the value.
+		t.Fatalf("truncated-to-nothing reply resolved to rcode %d (%s); the extended bits in the OPT outlived the reset",
+			reply.Rcode, dns.RcodeToString[reply.Rcode])
+	}
+	verifyReplyMAC(t, raw, requestMAC)
+}
+
+// RFC 6891 §6.2.3: "Values lower than 512 MUST be treated as equal to 512."
+//
+// The floor has to be applied before the signature is reserved, not left to
+// Msg.Truncate, or a client advertising 256 gets a budget the reservation eats
+// whole and a TC for an answer that fits comfortably. TestUDPSizeFloor covers
+// the floor on the unsigned path only, where Truncate applies it for us.
+func TestTsigSignedReplyFloorsATinyAdvertisedSize(t *testing.T) {
+	keys := sizeKeys(t)
+	answer := answerOfLen(t, sizeQName, 479)
+	addr := tsigServerAnswering(t, keys, answer)
+
+	q, requestMAC := signedQueryBytes(t, sizeQName, 256)
+	raw := rawUDPExchange(t, addr, q)
+
+	if len(raw) > dns.MinMsgSize {
+		t.Fatalf("signed reply was %d bytes", len(raw))
+	}
+	reply := unpackReply(t, raw)
+	if reply.Truncated {
+		t.Fatal("an advertised 256 was taken at face value; floored to 512 the answer fits, and the client is sent to TCP for nothing")
+	}
+	if len(reply.Answer) != len(answer) {
+		t.Fatalf("reply carried %d of %d records", len(reply.Answer), len(answer))
+	}
+	verifyReplyMAC(t, raw, requestMAC)
+}
+
+// The case around the fix: an unsigned reply to a non-EDNS client is truncated
+// exactly as it always was, partial answer and all. Nothing about reserving
+// room for a signature may reach a reply that has none.
+func TestUnsignedReplyToNonEDNSClientTruncatesAsBefore(t *testing.T) {
+	keys := sizeKeys(t)
+	addr := tsigServerAnswering(t, keys, answerOfLen(t, sizeQName, 2000))
+
+	q := new(dns.Msg)
+	q.SetQuestion(sizeQName, dns.TypeA)
+	packed, err := q.Pack()
+	if err != nil {
+		t.Fatalf("packing query: %v", err)
+	}
+	raw := rawUDPExchange(t, addr, packed)
+
+	if len(raw) > dns.MinMsgSize {
+		t.Fatalf("unsigned reply to a non-EDNS client was %d bytes", len(raw))
+	}
+	reply := unpackReply(t, raw)
+	if !reply.Truncated {
+		t.Fatal("a 2000-byte answer was cut to fit 512 but TC was not set")
+	}
+	if len(reply.Answer) == 0 {
+		t.Fatal("unsigned truncation lost every record; it used to keep as many as fit")
+	}
+	if reply.IsTsig() != nil {
+		t.Fatal("an unsigned query got a signed reply")
+	}
+}
+
+// TCP is never truncated: there is no 512-byte budget to reserve from, and a
+// zone transfer -- the thing D2 signs -- is TCP-only.
+func TestTsigSignedReplyOverTCPIsNotTruncated(t *testing.T) {
+	keys := sizeKeys(t)
+	answer := answerOfLen(t, sizeQName, 2000)
+	addr := tsigServerAnswering(t, keys, answer)
+
+	c := &dns.Client{Net: "tcp", TsigSecret: map[string]string{"xfer.e412.in.": goodSecret}}
+	m := new(dns.Msg)
+	m.SetQuestion(sizeQName, dns.TypeA)
+	m.SetTsig("xfer.e412.in.", dns.HmacSHA256, 300, time.Now().Unix())
+	reply, _, err := c.Exchange(m, addr)
+	if err != nil {
+		t.Fatalf("tcp exchange: %v", err)
+	}
+	if reply.Truncated {
+		t.Fatal("TC was set on a TCP reply")
+	}
+	if len(reply.Answer) != len(answer) {
+		t.Fatalf("tcp reply carried %d of %d records", len(reply.Answer), len(answer))
+	}
+	if reply.IsTsig() == nil {
+		t.Fatal("tcp reply carried no TSIG")
 	}
 }
 

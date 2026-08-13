@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/aloks98/dnsaur/internal/store"
+	"github.com/aloks98/dnsaur/internal/zones"
 	"github.com/miekg/dns"
 )
 
@@ -17,6 +18,7 @@ func (s *Server) zonesRoutes() {
 	s.route("GET /api/v1/zones/{id}", s.requireAuth(s.handleZoneGet))
 	s.route("PATCH /api/v1/zones/{id}", s.requireAuth(s.handleZonePatch))
 	s.route("DELETE /api/v1/zones/{id}", s.requireAuth(s.handleZoneDelete))
+	s.route("POST /api/v1/zones/{id}/refresh", s.requireAuth(s.handleZoneRefresh))
 }
 
 // reloadZones is called after successful zone mutations; failures are
@@ -43,19 +45,61 @@ const apexNSTTL = 3600
 // zone hands out uncacheable, forever re-querying us on every miss.
 const defaultSOATTL uint32 = 900
 
-// zoneTypePrimary is the only zone type Milestone A can create. This is
-// deliberately narrower than the schema (which already allows secondary |
-// stub | forwarder | internal for later milestones): internal/zones/answer.go
-// only special-cases "forwarder" and "stub" as non-answering, so a
-// "secondary" zone today would be served exactly like a primary — except a
-// secondary has no transfer mechanism until Milestone D, so it holds only
-// its apex NS record and every other name under it comes back an
-// authoritative NXDOMAIN. That silently takes a domain offline instead of
-// refusing to create it. Rather than teach the resolver to treat an
-// untransferable secondary as inert, the API refuses to create (or patch a
-// zone into) any type it cannot yet serve correctly — a type that cannot be
-// created cannot misbehave. Widen this once Milestone D adds transfers.
-const zoneTypePrimary = "primary"
+// The two zone types this API can create. Still narrower than the schema,
+// which has allowed secondary | stub | forwarder | internal since Milestone
+// A: internal/zones/answer.go treats forwarder and stub as non-answering and
+// nothing populates them, and internal is reserved for the RFC 6303
+// built-ins seeded at migration. The rule is unchanged from Milestone A —
+// the API refuses any type it cannot serve correctly, because a type that
+// cannot be created cannot misbehave — and what changed is that secondary is
+// now one it can: Milestone D2 gives it a transfer to fill it from.
+//
+// A secondary is only servable because it is *configured*, which is what
+// zoneCreate.Primaries and zoneCreate.TSIGKeyID are for and why they are
+// validated rather than merely stored.
+const (
+	zoneTypePrimary   = "primary"
+	zoneTypeSecondary = "secondary"
+)
+
+// checkZoneTransferConfig validates the (type, primaries, tsig_key_id)
+// triple as the zone would be stored, for create and patch alike — a rule
+// enforced on POST and not on PATCH is a rule with a way around it. It
+// returns the status code and message to answer with, or 0 when the
+// configuration is sound.
+func (s *Server) checkZoneTransferConfig(ctx context.Context, zoneType, primaries string, tsigKeyID int64) (int, string) {
+	if zoneType == zoneTypeSecondary {
+		// Syntax only, deliberately: zones.ValidatePrimaries does not
+		// resolve, so a primary named by hostname is stored as written and
+		// looked up at transfer time. See internal/zones/primaries.go.
+		if err := zones.ValidatePrimaries(primaries); err != nil {
+			return http.StatusBadRequest, "primaries: " + err.Error()
+		}
+	} else {
+		// primaries and tsig_key_id describe a transfer, and a zone that
+		// never transfers has none. Storing them anyway would leave
+		// configuration nothing reads, shown by the UI as though it meant
+		// something.
+		if primaries != "" {
+			return http.StatusBadRequest, "primaries applies to secondary zones only"
+		}
+		if tsigKeyID != 0 {
+			return http.StatusBadRequest, "tsig_key_id applies to secondary zones only"
+		}
+	}
+	if tsigKeyID != 0 {
+		// zones.tsig_key_id carries no foreign key — see the 0009 migration
+		// for why — so this is where a reference to a key that does not
+		// exist is caught. The other half of the same rule is
+		// tsigKeyStore.Delete, which refuses to remove a key a zone names.
+		if _, found, err := s.deps.Store.TSIGKeys().Get(ctx, tsigKeyID); err != nil {
+			return http.StatusServiceUnavailable, "storage unavailable"
+		} else if !found {
+			return http.StatusBadRequest, "tsig_key_id does not name an existing TSIG key"
+		}
+	}
+	return 0, ""
+}
 
 // normalizeZoneName lowercases name, strips a trailing dot, and validates
 // it. dns.IsDomainName gives RFC 1035 §2.3.4 (label <= 63 octets, name <=
@@ -107,8 +151,18 @@ func (s *Server) handleZoneGet(w http.ResponseWriter, r *http.Request) {
 // clients_handlers.go).
 type zoneCreate struct {
 	Name string `json:"name"`
-	// Type omitted means primary — the only type Milestone A can serve.
+	// Type omitted means primary. primary and secondary are the two this
+	// API creates — see zoneTypePrimary.
 	Type string `json:"type"`
+	// Primaries is where a secondary pulls from: a comma-separated list of
+	// host[:port], port defaulting to 53. Required for a secondary, refused
+	// on any other type, and stored exactly as written — see
+	// internal/zones/primaries.go.
+	Primaries string `json:"primaries"`
+	// TSIGKeyID names the key a secondary signs its transfer requests with.
+	// Optional (0 means the transfer is unsigned), but when set it must name
+	// a key that exists.
+	TSIGKeyID int64 `json:"tsig_key_id"`
 	// Enabled is a pointer so "not sent" differs from "false".
 	Enabled *bool `json:"enabled"`
 	// SOA fields, all optional: omitted means the generated default, so a
@@ -136,8 +190,12 @@ func (s *Server) handleZoneCreate(w http.ResponseWriter, r *http.Request) {
 	zoneType := body.Type
 	if zoneType == "" {
 		zoneType = zoneTypePrimary
-	} else if zoneType != zoneTypePrimary {
-		errJSON(w, http.StatusBadRequest, "only primary zones are supported")
+	} else if zoneType != zoneTypePrimary && zoneType != zoneTypeSecondary {
+		errJSON(w, http.StatusBadRequest, "only primary and secondary zones are supported")
+		return
+	}
+	if code, msg := s.checkZoneTransferConfig(r.Context(), zoneType, body.Primaries, body.TSIGKeyID); code != 0 {
+		errJSON(w, code, msg)
 		return
 	}
 	enabled := true
@@ -183,7 +241,11 @@ func (s *Server) handleZoneCreate(w http.ResponseWriter, r *http.Request) {
 		SOAExpire:  soaExpire,
 		SOAMinimum: soaMinimum,
 		// Fixed, not client-settable — see defaultSOATTL.
-		SOATTL:     defaultSOATTL,
+		SOATTL: defaultSOATTL,
+		// Empty and 0 for a primary, both already checked by
+		// checkZoneTransferConfig above.
+		Primaries:  body.Primaries,
+		TSIGKeyID:  body.TSIGKeyID,
 		CreatedAt:  now,
 		ModifiedAt: now,
 	})
@@ -198,15 +260,23 @@ func (s *Server) handleZoneCreate(w http.ResponseWriter, r *http.Request) {
 	// handleGroupCreate's list assignment below it: the zone itself already
 	// committed, so a failure here is logged rather than turned into a
 	// response the caller can't reconcile with the id it was just handed.
-	if _, err := s.deps.Store.Zones().AddRecord(r.Context(), store.ZoneRecord{
-		ZoneID:  id,
-		Name:    "@",
-		Type:    "NS",
-		TTL:     apexNSTTL,
-		RData:   dns.Fqdn(soaNS),
-		Enabled: true,
-	}); err != nil {
-		slog.Error("creating apex NS record for new zone failed", "zone", id, "err", err)
+	//
+	// Primary zones only. A secondary's contents are its primary's, arriving
+	// whole on the first transfer and replacing whatever is there; seeding
+	// an NS record here would be dnsaur authoring data in a zone it does not
+	// own, and serving it as authoritative in the window before that
+	// transfer lands.
+	if zoneType == zoneTypePrimary {
+		if _, err := s.deps.Store.Zones().AddRecord(r.Context(), store.ZoneRecord{
+			ZoneID:  id,
+			Name:    "@",
+			Type:    "NS",
+			TTL:     apexNSTTL,
+			RData:   dns.Fqdn(soaNS),
+			Enabled: true,
+		}); err != nil {
+			slog.Error("creating apex NS record for new zone failed", "zone", id, "err", err)
+		}
 	}
 
 	s.reloadZones(r)
@@ -227,6 +297,14 @@ type zonePatch struct {
 	SOARetry   *uint32 `json:"soa_retry"`
 	SOAExpire  *uint32 `json:"soa_expire"`
 	SOAMinimum *uint32 `json:"soa_minimum"`
+
+	// The transfer configuration, editable for the same reason type is: a
+	// primary that becomes a secondary needs somewhere to pull from in the
+	// same request, and a secondary whose primary moves needs to be able to
+	// say so. Validated against the zone as it will be — see
+	// checkZoneTransferConfig.
+	Primaries *string `json:"primaries"`
+	TSIGKeyID *int64  `json:"tsig_key_id"`
 }
 
 func (s *Server) handleZonePatch(w http.ResponseWriter, r *http.Request) {
@@ -240,8 +318,8 @@ func (s *Server) handleZonePatch(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusBadRequest, "invalid json")
 		return
 	}
-	if body.Type != nil && *body.Type != zoneTypePrimary {
-		errJSON(w, http.StatusBadRequest, "only primary zones are supported")
+	if body.Type != nil && *body.Type != zoneTypePrimary && *body.Type != zoneTypeSecondary {
+		errJSON(w, http.StatusBadRequest, "only primary and secondary zones are supported")
 		return
 	}
 
@@ -288,6 +366,20 @@ func (s *Server) handleZonePatch(w http.ResponseWriter, r *http.Request) {
 	}
 	if body.SOAMinimum != nil {
 		z.SOAMinimum = *body.SOAMinimum
+	}
+	if body.Primaries != nil {
+		z.Primaries = *body.Primaries
+	}
+	if body.TSIGKeyID != nil {
+		z.TSIGKeyID = *body.TSIGKeyID
+	}
+	// Checked on the merged zone rather than on the body: a patch that sets
+	// type without primaries, or clears primaries without changing type,
+	// leaves a secondary with nowhere to pull from either way, and only the
+	// result says which.
+	if code, msg := s.checkZoneTransferConfig(r.Context(), z.Type, z.Primaries, z.TSIGKeyID); code != 0 {
+		errJSON(w, code, msg)
+		return
 	}
 	z.ModifiedAt = time.Now().UnixMilli()
 
@@ -340,4 +432,81 @@ func (s *Server) handleZoneDelete(w http.ResponseWriter, r *http.Request) {
 	s.retireZonePTRs(r.Context(), recs, z.Name)
 	s.reloadZones(r)
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// zoneRefreshResult is what a completed manual transfer reports back.
+//
+// Everything here is also readable from the zone row afterwards except
+// `primary` and `records`, and those two are the reason the body exists: a
+// zone with three primaries says nothing about which one answered, and the
+// record count is what tells an operator the transfer actually carried a
+// zone rather than an empty one.
+type zoneRefreshResult struct {
+	Primary     string `json:"primary"`
+	Serial      uint32 `json:"serial"`
+	Records     int    `json:"records"`
+	RefreshedAt int64  `json:"refreshed_at"`
+	ExpiresAt   int64  `json:"expires_at"`
+}
+
+// handleZoneRefresh transfers one secondary zone now, whatever its schedule
+// says, and answers only once the transfer has finished. That is deliberately
+// synchronous: the caller pressed a button to find out whether the transfer
+// works, and a 202 would hand back "started" — which is the one thing they
+// already knew — leaving the answer (and the error, which is the whole point)
+// nowhere to be read. A transfer takes as long as one TCP conversation with
+// the primary, bounded by the Transferrer's own timeouts.
+//
+// A failed transfer is a 502, not a 500: nothing here is broken, a server
+// this one depends on refused or could not be reached, and the message names
+// every primary that was tried. The zone is left exactly as it was — a failed
+// transfer changes nothing (see zones.Transferrer.Transfer) — so a 502 here
+// means "still serving what it had", never "half-applied".
+func (s *Server) handleZoneRefresh(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(r)
+	if !ok {
+		errJSON(w, http.StatusBadRequest, "bad id")
+		return
+	}
+	// Nil in a server built without the scheduler (every test server that has
+	// no business opening TCP connections to a primary). 503 rather than a
+	// panic, and rather than a 404 that would read as "no such zone".
+	if s.deps.ZoneRefresher == nil {
+		errJSON(w, http.StatusServiceUnavailable, "zone transfers are not running")
+		return
+	}
+	z, err := s.deps.Store.Zones().Zone(r.Context(), id)
+	if err != nil {
+		storeErr(w, err)
+		return
+	}
+	// Only a secondary is a copy of someone else's zone. Asking a primary to
+	// transfer is not a failure to report against a primary — there is
+	// nowhere for it to pull from — so it is refused here rather than left to
+	// come back as a confusing 502 from Transfer's own type check.
+	if !strings.EqualFold(z.Type, zoneTypeSecondary) {
+		errJSON(w, http.StatusBadRequest, "only secondary zones are transferred")
+		return
+	}
+	res, err := s.deps.ZoneRefresher.Refresh(r.Context(), id)
+	if err != nil {
+		// The error is passed through verbatim. It is the only account of why
+		// this transfer failed that the dashboard will ever see — the
+		// scheduler's own record of a failure is process-local (see
+		// zones.Refresher.Status) — and rewriting "dial tcp 203.0.113.9:53:
+		// connect: connection refused" into "couldn't transfer" would throw
+		// away the whole of what makes it actionable.
+		errJSON(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	// The transfer already republished the served snapshot itself (the
+	// Transferrer is built WithReload), so there is no reloadZones here —
+	// unlike every other write in this file.
+	writeJSON(w, http.StatusOK, zoneRefreshResult{
+		Primary:     res.Primary.String(),
+		Serial:      res.Serial,
+		Records:     res.Records,
+		RefreshedAt: res.RefreshedAt,
+		ExpiresAt:   res.ExpiresAt,
+	})
 }

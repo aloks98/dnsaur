@@ -31,15 +31,72 @@ const maxCNAMEChase = 8
 //	name absent  → the wildcard at the closest encloser, else NXDOMAIN + SOA
 //
 // qname must be inside this zone; Index.Find is what establishes that.
-func (z *Zone) Answer(m *dns.Msg, qname string, qtype uint16) (handled bool) {
+//
+// nowMs is unix milliseconds, passed in rather than read here, and is used
+// for exactly one thing: deciding whether a secondary is still entitled to
+// answer at all (see Serving).
+func (z *Zone) Answer(m *dns.Msg, qname string, qtype uint16, nowMs int64) (handled bool) {
 	switch strings.ToLower(z.Type) {
 	case "forwarder", "stub":
 		return false
+	}
+	if !z.Serving(nowMs) {
+		// Handled, but with nothing: no AA, no records, and above all no
+		// SOA. See Serving for why this is not a denial and not a
+		// fall-through.
+		m.Rcode = dns.RcodeServerFailure
+		return true
 	}
 	m.Authoritative = true
 	m.Rcode = dns.RcodeSuccess
 	z.resolve(m, dns.Fqdn(qname), RelName(qname, z.Name), qtype, 0)
 	return true
+}
+
+// Serving reports whether z is entitled to answer from the records it holds,
+// as of nowMs (unix milliseconds). Every type but secondary always is: a
+// primary owns its data outright.
+//
+// A secondary holds its primary's data on loan, and there are two states in
+// which it holds nothing it may speak for:
+//
+//   - it has never transferred (RefreshedAt == 0). This is every secondary
+//     from the moment it is created until the first transfer lands.
+//   - its data has expired (RFC 1034 §4.3.5): past ExpiresAt it can no
+//     longer confirm what it holds is current, and serving it anyway is
+//     worse than serving nothing, because the resolver asking cannot tell.
+//     ExpiresAt is 0 until a transfer records a deadline, which is why the
+//     comparison is guarded rather than being nowMs >= ExpiresAt outright.
+//
+// What such a zone must not do is answer NXDOMAIN + SOA. That is an
+// authoritative claim that the name does not exist — RFC 8020 makes it a
+// claim about everything beneath it too — so an empty secondary would
+// black-hole its own suffix for every resolver that believed it, and the
+// SOA would have them cache the black hole for soa_minimum seconds. Nor may
+// it fall through to the forwarder: a name inside a zone we claim would then
+// leak upstream and a public record could shadow the internal one, which is
+// the leak zones exist to close. Answer answers SERVFAIL — "ask again, I
+// cannot say" — which asserts nothing and caches nowhere.
+// Disabled is deliberately NOT part of this rule, and the difference is worth
+// stating because it looks like an inconsistency. A zone that cannot vouch for
+// its data answers SERVFAIL rather than falling through, since a public record
+// would otherwise shadow the internal one. A *disabled* zone falls through:
+// Index.Find skips it entirely, so the query reaches the forwarder and the
+// public answer wins.
+//
+// That is a decision, not an oversight (2026-08-13). Disabling a zone means
+// dnsaur gives up the name, so the internet's answer applies; it matches
+// Technitium, and §1's scope line is full Technitium parity. The consequence
+// to know is that disabling a split-horizon zone exposes its names to public
+// answers rather than making them fail.
+func (z *Zone) Serving(nowMs int64) bool {
+	if !strings.EqualFold(z.Type, "secondary") {
+		return true
+	}
+	if z.RefreshedAt == 0 {
+		return false
+	}
+	return z.ExpiresAt == 0 || nowMs < z.ExpiresAt
 }
 
 // resolve answers for one name, and is re-entered for each in-zone CNAME

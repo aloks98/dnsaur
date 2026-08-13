@@ -77,23 +77,26 @@ func (s *swappable) ServeDNS(ctx context.Context, req *dnssrv.Request) (*dnssrv.
 }
 
 type App struct {
-	cfg       *config.Config
-	version   string
-	st        store.Store
-	registry  *clients.Registry
-	engine    *filter.Engine
-	resolver  *zones.Resolver
-	refresher *filter.Refresher
-	logger    *qlog.Logger
-	fwd       *swappable
-	servers   []*dnssrv.Server
-	apiSrv    *http.Server
-	apiAddr   string
-	apiCancel context.CancelFunc
-	bg        []func(context.Context)
-	cancel    context.CancelFunc
-	ready     chan struct{}
-	wg        sync.WaitGroup
+	cfg      *config.Config
+	version  string
+	st       store.Store
+	registry *clients.Registry
+	engine   *filter.Engine
+	resolver *zones.Resolver
+	// refresher keeps blocklists current; zoneRefresh keeps secondary zones
+	// current. Different schedules, different stores, same shape.
+	refresher   *filter.Refresher
+	zoneRefresh *zones.Refresher
+	logger      *qlog.Logger
+	fwd         *swappable
+	servers     []*dnssrv.Server
+	apiSrv      *http.Server
+	apiAddr     string
+	apiCancel   context.CancelFunc
+	bg          []func(context.Context)
+	cancel      context.CancelFunc
+	ready       chan struct{}
+	wg          sync.WaitGroup
 }
 
 func New(ctx context.Context, cfg *config.Config, version string) (*App, error) {
@@ -125,6 +128,13 @@ func New(ctx context.Context, cfg *config.Config, version string) (*App, error) 
 		ready:    make(chan struct{}),
 	}
 	a.refresher = filter.NewRefresher(st.Filters(), st.Clients(), a.engine, cfg.DataDir)
+	// The transfer republishes the served snapshot itself: a zone installed
+	// into the store that nothing reloaded is answering from the copy it just
+	// replaced. The key store is passed live, not a snapshot, for the same
+	// reason the DNS servers get it that way — a key edited through the API
+	// signs the next transfer, not the next restart.
+	a.zoneRefresh = zones.NewRefresher(st.Zones(),
+		zones.NewTransferrer(st.Zones(), st.TSIGKeys(), zones.WithReload(a.resolver.Reload)))
 	return a, nil
 }
 
@@ -286,7 +296,8 @@ func (a *App) Start(ctx context.Context) error {
 	apiSrv := api.New(api.Deps{
 		Store: a.st, Auth: auth.New(a.st.Users(), a.st.Tokens()),
 		Engine: a.engine, Reloader: a, Logger: a.logger, Refresher: a.refresher,
-		Version: a.version, Static: web.Dist(),
+		ZoneRefresher: a.zoneRefresh,
+		Version:       a.version, Static: web.Dist(),
 	})
 	ln, err := net.Listen("tcp", a.cfg.HTTPListen)
 	if err != nil {
@@ -322,6 +333,10 @@ func (a *App) Start(ctx context.Context) error {
 		pruner.Run,
 		a.runTokenCleanup,
 		rollups.Run,
+		// Secondary zones, on each zone's own SOA schedule. It transfers what
+		// is already due before its first tick, so a restart does not leave a
+		// zone that expired overnight answering nothing for another interval.
+		a.zoneRefresh.Run,
 		func(c context.Context) { a.refresher.Run(c, refreshEvery) },
 		func(c context.Context) {
 			for {

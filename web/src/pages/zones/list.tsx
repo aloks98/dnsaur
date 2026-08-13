@@ -1,6 +1,15 @@
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { Link } from "react-router";
-import { ChevronRight, Lock, Pencil, Plus, Trash2, TriangleAlert, X } from "lucide-react";
+import {
+  ArrowDownToLine,
+  ChevronRight,
+  Lock,
+  Pencil,
+  Plus,
+  Trash2,
+  TriangleAlert,
+  X,
+} from "lucide-react";
 import { toast } from "sonner";
 import { useForm, type Control } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
@@ -36,9 +45,18 @@ import {
 } from "@e412/rnui-react";
 import { ApiError } from "../../api/client";
 import type { Zone } from "../../api/types";
-import { useCreateZone, useDeleteZone, useZoneRecords, useZones } from "../../hooks/use-zones";
+import {
+  useCreateZone,
+  useDeleteZone,
+  useRecordsFollowTransfers,
+  useRefreshZone,
+  useZoneRecords,
+  useZones,
+} from "../../hooks/use-zones";
+import { useTSIGKeys } from "../../hooks/use-tsig-keys";
 import { StaleDataAlert } from "../../components/stale-data-alert";
 import { relativeTime } from "../../lib/format";
+import { lastTransferError, transferErrorLead, transferState } from "../../lib/zones";
 
 // A category tag, not a verdict. Exact mapping from the artboard —
 // deliberately not "each type gets a fresh colour": stub shares its badge
@@ -52,21 +70,22 @@ const TYPE_VARIANT: Record<Zone["type"], NonNullable<BadgeProps["variant"]>> = {
 };
 
 /**
- * The types the create row's select actually offers. `secondary` is not
- * merely unimplemented — investigation triggered by this page's own
- * `primaries` finding (see PrimariesField below) turned up that
- * answer.go's forwarder/stub fall-through list is missing `secondary`
- * entirely, so a secondary zone with no transfer mechanism behind it (no
- * transfers exist before #72) gets served like a primary: authoritative
- * NXDOMAIN for every name but its apex NS, for a domain the user actually
- * owns. The API now 400s anything but `primary` ("only primary zones are
- * supported", commit 6cdbf85) — this list is that restriction, not an
- * arbitrary one, and it is meant to widen back to the four below the
- * moment #72 (zone transfers, Milestone D) ships. A single-option select
- * is honest about what Milestone A can actually do; four options where
- * three 400 is not.
+ * The types the create row's select offers, which is exactly the set the API
+ * accepts (`zoneTypePrimary`/`zoneTypeSecondary` in
+ * internal/api/zones_handlers.go — anything else is a 400).
+ *
+ * Milestone D2 is what widened this from `primary` alone: a secondary is now
+ * servable because it is *configured*, with somewhere to pull from and a
+ * transfer that runs on the zone's own SOA schedule to fill it.
+ *
+ * `stub` and `forwarder` are deliberately still absent, and the artboard
+ * offering all four is a contradiction rather than a spec. The API 400s both;
+ * `forwarder` arrives in Milestone D6 and `stub` is in no milestone at all.
+ * A select whose options half-work is worse than a shorter select — it
+ * promises a zone type and then hands back a validation error from the
+ * server.
  */
-const CREATABLE_TYPES = ["primary"] as const satisfies readonly Zone["type"][];
+const CREATABLE_TYPES = ["primary", "secondary"] as const satisfies readonly Zone["type"][];
 
 /** Mirrors the server's own check (internal/api/zones_handlers.go's
  * normalizeZoneName) closely enough that a name accepted here round-trips —
@@ -82,19 +101,55 @@ const zoneNameSchema = z
     return !name.split(".").some((label) => label === "");
   }, "Enter a domain name, e.g. example.com");
 
-const addZoneSchema = z.object({
-  name: zoneNameSchema,
-  type: z.enum(CREATABLE_TYPES),
-  // Free text, unvalidated — see the comment beside the primaries field for
-  // why it is collected but not sent anywhere yet.
-  primaries: z.string(),
-});
+const addZoneSchema = z
+  .object({
+    name: zoneNameSchema,
+    type: z.enum(CREATABLE_TYPES),
+    /**
+     * Comma-separated `host[:port]`. Deliberately free text beyond "not
+     * blank": zones.ValidatePrimaries is the real check and it accepts IP
+     * literals, bracketed IPv6, and bare hostnames with per-entry ports, so a
+     * second implementation of that grammar here would only drift from it.
+     * The server's own message lands on the field when it disagrees.
+     */
+    primaries: z.string(),
+    /**
+     * The chosen key's **id**, as the select's string value; "" is no key.
+     *
+     * Id, not name — this is the one place the artboard is actively
+     * dangerous. It draws this select valued by key name (`xfer.e412.in.`),
+     * but the API field is `tsig_key_id`, so a name-valued select needs a
+     * name→id lookup at submit time and silently attaches the *wrong key* the
+     * moment that lookup misses (two keys, a rename between fetch and
+     * submit). Valuing the option with the id is the same fix lib/tsig.ts
+     * applies to the algorithm select: carry the API's own value, and let the
+     * label be the only thing that is for humans.
+     */
+    tsig_key_id: z.string(),
+  })
+  .superRefine((values, ctx) => {
+    // The server refuses a secondary with no primaries, and it is right to:
+    // a secondary that names nowhere to pull from can never transfer, so it
+    // would answer SERVFAIL for its whole suffix forever. Caught here only to
+    // save the round trip, and phrased as the thing to type rather than as
+    // "required".
+    if (values.type === "secondary" && values.primaries.trim() === "") {
+      ctx.addIssue({
+        code: "custom",
+        message: "Where to pull from, e.g. 192.168.150.1",
+        path: ["primaries"],
+      });
+    }
+  });
 // Exported so list.test.tsx can build a standalone `useForm<AddZoneValues>`
-// harness for PrimariesField/CreateRowHint below — see their own comments
-// for why that's currently the only way to exercise the type !== "primary"
-// branch at all.
+// harness for the type-dependent create-row cells below.
 export type AddZoneValues = z.infer<typeof addZoneSchema>;
-const ADD_ZONE_DEFAULTS: AddZoneValues = { name: "", type: "primary", primaries: "" };
+const ADD_ZONE_DEFAULTS: AddZoneValues = {
+  name: "",
+  type: "primary",
+  primaries: "",
+  tsig_key_id: "",
+};
 
 /** One declaration of the column geometry, shared by the header, the create
  * row and every zone row — matching the artboard's grid exactly. */
@@ -110,26 +165,118 @@ function daysAgo(epochMs: number): string {
   return `${days} ${days === 1 ? "day" : "days"}`;
 }
 
-/** A secondary past its SOA expiry is a stronger claim than "disabled": the
- * zone may still be `enabled`, but nothing behind it can answer for it
- * anymore. Only secondary zones carry `expires_at` at all (primary/stub/
- * forwarder/internal leave it 0 — see api/types.ts's Zone doc). */
-function isExpiredSecondary(zone: Zone): boolean {
-  return zone.type === "secondary" && zone.expires_at !== 0 && zone.expires_at < Date.now();
+/**
+ * What the STATUS cell says, which for a secondary is a different question
+ * from "is it enabled".
+ *
+ * A secondary holds its primary's data on loan. Two of its states — never
+ * transferred, and expired — leave it answering SERVFAIL for its whole suffix
+ * while `enabled` is still true in the database (Zone.Serving,
+ * internal/zones/answer.go), so a cell that read `enabled` alone would call
+ * such a zone healthy at exactly the moment it is serving nothing. The
+ * artboard makes this the pulled zone's whole column, and it is right to: the
+ * transfer state *is* the thing worth knowing about a zone that is a copy.
+ *
+ * Disabled is checked first, for every type. A zone the admin switched off is
+ * not answering because they switched it off, and the scheduler skips it
+ * entirely — reporting its transfer state instead would be pointing at a
+ * consequence and calling it the cause.
+ */
+function zoneStatus(zone: Zone): { dot: string; text: string; label: string } {
+  const muted = { dot: "bg-muted-foreground", text: "text-muted-foreground" };
+  const bad = { dot: "bg-destructive", text: "font-semibold text-destructive-foreground" };
+  const warn = { dot: "bg-warning", text: "font-semibold text-warning-foreground" };
+
+  if (!zone.enabled) return { ...muted, label: "Disabled" };
+  if (zone.type !== "secondary") return { dot: "bg-success", text: "", label: "Enabled" };
+
+  switch (transferState(zone)) {
+    // One label for both, because it is one fact: the zone holds nothing it
+    // may speak for and answers SERVFAIL. *Which* of the two it is belongs in
+    // the warning row below, which has room to say it.
+    case "never":
+    case "expired":
+      return { ...bad, label: "Not answering" };
+    // Not "Serving, transfer failing": the warning row below now ends in
+    // "Still serving the copy from 31h ago.", which says the serving half
+    // better than a clause in a status cell can — including *what* is being
+    // served and how old it is. Overdue keeps its "Serving," because its own
+    // warning row does not say it: nothing has transferred, and that sentence
+    // is about the schedule rather than about what is being answered.
+    case "failing":
+      return { ...warn, label: "Transfer failing" };
+    case "overdue":
+      return { ...warn, label: "Serving, transfer overdue" };
+    default:
+      // Not "Enabled": for a copy, when it was last confirmed current is
+      // strictly more than the fact that it is switched on.
+      return { dot: "bg-success", text: "", label: `Refreshed ${relativeTime(zone.refreshed_at)}` };
+  }
 }
 
-function zoneStatus(zone: Zone, expired: boolean): { dot: string; text: string; label: string } {
-  if (expired) {
-    return {
-      dot: "bg-destructive",
-      text: "font-semibold text-destructive-foreground",
-      label: "Not answering",
-    };
+/**
+ * The warning band under a secondary that is not in good standing, or null
+ * when it is.
+ *
+ * The cause comes from the zone row (`last_error`), not from anything this
+ * page remembers, which is what lets it be here at all: the scheduler's own
+ * record of a failure is process-local, so a row built on that would go blank
+ * after a restart for a zone that is still failing.
+ *
+ * It is deliberately its own value rather than a phrase glued to the front of
+ * `note` with a dash. Concatenated, the transfer's own words and this page's
+ * sentence about the consequence ran together as one long line with nothing
+ * saying where the server stopped talking and the UI started — which for the
+ * longest string on the row was exactly backwards. `lead` is what the row
+ * shows and `full` is what it carries in `title`, so nothing the server said
+ * is lost by shortening what is drawn (see transferErrorLead).
+ */
+function transferWarning(zone: Zone): {
+  label: string;
+  tone: "bad" | "warn";
+  cause: { lead: string; full: string } | null;
+  note: string;
+} | null {
+  if (zone.type !== "secondary" || !zone.enabled) return null;
+  const from = zone.primaries || "unknown";
+  const failure = lastTransferError(zone);
+  const cause = failure
+    ? { lead: transferErrorLead(failure.message), full: failure.message }
+    : null;
+  switch (transferState(zone)) {
+    case "never":
+      return {
+        label: "Never transferred",
+        tone: "bad",
+        cause,
+        note: `No transfer from ${from} has succeeded yet. Answering nothing.`,
+      };
+    case "expired":
+      return {
+        label: "Expired",
+        tone: "bad",
+        cause,
+        note: `Transfer from ${from} last succeeded ${daysAgo(zone.refreshed_at)} ago, past the SOA expiry.`,
+      };
+    case "failing":
+      return {
+        label: "Last transfer",
+        tone: "warn",
+        cause,
+        note: `Still serving the copy from ${relativeTime(zone.refreshed_at)}.`,
+      };
+    case "overdue":
+      // No cause by definition: overdue is the state with nothing recorded
+      // against it (see lib/zones.ts), so there is no error to lead with.
+      return {
+        label: "Overdue",
+        tone: "warn",
+        cause: null,
+        note: `Nothing has transferred from ${from} since ${relativeTime(zone.refreshed_at)}, past the refresh the SOA asks for.`,
+      };
+    default:
+      return null;
   }
-  if (zone.enabled) {
-    return { dot: "bg-success", text: "", label: "Enabled" };
-  }
-  return { dot: "bg-muted-foreground", text: "text-muted-foreground", label: "Disabled" };
 }
 
 /** The Records column: a per-zone request rather than a field on Zone
@@ -150,21 +297,16 @@ function RecordsCell({ zoneId }: { zoneId: number }) {
 }
 
 /**
- * The create row's STATUS-column cell: a primaries input for secondary/
- * stub/forwarder zones, an empty cell for primary. Milestone A's create/
- * patch endpoints (zoneCreate/zonePatch in zones_handlers.go) have no
- * `primaries` field at all yet, so nothing typed here is sent — see
- * AddZoneRow's onSubmit.
+ * Everything the create row shows only for a secondary: where to pull from,
+ * and which key to sign the request with.
  *
- * Split out into its own component, taking `type` as a plain prop rather
- * than reading `form.watch("type")` itself, so this branch stays directly
- * testable. The type select above currently offers only "primary" (see
- * CREATABLE_TYPES) — nothing a real user can click ever drives `type` here
- * away from "primary", so in the running app this always renders the empty
- * cell. list.test.tsx renders this component on its own, with `type` set
- * directly, which is currently the *only* way `type !== "primary"` is
- * exercised anywhere. #72 (zone transfers, Milestone D) widens the select
- * back out and makes this reachable for real.
+ * The artboard puts these two in the STATUS and SERIAL columns — the columns
+ * a zone that does not exist yet has nothing to put in anyway — so the row
+ * keeps one grid rather than reflowing when the type changes.
+ *
+ * `type` is a plain prop rather than a `form.watch` of its own, so
+ * list.test.tsx can render this cell directly with either type instead of
+ * having to drive the select first.
  */
 export function PrimariesField({
   type,
@@ -173,7 +315,12 @@ export function PrimariesField({
   type: Zone["type"];
   control: Control<AddZoneValues>;
 }) {
-  if (type !== "secondary" && type !== "stub" && type !== "forwarder") return <span />;
+  // Secondary only. The artboard's `needsPrimaries` also covers stub and
+  // forwarder, which is wrong twice over: neither is creatable (see
+  // CREATABLE_TYPES), and a forwarder does not have primaries at all — it has
+  // upstreams to ask, which is a different thing that will need its own field
+  // when Milestone D6 brings it.
+  if (type !== "secondary") return <span />;
   return (
     <FormField
       control={control}
@@ -196,42 +343,100 @@ export function PrimariesField({
 }
 
 /**
- * The create row's hint line: column 1 normally ("SOA defaults are filled
- * in."), column 3 once PrimariesField above is showing ("Primary servers,
- * comma separated."), matching the artboard exactly rather than pinning
- * both to column 1. A name validation error takes over column 1 when there
- * is one.
+ * The TSIG key select, in the SERIAL column and for a secondary only.
  *
- * Same reachability note as PrimariesField: `type` is a prop rather than
- * read from the form, so list.test.tsx can drive the non-primary branch
- * directly even though the select above cannot produce one today.
+ * Options are valued by **id**, labelled by name — see the schema's
+ * `tsig_key_id` comment for why the artboard's name-valued select is a
+ * silent-wrong-key bug rather than a style choice.
+ *
+ * Fetches the key list itself, so nothing is requested until a secondary is
+ * actually being created. An instance with no keys still gets the select,
+ * showing only "No TSIG": an unsigned transfer is a legitimate configuration
+ * (a primary on a trusted LAN), so there is nothing here to guide anyone out
+ * of, and a control that vanishes is a control someone goes looking for.
+ */
+export function TSIGKeyField({
+  type,
+  control,
+}: {
+  type: Zone["type"];
+  control: Control<AddZoneValues>;
+}) {
+  if (type !== "secondary") return <TSIGKeyFieldPlaceholder />;
+  return <TSIGKeySelect control={control} />;
+}
+
+/** The SERIAL column's resting content: the same em dash every other
+ * server-decided cell in the create row shows. */
+function TSIGKeyFieldPlaceholder() {
+  return <span className="text-right font-mono text-sm text-muted-foreground">—</span>;
+}
+
+function TSIGKeySelect({ control }: { control: Control<AddZoneValues> }) {
+  const keys = useTSIGKeys();
+  return (
+    <FormField
+      control={control}
+      name="tsig_key_id"
+      render={({ field }) => (
+        <FormItem>
+          <FormControl>
+            <NativeSelect {...field} aria-label="TSIG key">
+              <NativeSelectOption value="">No TSIG</NativeSelectOption>
+              {(keys.data ?? []).map((key) => (
+                <NativeSelectOption key={key.id} value={String(key.id)}>
+                  {key.name}
+                </NativeSelectOption>
+              ))}
+            </NativeSelect>
+          </FormControl>
+        </FormItem>
+      )}
+    />
+  );
+}
+
+/**
+ * The create row's hint line: column 1 for a primary ("SOA defaults are
+ * filled in."), columns 3 and 4 for a secondary, under the two fields that
+ * only it shows — matching the artboard exactly rather than pinning
+ * everything to column 1. A field's validation error takes over its own
+ * column when there is one.
+ *
+ * Same note as PrimariesField: `type` is a prop rather than read from the
+ * form, so this cell can be rendered directly in a test.
  */
 export function CreateRowHint({
   type,
   control,
   nameError,
+  primariesError,
 }: {
   type: Zone["type"];
   control: Control<AddZoneValues>;
   nameError: string | undefined;
+  primariesError: string | undefined;
 }) {
-  const showPrimaries = type === "secondary" || type === "stub" || type === "forwarder";
+  const isSecondary = type === "secondary";
   return (
     <div className={cn(GRID, "items-start pb-2.5 text-xs text-pretty")}>
       <span>
         {nameError ? (
           <FormField control={control} name="name" render={() => <FormMessage />} />
-        ) : !showPrimaries ? (
+        ) : !isSecondary ? (
           <span className="text-muted-foreground">SOA defaults are filled in.</span>
         ) : null}
       </span>
       <span />
       <span>
-        {showPrimaries && (
-          <span className="text-muted-foreground">Primary servers, comma separated.</span>
-        )}
+        {isSecondary &&
+          (primariesError ? (
+            <FormField control={control} name="primaries" render={() => <FormMessage />} />
+          ) : (
+            <span className="text-muted-foreground">Primary servers, comma separated.</span>
+          ))}
       </span>
-      <span />
+      <span>{isSecondary && <span className="text-muted-foreground">Optional.</span>}</span>
       <span />
       <span />
       <span />
@@ -259,8 +464,23 @@ function AddZoneRow({ onClose }: { onClose: () => void }) {
 
   const type = form.watch("type");
   const nameError = form.formState.errors.name?.message;
+  const primariesError = form.formState.errors.primaries?.message;
 
   function onSubmit(values: AddZoneValues) {
+    // primaries and tsig_key_id are sent for a secondary and omitted
+    // otherwise, not sent empty: the server refuses either field on a zone
+    // that never transfers, deliberately, rather than storing configuration
+    // nothing will read (checkZoneTransferConfig in zones_handlers.go).
+    const transfer =
+      values.type === "secondary"
+        ? {
+            primaries: values.primaries.trim(),
+            // "" means an unsigned transfer, which is 0 on the wire — and 0
+            // is also what the server reads an omitted field as, so the key
+            // is only named when one was actually chosen.
+            ...(values.tsig_key_id === "" ? {} : { tsig_key_id: Number(values.tsig_key_id) }),
+          }
+        : {};
     createZone.mutate(
       {
         name: values.name.trim(),
@@ -268,8 +488,7 @@ function AddZoneRow({ onClose }: { onClose: () => void }) {
         // missing type as "primary" (zones_handlers.go), so there is no
         // need to say it explicitly in the common case.
         ...(values.type === "primary" ? {} : { type: values.type }),
-        // primaries is deliberately NOT sent — see PrimariesField's own
-        // comment above for why.
+        ...transfer,
       },
       {
         onSuccess: () => {
@@ -314,38 +533,21 @@ function AddZoneRow({ onClose }: { onClose: () => void }) {
             render={({ field }) => (
               <FormItem>
                 <FormControl>
-                  {/* Milestone A only: `primary` is the sole option — see
-                      CREATABLE_TYPES for why (a real bug this page's
-                      `primaries` finding surfaced, not just "unbuilt").
-                      Widens back to primary/secondary/stub/forwarder the
-                      moment #72 (zone transfers, Milestone D) ships; the
-                      control stays here now rather than disappearing and
-                      reappearing later. */}
-                  {CREATABLE_TYPES.length === 1 ? (
-                    // A select with one option is a control that cannot be
-                    // used — it invites a click and then does nothing. While
-                    // `primary` is the only creatable type this cell just
-                    // states it, matching the row's other server-decided
-                    // cells. The select comes back, populated, with #72.
-                    <span className="font-mono text-sm text-muted-foreground">
-                      {CREATABLE_TYPES[0]}
-                      <input type="hidden" {...field} />
-                    </span>
-                  ) : (
-                    <NativeSelect {...field} aria-label="Zone type">
-                      {CREATABLE_TYPES.map((t) => (
-                        <NativeSelectOption key={t} value={t}>
-                          {t}
-                        </NativeSelectOption>
-                      ))}
-                    </NativeSelect>
-                  )}
+                  {/* primary and secondary, which is the whole of what the
+                      API accepts — see CREATABLE_TYPES. */}
+                  <NativeSelect {...field} aria-label="Zone type">
+                    {CREATABLE_TYPES.map((t) => (
+                      <NativeSelectOption key={t} value={t}>
+                        {t}
+                      </NativeSelectOption>
+                    ))}
+                  </NativeSelect>
                 </FormControl>
               </FormItem>
             )}
           />
           <PrimariesField type={type} control={form.control} />
-          <span className="text-right font-mono text-sm text-muted-foreground">—</span>
+          <TSIGKeyField type={type} control={form.control} />
           <span className="text-right font-mono text-sm text-muted-foreground">—</span>
           <span className="text-right font-mono text-xs text-muted-foreground">—</span>
           <div className="flex items-center justify-end gap-1">
@@ -364,7 +566,12 @@ function AddZoneRow({ onClose }: { onClose: () => void }) {
           </div>
         </div>
 
-        <CreateRowHint type={type} control={form.control} nameError={nameError} />
+        <CreateRowHint
+          type={type}
+          control={form.control}
+          nameError={nameError}
+          primariesError={primariesError}
+        />
       </form>
     </Form>
   );
@@ -380,8 +587,20 @@ function AddZoneRow({ onClose }: { onClose: () => void }) {
  */
 function ZoneRow({ zone, onDelete }: { zone: Zone; onDelete: () => void }) {
   const isInternal = zone.type === "internal";
-  const expired = isExpiredSecondary(zone);
-  const status = zoneStatus(zone, expired);
+  const status = zoneStatus(zone);
+  const warning = transferWarning(zone);
+  const refreshZone = useRefreshZone();
+
+  function onTransferNow() {
+    refreshZone.mutate(zone.id, {
+      onSuccess: () => toast.success(`${zone.name} transferred`),
+      // The server's text names every primary it tried and why each refused
+      // — see useRefreshZone. There is no band on this row to hold it, so it
+      // goes to a toast rather than being thrown away for a shorter message.
+      onError: (err) =>
+        toast.error(err instanceof ApiError ? err.message : `Couldn't transfer ${zone.name}`),
+    });
+  }
 
   return (
     <div
@@ -390,10 +609,11 @@ function ZoneRow({ zone, onDelete }: { zone: Zone; onDelete: () => void }) {
       className={cn(
         "border-b border-border-muted",
         isInternal && "bg-muted/30 text-muted-foreground",
-        // The expired warning below gets its own left-edge mark and tint —
-        // the same "this needs a human" treatment idle filter lists get in
+        // The warning below gets its own left-edge mark and tint — the same
+        // "this needs a human" treatment idle filter lists get in
         // filtering/lists.tsx, on the row that contains the reason.
-        expired && "bg-destructive/5 shadow-[inset_3px_0_0_var(--destructive)]",
+        warning?.tone === "bad" && "bg-destructive/5 shadow-[inset_3px_0_0_var(--destructive)]",
+        warning?.tone === "warn" && "bg-warning/5 shadow-[inset_3px_0_0_var(--warning)]",
       )}
     >
       <div className={cn(GRID, "py-2.5")}>
@@ -405,13 +625,26 @@ function ZoneRow({ zone, onDelete }: { zone: Zone; onDelete: () => void }) {
         ) : (
           // Zone detail (Task 12) owns SOA fields and records — see
           // pages/zones/detail.tsx.
-          <Link
-            to={`/zones/${zone.id}`}
-            className="truncate text-sm font-medium text-primary underline decoration-2 underline-offset-[3px]"
-            title={zone.name}
-          >
-            {zone.name}
-          </Link>
+          <span className="flex min-w-0 items-center gap-1.5">
+            <Link
+              to={`/zones/${zone.id}`}
+              className="truncate text-sm font-medium text-primary underline decoration-2 underline-offset-[3px]"
+              title={zone.name}
+            >
+              {zone.name}
+            </Link>
+            {/* A pulled zone is marked at its name, not only by its type
+                badge: the badge says what kind of zone it is, this says the
+                records under it were written by someone else. It is also the
+                one thing that stays visible when the type column is scanned
+                past. */}
+            {zone.type === "secondary" && (
+              <ArrowDownToLine
+                aria-label="Pulled from another server"
+                className="size-3 shrink-0 text-muted-foreground"
+              />
+            )}
+          </span>
         )}
         <span>
           <Badge variant={TYPE_VARIANT[zone.type]}>{zone.type}</Badge>
@@ -457,20 +690,46 @@ function ZoneRow({ zone, onDelete }: { zone: Zone; onDelete: () => void }) {
         </span>
       </div>
 
-      {expired && (
-        <div className="flex items-center gap-3 px-4 pb-2.5">
-          <span className="shrink-0 font-mono text-[9.5px] font-semibold tracking-[0.14em] text-destructive-foreground uppercase">
-            Expired
+      {warning && (
+        <div className="flex items-center gap-2.5 px-4 pb-2.5">
+          <span
+            className={cn(
+              "shrink-0 font-mono text-[9.5px] font-semibold tracking-[0.14em] uppercase",
+              warning.tone === "bad" ? "text-destructive-foreground" : "text-warning-foreground",
+            )}
+          >
+            {warning.label}
           </span>
-          <span className="min-w-0 flex-1 text-pretty text-xs text-muted-foreground">
-            Transfer from {zone.primaries || "unknown"} last succeeded {daysAgo(zone.refreshed_at)}{" "}
-            ago, past the SOA expiry.
+          {/* The transfer's own words, and the one thing on this row with no
+              bound on its length — so it is the only thing here that gives way
+              when the row runs out of width. The whole message stays in
+              `title`, and the zone's own page prints it in full. */}
+          {warning.cause && (
+            <span
+              data-testid="zone-transfer-error"
+              title={warning.cause.full}
+              className={cn(
+                "min-w-0 truncate font-mono text-[11.5px]",
+                warning.tone === "bad" ? "text-destructive-foreground" : "text-warning-foreground",
+              )}
+            >
+              {warning.cause.lead}
+            </span>
+          )}
+          {/* Never shrinks: what the zone is doing about it is the part an
+              operator scanning the list has to be able to read outright. */}
+          <span data-testid="zone-transfer-note" className="shrink-0 text-xs text-muted-foreground">
+            {warning.note}
           </span>
-          {/* No API for zone transfers in this milestone (they arrive in
-              Milestone D) — rendered to match the design, deliberately not
-              wired to anything. */}
-          <Button type="button" size="sm" variant="outline" className="shrink-0">
-            Retry transfer
+          <Button
+            type="button"
+            size="sm"
+            variant="outline"
+            className="ml-auto shrink-0"
+            onClick={onTransferNow}
+            disabled={refreshZone.isPending}
+          >
+            {refreshZone.isPending ? "Transferring…" : "Retry transfer"}
           </Button>
         </div>
       )}
@@ -536,6 +795,10 @@ function BuiltinsDisclosure({ zones }: { zones: Zone[] }) {
 export function ZonesList() {
   const zones = useZones();
   const deleteZone = useDeleteZone();
+  // The Records column is the one thing here a transfer changes that the
+  // zones response does not carry, so it follows the zone rather than
+  // polling on its own — see useRecordsFollowTransfers.
+  useRecordsFollowTransfers(zones.data);
 
   const [addOpen, setAddOpen] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<Zone | null>(null);

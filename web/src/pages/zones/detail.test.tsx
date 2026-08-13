@@ -1,7 +1,7 @@
 import { http, HttpResponse } from "msw";
 import { toast } from "sonner";
 import { afterEach, expect, test, vi } from "vitest";
-import { fireEvent, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { Route, Routes } from "react-router";
 import { server } from "../../test/msw-server";
@@ -27,6 +27,8 @@ function zone(overrides: Partial<Zone> = {}): Zone {
     tsig_key_id: 0,
     expires_at: 0,
     refreshed_at: 0,
+    last_error: "",
+    last_attempt: 0,
     created_at: Date.now() - 86_400_000,
     modified_at: Date.now() - 60_000,
     ...overrides,
@@ -127,6 +129,7 @@ function trackFetchedPaths(): string[] {
 
 afterEach(() => {
   vi.restoreAllMocks();
+  vi.useRealTimers();
   server.events.removeAllListeners();
 });
 
@@ -1232,4 +1235,470 @@ test("a built-in zone offers no Import, but still exports", async () => {
   expect(screen.queryByRole("button", { name: /^import$/i })).not.toBeInTheDocument();
   // Export stays — the server refuses writes to a built-in zone, not reads.
   expect(screen.getByRole("button", { name: /^export$/i })).toBeInTheDocument();
+});
+
+// ── A secondary zone ────────────────────────────────────────────────────────
+// A copy of someone else's zone, and the page has to say so in three places:
+// the header (what it is and whether it can answer), the transfer band (where
+// it comes from and how current it is) and the record list (which is not
+// yours to edit).
+
+/** A healthy secondary: transferred recently, well inside its expiry. */
+function secondary(overrides: Partial<Zone> = {}): Zone {
+  return zone({
+    id: 1,
+    name: "e412.in",
+    type: "secondary",
+    primaries: "203.0.113.9, ns2.example.net:5353",
+    // 7h refresh against a transfer 2h ago: comfortably inside the schedule,
+    // so the state is "fresh" rather than sitting on the boundary.
+    soa_refresh: 25200,
+    soa_retry: 3600,
+    refreshed_at: Date.now() - 2 * 3600_000,
+    expires_at: Date.now() + 1209600_000,
+    ...overrides,
+  });
+}
+
+// All four record-write routes answer 409 for a secondary, so every control
+// that would produce one is absent rather than left to fail on click. Import
+// is absent for the same reason and one more: the next transfer would replace
+// whatever it wrote.
+test("a secondary's records are read-only — no Add record, no row actions, no Import", async () => {
+  renderZoneDetail({ zone: secondary(), records: [record({ id: 1, name: "bifrost" })] });
+  await screen.findByText("e412.in");
+
+  expect(screen.queryByRole("button", { name: /add record/i })).not.toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: /^import$/i })).not.toBeInTheDocument();
+  const rows = recordRows();
+  expect(rows).toHaveLength(1);
+  expect(within(rows[0]).queryByRole("button", { name: /^edit/i })).not.toBeInTheDocument();
+  expect(within(rows[0]).queryByRole("button", { name: /^delete/i })).not.toBeInTheDocument();
+  // Export stays: reading a secondary is allowed.
+  expect(screen.getByRole("button", { name: /^export$/i })).toBeInTheDocument();
+  expect(screen.getByText(/pulled · read-only/i)).toBeInTheDocument();
+});
+
+// A secondary's SOA is its primary's, replaced wholesale by every transfer.
+// An editable SOA form here would offer to write values the next transfer
+// silently discards.
+test("a secondary shows the transfer band in place of the SOA form", async () => {
+  renderZoneDetail({ zone: secondary() });
+  await screen.findByText("e412.in");
+
+  expect(screen.queryByRole("button", { name: /save soa/i })).not.toBeInTheDocument();
+  expect(screen.getByText("Primaries")).toBeInTheDocument();
+  expect(screen.getByText("203.0.113.9, ns2.example.net:5353")).toBeInTheDocument();
+  expect(screen.getByText("Last refresh")).toBeInTheDocument();
+  expect(screen.getByText("2h ago")).toBeInTheDocument();
+  // A 7h refresh against a transfer 2h ago: the next one is about 5h out.
+  // Matched loosely because the fixture's "now" and the render's are a few
+  // milliseconds apart, which is enough to move 5h to 4h 59m.
+  expect(screen.getByText(/^in [45]h/)).toBeInTheDocument();
+});
+
+// The select that attaches a key is valued by id; this is the other end of
+// the same mapping — the band has to turn that id back into the name the peer
+// knows the key by.
+test("the transfer band names the TSIG key, resolving it from its id", async () => {
+  server.use(
+    http.get("/api/v1/tsig-keys", () =>
+      HttpResponse.json([
+        {
+          id: 4,
+          name: "xfer.e412.in.",
+          algorithm: "hmac-sha256.",
+          secret: "Sh5ZuulpjcmcJuN6VwMQCVEhTJyUmlPTSHexvePtaWo=",
+          created_at: Date.now(),
+        },
+      ]),
+    ),
+  );
+  renderZoneDetail({ zone: secondary({ tsig_key_id: 4 }) });
+  await screen.findByText("e412.in");
+
+  expect(await screen.findByText("xfer.e412.in.")).toBeInTheDocument();
+});
+
+test("a secondary with no TSIG key says none rather than showing a zero", async () => {
+  renderZoneDetail({ zone: secondary({ tsig_key_id: 0 }) });
+  await screen.findByText("e412.in");
+
+  expect(screen.getByText("none")).toBeInTheDocument();
+});
+
+// The badge an `enabled` flag alone gets most wrong: this zone is enabled in
+// the database and answering SERVFAIL for its whole suffix, because past
+// expires_at it can no longer vouch for what it holds (Zone.Serving).
+test("an expired secondary reads Not answering, not Enabled", async () => {
+  renderZoneDetail({
+    zone: secondary({
+      enabled: true,
+      refreshed_at: Date.now() - 17 * 86_400_000,
+      expires_at: Date.now() - 1000,
+      last_error: "transfer refused by server",
+      last_attempt: Date.now() - 5 * 60_000,
+    }),
+  });
+  await screen.findByText("e412.in");
+
+  expect(screen.getByText("Not answering")).toBeInTheDocument();
+  expect(screen.queryByText("Enabled")).not.toBeInTheDocument();
+  expect(screen.getByText("Answering nothing until a transfer succeeds.")).toBeInTheDocument();
+});
+
+// The whole reason last_error is a column. It arrives with the zone, so it
+// reads the same after a restart as before one — and it is shown verbatim,
+// because the resolver's own words are the only actionable part. The band
+// leads with the failure and prints the whole message under it; neither is a
+// rewrite of what the server said.
+test("the last transfer error is shown verbatim, with when it happened", async () => {
+  renderZoneDetail({
+    zone: secondary({
+      last_error: "203.0.113.9:53: dial tcp: connect: connection refused",
+      last_attempt: Date.now() - 4 * 60_000,
+    }),
+  });
+  await screen.findByText("e412.in");
+
+  // Just the failure, with the note beside it as its own element rather than
+  // concatenated onto the end of it.
+  expect((await screen.findByTestId("transfer-error")).textContent).toBe("connection refused");
+  expect(screen.getByTestId("transfer-error-raw")).toHaveTextContent(
+    "203.0.113.9:53: dial tcp: connect: connection refused",
+  );
+  // Never without its date: the same words mean different things four
+  // minutes and four days after the fact.
+  expect(screen.getByText(/last attempt · 4m ago/i)).toBeInTheDocument();
+  expect(screen.getByTestId("transfer-note").textContent).toBe(
+    "Still serving the copy from 2h ago.",
+  );
+});
+
+// A message with no context wrapped around it is not printed twice: the lead
+// already is the whole of it.
+test("an error with nothing to lead out of is shown once, not on two lines", async () => {
+  renderZoneDetail({
+    zone: secondary({
+      last_error: "transfer refused by server",
+      last_attempt: Date.now() - 4 * 60_000,
+    }),
+  });
+  await screen.findByText("e412.in");
+
+  expect(await screen.findByTestId("transfer-error")).toHaveTextContent(
+    "transfer refused by server",
+  );
+  expect(screen.queryByTestId("transfer-error-raw")).not.toBeInTheDocument();
+});
+
+// The defect this band had: the error and the neutral note were siblings on
+// one flex row with nothing separating them, so a long error ran straight
+// into "Still serving the copy from …" and pushed it off the end. They are
+// two elements now, and the note is the one that never gives way.
+test("a long transfer error does not run into the note or crowd it out", async () => {
+  const longError = `zone "e412.in": every primary failed: ${"203.0.113.9:53: dial tcp 203.0.113.9:53: no route to host: ".repeat(8)}connection refused`;
+  renderZoneDetail({
+    zone: secondary({ last_error: longError, last_attempt: Date.now() - 4 * 60_000 }),
+  });
+  await screen.findByText("e412.in");
+
+  const note = await screen.findByTestId("transfer-note");
+  expect(note.textContent).toBe("Still serving the copy from 2h ago.");
+
+  // The lead is short whatever the message's length, so the actionable part
+  // survives however little of the line is drawn — and it is only the error,
+  // with none of the note run into the end of it.
+  const lead = screen.getByTestId("transfer-error");
+  expect(lead.textContent).toBe("connection refused");
+
+  // And the whole message is still on screen, on its own line, in full.
+  expect(screen.getByTestId("transfer-error-raw")).toHaveTextContent(longError);
+});
+
+test("a healthy secondary shows no error line at all", async () => {
+  renderZoneDetail({ zone: secondary() });
+  await screen.findByText("e412.in");
+
+  expect(screen.queryByTestId("transfer-error")).not.toBeInTheDocument();
+});
+
+test("Refresh now transfers the zone and reports what arrived", async () => {
+  const user = userEvent.setup();
+  const successSpy = vi.spyOn(toast, "success");
+  renderZoneDetail({ zone: secondary() });
+  await screen.findByText("e412.in");
+  server.use(
+    http.post("/api/v1/zones/1/refresh", () =>
+      HttpResponse.json({
+        primary: "203.0.113.9:53",
+        serial: 2026080601,
+        records: 17,
+        refreshed_at: Date.now(),
+        expires_at: Date.now() + 1209600_000,
+      }),
+    ),
+  );
+
+  await user.click(screen.getByRole("button", { name: /refresh now/i }));
+
+  await waitFor(() =>
+    expect(successSpy).toHaveBeenCalledWith("Transferred 17 records from 203.0.113.9:53"),
+  );
+});
+
+// The failure is not kept in component state: the server wrote it to the zone
+// row, the mutation refetches either way, and the band renders what came
+// back. That is what makes it survive a reload instead of vanishing with the
+// component.
+test("a failed Refresh now leaves the server's reason in the band, from the refetched zone", async () => {
+  const user = userEvent.setup();
+  let refreshed = false;
+  server.use(
+    http.get("/api/v1/zones/1", () =>
+      HttpResponse.json(
+        refreshed
+          ? secondary({
+              last_error: "203.0.113.9:53: dial tcp: connect: connection refused",
+              last_attempt: Date.now(),
+            })
+          : secondary(),
+      ),
+    ),
+    http.post("/api/v1/zones/1/refresh", () => {
+      refreshed = true;
+      return HttpResponse.json(
+        { error: "203.0.113.9:53: dial tcp: connect: connection refused" },
+        { status: 502 },
+      );
+    }),
+  );
+  mockRecords(1, []);
+  renderDetail("/zones/1");
+  await screen.findByText("e412.in");
+  expect(screen.queryByTestId("transfer-error")).not.toBeInTheDocument();
+
+  await user.click(screen.getByRole("button", { name: /refresh now/i }));
+
+  expect(await screen.findByTestId("transfer-error")).toHaveTextContent("connection refused");
+  expect(screen.getByTestId("transfer-error-raw")).toHaveTextContent(
+    "203.0.113.9:53: dial tcp: connect: connection refused",
+  );
+});
+
+test("a primary zone shows the SOA form and no transfer band", async () => {
+  renderZoneDetail({ zone: zone({ id: 1, name: "e412.in", type: "primary" }) });
+  await screen.findByText("e412.in");
+
+  expect(screen.getByRole("button", { name: /add record/i })).toBeInTheDocument();
+  expect(screen.queryByText("Primaries")).not.toBeInTheDocument();
+  expect(screen.queryByText("Next refresh")).not.toBeInTheDocument();
+});
+
+// The state the band had no opinion about, and so contradicted the header
+// about. A disabled zone is skipped by the scheduler outright (RefreshDue) and
+// skipped again at answer time (Index.Find), so "retrying every 1h" and "still
+// serving the copy from …" are both false — while the badge two rows above
+// says Disabled.
+test("a disabled secondary does not claim to be retrying or serving", async () => {
+  renderZoneDetail({
+    zone: secondary({
+      enabled: false,
+      soa_retry: 3600,
+      refreshed_at: Date.now() - 9 * 3600_000,
+    }),
+  });
+  await screen.findByText("e412.in");
+
+  expect(screen.getByText("Disabled")).toBeInTheDocument();
+  expect(screen.queryByText(/retrying every/i)).not.toBeInTheDocument();
+  expect(screen.queryByText(/still serving the copy/i)).not.toBeInTheDocument();
+  expect(screen.getByText("not while disabled")).toBeInTheDocument();
+  // And it must not claim to answer nothing either. A disabled zone is
+  // skipped by Index.Find, so names under it are *forwarded* — the zone stops
+  // being consulted rather than starting to refuse. Saying "answers nothing"
+  // would describe the one behaviour it does not have, and would hide the
+  // thing worth knowing: an internal name is now resolved by a public server.
+  expect(screen.queryByText(/answers nothing/i)).not.toBeInTheDocument();
+  expect(screen.getByText(/forwarded upstream/i)).toBeInTheDocument();
+});
+
+// A disabled zone that had failed before it was switched off keeps that
+// failure on screen — it is dated, and it is still the last thing that
+// happened — but the consequence beside it is the switch, not the failure.
+test("a disabled secondary keeps its recorded failure but not the failure's consequence", async () => {
+  renderZoneDetail({
+    zone: secondary({
+      enabled: false,
+      last_error: "203.0.113.9:53: connection refused",
+      last_attempt: Date.now() - 4 * 60_000,
+    }),
+  });
+  await screen.findByText("e412.in");
+
+  expect(await screen.findByTestId("transfer-error")).toHaveTextContent("connection refused");
+  expect(screen.queryByText(/still serving the copy/i)).not.toBeInTheDocument();
+  expect(screen.getByText(/forwarded upstream/i)).toBeInTheDocument();
+});
+
+// `overdue` is the state added beyond the design boards: the refresh deadline
+// passed with no failure recorded against it, so nothing claims to have tried.
+// An enabled zone reaches it when the process has only just started.
+test("an enabled secondary past its deadline with nothing recorded reads Overdue", async () => {
+  renderZoneDetail({
+    zone: secondary({
+      soa_refresh: 7200,
+      soa_retry: 3600,
+      refreshed_at: Date.now() - 5 * 3600_000,
+      last_attempt: Date.now() - 5 * 3600_000,
+    }),
+  });
+  await screen.findByText("e412.in");
+
+  expect(screen.getByText("Overdue")).toBeInTheDocument();
+  // The exact moment of the next attempt lives in the scheduler's in-memory
+  // back-off, so the band names the interval instead of guessing a time.
+  expect(screen.getByText("retrying every 1h")).toBeInTheDocument();
+  expect(screen.getByText(/still serving the copy from 5h ago/i)).toBeInTheDocument();
+  // Nothing recorded a reason, so none is invented.
+  expect(screen.queryByTestId("transfer-error")).not.toBeInTheDocument();
+});
+
+// ── Keeping up with the scheduler ───────────────────────────────────────────
+//
+// This page is the one place in the app whose subject changes with nobody
+// touching it: the scheduler transfers on the SOA's refresh, retries when a
+// primary comes back, and lets an unreachable zone expire. So the zone query
+// polls — but only while the zone is a secondary, and the record list never
+// does. See use-zones.ts's watchesTransfers and useRecordsFollowTransfers.
+
+test("a failing secondary recovers on screen, with nobody touching the page", async () => {
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  // One transfer stamp across both, so this test turns on the poll alone and
+  // nothing else follows from the zone changing.
+  const refreshedAt = Date.now() - 2 * 3600_000;
+  const failingZone = secondary({
+    refreshed_at: refreshedAt,
+    last_error: "203.0.113.9:53: dial tcp: connect: connection refused",
+    last_attempt: Date.now(),
+  });
+  const healthyZone = secondary({ refreshed_at: refreshedAt });
+  let failing = true;
+  server.use(
+    http.get("/api/v1/zones/1", () => HttpResponse.json(failing ? failingZone : healthyZone)),
+  );
+  mockRecords(1, [record({ id: 1, name: "bifrost" })]);
+
+  renderDetail("/zones/1");
+  expect(await screen.findByTestId("transfer-error")).toHaveTextContent("connection refused");
+
+  // The primary came back and the scheduler's next attempt succeeded. This
+  // page was told nothing and nobody clicked anything.
+  failing = false;
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(30_000);
+  });
+
+  await waitFor(() => expect(screen.queryByTestId("transfer-error")).not.toBeInTheDocument());
+});
+
+// A primary owns its data outright: nothing about it can change unless
+// someone changes it, and whoever does has already invalidated. So the page
+// reads once and stops — the whole reason the poll is conditional.
+test("a primary's page is read once and never again", async () => {
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  const paths = trackFetchedPaths();
+  renderZoneDetail({ zone: zone({ id: 1, name: "e412.in" }), records: [record({ id: 1 })] });
+  await screen.findByText("e412.in");
+
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(5 * 60_000);
+  });
+
+  expect(paths.filter((p) => p === "/api/v1/zones/1")).toHaveLength(1);
+  expect(paths.filter((p) => p === "/api/v1/zones/1/records")).toHaveLength(1);
+});
+
+// The trap this design exists to avoid: a secondary's records change exactly
+// when a transfer replaces them, which the zone row already reports. Polling
+// both would double the request rate to learn one fact — so the record list
+// is re-read when `refreshed_at` moves, and at no other time.
+test("a transfer landing replaces the records, and the record list is never polled for it", async () => {
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  const paths = trackFetchedPaths();
+  const before = Date.now() - 2 * 3600_000;
+  let refreshedAt = before;
+  server.use(
+    http.get("/api/v1/zones/1", () => HttpResponse.json(secondary({ refreshed_at: refreshedAt }))),
+    http.get("/api/v1/zones/1/records", () =>
+      HttpResponse.json(
+        refreshedAt === before
+          ? [record({ id: 1, name: "bifrost" })]
+          : [record({ id: 1, name: "bifrost" }), record({ id: 2, name: "heimdall" })],
+      ),
+    ),
+  );
+
+  renderDetail("/zones/1");
+  await screen.findByText("bifrost");
+  expect(screen.queryByText("heimdall")).not.toBeInTheDocument();
+
+  // Two minutes of watching a zone that transfers once, a minute in.
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(60_000);
+  });
+  expect(paths.filter((p) => p === "/api/v1/zones/1/records")).toHaveLength(1);
+  refreshedAt = Date.now();
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(60_000);
+  });
+
+  expect(await screen.findByText("heimdall")).toBeInTheDocument();
+  // Once on load, once because the transfer landed. The zone itself was read
+  // many times over the same two minutes.
+  expect(paths.filter((p) => p === "/api/v1/zones/1/records")).toHaveLength(2);
+  expect(paths.filter((p) => p === "/api/v1/zones/1").length).toBeGreaterThan(2);
+});
+
+// Refresh now goes through the same door as the scheduler's own transfer:
+// the mutation refetches the zone, and the record list follows the zone. The
+// mutation invalidating the records itself would fetch the same list twice
+// for one transfer — and would fetch it after a *failed* refresh, which
+// replaced no record at all.
+test("Refresh now brings the new records in, in one read of them", async () => {
+  const user = userEvent.setup();
+  const paths = trackFetchedPaths();
+  let refreshed = false;
+  server.use(
+    http.get("/api/v1/zones/1", () =>
+      HttpResponse.json(
+        secondary(refreshed ? { refreshed_at: Date.now(), soa_serial: 2026080601 } : {}),
+      ),
+    ),
+    http.get("/api/v1/zones/1/records", () =>
+      HttpResponse.json(
+        refreshed
+          ? [record({ id: 1, name: "bifrost" }), record({ id: 2, name: "heimdall" })]
+          : [record({ id: 1, name: "bifrost" })],
+      ),
+    ),
+    http.post("/api/v1/zones/1/refresh", () => {
+      refreshed = true;
+      return HttpResponse.json({
+        primary: "203.0.113.9:53",
+        serial: 2026080601,
+        records: 2,
+        refreshed_at: Date.now(),
+        expires_at: Date.now() + 1209600_000,
+      });
+    }),
+  );
+
+  renderDetail("/zones/1");
+  await screen.findByText("bifrost");
+
+  await user.click(screen.getByRole("button", { name: /refresh now/i }));
+
+  expect(await screen.findByText("heimdall")).toBeInTheDocument();
+  expect(paths.filter((p) => p === "/api/v1/zones/1/records")).toHaveLength(2);
 });

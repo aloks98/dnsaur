@@ -5,7 +5,7 @@ import { screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { server } from "../test/msw-server";
 import { renderWithProviders } from "../test/render";
-import type { TSIGKey } from "../api/types";
+import type { TSIGKey, Zone } from "../api/types";
 import { MASK, TSIGKeys } from "./tsig-keys";
 
 // A real 32-byte base64 secret, the shape the generator produces and the
@@ -25,6 +25,37 @@ function key(overrides: Partial<TSIGKey> = {}): TSIGKey {
     created_at: Date.now() - 86_400_000,
     ...overrides,
   };
+}
+
+/** A zone that names a TSIG key — the only field of it this screen reads. */
+function zone(overrides: Partial<Zone> = {}): Zone {
+  return {
+    id: 1,
+    name: "e412.in",
+    type: "secondary",
+    enabled: true,
+    soa_ns: "ns.e412.in",
+    soa_mbox: "hostadmin.e412.in",
+    soa_serial: 1,
+    soa_refresh: 900,
+    soa_retry: 300,
+    soa_expire: 604800,
+    soa_minimum: 900,
+    soa_ttl: 900,
+    primaries: "203.0.113.9",
+    tsig_key_id: 0,
+    expires_at: 0,
+    refreshed_at: 0,
+    last_error: "",
+    last_attempt: 0,
+    created_at: Date.now() - 86_400_000,
+    modified_at: Date.now() - 60_000,
+    ...overrides,
+  };
+}
+
+function mockZones(zones: Zone[]) {
+  server.use(http.get("/api/v1/zones", () => HttpResponse.json(zones)));
 }
 
 function mockKeys(keys: TSIGKey[]) {
@@ -349,20 +380,88 @@ test("the header counts keys and pluralises", async () => {
   expect(await screen.findByText("2 keys")).toBeInTheDocument();
 });
 
-// Milestone D2's work, deliberately not built: nothing reads zones.tsig_key_id
-// yet, so a USED BY column would be empty on every row forever and the
-// in-use delete guard could never fire. Pinned so the omission stays a
-// decision rather than becoming an oversight.
-test("there is no USED BY column while nothing references a key", async () => {
-  mockKeys([key({ id: 1 })]);
+// Held back through Milestone D1 because nothing could reference a key yet;
+// D2 is what gives it something to count. The count is folded from the zones
+// list rather than served as a field on the key — every zone already carries
+// tsig_key_id, so an endpoint for it would be a second source of the same
+// truth.
+test("the USED BY column counts the zones that name each key", async () => {
+  mockKeys([
+    key({ id: 1 }),
+    key({ id: 2, name: "solo.e412.in." }),
+    key({ id: 3, name: "un.e412.in." }),
+  ]);
+  mockZones([
+    zone({ id: 10, tsig_key_id: 1 }),
+    zone({ id: 11, tsig_key_id: 1 }),
+    zone({ id: 12, tsig_key_id: 2 }),
+    zone({ id: 13, tsig_key_id: 0 }),
+  ]);
+  renderWithProviders(<TSIGKeys />);
+  await waitFor(() => expect(rows()).toHaveLength(3));
+
+  expect(screen.getByText("Used by")).toBeInTheDocument();
+  expect(within(rows()[0]).getByText("2 zones")).toBeInTheDocument();
+  expect(within(rows()[1]).getByText("1 zone")).toBeInTheDocument();
+  // "—", not "0": the column answers "what depends on this", and nothing is
+  // not a quantity.
+  expect(within(rows()[2]).getByText("—")).toBeInTheDocument();
+});
+
+// The server refuses this delete with 409 (tsigKeyStore.Delete, one
+// statement), because removing the key would leave that secondary unable to
+// authenticate its transfers with nothing on the zone to say why. The guard
+// is what stops the button producing that 409 on click.
+test("a key a zone uses cannot be deleted, and the confirm says why", async () => {
+  const user = userEvent.setup();
+  let deleted = false;
+  mockKeys([key({ id: 5 })]);
+  mockZones([zone({ id: 10, tsig_key_id: 5 }), zone({ id: 11, tsig_key_id: 5 })]);
+  server.use(
+    http.delete("/api/v1/tsig-keys/5", () => {
+      deleted = true;
+      return new HttpResponse(null, { status: 204 });
+    }),
+  );
   renderWithProviders(<TSIGKeys />);
   await waitFor(() => expect(rows()).toHaveLength(1));
 
-  expect(screen.queryByText(/used by/i)).not.toBeInTheDocument();
-  expect(screen.getByText("Name")).toBeInTheDocument();
-  expect(screen.getByText("Algorithm")).toBeInTheDocument();
-  expect(screen.getByText("Secret")).toBeInTheDocument();
-  expect(screen.getByText("Actions")).toBeInTheDocument();
+  await user.click(screen.getByRole("button", { name: /delete xfer\.e412\.in\./i }));
+  expect(
+    await screen.findByText("In use by 2 zones. Remove it from them first."),
+  ).toBeInTheDocument();
+  const confirm = screen.getByRole("button", { name: /^delete$/i });
+  expect(confirm).toBeDisabled();
+
+  await user.click(confirm);
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  expect(deleted).toBe(false);
+});
+
+// The guard reads a list that can be missing: if /zones failed, every key
+// reads "—" and every Delete is enabled. The server still refuses, and the
+// 409 has to say something better than its own "resource in use".
+test("a 409 on delete explains itself, even when the zones list never loaded", async () => {
+  const user = userEvent.setup();
+  mockKeys([key({ id: 5 })]);
+  server.use(
+    http.get("/api/v1/zones", () => HttpResponse.json({ error: "boom" }, { status: 500 })),
+    http.delete("/api/v1/tsig-keys/5", () =>
+      HttpResponse.json({ error: "resource in use" }, { status: 409 }),
+    ),
+  );
+  const errorSpy = vi.spyOn(toast, "error");
+  renderWithProviders(<TSIGKeys />);
+  await waitFor(() => expect(rows()).toHaveLength(1));
+
+  await user.click(screen.getByRole("button", { name: /delete xfer\.e412\.in\./i }));
+  const confirm = await screen.findByRole("button", { name: /^delete$/i });
+  expect(confirm).toBeEnabled();
+  await user.click(confirm);
+
+  await waitFor(() =>
+    expect(errorSpy).toHaveBeenCalledWith(expect.stringMatching(/is in use by a zone/i)),
+  );
 });
 
 test("a failed delete shows a toast and leaves the key in the list", async () => {

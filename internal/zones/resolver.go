@@ -3,6 +3,7 @@ package zones
 import (
 	"context"
 	"sync/atomic"
+	"time"
 
 	"github.com/aloks98/dnsaur/internal/dnssrv"
 	"github.com/aloks98/dnsaur/internal/store"
@@ -16,12 +17,34 @@ import (
 type Resolver struct {
 	zs   store.ZoneStore
 	snap atomic.Pointer[Index]
+	// now is the clock Answer is given, injected rather than read inside
+	// the zone so "this secondary's data has expired" is a decision a test
+	// can drive instead of one it has to wait for. Same purpose as
+	// filter.Refresher's field of the same name, but reachable through
+	// WithNow rather than by assignment: this package's tests are external
+	// (package zones_test), so an unexported field alone would make the
+	// seam decorative — nothing outside could drive it, and a broken clock
+	// would pass every test.
+	now func() time.Time
+}
+
+// ResolverOption configures a Resolver at construction.
+type ResolverOption func(*Resolver)
+
+// WithNow replaces the clock the Resolver reads when deciding whether a
+// secondary's data has expired. Tests use it to cross a deadline without
+// waiting for one; production leaves it alone and gets time.Now.
+func WithNow(now func() time.Time) ResolverOption {
+	return func(r *Resolver) { r.now = now }
 }
 
 // NewResolver returns a Resolver with an empty snapshot; call Reload before
 // serving traffic.
-func NewResolver(zs store.ZoneStore) *Resolver {
-	r := &Resolver{zs: zs}
+func NewResolver(zs store.ZoneStore, opts ...ResolverOption) *Resolver {
+	r := &Resolver{zs: zs, now: time.Now}
+	for _, opt := range opts {
+		opt(r)
+	}
 	r.snap.Store(NewIndex(nil))
 	return r
 }
@@ -31,6 +54,45 @@ func NewResolver(zs store.ZoneStore) *Resolver {
 // to it. Each zone is built through NewZone, so the disabled-record rule it
 // enforces is applied here exactly as it is everywhere else that serves a
 // zone.
+//
+// Whole-store rebuild, deliberately, even though the refresh scheduler
+// (refresh.go) now calls this once per zone per successful transfer rather
+// than once per human edit. That was a reason to measure, not a reason to
+// assume a per-zone path is needed — see
+// internal/zones/reload_bench_test.go, committed so this decision is
+// re-checkable rather than taken on faith.
+//
+// The spec (docs/superpowers/specs/2026-08-08-zones-design.md) never gives a
+// homelab a size in one place; it describes one as "single-digit zone
+// counts" (§4) of "tens to hundreds of records" (§9.6) — call it ~5 zones of
+// ~100. 20 zones of 500 records is a deliberately conservative fixture, an
+// order of magnitude above that, chosen so the measurement would not flatter
+// the decision. At that size Reload costs ~30ms, ~90% of which is the two
+// store reads (BenchmarkReloadStoreRead) and ~7% is rebuilding the Index in
+// memory (BenchmarkReloadIndexBuild). That split holds however the same
+// 10,000 records are spread across zones — one zone of 10,000 costs about
+// the same as 200 zones of 50 — so it is total record count that drives the
+// cost, not zone count, and a per-zone path would only ever shave the ~7%
+// half. At five of these already-conservative fixtures on one server (50
+// zones, 50,000 records) it is still ~155-160ms, and the store read's share
+// stays dominant there too, ~90-97% depending on hardware.
+//
+// The worst realistic case is several secondaries finishing their transfers
+// in the same scheduler tick once the startup spread (refresh.go,
+// startupSpread) has expired, each triggering a whole-store Reload. Measured
+// too (BenchmarkReloadConcurrent): sqlite's single connection
+// (internal/store/store.go, SetMaxOpenConns(1)) means concurrent Reloads
+// cannot overlap, so they queue rather than compound — end to end they cost
+// no more than the same calls made one after another, nowhere near the
+// 60-second floor (refresh.go, minInterval) under how often any one zone
+// can trigger this.
+//
+// And none of it sits on the query path: Middleware reads r.snap, an atomic
+// pointer, and never touches zs, so a Reload in progress burns CPU and the
+// store's connection beside query answering, not instead of it. If a future
+// deployment's scale looks nothing like these numbers, re-run the
+// benchmark before reaching for a per-zone rebuild on the strength of this
+// comment alone.
 func (r *Resolver) Reload(ctx context.Context) error {
 	zs, err := r.zs.Zones(ctx)
 	if err != nil {
@@ -63,13 +125,24 @@ func (r *Resolver) Middleware() dnssrv.Middleware {
 			}
 			m := new(dns.Msg)
 			m.SetReply(req.Msg)
-			if !z.Answer(m, req.QName(), req.QType()) {
+			if !z.Answer(m, req.QName(), req.QType(), r.now().UnixMilli()) {
 				// forwarder/stub zone types name somewhere else to ask rather
 				// than holding data (Milestone D); until that lands, treat
 				// them the same as not being covered at all.
 				return next.ServeDNS(ctx, req)
 			}
-			return &dnssrv.Response{Msg: m, Decision: dnssrv.DecisionAuthoritative}, nil
+			// A zone that answered SERVFAIL did not answer authoritatively —
+			// it declined to, which is the whole point (see Zone.Serving).
+			// Logging it as "authoritative" would put decision=authoritative
+			// beside rcode=SERVFAIL in the query log, and an admin reading
+			// that row would be looking for a zone defect rather than a
+			// secondary that has not transferred. DecisionError is the same
+			// label the pipeline's own failure path uses for a SERVFAIL.
+			decision := dnssrv.DecisionAuthoritative
+			if m.Rcode == dns.RcodeServerFailure {
+				decision = dnssrv.DecisionError
+			}
+			return &dnssrv.Response{Msg: m, Decision: decision}, nil
 		})
 	}
 }

@@ -1,6 +1,8 @@
+import { useEffect, useRef } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, ApiError } from "../api/client";
 import { downloadBlob, filenameFromDisposition } from "../lib/download";
+import { REFRESH_TICK_MS } from "../lib/zones";
 import type { Zone, ZoneRecord } from "../api/types";
 
 // Zones-domain hooks — authoritative DNS zones (Task 11) and the records
@@ -24,10 +26,69 @@ export const zoneRecordKeys = {
   list: (zoneId: number) => ["zoneRecords", zoneId] as const,
 };
 
+/**
+ * How often a screen keeps a secondary's transfer state honest, and the one
+ * cadence in this file — see `watchesTransfers` for when it applies at all.
+ *
+ * It is the scheduler's own tick (`refreshTick`, internal/zones/refresh.go),
+ * deliberately rather than a number picked for feel: that tick is how often
+ * the server asks which zones are due, so it is also the finest resolution at
+ * which any of this can change. Polling faster cannot surface anything
+ * sooner — between two ticks there is nothing new to read — and polling
+ * slower would let the screen sit behind a decision the server has already
+ * made. It is the same slack `transferState` already grants a zone before
+ * calling it overdue (lib/zones.ts), so the two agree by construction.
+ *
+ * 30s also happens to be what the dashboard's stats and the pause banner
+ * already use (use-stats.ts, use-blocking.ts), so the app has one live
+ * cadence rather than three.
+ */
+const TRANSFER_POLL_MS = REFRESH_TICK_MS;
+
+/**
+ * Whether anything in this query's data can change with nobody touching it.
+ *
+ * Only a secondary can. Its records, serial and transfer stamps are written
+ * by the scheduler in the background — on the SOA's refresh, on a retry when
+ * a primary comes back, on crossing into expiry — so a screen showing one is
+ * out of date the moment it stops asking. Everything else on these screens
+ * (a primary's records, any zone's settings) changes only when an operator
+ * changes it, and the mutation that did it has already invalidated.
+ *
+ * So this is the single gate on both the poll and the focus revalidation
+ * below. A homelab with primaries alone issues exactly the requests it did
+ * before this existed: one per page.
+ *
+ * Not narrowed further to *enabled* secondaries. A disabled one is skipped by
+ * the scheduler, but it can still cross its expiry while on screen (a fact
+ * about the clock, which the re-render is what surfaces) and can still be
+ * re-enabled from another tab.
+ */
+function watchesTransfers(zones: Zone | Zone[] | undefined): boolean {
+  if (zones === undefined) return false;
+  const isSecondary = (zone: Zone) => zone.type === "secondary";
+  return Array.isArray(zones) ? zones.some(isSecondary) : isSecondary(zones);
+}
+
 interface ZoneCreateInput {
   name: string;
   type?: Zone["type"];
   enabled?: boolean;
+  /**
+   * Where a secondary pulls from: comma-separated `host[:port]`, port 53 by
+   * default. Required and non-empty for a secondary, and **refused with 400
+   * on any other type** — a zone that never transfers has no primaries, and
+   * the server will not store configuration nothing reads (see
+   * checkZoneTransferConfig in internal/api/zones_handlers.go). So this is
+   * omitted, not sent empty, for a primary.
+   */
+  primaries?: string;
+  /**
+   * The key a secondary signs its transfer requests with. Optional (0, or
+   * omitted, means an unsigned transfer), secondary-only on the same terms as
+   * `primaries`, and validated to name a key that exists.
+   */
+  tsig_key_id?: number;
   soa_ns?: string;
   soa_mbox?: string;
   soa_refresh?: number;
@@ -52,17 +113,33 @@ interface ZoneRecordInput {
   comment?: string;
 }
 
+/**
+ * Every zone, re-read while any of them is a secondary.
+ *
+ * The interval and the focus revalidation are both functions of the data
+ * rather than constants, so the cost is paid only by a list that actually has
+ * something in it that moves on its own — see `watchesTransfers`. Focus is
+ * worth having alongside the timer, not instead of it: query-core does not
+ * poll a hidden tab, so without this, coming back to one shows the state it
+ * had when you left for up to a full interval.
+ */
 export function useZones() {
   return useQuery({
     queryKey: zoneKeys.all,
     queryFn: () => api.get<Zone[]>("/zones"),
+    refetchInterval: (query) => (watchesTransfers(query.state.data) ? TRANSFER_POLL_MS : false),
+    refetchOnWindowFocus: (query) => watchesTransfers(query.state.data),
   });
 }
 
+/** One zone, on the same terms as useZones — here the question is simply
+ * whether this zone is the secondary. */
 export function useZone(id: number) {
   return useQuery({
     queryKey: zoneKeys.detail(id),
     queryFn: () => api.get<Zone>(`/zones/${id}`),
+    refetchInterval: (query) => (watchesTransfers(query.state.data) ? TRANSFER_POLL_MS : false),
+    refetchOnWindowFocus: (query) => watchesTransfers(query.state.data),
   });
 }
 
@@ -102,11 +179,59 @@ export function useDeleteZone() {
   });
 }
 
+/**
+ * A zone's records. Deliberately **not** polled, for a secondary or anything
+ * else.
+ *
+ * A secondary's records change exactly when a transfer replaces them, and a
+ * transfer that replaced them moved `refreshed_at` on the zone row — which
+ * the zone queries above are already watching. A second timer here would
+ * double the request rate to learn one fact, and would learn it no sooner.
+ * `useRecordsFollowTransfers` is the other half of that bargain.
+ */
 export function useZoneRecords(zoneId: number) {
   return useQuery({
     queryKey: zoneRecordKeys.list(zoneId),
     queryFn: () => api.get<ZoneRecord[]>(`/zones/${zoneId}/records`),
   });
+}
+
+/**
+ * Refetches a zone's records when its last transfer moved — the single rule
+ * that keeps a record list current under a secondary without polling it.
+ *
+ * `refreshed_at` is the signal, and it is chosen over `soa_serial` on purpose
+ * even though a transfer moves both. The serial also moves on every ordinary
+ * record write, which already invalidates the records query itself, so
+ * watching it would fetch the list twice for every edit on a *primary*. Only
+ * a transfer touches `refreshed_at`, and a primary's is 0 forever.
+ *
+ * A zone is only ever compared against a reading of *itself* taken earlier in
+ * this component's life, so the first sight of a zone invalidates nothing —
+ * a mount would otherwise refetch the list it has just fetched.
+ *
+ * Takes either the whole list or one zone, because both pages need it for the
+ * same reason: the list shows a record count per row, the detail page shows
+ * the records. The alternative — putting this inside useZoneRecords — would
+ * have each of them read the zone back out of a different cache entry.
+ */
+export function useRecordsFollowTransfers(zones: Zone | Zone[] | undefined): void {
+  const qc = useQueryClient();
+  const seen = useRef<Map<number, number>>(new Map());
+
+  useEffect(() => {
+    if (zones === undefined) return;
+    const previous = seen.current;
+    const next = new Map<number, number>();
+    for (const zone of Array.isArray(zones) ? zones : [zones]) {
+      next.set(zone.id, zone.refreshed_at);
+      const before = previous.get(zone.id);
+      if (before !== undefined && before !== zone.refreshed_at) {
+        void qc.invalidateQueries({ queryKey: zoneRecordKeys.list(zone.id) });
+      }
+    }
+    seen.current = next;
+  }, [zones, qc]);
 }
 
 /**
@@ -133,6 +258,58 @@ function invalidateZoneAndRecords(qc: ReturnType<typeof useQueryClient>, zoneId:
   void qc.invalidateQueries({ queryKey: zoneRecordKeys.all });
   void qc.invalidateQueries({ queryKey: zoneKeys.all });
   void qc.invalidateQueries({ queryKey: zoneKeys.detail(zoneId) });
+}
+
+/**
+ * What a completed transfer reports back (Go: zoneRefreshResult in
+ * internal/api/zones_handlers.go). `primary` and `records` are why the body
+ * exists at all — the zone row afterwards carries the serial and the two
+ * stamps, but says nothing about *which* of its primaries answered or how
+ * much arrived.
+ */
+export interface ZoneRefreshResult {
+  /** The primary that answered, as `host:port`. */
+  primary: string;
+  serial: number;
+  records: number;
+  refreshed_at: number;
+  expires_at: number;
+}
+
+/**
+ * Transfers a secondary now, whatever its SOA schedule says.
+ *
+ * Synchronous on the wire: the request does not answer until the transfer has
+ * finished, because the outcome — and especially the failure — is the whole
+ * reason anyone presses the button. That failure arrives as an ApiError whose
+ * message is the transfer's own text, naming every primary tried.
+ *
+ * Invalidates on **either** outcome, which is the part worth stating. A
+ * success obviously moved things — the record set was replaced and the
+ * serial and stamps came with it. A failure moves things too, and less
+ * obviously: it writes `last_error` and `last_attempt` onto the zone row (see
+ * lib/zones.ts). So the pages that read those refetch after a failed transfer
+ * as much as after a successful one, which is also what lets them show the
+ * cause without holding a copy of it in component state.
+ */
+export function useRefreshZone() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (id: number) => api.post<ZoneRefreshResult>(`/zones/${id}/refresh`, {}),
+    // The zone queries only, and not the records — which is the point of
+    // useRecordsFollowTransfers. A transfer that actually replaced the record
+    // set moved `refreshed_at` on the row this is about to refetch, so the
+    // record list is refreshed by the zone arriving rather than by this
+    // mutation guessing that it should be. Invalidating both here would fire
+    // two fetches of the same list for one transfer, and would refetch it
+    // after a *failed* refresh, which changed no record at all.
+    //
+    // onSettled, not onSuccess: see above.
+    onSettled: (_data, _err, id) => {
+      void qc.invalidateQueries({ queryKey: zoneKeys.all });
+      void qc.invalidateQueries({ queryKey: zoneKeys.detail(id) });
+    },
+  });
 }
 
 export function useCreateZoneRecord() {

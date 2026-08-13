@@ -153,3 +153,57 @@ func TestTSIGKeyGetMissingIs404(t *testing.T) {
 func itoa(id int64) string {
 	return strconv.FormatInt(id, 10)
 }
+
+// createTSIGKey creates a key through the real POST handler and returns its
+// id, for tests whose subject is something that references a key rather than
+// the key CRUD itself.
+func createTSIGKey(t *testing.T, srv *zoneTestServer, name string) int64 {
+	t.Helper()
+	rec := srv.do(t, "POST", "/api/v1/tsig-keys",
+		`{"name":"`+name+`","algorithm":"hmac-sha256.","secret":"c2VjcmV0LXNlY3JldC1zZWNyZXQ="}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create key %q: %d %s", name, rec.Code, rec.Body)
+	}
+	var created struct {
+		ID int64 `json:"id"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &created); err != nil {
+		t.Fatalf("unmarshal create response: %v", err)
+	}
+	return created.ID
+}
+
+// The guard D1 deferred: a key a zone depends on must not vanish silently.
+// Deleting it would leave the secondary unable to authenticate its transfers
+// with nothing on the zone to say why.
+func TestDeletingATSIGKeyInUseIsRefused(t *testing.T) {
+	srv := newTestServer(t)
+	keyID := createTSIGKey(t, srv, "xfer.e412.in.")
+	if rec := srv.do(t, "POST", "/api/v1/zones",
+		`{"name":"e412.in","type":"secondary","primaries":"192.168.150.5","tsig_key_id":`+itoa(keyID)+`}`); rec.Code != http.StatusCreated {
+		t.Fatalf("create zone: %d %s", rec.Code, rec.Body)
+	}
+
+	rec := srv.do(t, "DELETE", "/api/v1/tsig-keys/"+itoa(keyID), "")
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status = %d; want 409 — deleting it would leave the zone unable to authenticate", rec.Code)
+	}
+	if _, found, err := srv.store.TSIGKeys().Get(t.Context(), keyID); err != nil || !found {
+		t.Fatalf("key gone after a refused delete: found=%v err=%v", found, err)
+	}
+}
+
+// The other half: the guard must not turn every delete into a 409. A key no
+// zone references still goes.
+func TestDeletingAnUnusedTSIGKeySucceeds(t *testing.T) {
+	srv := newTestServer(t)
+	used := createTSIGKey(t, srv, "used.e412.in.")
+	unused := createTSIGKey(t, srv, "unused.e412.in.")
+	if rec := srv.do(t, "POST", "/api/v1/zones",
+		`{"name":"e412.in","type":"secondary","primaries":"192.168.150.5","tsig_key_id":`+itoa(used)+`}`); rec.Code != http.StatusCreated {
+		t.Fatalf("create zone: %d %s", rec.Code, rec.Body)
+	}
+	if rec := srv.do(t, "DELETE", "/api/v1/tsig-keys/"+itoa(unused), ""); rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d; want 204", rec.Code)
+	}
+}

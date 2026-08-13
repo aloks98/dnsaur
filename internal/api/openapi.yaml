@@ -125,8 +125,26 @@ components:
             loopback/special-use reverse zones); it cannot be created or
             reassigned through this API, and every write to a zone of
             this type — PATCH, DELETE, or any write under
-            /zones/{id}/records — is rejected with 409. secondary, stub
-            and forwarder are accepted and stored but not yet acted on.
+            /zones/{id}/records — is rejected with 409.
+
+
+            primary and secondary are the only two this API creates or
+            patches into; stub, forwarder and internal are rejected with
+            400. A secondary is filled by transfer from its primaries and
+            is created empty — no apex NS record is seeded for it, unlike
+            a primary. Its records are read-only through this API: every
+            write under /zones/{id}/records, and a zone file import, is
+            rejected with 409, because a transfer replaces the whole zone
+            and would delete the write at the next refresh. The zone
+            itself stays editable — PATCH and DELETE work, and that is how
+            its primaries and TSIG key are changed.
+
+
+            Until its first transfer lands (refreshed_at is 0), and again
+            once its data has expired, a secondary answers SERVFAIL for
+            every name beneath its apex rather than an authoritative
+            NXDOMAIN: it holds nothing it is entitled to speak for, and a
+            denial would assert that those names do not exist.
         enabled: { type: boolean }
         soa_ns: { type: string }
         soa_mbox: { type: string }
@@ -147,10 +165,54 @@ components:
             seconds; the SOA record's own header TTL, distinct from
             soa_minimum. Fixed at 900 in Milestone A — there is no request
             field to set it, on create or patch.
-        primaries: { type: string, description: secondary/stub/forwarder only; unused and empty for primary/internal }
-        tsig_key_id: { type: integer, format: int64 }
+        primaries:
+          type: string
+          description: >
+            Where a secondary pulls the zone from: a comma-separated list
+            of host[:port], port defaulting to 53, where host is an IP
+            address or a domain name — "192.168.150.5",
+            "192.168.150.5:5353, ns1.upstream.example", "[2001:db8::1]:5353".
+
+
+            Stored exactly as written and resolved at transfer time, not
+            at write: a primary named by hostname has to survive its
+            address changing, and a primary that is unreachable right now
+            must not block the zone from being configured. Required and
+            non-empty for a secondary; must be empty on every other type.
+        tsig_key_id:
+          type: integer
+          format: int64
+          description: >
+            The TSIG key a secondary signs its transfer requests with; 0
+            means unsigned. Optional, but when set it must name a key
+            that exists, and while a zone names it that key cannot be
+            deleted (DELETE /tsig-keys/{id} answers 409). Must be 0 on
+            every type other than secondary.
         expires_at: { type: integer, format: int64, description: unix ms; secondary only, 0 otherwise }
-        refreshed_at: { type: integer, format: int64, description: unix ms; secondary only, 0 otherwise }
+        refreshed_at:
+          type: integer
+          format: int64
+          description: >
+            unix ms of the last transfer that succeeded; secondary only,
+            0 = never. Distinct from last_attempt, which dates the last
+            transfer that was tried.
+        last_error:
+          type: string
+          description: >
+            Why the most recent transfer attempt failed, in the
+            transfer's own words, or "" when it succeeded. Cleared on
+            success, so a zone that recovered stops reporting one, and
+            written together with last_attempt in a single statement so
+            the two can never disagree. Read-only: no request body sets
+            it. Secondary only.
+        last_attempt:
+          type: integer
+          format: int64
+          description: >
+            unix ms of the last transfer attempt, successful or not;
+            0 = never attempted. Only meaningful read beside last_error,
+            which without a date is a claim about the present made by an
+            unknown past. Read-only. Secondary only.
         created_at: { type: integer, format: int64 }
         modified_at: { type: integer, format: int64 }
     ZoneRecord:
@@ -1452,12 +1514,18 @@ paths:
         and 900 seconds respectively. type defaults to primary.
 
 
-        Creating a zone also creates its apex NS record, pointed at
-        soa_ns — RFC 2181 §10.1 requires an authoritative zone to carry NS
-        records at its apex, so a zone is never left without one. That
+        Creating a primary zone also creates its apex NS record, pointed
+        at soa_ns — RFC 2181 §10.1 requires an authoritative zone to carry
+        NS records at its apex, so a zone is never left without one. That
         insert is best-effort: the zone itself is already committed by the
         time it runs, so a failure there is logged, not surfaced, and
         GET /zones/{id}/records is the way to confirm the NS record exists.
+
+
+        A secondary is created empty and gets no apex NS: its contents are
+        its primary's, arriving whole on the first transfer. It requires a
+        non-empty primaries, and tsig_key_id when set must name an
+        existing TSIG key.
       requestBody:
         required: true
         content:
@@ -1469,8 +1537,23 @@ paths:
                 name: { type: string, description: apex domain name, e.g. example.com }
                 type:
                   type: string
-                  description: primary | secondary | stub | forwarder | internal; defaults to primary
+                  enum: [primary, secondary]
+                  description: >
+                    defaults to primary. stub, forwarder and internal are
+                    rejected with 400 — see the Zone schema's type field.
                 enabled: { type: boolean, default: true }
+                primaries:
+                  type: string
+                  description: >
+                    required and non-empty for a secondary, rejected on
+                    any other type; see the Zone schema's primaries field
+                    for the format
+                tsig_key_id:
+                  type: integer
+                  format: int64
+                  description: >
+                    secondary only; optional, and when set must name an
+                    existing TSIG key
                 soa_ns: { type: string, description: 'defaults to "ns.<name>"' }
                 soa_mbox: { type: string, description: 'defaults to "hostadmin.<name>"' }
                 soa_refresh: { type: integer, format: int64, description: seconds; defaults to 900 }
@@ -1488,9 +1571,12 @@ paths:
                   id: { type: integer, format: int64 }
         "400":
           description: >
-            invalid json; name must be a valid domain name; or type is
-            set to something other than primary ("only primary zones are
-            supported")
+            invalid json; name must be a valid domain name; type is set
+            to something other than primary or secondary ("only primary
+            and secondary zones are supported"); a secondary's primaries
+            is missing or malformed; primaries or tsig_key_id is set on a
+            zone that is not a secondary; or tsig_key_id names no
+            existing key
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -1554,14 +1640,20 @@ paths:
         Every property is optional; only fields present are changed. Same
         name validation as create applies when name is sent. soa_ttl is
         not editable here — see the Zone schema. type, if sent, must be
-        primary, or the request is rejected with 400 regardless of the
-        zone's current type.
+        primary or secondary, or the request is rejected with 400
+        regardless of the zone's current type.
 
 
         A zone of type internal — the RFC 6303 built-ins seeded at
         migration, see the Zone schema's type field — rejects the whole
         request with 409, checked right after the type validation above
         and before any field is applied.
+
+
+        primaries and tsig_key_id are validated against the zone as it
+        will be, not against the request: patching a zone to secondary
+        without giving it primaries is rejected, and so is clearing the
+        primaries of a zone that is already one.
       requestBody:
         required: true
         content:
@@ -1570,7 +1662,7 @@ paths:
               type: object
               properties:
                 name: { type: string, description: apex domain name, e.g. example.com }
-                type: { type: string, description: primary | secondary | stub | forwarder | internal }
+                type: { type: string, enum: [primary, secondary] }
                 enabled: { type: boolean }
                 soa_ns: { type: string }
                 soa_mbox: { type: string }
@@ -1578,14 +1670,19 @@ paths:
                 soa_retry: { type: integer, format: int64, description: seconds }
                 soa_expire: { type: integer, format: int64, description: seconds }
                 soa_minimum: { type: integer, format: int64, description: seconds }
+                primaries: { type: string, description: 'see the Zone schema''s primaries field' }
+                tsig_key_id: { type: integer, format: int64 }
       responses:
         "204":
           description: No Content
         "400":
           description: >
-            bad id, invalid json, name must be a valid domain name, or
-            type is set to something other than primary ("only primary
-            zones are supported")
+            bad id, invalid json, name must be a valid domain name, type
+            is set to something other than primary or secondary ("only
+            primary and secondary zones are supported"), the zone would
+            be left a secondary without valid primaries, primaries or
+            tsig_key_id is set on a zone that is not a secondary, or
+            tsig_key_id names no existing key
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -1657,6 +1754,91 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
 
+  /zones/{id}/refresh:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: integer, format: int64 }
+    post:
+      tags: [Zones]
+      summary: Transfer a secondary zone from its primaries now
+      description: >
+        Runs one AXFR immediately, whatever the SOA schedule says, and
+        answers only once it has finished — so the response is the
+        outcome, not an acknowledgement. Secondary zones only: any other
+        type has nowhere to pull from and is refused with 400.
+
+
+        A transfer that fails changes nothing at all: the zone keeps the
+        records, the serial and the refreshed_at it already had. So a 502
+        always means "still serving whatever it had", never a
+        half-applied zone.
+
+
+        The scheduler runs the same transfer on the zone's own SOA
+        refresh/retry timers without anyone asking; this endpoint exists
+        for the case where waiting for the next tick is not the answer. A
+        transfer already in flight for this zone is waited for rather than
+        skipped, so a request may take as long as that one has left.
+
+
+        The dashboard's "Refresh now" button is the only caller. Note the
+        server keeps no persistent record of a failed attempt — the
+        scheduler's own view of it (last error, next attempt) is
+        process-local and does not survive a restart — which is why the
+        error text here is returned verbatim: this response is the only
+        account of a failure the API ever gives.
+      responses:
+        "200":
+          description: the transfer completed and the zone was replaced with what arrived
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  primary:
+                    type: string
+                    description: >
+                      the primary that answered, as host:port — one of the
+                      zone's primaries, not the whole list
+                    example: 203.0.113.9:53
+                  serial: { type: integer, format: int64, description: the primary's serial, adopted verbatim }
+                  records: { type: integer, description: rows the zone holds after the install }
+                  refreshed_at: { type: integer, format: int64, description: unix ms }
+                  expires_at: { type: integer, format: int64, description: unix ms }
+        "400":
+          description: bad id, or the zone is not a secondary ("only secondary zones are transferred")
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401":
+          description: authentication required
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "403":
+          $ref: "#/components/responses/ReadOnlyToken"
+        "404":
+          description: not found
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "502":
+          description: >
+            the transfer failed. The message is the transfer's own error,
+            verbatim, and names every primary that was tried — a refused
+            connection, a rejected TSIG, an rcode, a malformed stream, or
+            a zone this server would not accept. The zone is unchanged.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503":
+          description: storage unavailable, or this server is running without the zone scheduler
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
   /zones/{id}/records:
     parameters:
       - name: id
@@ -1698,8 +1880,11 @@ paths:
       tags: [Zones]
       summary: Create a record in a zone
       description: >
-        Rejected with 409 before the body is even read if the zone is
-        type internal — the RFC 6303 built-ins seeded at migration, see
+        Rejected with 409 before the body is even read if the zone's
+        records are authored somewhere other than here: type internal —
+        the RFC 6303 built-ins seeded at migration — or type secondary,
+        whose records arrive whole from its primary on every transfer and
+        would replace anything written by hand at the next refresh. See
         the Zone schema's type field.
 
 
@@ -1810,12 +1995,13 @@ paths:
         "409":
           description: >
             the zone is type internal ("built-in zones cannot be
-            changed"), checked before the body is parsed; or, once the
-            body is valid: CNAME at the zone apex (RFC 1912 §2.4); CNAME
-            beside another record at the same name in either write order
-            (RFC 1034 §3.6.2); or a TTL that doesn't match the rest of
-            the RRSet at this name and type (RFC 2181 §5.2) — checked in
-            that order
+            changed") or type secondary ("a secondary zone's records come
+            from its primary; change them there"), checked before the
+            body is parsed; or, once the body is valid: CNAME at the zone
+            apex (RFC 1912 §2.4); CNAME beside another record at the same
+            name in either write order (RFC 1034 §3.6.2); or a TTL that
+            doesn't match the rest of the RRSet at this name and type
+            (RFC 2181 §5.2) — checked in that order
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -1899,12 +2085,13 @@ paths:
         "409":
           description: >
             the zone is type internal ("built-in zones cannot be
-            changed"), checked before the body is parsed; or, once the
-            body is valid: CNAME at the zone apex (RFC 1912 §2.4); CNAME
-            beside another record at the same name in either write order
-            (RFC 1034 §3.6.2); or a TTL that doesn't match the rest of
-            the RRSet at this name and type (RFC 2181 §5.2) — checked in
-            that order
+            changed") or type secondary ("a secondary zone's records come
+            from its primary; change them there"), checked before the
+            body is parsed; or, once the body is valid: CNAME at the zone
+            apex (RFC 1912 §2.4); CNAME beside another record at the same
+            name in either write order (RFC 1034 §3.6.2); or a TTL that
+            doesn't match the rest of the RRSet at this name and type
+            (RFC 2181 §5.2) — checked in that order
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -1951,7 +2138,10 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
         "409":
-          description: the zone is type internal ("built-in zones cannot be changed")
+          description: >
+            the zone is type internal ("built-in zones cannot be
+            changed") or type secondary ("a secondary zone's records come
+            from its primary; change them there")
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -2041,8 +2231,11 @@ paths:
         named; import the reverse zone's own file to change its PTRs.
 
 
-        A zone of type internal — the RFC 6303 built-ins seeded at
-        migration — rejects import with 409, like every other write.
+        A zone whose records are authored somewhere other than here
+        rejects import with 409, like every other write: type internal —
+        the RFC 6303 built-ins seeded at migration — and type secondary,
+        whose contents arrive whole from its primary on every transfer.
+        Export (GET) is allowed for both.
 
 
         The request body is limited to 1 MiB — roughly 35,000 records. A
@@ -2096,7 +2289,10 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
         "409":
-          description: built-in zones cannot be changed
+          description: >
+            the zone is type internal ("built-in zones cannot be
+            changed") or type secondary ("a secondary zone's records come
+            from its primary; change them there")
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -2287,6 +2483,11 @@ paths:
     delete:
       tags: [TSIG Keys]
       summary: Delete a TSIG key
+      description: >
+        Refused with 409 while any zone's tsig_key_id names this key.
+        Deleting it would leave that secondary unable to authenticate its
+        transfers, with nothing on the zone to say why — so the key has to
+        be released from every zone that uses it first.
       responses:
         "204":
           description: No Content
@@ -2304,6 +2505,11 @@ paths:
           $ref: "#/components/responses/ReadOnlyToken"
         "404":
           description: not found
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "409":
+          description: a zone still references this key ("resource in use")
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }

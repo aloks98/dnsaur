@@ -137,9 +137,8 @@ Full parameter/response detail lives in `internal/api/openapi.yaml`
   Authoritative DNS zones: a name inside an enabled zone is answered or
   refused, never forwarded upstream. `name` alone is enough to create one —
   SOA fields default to generated values, and an apex NS record is created
-  alongside it. Only `type: "primary"` can be created or patched in this
-  release; `secondary`, `stub` and `forwarder` exist in the schema for zone
-  transfers to come but 400 today. `type: "internal"` is the fifth: the
+  alongside it. `type` may be `"primary"` or `"secondary"`; `stub` and
+  `forwarder` exist in the schema but 400 today. `type: "internal"` is the fifth: the
   built-in zones (`localhost` plus every RFC 6303 §4 reverse zone except
   the private ranges — `BuiltinZones` in `internal/store/builtins.go` has
   the exact list), seeded at migration and never created through this
@@ -148,6 +147,30 @@ Full parameter/response detail lives in `internal/api/openapi.yaml`
   refused with `409`. A reverse zone for your own network isn't a distinct
   type; it's an ordinary `primary` zone whose `name` ends in
   `in-addr.arpa` or `ip6.arpa` (e.g. `168.192.in-addr.arpa`).
+- **Secondary zones** — a `secondary` is a copy of a zone held elsewhere,
+  pulled over AXFR and kept fresh on the schedule its own SOA publishes.
+  Creating one requires `primaries` — comma-separated `host[:port]`, port
+  53 by default, stored as written and resolved at transfer time — and
+  takes an optional `tsig_key_id` naming the key to sign transfers with.
+  Both fields are refused with `400` on any other type. **Its records are
+  read-only**: `POST`/`PUT`/`DELETE` under `/zones/{id}/records`, and
+  `POST /zones/{id}/file`, all answer `409`, because the next transfer
+  would replace whatever they wrote. It answers `SERVFAIL` for its whole
+  suffix before its first transfer lands and again once `expires_at`
+  passes — never `NXDOMAIN`, which would be an authoritative claim it is in
+  no position to make.
+  `POST /zones/{id}/refresh` transfers one now, whatever the schedule says.
+  It answers only when the transfer has finished — `200` with the primary
+  that answered, the serial and the record count, or `502` carrying the
+  transfer's own error. A failed transfer changes nothing: the zone keeps
+  the records, serial and `refreshed_at` it already had.
+  Three read-only fields on the zone describe all of this. `refreshed_at`
+  is the last transfer that **succeeded**; `last_attempt` is the last one
+  **tried**, successful or not; and `last_error` is why that attempt failed,
+  in the transfer's own words, or `""` when it succeeded. The last two are
+  written together and survive a restart — the scheduler's own view of a
+  failure does not — so they are the honest answer to "is this zone
+  working", and `last_error` should always be read beside `last_attempt`.
 - **Zone records** — `GET /zones/{id}/records`, `POST /zones/{id}/records`,
   `PUT /zones/{id}/records/{rid}`, `DELETE /zones/{id}/records/{rid}` —
   records within a zone, named relative to its apex (`@`, `bifrost`, `*`,
@@ -243,7 +266,14 @@ Full parameter/response detail lives in `internal/api/openapi.yaml`
   message must be signed with the algorithm the key was created with; one
   signed with a different algorithm is rejected rather than verified under
   the algorithm it names, so a peer-side algorithm upgrade needs the key
-  updated here too.
+  updated here too. Over UDP a signed reply is fitted to the client's
+  advertised size with the signature's own bytes counted in. A client that
+  advertises no EDNS size has 512 bytes, of which the signature takes about a
+  hundred; per RFC 8945 §5.3, an answer that will not fit in what is left
+  comes back with no records, `TC` set and rcode `NOERROR`, which is the
+  instruction to ask again over TCP — so a truncated `NXDOMAIN` reports its
+  real rcode only on the TCP retry. Transfers are TCP and are never
+  truncated.
 - **Queries** — `GET /queries` (search the query log; filters: `from`,
   `to`, `client`, `q`, `decision`, `type`, `limit` [default 100, capped
   1000], `offset`), `GET /queries/tail` (live tail as Server-Sent Events,

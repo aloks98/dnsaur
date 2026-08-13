@@ -1,0 +1,62 @@
+-- +goose Up
+-- zones.tsig_key_id has been an inert column since 0004: written, read back,
+-- and referenced by nothing. Milestone D2 gives it meaning — it names the key
+-- a secondary signs its transfer requests with — and with meaning comes the
+-- rule that the key it names has to exist, and has to keep existing.
+--
+-- **That rule is enforced in the application, not by a foreign key here.**
+-- The reasoning, recorded because the absence of a REFERENCES clause in this
+-- file is otherwise indistinguishable from an oversight:
+--
+-- 1. The column is `NOT NULL DEFAULT 0` and 0 means "no key". No key has id
+--    0, and a foreign key skips only NULL, not zero, so
+--    `REFERENCES tsig_keys(id)` as the column stands would reject every zone
+--    that has no key — which is every zone. Getting a foreign key requires
+--    first making the column nullable and rewriting 0 to NULL.
+--
+-- 2. On SQLite that rewrite is a whole-table rebuild, and `zones` is the
+--    parent of `zone_records ... ON DELETE CASCADE`. `DROP TABLE zones`
+--    performs an implicit DELETE that fires that cascade — verified, not
+--    assumed: with foreign_keys on, dropping the parent leaves the child
+--    empty. `PRAGMA foreign_keys=off` cannot be used to avoid it either,
+--    because the pragma is a no-op inside a transaction and goose wraps this
+--    file in one. Doing it safely means rebuilding both tables in a precise
+--    order, where one wrong step silently deletes every record in every
+--    zone. That is the risk being traded against, and it buys a second
+--    enforcement of a rule the delete path already enforces.
+--
+-- 3. The two dialects would diverge sharply — four lines on Postgres against
+--    forty on SQLite — which is the same argument that put zone seeding in Go
+--    (see migrate.go on versions 5 and 7): one implementation that is tested
+--    beats two that can disagree.
+--
+-- 4. The client-visible answer has to be 400 (no such key) or 409 (key in
+--    use) either way. A raw constraint violation is neither: it reaches
+--    storeErrDup's default branch as 503 "storage unavailable", which tells
+--    the caller their storage is broken when what actually happened is that
+--    they asked for something the data does not allow.
+--
+-- What is enforced, and where: tsigKeyStore.Delete refuses to delete a key a
+-- zone still references (ErrInUse -> 409), in one statement rather than
+-- check-then-delete, and the zone create/patch handlers refuse a tsig_key_id
+-- that names no key (400).
+--
+-- What that does not enforce, so the trade is recorded on both sides: the
+-- handler's existence check and its zone insert are two statements, and a
+-- key deleted between them leaves a zone naming an id nothing answers to.
+-- Measured on postgres, where it is the common outcome under concurrency
+-- rather than a corner case, and measurably possible on sqlite too --
+-- SetMaxOpenConns(1) serialises statements, not the handler's sequence, so
+-- it narrows the window rather than closing it. A foreign key here is one
+-- of the three constructs that would close it (the others being
+-- SELECT ... FOR UPDATE around the check, which sqlite has no syntax for,
+-- and SERIALIZABLE isolation on postgres, which needs retry handling this
+-- path has none of) -- see tsigKeyStore.Delete's doc comment for why none
+-- of them is cheap. The cost when it happens is a named transfer failure at
+-- the next refresh, not silent breakage.
+--
+-- What this migration adds is the index that guard reads through, so
+-- "is any zone using this key" is a lookup rather than a scan of the zones
+-- table on every key delete and, from the TSIG keys screen, once per key
+-- listed.
+CREATE INDEX idx_zones_tsig_key_id ON zones(tsig_key_id);

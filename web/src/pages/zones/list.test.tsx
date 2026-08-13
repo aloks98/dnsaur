@@ -1,14 +1,14 @@
 import { http, HttpResponse } from "msw";
 import { toast } from "sonner";
 import { afterEach, expect, test, vi } from "vitest";
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { act, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { useForm } from "react-hook-form";
 import { Form } from "@e412/rnui-react";
 import { server } from "../../test/msw-server";
 import { renderWithProviders } from "../../test/render";
 import type { Zone, ZoneRecord } from "../../api/types";
-import { CreateRowHint, PrimariesField, ZonesList, type AddZoneValues } from "./list";
+import { CreateRowHint, PrimariesField, TSIGKeyField, ZonesList, type AddZoneValues } from "./list";
 
 function zone(overrides: Partial<Zone> = {}): Zone {
   return {
@@ -28,6 +28,8 @@ function zone(overrides: Partial<Zone> = {}): Zone {
     tsig_key_id: 0,
     expires_at: 0,
     refreshed_at: 0,
+    last_error: "",
+    last_attempt: 0,
     created_at: Date.now() - 86_400_000,
     modified_at: Date.now() - 60_000,
     ...overrides,
@@ -67,26 +69,54 @@ async function openCreateRow(user: ReturnType<typeof userEvent.setup>) {
 }
 
 /**
- * Renders PrimariesField and CreateRowHint directly, with `type` set by the
- * caller rather than driven through the create row's real select — which,
- * in this milestone, offers only "primary" (see list.tsx's CREATABLE_TYPES)
- * and so can never actually produce "secondary"/"stub"/"forwarder" itself.
- * This harness is currently the *only* way anything exercises those two
- * components with a non-primary type; see their own comments in list.tsx.
+ * Renders the three type-dependent create-row cells directly, with `type` set
+ * by the caller rather than driven through the real select. The select can
+ * now produce both values a user can pick, but it cannot produce `stub`,
+ * `forwarder` or `internal` — and those are exactly the cases worth pinning,
+ * since the artboard asks for `stub`/`forwarder` to behave like `secondary`
+ * here and they deliberately do not (see PrimariesField in list.tsx).
  */
 function TypeAwareFieldsHarness({ type }: { type: Zone["type"] }) {
   const form = useForm<AddZoneValues>({
-    defaultValues: { name: "", type: "primary", primaries: "" },
+    defaultValues: { name: "", type: "primary", primaries: "", tsig_key_id: "" },
   });
   return (
     <Form {...form}>
       <PrimariesField type={type} control={form.control} />
-      <CreateRowHint type={type} control={form.control} nameError={undefined} />
+      <TSIGKeyField type={type} control={form.control} />
+      <CreateRowHint
+        type={type}
+        control={form.control}
+        nameError={undefined}
+        primariesError={undefined}
+      />
     </Form>
   );
 }
 
-afterEach(() => vi.restoreAllMocks());
+/**
+ * Every path MSW served during the test — the only way to prove a *negative*
+ * about the network, which the polling tests below are mostly made of.
+ * Torn down in the afterEach alongside MSW's own per-test handler reset.
+ */
+function trackFetchedPaths(): string[] {
+  const paths: string[] = [];
+  server.events.on("request:start", ({ request }) => {
+    paths.push(new URL(request.url).pathname);
+  });
+  return paths;
+}
+
+/** How many times one endpoint was actually read. */
+function reads(paths: string[], path: string): number {
+  return paths.filter((p) => p === path).length;
+}
+
+afterEach(() => {
+  vi.restoreAllMocks();
+  vi.useRealTimers();
+  server.events.removeAllListeners();
+});
 
 // The RFC 6303 zones exist to stop junk queries reaching the roots;
 // offering a delete that the API refuses is a button that lies. Built-ins
@@ -382,18 +412,25 @@ test("the records count groups with thousands separators", async () => {
   expect(await screen.findByText("1,234")).toBeInTheDocument();
 });
 
-// Milestone A ships primary zones only: a secondary/stub/forwarder zone
-// with no transfer mechanism behind it (transfers arrive in #72) doesn't
-// merely do nothing — answer.go's forwarder/stub fall-through list is
-// missing `secondary`, so it gets served like a primary, holding only its
-// apex NS and NXDOMAINing every other name under a domain the user owns.
-// The API now 400s anything but primary; a single-option select is the
-// honest reflection of that on this row, not an arbitrary restriction.
-// While `primary` is the only creatable type, the type cell is static text
-// rather than a one-option select — a select a user can open and not change
-// is a control that does nothing. It still has to POST `primary`, which is
-// what the hidden input is for and what this asserts.
-test("the type cell states primary rather than offering a dead select", async () => {
+// The type select offers exactly what the API accepts. The artboard draws
+// four options — primary, secondary, stub, forwarder — and two of them 400:
+// `forwarder` is Milestone D6 and `stub` is in no milestone at all. An option
+// that always fails is worse than an absent one, so this pins the list rather
+// than leaving it to drift back to the artboard's.
+test("the type select offers primary and secondary, and nothing the API would refuse", async () => {
+  const user = userEvent.setup();
+  mockZones([]);
+  renderWithProviders(<ZonesList />);
+  await openCreateRow(user);
+
+  const select = screen.getByLabelText("Zone type");
+  expect(Array.from(select.querySelectorAll("option")).map((option) => option.value)).toEqual([
+    "primary",
+    "secondary",
+  ]);
+});
+
+test("creating a primary posts the name alone — no type, no transfer fields", async () => {
   const user = userEvent.setup();
   let body: unknown;
   mockZones([]);
@@ -407,16 +444,112 @@ test("the type cell states primary rather than offering a dead select", async ()
   await openCreateRow(user);
 
   const row = document.querySelector<HTMLElement>('[data-slot="add-zone-row"]')!;
-  expect(within(row).queryByRole("combobox")).not.toBeInTheDocument();
-  expect(within(row).getByText("primary")).toBeInTheDocument();
-
   await user.type(within(row).getByPlaceholderText("home.lan"), "e412.in");
   await user.click(within(row).getByRole("button", { name: "Add" }));
+
   // `type` is omitted, not sent as "primary": onSubmit drops it when it is
-  // the default, and handleZoneCreate reads an absent type as primary. The
-  // hidden input exists to keep the form value valid for the zod enum, not
-  // to put a field on the wire.
+  // the default, and handleZoneCreate reads an absent type as primary.
+  // primaries and tsig_key_id are omitted too, and must be — the server 400s
+  // either one on a zone that is not a secondary.
   await waitFor(() => expect(body).toEqual({ name: "e412.in" }));
+});
+
+// The artboard values this select by key NAME ("xfer.e412.in."). The API
+// field is tsig_key_id. Building it as drawn needs a name->id lookup at
+// submit time, and the failure mode when that lookup misses is silent: the
+// zone is created signing with the wrong key, or none, and nothing says so
+// until a transfer is refused. This pins the id on the wire.
+test("creating a secondary posts primaries and the TSIG key's id, not its name", async () => {
+  const user = userEvent.setup();
+  let body: unknown;
+  mockZones([]);
+  server.use(
+    http.get("/api/v1/tsig-keys", () =>
+      HttpResponse.json([
+        {
+          id: 4,
+          name: "xfer.e412.in.",
+          algorithm: "hmac-sha256.",
+          secret: "Sh5ZuulpjcmcJuN6VwMQCVEhTJyUmlPTSHexvePtaWo=",
+          created_at: Date.now(),
+        },
+      ]),
+    ),
+    http.post("*/api/v1/zones", async ({ request }) => {
+      body = await request.json();
+      return HttpResponse.json({ id: 1 }, { status: 201 });
+    }),
+  );
+  renderWithProviders(<ZonesList />);
+  await openCreateRow(user);
+
+  await user.selectOptions(screen.getByLabelText("Zone type"), "secondary");
+  await user.type(screen.getByLabelText(/zone name/i), "e412.in");
+  await user.type(screen.getByLabelText(/primary servers/i), "203.0.113.9, ns2.example.net:5353");
+  await user.selectOptions(await screen.findByLabelText(/tsig key/i), "4");
+  await user.click(screen.getByRole("button", { name: "Add" }));
+
+  await waitFor(() =>
+    expect(body).toEqual({
+      name: "e412.in",
+      type: "secondary",
+      primaries: "203.0.113.9, ns2.example.net:5353",
+      tsig_key_id: 4,
+    }),
+  );
+});
+
+// An unsigned transfer is a legitimate configuration, and 0 is what the
+// server reads an omitted tsig_key_id as — so "No TSIG" puts no field on the
+// wire rather than an explicit zero.
+test("a secondary with no TSIG key omits tsig_key_id entirely", async () => {
+  const user = userEvent.setup();
+  let body: unknown;
+  mockZones([]);
+  server.use(
+    http.post("*/api/v1/zones", async ({ request }) => {
+      body = await request.json();
+      return HttpResponse.json({ id: 1 }, { status: 201 });
+    }),
+  );
+  renderWithProviders(<ZonesList />);
+  await openCreateRow(user);
+
+  await user.selectOptions(screen.getByLabelText("Zone type"), "secondary");
+  await user.type(screen.getByLabelText(/zone name/i), "e412.in");
+  await user.type(screen.getByLabelText(/primary servers/i), "203.0.113.9");
+  await user.click(screen.getByRole("button", { name: "Add" }));
+
+  await waitFor(() =>
+    expect(body).toEqual({ name: "e412.in", type: "secondary", primaries: "203.0.113.9" }),
+  );
+});
+
+// The server refuses this and is right to: a secondary with nowhere to pull
+// from can never transfer, so it would answer SERVFAIL for its whole suffix
+// forever. Caught client-side only to save the round trip — and the message
+// has to land under the field it is about, not in column 1 where the name's
+// errors go.
+test("a secondary with no primaries is rejected client-side and never posted", async () => {
+  const user = userEvent.setup();
+  let posted = false;
+  mockZones([]);
+  server.use(
+    http.post("*/api/v1/zones", () => {
+      posted = true;
+      return HttpResponse.json({ id: 1 }, { status: 201 });
+    }),
+  );
+  renderWithProviders(<ZonesList />);
+  await openCreateRow(user);
+
+  await user.selectOptions(screen.getByLabelText("Zone type"), "secondary");
+  await user.type(screen.getByLabelText(/zone name/i), "e412.in");
+  await user.click(screen.getByRole("button", { name: "Add" }));
+
+  expect(await screen.findByText(/where to pull from/i)).toBeInTheDocument();
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  expect(posted).toBe(false);
 });
 
 // The type cell above is static "primary" (previous test), so nothing
@@ -424,26 +557,32 @@ test("the type cell states primary rather than offering a dead select", async ()
 // prop away from "primary" — this harness (see its own comment) is
 // currently the only thing that does, ahead of #72 widening the select
 // back out to the four types this still knows how to render.
-test("the primaries field and its hint appear only for the three non-primary types", () => {
-  const { rerender } = render(<TypeAwareFieldsHarness type="primary" />);
-  expect(screen.queryByLabelText(/primary servers/i)).not.toBeInTheDocument();
-  expect(screen.getByText("SOA defaults are filled in.")).toBeInTheDocument();
+// The artboard's `needsPrimaries` covers secondary, stub AND forwarder. Only
+// secondary is right: neither of the other two is creatable at all (the API
+// 400s them), and a forwarder does not have primaries in the first place — it
+// has upstreams to ask, which is a different field for a different milestone.
+// Building the artboard as drawn would have put a "Primary servers" input in
+// front of a zone type that has none.
+test("the transfer fields and their hints appear for secondary alone, never for stub or forwarder", () => {
+  // A fresh render per type rather than rerender(): rerender replaces the
+  // whole tree, wrapper included, and TSIGKeyField reads a query client.
+  const secondary = renderWithProviders(<TypeAwareFieldsHarness type="secondary" />);
+  expect(screen.getByLabelText(/primary servers/i)).toBeInTheDocument();
+  expect(screen.getByLabelText(/tsig key/i)).toBeInTheDocument();
+  expect(screen.getByText("Primary servers, comma separated.")).toBeInTheDocument();
+  expect(screen.getByText("Optional.")).toBeInTheDocument();
+  expect(screen.queryByText("SOA defaults are filled in.")).not.toBeInTheDocument();
+  secondary.unmount();
 
-  for (const type of ["secondary", "stub", "forwarder"] as const) {
-    rerender(<TypeAwareFieldsHarness type={type} />);
-    expect(screen.getByLabelText(/primary servers/i)).toBeInTheDocument();
-    expect(screen.getByText("Primary servers, comma separated.")).toBeInTheDocument();
-    expect(screen.queryByText("SOA defaults are filled in.")).not.toBeInTheDocument();
+  for (const type of ["primary", "stub", "forwarder", "internal"] as const) {
+    const other = renderWithProviders(<TypeAwareFieldsHarness type={type} />);
+    expect(screen.queryByLabelText(/primary servers/i)).not.toBeInTheDocument();
+    expect(screen.queryByLabelText(/tsig key/i)).not.toBeInTheDocument();
+    other.unmount();
   }
 
-  rerender(<TypeAwareFieldsHarness type="primary" />);
-  expect(screen.queryByLabelText(/primary servers/i)).not.toBeInTheDocument();
+  renderWithProviders(<TypeAwareFieldsHarness type="primary" />);
   expect(screen.getByText("SOA defaults are filled in.")).toBeInTheDocument();
-
-  // internal is never offered by the select either, but PrimariesField
-  // treats it the same as primary — no primaries of its own.
-  rerender(<TypeAwareFieldsHarness type="internal" />);
-  expect(screen.queryByLabelText(/primary servers/i)).not.toBeInTheDocument();
 });
 
 test("the create row shows an em dash for serial, records and modified", async () => {
@@ -488,20 +627,181 @@ test("an expired secondary shows the EXPIRED warning row with a Retry transfer b
   expect(retry).not.toHaveAttribute("type", "submit");
 });
 
-test("a non-expired secondary shows no EXPIRED warning row", async () => {
+test("a healthy secondary shows no warning row at all, and reads when it last refreshed", async () => {
   mockZones([
     zone({
       id: 8,
       name: "ok-secondary.example.com",
       type: "secondary",
-      expires_at: Date.now() + 999_999,
+      primaries: "203.0.113.9",
+      soa_refresh: 7200,
+      refreshed_at: Date.now() - 2 * 3600_000,
+      expires_at: Date.now() + 999_999_999,
     }),
   ]);
   renderWithProviders(<ZonesList />);
-  await screen.findAllByTestId("zone-row");
+  const rows = await screen.findAllByTestId("zone-row");
 
+  // Not "Enabled": for a copy, when it was last confirmed current is the
+  // thing worth knowing, and a plain "Enabled" hides it.
+  expect(within(rows[0]).getByText("Refreshed 2h ago")).toBeInTheDocument();
   expect(screen.queryByText("Expired")).not.toBeInTheDocument();
   expect(screen.queryByRole("button", { name: /retry transfer/i })).not.toBeInTheDocument();
+});
+
+// The state a fresh secondary is in for its first minute, and the one an
+// "Enabled" badge is most wrong about: the zone is enabled in the database
+// and answering SERVFAIL for its whole suffix, because it holds nothing it
+// may speak for (Zone.Serving, internal/zones/answer.go).
+test("a secondary that has never transferred says so, rather than reading as enabled", async () => {
+  mockZones([
+    zone({
+      id: 9,
+      name: "new-secondary.example.com",
+      type: "secondary",
+      enabled: true,
+      primaries: "203.0.113.9",
+    }),
+  ]);
+  renderWithProviders(<ZonesList />);
+  const rows = await screen.findAllByTestId("zone-row");
+
+  // "Not answering" in the status column — the same words an expired zone
+  // gets, because it is the same fact — and the warning row below is what
+  // says which of the two this is.
+  expect(within(rows[0]).getByText("Not answering")).toBeInTheDocument();
+  expect(within(rows[0]).getByText("Never transferred")).toBeInTheDocument();
+  expect(within(rows[0]).queryByText("Enabled")).not.toBeInTheDocument();
+});
+
+// The whole point of persisting last_error: this zone is failing for a
+// reason recorded in the database, so it reads the same after a restart as
+// before one. The row leads with the failure itself and keeps the server's
+// whole sentence on the element, because rewriting a resolver error into
+// "couldn't transfer" throws away everything actionable about it.
+test("a failing secondary leads with the failure and keeps the whole message", async () => {
+  mockZones([
+    zone({
+      id: 10,
+      name: "failing.example.com",
+      type: "secondary",
+      primaries: "203.0.113.9",
+      soa_refresh: 7200,
+      refreshed_at: Date.now() - 31 * 3600_000,
+      expires_at: Date.now() + 999_999_999,
+      last_error: "203.0.113.9:53: dial tcp: connect: connection refused",
+      last_attempt: Date.now() - 60_000,
+    }),
+  ]);
+  renderWithProviders(<ZonesList />);
+  const rows = await screen.findAllByTestId("zone-row");
+
+  // Not "Serving, transfer failing": the note below says what is being
+  // served, and how old it is, which the status column cannot.
+  expect(within(rows[0]).getByText("Transfer failing")).toBeInTheDocument();
+  const cause = within(rows[0]).getByTestId("zone-transfer-error");
+  // Just the failure — this page's own sentence about the consequence is a
+  // separate element beside it, not concatenated onto the end of it.
+  expect(cause.textContent).toBe("connection refused");
+  expect(cause).toHaveAttribute("title", "203.0.113.9:53: dial tcp: connect: connection refused");
+  expect(within(rows[0]).getByTestId("zone-transfer-note").textContent).toBe(
+    "Still serving the copy from 1d ago.",
+  );
+});
+
+// The defect this row had: the transfer's error and this page's own sentence
+// about the consequence were one concatenated string, so a long error ran
+// into the note with nothing between them and pushed it out of the row.
+// Whatever the server said, the note is a separate element and stays whole.
+test("a long transfer error does not run into the note or crowd it out", async () => {
+  const longError = `zone "failing.example.com": every primary failed: ${"203.0.113.9:53: dial tcp 203.0.113.9:53: no route to host: ".repeat(8)}connection refused`;
+  mockZones([
+    zone({
+      id: 10,
+      name: "failing.example.com",
+      type: "secondary",
+      primaries: "203.0.113.9",
+      soa_refresh: 7200,
+      refreshed_at: Date.now() - 31 * 3600_000,
+      expires_at: Date.now() + 999_999_999,
+      last_error: longError,
+      last_attempt: Date.now() - 60_000,
+    }),
+  ]);
+  renderWithProviders(<ZonesList />);
+  const rows = await screen.findAllByTestId("zone-row");
+
+  // The one thing the row has to keep: what the zone is doing about it, in
+  // its own element rather than glued to the end of 500 characters of error.
+  const note = within(rows[0]).getByTestId("zone-transfer-note");
+  expect(note.textContent).toBe("Still serving the copy from 1d ago.");
+
+  // And what is drawn of the error is short whatever its length — the part
+  // that says what went wrong, not the leading context an ellipsis would
+  // have left behind — with nothing of this page's own sentence run into it.
+  const cause = within(rows[0]).getByTestId("zone-transfer-error");
+  expect(cause.textContent).toBe("connection refused");
+  // Nothing is lost by drawing less of it.
+  expect(cause).toHaveAttribute("title", longError);
+});
+
+// An error left over from before the last success is not this zone's current
+// state, and a success whose bookkeeping write failed is the one way that can
+// happen (Refresher.recordAttempt is best-effort). Ordering the two stamps is
+// what stops a fixed problem sitting on screen forever.
+test("an error older than the last success is not shown", async () => {
+  mockZones([
+    zone({
+      id: 11,
+      name: "recovered.example.com",
+      type: "secondary",
+      primaries: "203.0.113.9",
+      soa_refresh: 7200,
+      refreshed_at: Date.now() - 60_000,
+      expires_at: Date.now() + 999_999_999,
+      last_error: "connection refused",
+      last_attempt: Date.now() - 9 * 3600_000,
+    }),
+  ]);
+  renderWithProviders(<ZonesList />);
+  const rows = await screen.findAllByTestId("zone-row");
+
+  expect(within(rows[0]).queryByText(/connection refused/)).not.toBeInTheDocument();
+  expect(within(rows[0]).getByText(/^Refreshed /)).toBeInTheDocument();
+});
+
+// The button was inert through Milestone A — there was no transfer endpoint
+// to call. It has one now.
+test("Retry transfer asks the server for a transfer now", async () => {
+  const user = userEvent.setup();
+  let refreshed = 0;
+  mockZones([
+    zone({
+      id: 12,
+      name: "branch.example.com",
+      type: "secondary",
+      primaries: "203.0.113.9",
+      refreshed_at: Date.now() - 17 * 86_400_000,
+      expires_at: Date.now() - 1000,
+    }),
+  ]);
+  server.use(
+    http.post("/api/v1/zones/12/refresh", () => {
+      refreshed++;
+      return HttpResponse.json({
+        primary: "203.0.113.9:53",
+        serial: 2026080601,
+        records: 17,
+        refreshed_at: Date.now(),
+        expires_at: Date.now() + 999_999,
+      });
+    }),
+  );
+  renderWithProviders(<ZonesList />);
+  await screen.findAllByTestId("zone-row");
+
+  await user.click(screen.getByRole("button", { name: /retry transfer/i }));
+  await waitFor(() => expect(refreshed).toBe(1));
 });
 
 test("a long .arpa apex does not break the zones-list grid", async () => {
@@ -517,4 +817,202 @@ test("a long .arpa apex does not break the zones-list grid", async () => {
   await user.click(await screen.findByRole("button", { name: /1 built-in zone/i }));
   const cell = await screen.findByTitle(/ip6\.arpa$/);
   expect(cell).toHaveClass("truncate");
+});
+
+// The fourth status a secondary can carry, and the one with no analogue on the
+// design boards: past its refresh deadline with no failure recorded against
+// it. Without this state the row would read "Refreshed 5h ago" in the calm
+// green of a zone that is up to date.
+test("a secondary past its refresh deadline with nothing recorded reads overdue", async () => {
+  mockZones([
+    zone({
+      id: 13,
+      name: "stale.example.com",
+      type: "secondary",
+      primaries: "203.0.113.9",
+      soa_refresh: 7200,
+      refreshed_at: Date.now() - 5 * 3600_000,
+      last_attempt: Date.now() - 5 * 3600_000,
+      expires_at: Date.now() + 999_999_999,
+    }),
+  ]);
+  renderWithProviders(<ZonesList />);
+  const rows = await screen.findAllByTestId("zone-row");
+
+  expect(within(rows[0]).getByText("Serving, transfer overdue")).toBeInTheDocument();
+  expect(within(rows[0]).getByText("Overdue")).toBeInTheDocument();
+  expect(
+    within(rows[0]).getByText(/nothing has transferred from 203\.0\.113\.9 since 5h ago/i),
+  ).toBeInTheDocument();
+});
+
+// A disabled zone is skipped by the scheduler entirely, so its transfer state
+// is a consequence of the switch rather than a problem of its own. The list
+// already checked `enabled` first; this pins that it keeps doing so.
+test("a disabled secondary reads Disabled, with no transfer warning of its own", async () => {
+  mockZones([
+    zone({
+      id: 14,
+      name: "off.example.com",
+      type: "secondary",
+      enabled: false,
+      primaries: "203.0.113.9",
+      refreshed_at: Date.now() - 5 * 86_400_000,
+      expires_at: Date.now() - 1000,
+      last_error: "connection refused",
+      last_attempt: Date.now() - 4 * 86_400_000,
+    }),
+  ]);
+  renderWithProviders(<ZonesList />);
+  const rows = await screen.findAllByTestId("zone-row");
+
+  expect(within(rows[0]).getByText("Disabled")).toBeInTheDocument();
+  expect(within(rows[0]).queryByText("Expired")).not.toBeInTheDocument();
+  expect(
+    within(rows[0]).queryByRole("button", { name: /retry transfer/i }),
+  ).not.toBeInTheDocument();
+});
+
+// ── Keeping up with the scheduler ───────────────────────────────────────────
+//
+// A secondary's transfer state is the one thing on any of these screens that
+// changes with nobody touching it: the scheduler transfers on the SOA's
+// refresh, retries a zone whose primary has come back, and lets an
+// unreachable one expire. Everything else here changes only when an operator
+// changes it, and the mutation that did already invalidated — which is why
+// the query client turns polling and focus revalidation off for the whole app
+// (lib/query-client.ts) and this is the one place that opts back in.
+//
+// Fake timers throughout: the point is what happens over minutes, and a test
+// that really waits them out is not a test anyone will keep.
+
+/** A healthy secondary two hours into a seven-hour refresh. */
+function watchedSecondary(overrides: Partial<Zone> = {}): Zone {
+  return zone({
+    id: 6,
+    name: "branch.example.com",
+    type: "secondary",
+    primaries: "203.0.113.9",
+    soa_refresh: 25_200,
+    refreshed_at: Date.now() - 2 * 3600_000,
+    expires_at: Date.now() + 999_999_999,
+    ...overrides,
+  });
+}
+
+test("a failing secondary recovers on screen, with nobody touching the page", async () => {
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  let failing = true;
+  server.use(
+    http.get("/api/v1/zones", () =>
+      HttpResponse.json([
+        watchedSecondary(
+          failing
+            ? {
+                last_error: "203.0.113.9:53: dial tcp: connect: connection refused",
+                last_attempt: Date.now(),
+              }
+            : {},
+        ),
+      ]),
+    ),
+  );
+
+  renderWithProviders(<ZonesList />);
+  expect(await screen.findByText(/connection refused/)).toBeInTheDocument();
+
+  // The primary came back and the scheduler transferred. Nothing told this
+  // page so, and nobody clicked anything.
+  failing = false;
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(30_000);
+  });
+
+  await waitFor(() => expect(screen.queryByText(/connection refused/)).not.toBeInTheDocument());
+  expect(screen.getByText("Refreshed 2h ago")).toBeInTheDocument();
+});
+
+// The constraint the poll is gated on: a homelab with primaries alone must
+// pay nothing for a feature that can only ever report on a secondary.
+test("a list of primaries alone is read once and never again", async () => {
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  const paths = trackFetchedPaths();
+  mockZones([zone({ id: 1, name: "example.com", type: "primary" })]);
+  mockZoneRecords(1, [zoneRecord(1, 1)]);
+
+  renderWithProviders(<ZonesList />);
+  await screen.findAllByTestId("zone-row");
+
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(5 * 60_000);
+  });
+
+  expect(reads(paths, "/api/v1/zones")).toBe(1);
+  expect(reads(paths, "/api/v1/zones/1/records")).toBe(1);
+});
+
+// The other half of the same bargain: watching is not hammering. Bounds
+// rather than an exact count, and measured off the wire rather than read back
+// off the query's config, so the assertion survives any reshuffling of how
+// the interval is expressed.
+test("watching a secondary for five minutes is a handful of reads, and none of its records", async () => {
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  const paths = trackFetchedPaths();
+  mockZones([watchedSecondary()]);
+  mockZoneRecords(6, [zoneRecord(6, 1)]);
+
+  renderWithProviders(<ZonesList />);
+  await screen.findAllByTestId("zone-row");
+
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(5 * 60_000);
+  });
+
+  const zonesReads = reads(paths, "/api/v1/zones");
+  expect(zonesReads).toBeGreaterThan(1);
+  // 5 minutes at one read per 30s, plus the first. Anything above this is a
+  // page hammering an endpoint whose answer cannot change that fast — the
+  // scheduler only decides what is due every 30s.
+  expect(zonesReads).toBeLessThanOrEqual(11);
+  // And the record list is not on a timer of its own. Nothing transferred, so
+  // there was nothing to re-read; polling it would have doubled the traffic
+  // to learn what the zone above already reports.
+  expect(reads(paths, "/api/v1/zones/6/records")).toBe(1);
+});
+
+// A transfer landing is the one thing that changes a secondary's records, and
+// it is the zone's own `refreshed_at` moving that says so.
+test("a transfer landing re-reads that zone's records, and only that zone's", async () => {
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  const paths = trackFetchedPaths();
+  const before = Date.now() - 2 * 3600_000;
+  let refreshedAt = before;
+  server.use(
+    http.get("/api/v1/zones", () =>
+      HttpResponse.json([
+        watchedSecondary({ refreshed_at: refreshedAt }),
+        zone({ id: 1, name: "example.com", type: "primary" }),
+      ]),
+    ),
+    http.get("/api/v1/zones/6/records", () =>
+      HttpResponse.json(
+        refreshedAt === before ? [zoneRecord(6, 1)] : [zoneRecord(6, 1), zoneRecord(6, 2)],
+      ),
+    ),
+  );
+  mockZoneRecords(1, [zoneRecord(1, 1)]);
+
+  renderWithProviders(<ZonesList />);
+  await waitFor(() => expect(zoneRows()).toHaveLength(2));
+  expect(within(zoneRows()[0]).getByText("1")).toBeInTheDocument();
+
+  refreshedAt = Date.now();
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(30_000);
+  });
+
+  await waitFor(() => expect(within(zoneRows()[0]).getByText("2")).toBeInTheDocument());
+  expect(reads(paths, "/api/v1/zones/6/records")).toBe(2);
+  // The primary beside it transferred nothing, because it cannot.
+  expect(reads(paths, "/api/v1/zones/1/records")).toBe(1);
 });

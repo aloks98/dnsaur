@@ -143,7 +143,7 @@ func recordAddr(rec *store.ZoneRecord) (netip.Addr, bool) {
 // recordFQDN is a record's owner name in the form PTR rdata takes: fully
 // qualified, trailing dot included.
 func recordFQDN(zoneName, relName string) string {
-	return dns.Fqdn(absoluteRecordName(zoneName, relName))
+	return dns.Fqdn(zones.RecordFQDN(zoneName, relName))
 }
 
 // ptrZoneCandidates is the set of zones auto-PTR may write into, as the
@@ -154,13 +154,23 @@ func recordFQDN(zoneName, relName string) string {
 // are the seeded RFC 6303 built-ins (store.BuiltinZones), which every other
 // write path refuses with a 409 — an automatic write must not become the one
 // exception, and 127.in-addr.arpa covers every loopback address a forward
-// record might carry. Types the API cannot create yet (secondary, stub,
-// forwarder) are excluded by the same test: a zone whose contents come from
-// somewhere else is not ours to add records to. Disabled zones are skipped
-// for the reason (*zones.Index).Find skips them — a PTR in a zone that
-// answers nothing is a PTR nobody can look up, and skipping it lets an
-// enabled parent zone take the address instead, which is where a reverse
-// query for it would actually be answered.
+// record might carry.
+//
+// `secondary` is excluded by the same test, and since Milestone D2 that is
+// the load-bearing half of it: a secondary is a zone the API *can* now
+// create, holding a copy of someone else's data that a transfer replaces
+// wholesale. This is the fifth write path into a zone — the four explicit
+// ones (POST/PUT/DELETE records, POST file) answer 409 for a secondary, and
+// this one is automatic, so nothing would refuse it on the caller's behalf.
+// Admitting one here would write a PTR the next transfer deletes and, worse,
+// bump a serial the primary owns, so this server would advertise a version
+// of the zone that no one else has. `stub` and `forwarder` are excluded for
+// the original reason: neither holds data at all.
+//
+// Disabled zones are skipped for the reason (*zones.Index).Find skips them —
+// a PTR in a zone that answers nothing is a PTR nobody can look up, and
+// skipping it lets an enabled parent zone take the address instead, which is
+// where a reverse query for it would actually be answered.
 func ptrZoneCandidates(zs []store.Zone) ([]string, map[string]store.Zone) {
 	names := make([]string, 0, len(zs))
 	byName := make(map[string]store.Zone, len(zs))

@@ -372,7 +372,7 @@ func TestRecordWriteStoresRDataWithOneMeaningEverywhere(t *testing.T) {
 			// than their spellings.
 			raw := stored
 			raw.RData = c.raw
-			fqdn := absoluteRecordName("e412.in", stored.Name)
+			fqdn := zones.RecordFQDN("e412.in", stored.Name)
 			fromStored, err := zones.ToRR(fqdn, stored)
 			if err != nil {
 				t.Fatalf("stored rdata %q no longer parses: %v", stored.RData, err)
@@ -451,6 +451,81 @@ func TestRecordCreateRejectsRDataThatParsesToNothing(t *testing.T) {
 		}
 		if recs := srv.records(t, zid); len(recs) != 0 {
 			t.Errorf("rdata %q: stored an unexportable record: %+v", raw, recs)
+		}
+	}
+}
+
+// A secondary zone's records are its primary's, arriving whole on every
+// transfer. A hand write into one is not merged with what the primary sends
+// and is not preserved by it — it is silently deleted by the next refresh,
+// which is worse than being refused, because between the write and the
+// refresh the server serves it authoritatively.
+//
+// This became reachable with Task 2: before a transfer existed, a record
+// written into a secondary simply stayed there.
+func TestRecordWritesIntoASecondaryAreRefused(t *testing.T) {
+	srv := newTestServer(t)
+	now := time.Now().UnixMilli()
+	zid, err := srv.store.Zones().AddZone(t.Context(), store.Zone{
+		Name: "e412.in", Type: "secondary", Enabled: true,
+		SOANS: "ns1.upstream.example", SOAMbox: "hostadmin.e412.in",
+		SOASerial: 7, SOARefresh: 900, SOARetry: 300, SOAExpire: 604800,
+		SOAMinimum: 900, SOATTL: 900,
+		Primaries: "192.168.150.5", CreatedAt: now, ModifiedAt: now,
+	})
+	if err != nil {
+		t.Fatalf("seed secondary: %v", err)
+	}
+	// A row the transfer would have installed, seeded through the store so
+	// there is something for PUT and DELETE to aim at.
+	rid, err := srv.store.Zones().AddRecord(t.Context(), store.ZoneRecord{
+		ZoneID: zid, Name: "bifrost", Type: "A", TTL: 300, RData: "10.9.0.10", Enabled: true,
+	})
+	if err != nil {
+		t.Fatalf("seed record: %v", err)
+	}
+
+	base := fmt.Sprintf("/api/v1/zones/%d", zid)
+	for _, c := range []struct{ method, path, body string }{
+		{"POST", base + "/records", `{"name":"nas","type":"A","ttl":300,"rdata":"10.9.0.20"}`},
+		{"PUT", fmt.Sprintf("%s/records/%d", base, rid), `{"name":"bifrost","type":"A","ttl":60,"rdata":"10.9.0.99"}`},
+		{"DELETE", fmt.Sprintf("%s/records/%d", base, rid), ""},
+		{"POST", base + "/file", `{"content":"@ 900 IN SOA ns1.e412.in. h.e412.in. 1 900 300 604800 900\n","dry_run":false}`},
+	} {
+		rec := srv.do(t, c.method, c.path, c.body)
+		if rec.Code != http.StatusConflict {
+			t.Errorf("%s %s: status = %d body = %s, want 409", c.method, c.path, rec.Code, rec.Body)
+		}
+		if !strings.Contains(rec.Body.String(), "primary") {
+			t.Errorf("%s %s: %s does not say where the records come from", c.method, c.path, rec.Body)
+		}
+	}
+
+	// Nothing got through, including the delete.
+	if recs := srv.records(t, zid); len(recs) != 1 || recs[0].RData != "10.9.0.10" {
+		t.Errorf("records = %+v, want the one seeded row unchanged", recs)
+	}
+}
+
+// Reads are untouched: a secondary's records are listable and its zone file
+// exportable, which is what the zone detail screen shows.
+func TestSecondaryZoneRecordsStayReadable(t *testing.T) {
+	srv := newTestServer(t)
+	now := time.Now().UnixMilli()
+	zid, err := srv.store.Zones().AddZone(t.Context(), store.Zone{
+		Name: "e412.in", Type: "secondary", Enabled: true,
+		SOANS: "ns1.upstream.example", SOAMbox: "hostadmin.e412.in",
+		SOASerial: 7, SOARefresh: 900, SOARetry: 300, SOAExpire: 604800,
+		SOAMinimum: 900, SOATTL: 900,
+		Primaries: "192.168.150.5", CreatedAt: now, ModifiedAt: now,
+	})
+	if err != nil {
+		t.Fatalf("seed secondary: %v", err)
+	}
+	base := fmt.Sprintf("/api/v1/zones/%d", zid)
+	for _, path := range []string{base + "/records", base + "/file"} {
+		if rec := srv.do(t, "GET", path, ""); rec.Code != http.StatusOK {
+			t.Errorf("GET %s: status = %d, want 200", path, rec.Code)
 		}
 	}
 }

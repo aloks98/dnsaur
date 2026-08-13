@@ -248,4 +248,78 @@ test("first-run setup, login, create a zone and add a record, dark mode persists
   await expect(keyRow.getByText("•".repeat(24))).toBeVisible();
   await keyRow.getByRole("button", { name: "Show the secret for xfer.e412.in." }).click();
   await expect(keyRow.getByText(generatedSecret, { exact: true })).toBeVisible();
+  // Nothing uses it yet, so it is deletable — the other half is asserted
+  // once a zone references it, below.
+  await expect(keyRow.getByText("—", { exact: true })).toBeVisible();
+
+  // --- a secondary zone, end to end -------------------------------------
+  // The one chain nothing else covers whole: the create row's TSIG select is
+  // valued by key *id* while the design shows names, the refresh endpoint is
+  // reached through the real app wiring, and the failure it reports is
+  // written to a column rather than kept in the process. A mocked POST would
+  // accept a name-valued select happily; the real handler 400s an id that
+  // names no key, and 400s a secondary with no primaries at all.
+  //
+  // The primary is a port nothing listens on, so the transfer fails fast and
+  // for a reason the operating system supplies rather than this test.
+  // Reached through the group menu, the same way as the first zone above —
+  // row 2's tab only exists once Zones is the current group.
+  await topNav.getByRole("button", { name: "Zones", exact: true }).click();
+  await page.getByRole("menuitem", { name: "Zones" }).click();
+  await page.getByRole("button", { name: "New zone" }).first().click();
+  await page.getByLabel("Zone type").selectOption("secondary");
+  await page.getByLabel("Zone name").fill("branch.e412.in");
+  await page.getByLabel("Primary servers").fill("127.0.0.1:1");
+  // By label, like the algorithm above: what reaches the server is whatever
+  // the option was valued with, and only an id is accepted there.
+  await page.getByLabel("TSIG key").selectOption({ label: "xfer.e412.in." });
+  await page.getByRole("button", { name: "Add", exact: true }).click();
+
+  const secondaryRow = page.locator('[data-testid="zone-row"]', { hasText: "branch.e412.in" });
+  await expect(secondaryRow).toBeVisible();
+  // Enabled in the database and answering nothing, because it holds nothing
+  // it may speak for. An "Enabled" badge here would be the screen's most
+  // misleading element.
+  await expect(secondaryRow.getByText("Not answering")).toBeVisible();
+  await expect(secondaryRow.getByText("Never transferred")).toBeVisible();
+
+  await page.getByRole("link", { name: "branch.e412.in", exact: true }).click();
+  await expect(page.getByText("127.0.0.1:1", { exact: true })).toBeVisible();
+  // The id round-tripped: the band resolves it back to the name the peer
+  // knows the key by. A wrong id would render "#N (missing)".
+  await expect(page.getByText("xfer.e412.in.", { exact: true })).toBeVisible();
+  // Read-only, because every write route answers 409 for a secondary.
+  await expect(page.getByRole("button", { name: /add record/i })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: /^import$/i })).toHaveCount(0);
+
+  await page.getByRole("button", { name: "Refresh now" }).click();
+  // The transfer's own error, from the server, in the band — on two lines:
+  // what actually failed, and the whole message under it. Reloading proves
+  // the point of storing it: a page that had only remembered the response
+  // would come back blank.
+  const rawError = page.getByTestId("transfer-error-raw");
+  await expect(rawError).toContainText("127.0.0.1:1");
+  await page.reload();
+  await expect(page.getByTestId("transfer-error-raw")).toContainText("127.0.0.1:1");
+
+  // The one place a REAL transfer error is checked rather than a fixture, and
+  // so the only one that can say the first line is genuinely part of the
+  // second. Asserted as a relation — a shorter verbatim tail — rather than as
+  // an expected phrase, because the innermost words there are the host's
+  // ("connect: connection refused"), not this project's, and the split is a
+  // presentation choice that must survive them changing (see
+  // transferErrorLead in src/lib/zones.ts).
+  const leadText = (await page.getByTestId("transfer-error").textContent()) ?? "";
+  const rawText = (await rawError.textContent()) ?? "";
+  expect(leadText.length).toBeGreaterThan(0);
+  expect(leadText.length).toBeLessThan(rawText.length);
+  expect(rawText.endsWith(leadText)).toBe(true);
+
+  // And the key it names cannot now be deleted out from under it.
+  await systemMenu.click();
+  await page.getByRole("menuitem", { name: "TSIG keys" }).click();
+  await expect(keyRow.getByText("1 zone", { exact: true })).toBeVisible();
+  await keyRow.getByRole("button", { name: "Delete xfer.e412.in." }).click();
+  await expect(page.getByText("In use by 1 zone. Remove it from them first.")).toBeVisible();
+  await expect(page.getByRole("button", { name: "Delete", exact: true })).toBeDisabled();
 });

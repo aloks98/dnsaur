@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/aloks98/dnsaur/internal/store"
 )
@@ -384,5 +385,48 @@ func TestAutoPTRZoneDeleteLeavesForeignPTRsAlone(t *testing.T) {
 		if got[name] != rdata {
 			t.Errorf("PTR %q = %q, want %q", name, got[name], rdata)
 		}
+	}
+}
+
+// Auto-PTR is the fifth write path into a zone, and the only automatic one.
+// The four explicit ones (POST/PUT/DELETE records, POST file) each answer 409
+// for a secondary; this one has no caller to refuse, so the only thing keeping
+// it out is ptrZoneCandidates' type test.
+//
+// It matters more since Milestone D2 made `secondary` a type the API can
+// actually create. A PTR written here would be deleted by the next transfer —
+// which is the harmless half — but the write also bumps the reverse zone's
+// serial (bumpZoneSerial), and that serial belongs to the primary this zone
+// is a copy of. This server would then advertise a version of someone else's
+// zone that no one else has, and a downstream secondary that had already seen
+// that number would never ask again.
+//
+// 192.168.150.10 reverses into the secondary below, which is enabled and
+// currently serving (refreshed_at set, expires_at ahead) — so nothing but the
+// type test can be what keeps auto-PTR out of it.
+func TestAutoPTRSkipsSecondaryZone(t *testing.T) {
+	srv := newTestServer(t)
+	fwd := srv.createZone(t, "e412.in")
+
+	rev := createSecondary(t, srv, "150.168.192.in-addr.arpa", "203.0.113.9")
+	// A secondary that has transferred, so it is answering rather than sitting
+	// in the "never transferred" state Zone.Serving refuses outright.
+	z := srv.zone(t, rev)
+	now := time.Now().UnixMilli()
+	z.RefreshedAt, z.ExpiresAt = now-60_000, now+604_800_000
+	if err := srv.store.Zones().UpdateZone(t.Context(), z); err != nil {
+		t.Fatalf("UpdateZone: %v", err)
+	}
+	before := srv.zone(t, rev).SOASerial
+
+	srv.createRecord(t, fwd, `{"name":"bifrost","type":"A","ttl":300,"rdata":"192.168.150.10"}`)
+
+	if ptr := srv.recordsByType(t, rev, "PTR"); len(ptr) != 0 {
+		t.Fatalf("auto-PTR wrote into a secondary zone: %+v", ptr)
+	}
+	// The serial is the half that outlives the next transfer's cleanup.
+	if after := srv.zone(t, rev).SOASerial; after != before {
+		t.Errorf("auto-PTR bumped a secondary's serial %d -> %d; that number is its primary's to advance",
+			before, after)
 	}
 }

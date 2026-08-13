@@ -10,6 +10,11 @@ import (
 
 const testApex = "e412.in"
 
+// testNow is the instant every Answer call in this file is made at, fixed so
+// a test that says nothing about a zone's transfer state gets the same answer
+// on every run. Only the secondary tests below give it meaning.
+const testNow int64 = 1786000000000
+
 // newZone builds a primary zone for e412.in holding recs, through the same
 // zones.NewZone the resolver's snapshot build uses — so the disabled-record
 // rule these tests rely on is the production one, not a test-local copy.
@@ -45,7 +50,7 @@ func reply(qname string, qtype uint16) *dns.Msg {
 func TestAnswerReturnsRecord(t *testing.T) {
 	z := newZone(t, store.ZoneRecord{Name: "bifrost", Type: "A", TTL: 3600, RData: "57.129.69.158", Enabled: true})
 	m := reply("bifrost.e412.in.", dns.TypeA)
-	z.Answer(m, "bifrost.e412.in", dns.TypeA)
+	z.Answer(m, "bifrost.e412.in", dns.TypeA, testNow)
 	if m.Rcode != dns.RcodeSuccess || len(m.Answer) != 1 || !m.Authoritative {
 		t.Fatalf("got rcode=%d answers=%d aa=%v; want NOERROR/1/true", m.Rcode, len(m.Answer), m.Authoritative)
 	}
@@ -57,7 +62,7 @@ func TestAnswerReturnsRecord(t *testing.T) {
 func TestAnswerNoDataCarriesSOA(t *testing.T) {
 	z := newZone(t, store.ZoneRecord{Name: "bifrost", Type: "A", TTL: 3600, RData: "57.129.69.158", Enabled: true})
 	m := reply("bifrost.e412.in.", dns.TypeAAAA)
-	z.Answer(m, "bifrost.e412.in", dns.TypeAAAA)
+	z.Answer(m, "bifrost.e412.in", dns.TypeAAAA, testNow)
 	if m.Rcode != dns.RcodeSuccess || len(m.Answer) != 0 {
 		t.Fatalf("got rcode=%d answers=%d; want NOERROR with no answers", m.Rcode, len(m.Answer))
 	}
@@ -72,7 +77,7 @@ func TestAnswerNoDataCarriesSOA(t *testing.T) {
 func TestAnswerNXDomainCarriesSOA(t *testing.T) {
 	z := newZone(t, store.ZoneRecord{Name: "bifrost", Type: "A", TTL: 3600, RData: "57.129.69.158", Enabled: true})
 	m := reply("nothere.e412.in.", dns.TypeA)
-	z.Answer(m, "nothere.e412.in", dns.TypeA)
+	z.Answer(m, "nothere.e412.in", dns.TypeA, testNow)
 	if m.Rcode != dns.RcodeNameError {
 		t.Fatalf("rcode = %d, want NXDOMAIN", m.Rcode)
 	}
@@ -84,7 +89,7 @@ func TestAnswerNXDomainCarriesSOA(t *testing.T) {
 func TestWildcardSynthesises(t *testing.T) {
 	z := newZone(t, store.ZoneRecord{Name: "*.nexus", Type: "A", TTL: 3600, RData: "192.168.160.200", Enabled: true})
 	m := reply("git.nexus.e412.in.", dns.TypeA)
-	z.Answer(m, "git.nexus.e412.in", dns.TypeA)
+	z.Answer(m, "git.nexus.e412.in", dns.TypeA, testNow)
 	if len(m.Answer) != 1 {
 		t.Fatalf("answers = %v, want the synthesised A", m.Answer)
 	}
@@ -102,7 +107,7 @@ func TestWildcardDoesNotCoverExistingName(t *testing.T) {
 		store.ZoneRecord{Name: "api", Type: "TXT", TTL: 3600, RData: `"hello"`, Enabled: true},
 	)
 	m := reply("api.e412.in.", dns.TypeA)
-	z.Answer(m, "api.e412.in", dns.TypeA)
+	z.Answer(m, "api.e412.in", dns.TypeA, testNow)
 	if len(m.Answer) != 0 || m.Rcode != dns.RcodeSuccess {
 		t.Fatalf("got rcode=%d answers=%v; want NODATA, not the wildcard", m.Rcode, m.Answer)
 	}
@@ -111,7 +116,7 @@ func TestWildcardDoesNotCoverExistingName(t *testing.T) {
 func TestDisabledRecordIsInvisible(t *testing.T) {
 	z := newZone(t, store.ZoneRecord{Name: "bifrost", Type: "A", TTL: 3600, RData: "57.129.69.158", Enabled: false})
 	m := reply("bifrost.e412.in.", dns.TypeA)
-	z.Answer(m, "bifrost.e412.in", dns.TypeA)
+	z.Answer(m, "bifrost.e412.in", dns.TypeA, testNow)
 	if m.Rcode != dns.RcodeNameError {
 		t.Errorf("rcode = %d, want NXDOMAIN — a disabled record must not exist", m.Rcode)
 	}
@@ -122,7 +127,7 @@ func TestDisabledRecordIsInvisible(t *testing.T) {
 func TestDelegationReturnsReferral(t *testing.T) {
 	z := newZone(t, store.ZoneRecord{Name: "sub", Type: "NS", TTL: 3600, RData: "ns1.other.test.", Enabled: true})
 	m := reply("host.sub.e412.in.", dns.TypeA)
-	z.Answer(m, "host.sub.e412.in", dns.TypeA)
+	z.Answer(m, "host.sub.e412.in", dns.TypeA, testNow)
 	if m.Authoritative {
 		t.Error("aa set on a referral")
 	}
@@ -141,7 +146,7 @@ func TestNegativeTTLIsMinOfMinimumAndSOATTL(t *testing.T) {
 	// never differ and the min() is untestable.
 	z := newZoneWithSOA(t, 300, 900)
 	m := reply("nothere.e412.in.", dns.TypeA)
-	z.Answer(m, "nothere.e412.in", dns.TypeA)
+	z.Answer(m, "nothere.e412.in", dns.TypeA, testNow)
 	if got := m.Ns[0].Header().Ttl; got != 300 {
 		t.Errorf("negative TTL = %d, want 300 (min of SOA TTL and MINIMUM)", got)
 	}
@@ -153,7 +158,7 @@ func TestNegativeTTLIsMinOfMinimumAndSOATTL(t *testing.T) {
 func TestNegativeTTLTakesMinimumWhenItIsSmaller(t *testing.T) {
 	z := newZoneWithSOA(t, 900, 60)
 	m := reply("nothere.e412.in.", dns.TypeA)
-	z.Answer(m, "nothere.e412.in", dns.TypeA)
+	z.Answer(m, "nothere.e412.in", dns.TypeA, testNow)
 	if got := m.Ns[0].Header().Ttl; got != 60 {
 		t.Errorf("negative TTL = %d, want 60 (min of SOA TTL and MINIMUM)", got)
 	}
@@ -169,13 +174,13 @@ func TestNonLeftmostAsteriskIsALiteralName(t *testing.T) {
 	z := newZone(t, store.ZoneRecord{Name: "a.*", Type: "A", TTL: 3600, RData: "10.0.0.7", Enabled: true})
 
 	m := reply("a.b.e412.in.", dns.TypeA)
-	z.Answer(m, "a.b.e412.in", dns.TypeA)
+	z.Answer(m, "a.b.e412.in", dns.TypeA, testNow)
 	if m.Rcode != dns.RcodeNameError || len(m.Answer) != 0 {
 		t.Errorf("got rcode=%d answers=%v; a non-leftmost asterisk must not match anything", m.Rcode, m.Answer)
 	}
 
 	lit := reply("a.*.e412.in.", dns.TypeA)
-	z.Answer(lit, "a.*.e412.in", dns.TypeA)
+	z.Answer(lit, "a.*.e412.in", dns.TypeA, testNow)
 	if len(lit.Answer) != 1 {
 		t.Errorf("answers for the literal name = %v, want the stored A", lit.Answer)
 	}
@@ -189,7 +194,7 @@ func TestNonLeftmostAsteriskIsALiteralName(t *testing.T) {
 func TestEmptyNonTerminalIsNoDataNotNXDomain(t *testing.T) {
 	z := newZone(t, store.ZoneRecord{Name: "host.sub", Type: "A", TTL: 3600, RData: "10.0.0.9", Enabled: true})
 	m := reply("sub.e412.in.", dns.TypeA)
-	z.Answer(m, "sub.e412.in", dns.TypeA)
+	z.Answer(m, "sub.e412.in", dns.TypeA, testNow)
 	if m.Rcode != dns.RcodeSuccess || len(m.Answer) != 0 {
 		t.Fatalf("got rcode=%d answers=%v; want NODATA for an empty non-terminal", m.Rcode, m.Answer)
 	}
@@ -209,7 +214,7 @@ func TestWildcardDoesNotReachAcrossACloserEncloser(t *testing.T) {
 		store.ZoneRecord{Name: "host.sub", Type: "A", TTL: 3600, RData: "10.0.0.9", Enabled: true},
 	)
 	m := reply("x.sub.e412.in.", dns.TypeA)
-	z.Answer(m, "x.sub.e412.in", dns.TypeA)
+	z.Answer(m, "x.sub.e412.in", dns.TypeA, testNow)
 	if m.Rcode != dns.RcodeNameError || len(m.Answer) != 0 {
 		t.Errorf("got rcode=%d answers=%v; want NXDOMAIN — *.e412.in cannot reach past sub.e412.in", m.Rcode, m.Answer)
 	}
@@ -221,7 +226,7 @@ func TestWildcardDoesNotReachAcrossACloserEncloser(t *testing.T) {
 func TestWildcardMatchWithWrongTypeIsNoData(t *testing.T) {
 	z := newZone(t, store.ZoneRecord{Name: "*.nexus", Type: "A", TTL: 3600, RData: "192.168.160.200", Enabled: true})
 	m := reply("git.nexus.e412.in.", dns.TypeTXT)
-	z.Answer(m, "git.nexus.e412.in", dns.TypeTXT)
+	z.Answer(m, "git.nexus.e412.in", dns.TypeTXT, testNow)
 	if m.Rcode != dns.RcodeSuccess || len(m.Answer) != 0 {
 		t.Fatalf("got rcode=%d answers=%v; want NODATA", m.Rcode, m.Answer)
 	}
@@ -240,7 +245,7 @@ func TestCNAMEIsFollowedInZone(t *testing.T) {
 		store.ZoneRecord{Name: "bifrost", Type: "A", TTL: 3600, RData: "57.129.69.158", Enabled: true},
 	)
 	m := reply("www.e412.in.", dns.TypeA)
-	z.Answer(m, "www.e412.in", dns.TypeA)
+	z.Answer(m, "www.e412.in", dns.TypeA, testNow)
 	if m.Rcode != dns.RcodeSuccess || len(m.Answer) != 2 || !m.Authoritative {
 		t.Fatalf("got rcode=%d answers=%v aa=%v; want the CNAME and the target's A", m.Rcode, m.Answer, m.Authoritative)
 	}
@@ -258,7 +263,7 @@ func TestCNAMEIsFollowedInZone(t *testing.T) {
 func TestCNAMEOutOfZoneStopsAtTheCNAME(t *testing.T) {
 	z := newZone(t, store.ZoneRecord{Name: "www", Type: "CNAME", TTL: 3600, RData: "elsewhere.example.com.", Enabled: true})
 	m := reply("www.e412.in.", dns.TypeA)
-	z.Answer(m, "www.e412.in", dns.TypeA)
+	z.Answer(m, "www.e412.in", dns.TypeA, testNow)
 	if m.Rcode != dns.RcodeSuccess || len(m.Answer) != 1 {
 		t.Fatalf("got rcode=%d answers=%v; want just the CNAME", m.Rcode, m.Answer)
 	}
@@ -275,7 +280,7 @@ func TestCNAMEOutOfZoneStopsAtTheCNAME(t *testing.T) {
 func TestCNAMEToMissingInZoneNameIsNXDomain(t *testing.T) {
 	z := newZone(t, store.ZoneRecord{Name: "www", Type: "CNAME", TTL: 3600, RData: "gone.e412.in.", Enabled: true})
 	m := reply("www.e412.in.", dns.TypeA)
-	z.Answer(m, "www.e412.in", dns.TypeA)
+	z.Answer(m, "www.e412.in", dns.TypeA, testNow)
 	if m.Rcode != dns.RcodeNameError || len(m.Answer) != 1 {
 		t.Fatalf("got rcode=%d answers=%v; want NXDOMAIN with the CNAME kept", m.Rcode, m.Answer)
 	}
@@ -289,7 +294,7 @@ func TestCNAMEQueriedDirectlyIsNotFollowed(t *testing.T) {
 		store.ZoneRecord{Name: "bifrost", Type: "A", TTL: 3600, RData: "57.129.69.158", Enabled: true},
 	)
 	m := reply("www.e412.in.", dns.TypeCNAME)
-	z.Answer(m, "www.e412.in", dns.TypeCNAME)
+	z.Answer(m, "www.e412.in", dns.TypeCNAME, testNow)
 	if len(m.Answer) != 1 || m.Answer[0].Header().Rrtype != dns.TypeCNAME {
 		t.Fatalf("answers = %v, want exactly the CNAME", m.Answer)
 	}
@@ -304,7 +309,7 @@ func TestCNAMELoopTerminates(t *testing.T) {
 		store.ZoneRecord{Name: "b", Type: "CNAME", TTL: 60, RData: "a.e412.in.", Enabled: true},
 	)
 	m := reply("a.e412.in.", dns.TypeA)
-	z.Answer(m, "a.e412.in", dns.TypeA)
+	z.Answer(m, "a.e412.in", dns.TypeA, testNow)
 	if len(m.Answer) > 16 {
 		t.Errorf("answers = %d, want a bounded chase", len(m.Answer))
 	}
@@ -320,7 +325,7 @@ func TestReferralCarriesInZoneGlueOnly(t *testing.T) {
 		store.ZoneRecord{Name: "ns1.sub", Type: "A", TTL: 3600, RData: "10.0.0.53", Enabled: true},
 	)
 	m := reply("host.sub.e412.in.", dns.TypeA)
-	z.Answer(m, "host.sub.e412.in", dns.TypeA)
+	z.Answer(m, "host.sub.e412.in", dns.TypeA, testNow)
 	if len(m.Extra) != 1 {
 		t.Fatalf("ADDITIONAL = %v, want ns1.sub.e412.in.'s A as glue", m.Extra)
 	}
@@ -330,7 +335,7 @@ func TestReferralCarriesInZoneGlueOnly(t *testing.T) {
 
 	out := newZone(t, store.ZoneRecord{Name: "sub", Type: "NS", TTL: 3600, RData: "ns1.other.test.", Enabled: true})
 	om := reply("host.sub.e412.in.", dns.TypeA)
-	out.Answer(om, "host.sub.e412.in", dns.TypeA)
+	out.Answer(om, "host.sub.e412.in", dns.TypeA, testNow)
 	if len(om.Extra) != 0 {
 		t.Errorf("ADDITIONAL = %v, want none for an out-of-zone nameserver", om.Extra)
 	}
@@ -345,7 +350,7 @@ func TestDelegationWinsOverRecordsBelowTheCut(t *testing.T) {
 		store.ZoneRecord{Name: "host.sub", Type: "A", TTL: 3600, RData: "10.0.0.9", Enabled: true},
 	)
 	m := reply("host.sub.e412.in.", dns.TypeA)
-	z.Answer(m, "host.sub.e412.in", dns.TypeA)
+	z.Answer(m, "host.sub.e412.in", dns.TypeA, testNow)
 	if len(m.Answer) != 0 || m.Authoritative {
 		t.Fatalf("got answers=%v aa=%v; want a referral, not an answer", m.Answer, m.Authoritative)
 	}
@@ -357,7 +362,7 @@ func TestDelegationWinsOverRecordsBelowTheCut(t *testing.T) {
 func TestApexNSIsNotADelegation(t *testing.T) {
 	z := newZone(t, store.ZoneRecord{Name: "@", Type: "NS", TTL: 3600, RData: "ns1.e412.in.", Enabled: true})
 	m := reply("nothere.e412.in.", dns.TypeA)
-	z.Answer(m, "nothere.e412.in", dns.TypeA)
+	z.Answer(m, "nothere.e412.in", dns.TypeA, testNow)
 	if m.Rcode != dns.RcodeNameError || !m.Authoritative {
 		t.Fatalf("got rcode=%d aa=%v; want an authoritative NXDOMAIN", m.Rcode, m.Authoritative)
 	}
@@ -370,7 +375,7 @@ func TestApexNSIsNotADelegation(t *testing.T) {
 func TestApexSOAIsAnswered(t *testing.T) {
 	z := newZone(t, store.ZoneRecord{Name: "bifrost", Type: "A", TTL: 3600, RData: "57.129.69.158", Enabled: true})
 	m := reply("e412.in.", dns.TypeSOA)
-	z.Answer(m, "e412.in", dns.TypeSOA)
+	z.Answer(m, "e412.in", dns.TypeSOA, testNow)
 	if len(m.Answer) != 1 || !m.Authoritative {
 		t.Fatalf("answers = %v aa=%v; want the zone's SOA", m.Answer, m.Authoritative)
 	}
@@ -385,7 +390,7 @@ func TestApexSOAIsAnswered(t *testing.T) {
 func TestApexWithoutRecordsIsNoDataNotNXDomain(t *testing.T) {
 	z := newZone(t)
 	m := reply("e412.in.", dns.TypeA)
-	z.Answer(m, "e412.in", dns.TypeA)
+	z.Answer(m, "e412.in", dns.TypeA, testNow)
 	if m.Rcode != dns.RcodeSuccess {
 		t.Fatalf("rcode = %d, want NODATA — the apex always exists", m.Rcode)
 	}
@@ -399,7 +404,7 @@ func TestApexWithoutRecordsIsNoDataNotNXDomain(t *testing.T) {
 func TestAnswerIsCaseInsensitive(t *testing.T) {
 	z := newZone(t, store.ZoneRecord{Name: "BiFrOsT", Type: "A", TTL: 3600, RData: "57.129.69.158", Enabled: true})
 	m := reply("BIFROST.E412.IN.", dns.TypeA)
-	z.Answer(m, "BIFROST.E412.IN.", dns.TypeA)
+	z.Answer(m, "BIFROST.E412.IN.", dns.TypeA, testNow)
 	if len(m.Answer) != 1 {
 		t.Fatalf("answers = %v, want the A regardless of case", m.Answer)
 	}
@@ -416,7 +421,7 @@ func TestForwarderZoneDoesNotAnswer(t *testing.T) {
 	z := newZone(t)
 	z.Type = "forwarder"
 	m := reply("nothere.e412.in.", dns.TypeA)
-	if handled := z.Answer(m, "nothere.e412.in", dns.TypeA); handled {
+	if handled := z.Answer(m, "nothere.e412.in", dns.TypeA, testNow); handled {
 		t.Fatal("a forwarder zone reported that it answered")
 	}
 	if m.Rcode != dns.RcodeSuccess || len(m.Answer) != 0 || len(m.Ns) != 0 || m.Authoritative {
@@ -433,8 +438,110 @@ func TestUnparseableRDataReadsAsAbsent(t *testing.T) {
 		store.ZoneRecord{Name: "bifrost", Type: "A", TTL: 3600, RData: "57.129.69.158", Enabled: true},
 	)
 	m := reply("bifrost.e412.in.", dns.TypeA)
-	z.Answer(m, "bifrost.e412.in", dns.TypeA)
+	z.Answer(m, "bifrost.e412.in", dns.TypeA, testNow)
 	if len(m.Answer) != 1 {
 		t.Fatalf("answers = %v, want the one servable A", m.Answer)
+	}
+}
+
+// newSecondary builds a secondary zone with the two timestamps that decide
+// whether it may answer at all: refreshedAt is when a transfer last landed
+// (0 = never), expiresAt the deadline past which its data can no longer be
+// confirmed (0 = no deadline recorded yet).
+func newSecondary(t *testing.T, refreshedAt, expiresAt int64, recs ...store.ZoneRecord) *zones.Zone {
+	t.Helper()
+	z := zones.NewZone(store.Zone{
+		Name: testApex, Type: "secondary", Enabled: true,
+		SOANS: "ns1." + testApex, SOAMbox: "hostadmin." + testApex,
+		SOASerial: 2026080801, SOARefresh: 900, SOARetry: 300, SOAExpire: 604800,
+		SOAMinimum: 900, SOATTL: 900,
+		Primaries: "192.168.150.5", RefreshedAt: refreshedAt, ExpiresAt: expiresAt,
+	}, recs)
+	return &z
+}
+
+// A secondary that has never transferred holds nothing, and "nothing" must
+// not be spoken as authority. Answering NXDOMAIN + SOA here is a claim that
+// every name under the apex does not exist — RFC 8020 makes that a claim
+// about the whole subtree — so the moment such a zone is created it would
+// black-hole its own suffix for every resolver that believed it. It is also
+// not a fall-through: forwarding would leak an internal name upstream and
+// let a public record shadow it, which is the leak zones exist to close.
+func TestSecondaryThatHasNeverTransferredServesNothing(t *testing.T) {
+	z := newSecondary(t, 0, 0)
+	m := reply("bifrost.e412.in.", dns.TypeA)
+	if !z.Answer(m, "bifrost.e412.in", dns.TypeA, testNow) {
+		t.Fatal("handled = false; the query must not fall through to the forwarder")
+	}
+	if m.Rcode != dns.RcodeServerFailure {
+		t.Errorf("rcode = %d, want SERVFAIL", m.Rcode)
+	}
+	if m.Authoritative {
+		t.Error("aa = true; a zone with no data has no authority to assert")
+	}
+	if len(m.Answer) != 0 || len(m.Ns) != 0 {
+		t.Errorf("answer=%v authority=%v; want both empty — an SOA here would cache the denial", m.Answer, m.Ns)
+	}
+}
+
+// RFC 1034 §4.3.5: past the SOA expire a secondary can no longer confirm its
+// data is current, and serving it anyway is worse than serving none because
+// the resolver asking has no way to tell.
+func TestSecondaryPastItsExpiryServesNothing(t *testing.T) {
+	rec := store.ZoneRecord{Name: "bifrost", Type: "A", TTL: 3600, RData: "57.129.69.158", Enabled: true}
+	z := newSecondary(t, testNow-1000, testNow-1, rec)
+	m := reply("bifrost.e412.in.", dns.TypeA)
+	if !z.Answer(m, "bifrost.e412.in", dns.TypeA, testNow) {
+		t.Fatal("handled = false; an expired zone must not fall through either")
+	}
+	if m.Rcode != dns.RcodeServerFailure || len(m.Answer) != 0 {
+		t.Fatalf("rcode = %d answers = %v; want SERVFAIL and nothing served", m.Rcode, m.Answer)
+	}
+}
+
+// The other side of the same rule: a secondary that has transferred and is
+// inside its expiry is an ordinary authoritative zone.
+func TestSecondaryThatHasTransferredAnswersFromItsRecords(t *testing.T) {
+	rec := store.ZoneRecord{Name: "bifrost", Type: "A", TTL: 3600, RData: "57.129.69.158", Enabled: true}
+	z := newSecondary(t, testNow-1000, testNow+1000, rec)
+
+	m := reply("bifrost.e412.in.", dns.TypeA)
+	z.Answer(m, "bifrost.e412.in", dns.TypeA, testNow)
+	if m.Rcode != dns.RcodeSuccess || len(m.Answer) != 1 || !m.Authoritative {
+		t.Fatalf("rcode=%d answers=%d aa=%v; want NOERROR/1/true", m.Rcode, len(m.Answer), m.Authoritative)
+	}
+	// And a name it does not hold is an authoritative NXDOMAIN, exactly as
+	// it would be from a primary — the denial is only wrong when the zone
+	// has no confirmed data behind it.
+	nx := reply("nothere.e412.in.", dns.TypeA)
+	z.Answer(nx, "nothere.e412.in", dns.TypeA, testNow)
+	if nx.Rcode != dns.RcodeNameError || len(nx.Ns) != 1 {
+		t.Fatalf("rcode=%d authority=%v; want NXDOMAIN carrying the SOA", nx.Rcode, nx.Ns)
+	}
+}
+
+// A secondary with a deadline it has not reached is serving; the expiry
+// comparison must not be an off-by-one that retires a zone a millisecond
+// early, nor a `!= 0` test that retires every zone Task 3 has not yet
+// stamped a deadline onto.
+func TestSecondaryExpiryBoundary(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		expiresAt int64
+		wantRcode int
+	}{
+		{"one ms before the deadline", testNow + 1, dns.RcodeSuccess},
+		{"exactly at the deadline", testNow, dns.RcodeServerFailure},
+		{"no deadline recorded", 0, dns.RcodeSuccess},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := store.ZoneRecord{Name: "bifrost", Type: "A", TTL: 3600, RData: "57.129.69.158", Enabled: true}
+			z := newSecondary(t, testNow-1000, tc.expiresAt, rec)
+			m := reply("bifrost.e412.in.", dns.TypeA)
+			z.Answer(m, "bifrost.e412.in", dns.TypeA, testNow)
+			if m.Rcode != tc.wantRcode {
+				t.Fatalf("rcode = %d, want %d", m.Rcode, tc.wantRcode)
+			}
+		})
 	}
 }

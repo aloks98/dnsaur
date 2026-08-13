@@ -1,13 +1,18 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
+	"sync"
 	"testing"
 
 	"github.com/aloks98/dnsaur/internal/store"
+	"github.com/aloks98/dnsaur/internal/zones"
 )
 
 // zoneTestServer is a thin convenience wrapper over the package's existing
@@ -161,16 +166,16 @@ func TestZoneCreateRejectsBadName(t *testing.T) {
 	}
 }
 
-// Milestone A ships primary zones only. internal/zones/answer.go only
-// special-cases "forwarder"/"stub" as non-answering, so a "secondary" zone
-// would otherwise be served exactly like a primary — except a secondary has
-// no transfer mechanism until Milestone D, so it holds only its apex NS
-// record and every other name under it comes back an authoritative
-// NXDOMAIN, silently taking a domain offline. Any type other than the
-// primary default must 400, not just nonsense values.
-func TestZoneCreateRejectsNonPrimaryType(t *testing.T) {
+// primary and secondary are the two types this API can create. The schema
+// has allowed stub | forwarder | internal since Milestone A, but
+// internal/zones/answer.go treats forwarder and stub as non-answering and
+// nothing populates them, and internal is the RFC 6303 built-ins seeded at
+// migration — a type that cannot be created cannot misbehave, so each is
+// refused rather than stored as a zone the resolver would ignore. Any type
+// outside the two must 400, not just nonsense values.
+func TestZoneCreateRejectsAnUnservableType(t *testing.T) {
 	srv := newTestServer(t)
-	for _, zt := range []string{"secondary", "banana"} {
+	for _, zt := range []string{"stub", "forwarder", "internal", "banana"} {
 		body := `{"name":"e412.in","type":"` + zt + `"}`
 		if rec := srv.do(t, "POST", "/api/v1/zones", body); rec.Code != http.StatusBadRequest {
 			t.Errorf("POST type=%q status = %d, want 400", zt, rec.Code)
@@ -331,18 +336,25 @@ func TestZonePatch(t *testing.T) {
 	}
 }
 
-func TestZonePatchRejectsNonPrimaryType(t *testing.T) {
+// The PATCH twin of TestZoneCreateRejectsAnUnservableType. Renamed from
+// TestZonePatchRejectsNonPrimaryType, which used "secondary" as its rejected
+// type and so measured nothing once secondary became creatable — it would
+// have kept passing on the missing primaries alone, which is
+// TestPatchToSecondaryRequiresPrimaries' job.
+func TestZonePatchRejectsAnUnservableType(t *testing.T) {
 	srv := newTestServer(t)
 	rec := srv.do(t, "POST", "/api/v1/zones", `{"name":"e412.in"}`)
 	var got struct{ ID int64 }
 	_ = json.Unmarshal(rec.Body.Bytes(), &got)
 
 	path := fmt.Sprintf("/api/v1/zones/%d", got.ID)
-	if rec := srv.do(t, "PATCH", path, `{"type":"secondary"}`); rec.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400", rec.Code)
-	}
-	if z := srv.zone(t, got.ID); z.Type != "primary" {
-		t.Fatalf("type changed despite rejection: %q", z.Type)
+	for _, zt := range []string{"stub", "forwarder", "internal", "banana"} {
+		if rec := srv.do(t, "PATCH", path, `{"type":"`+zt+`"}`); rec.Code != http.StatusBadRequest {
+			t.Errorf("PATCH type=%q status = %d, want 400", zt, rec.Code)
+		}
+		if z := srv.zone(t, got.ID); z.Type != "primary" {
+			t.Fatalf("type changed despite rejection: %q", z.Type)
+		}
 	}
 }
 
@@ -394,5 +406,261 @@ func TestInternalZoneAllowsReads(t *testing.T) {
 	}
 	if rec := srv.do(t, "GET", fmt.Sprintf("/api/v1/zones/%d/records", id), ""); rec.Code != http.StatusOK {
 		t.Errorf("GET records status = %d, want 200", rec.Code)
+	}
+}
+
+// A secondary is defined by where it pulls from; without that it is an empty
+// zone that answers authoritatively for nothing.
+func TestSecondaryZoneRequiresPrimaries(t *testing.T) {
+	srv := newTestServer(t)
+	rec := srv.do(t, "POST", "/api/v1/zones", `{"name":"e412.in","type":"secondary"}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d body = %s; want 400", rec.Code, rec.Body)
+	}
+}
+
+func TestSecondaryZoneRejectsAnUnknownTSIGKey(t *testing.T) {
+	srv := newTestServer(t)
+	rec := srv.do(t, "POST", "/api/v1/zones",
+		`{"name":"e412.in","type":"secondary","primaries":"192.168.150.5","tsig_key_id":9999}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d; want 400 — a key that does not exist cannot sign", rec.Code)
+	}
+}
+
+// The two tests above assert a refusal, and a handler that refused every
+// secondary would satisfy both. This is the one that says a secondary is
+// creatable at all, and it pins the three things that make it one: the
+// primaries string is stored exactly as written (a hostname primary has to
+// survive its address changing, so nothing is resolved at write), the TSIG
+// key is recorded, and no apex NS is invented — a secondary's contents come
+// from its primary, and seeding a record dnsaur made up would put data in a
+// zone it does not own.
+func TestSecondaryZoneIsCreatable(t *testing.T) {
+	srv := newTestServer(t)
+	keyID := createTSIGKey(t, srv, "xfer.e412.in.")
+
+	body := `{"name":"e412.in","type":"secondary","primaries":"ns1.upstream.example, 192.168.150.6:5353","tsig_key_id":` + itoa(keyID) + `}`
+	rec := srv.do(t, "POST", "/api/v1/zones", body)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d body = %s; want 201", rec.Code, rec.Body)
+	}
+	var got struct{ ID int64 }
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	z := srv.zone(t, got.ID)
+	if z.Type != "secondary" {
+		t.Errorf("type = %q, want secondary", z.Type)
+	}
+	if z.Primaries != "ns1.upstream.example, 192.168.150.6:5353" {
+		t.Errorf("primaries = %q, want it stored as written", z.Primaries)
+	}
+	if z.TSIGKeyID != keyID {
+		t.Errorf("tsig_key_id = %d, want %d", z.TSIGKeyID, keyID)
+	}
+	if recs := srv.records(t, got.ID); len(recs) != 0 {
+		t.Errorf("records = %+v, want none until the first transfer", recs)
+	}
+}
+
+func TestSecondaryZoneRejectsMalformedPrimaries(t *testing.T) {
+	srv := newTestServer(t)
+	for _, p := range []string{"not a host", "192.168.150.5:0", "192.168.150.5:banana"} {
+		body := `{"name":"e412.in","type":"secondary","primaries":"` + p + `"}`
+		if rec := srv.do(t, "POST", "/api/v1/zones", body); rec.Code != http.StatusBadRequest {
+			t.Errorf("POST primaries=%q status = %d, want 400", p, rec.Code)
+		}
+	}
+}
+
+// primaries and tsig_key_id describe a transfer. A primary zone has none, so
+// accepting them there would store configuration that nothing will ever read
+// and that the UI would show as if it meant something.
+func TestPrimaryZoneRejectsTransferFields(t *testing.T) {
+	srv := newTestServer(t)
+	if rec := srv.do(t, "POST", "/api/v1/zones",
+		`{"name":"e412.in","primaries":"192.168.150.5"}`); rec.Code != http.StatusBadRequest {
+		t.Errorf("primaries on a primary: status = %d, want 400", rec.Code)
+	}
+	keyID := createTSIGKey(t, srv, "xfer.e412.in.")
+	if rec := srv.do(t, "POST", "/api/v1/zones",
+		`{"name":"e412.in","tsig_key_id":`+itoa(keyID)+`}`); rec.Code != http.StatusBadRequest {
+		t.Errorf("tsig_key_id on a primary: status = %d, want 400", rec.Code)
+	}
+}
+
+// PATCH has to enforce the same rule as POST or it is the way around it: a
+// primary patched to secondary without primaries would be exactly the zone
+// TestSecondaryZoneRequiresPrimaries refuses to create.
+func TestPatchToSecondaryRequiresPrimaries(t *testing.T) {
+	srv := newTestServer(t)
+	rec := srv.do(t, "POST", "/api/v1/zones", `{"name":"e412.in"}`)
+	var got struct{ ID int64 }
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	path := fmt.Sprintf("/api/v1/zones/%d", got.ID)
+
+	if rec := srv.do(t, "PATCH", path, `{"type":"secondary"}`); rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d body = %s; want 400", rec.Code, rec.Body)
+	}
+	if rec := srv.do(t, "PATCH", path, `{"type":"secondary","primaries":"192.168.150.5"}`); rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d body = %s; want 204", rec.Code, rec.Body)
+	}
+	if z := srv.zone(t, got.ID); z.Type != "secondary" || z.Primaries != "192.168.150.5" {
+		t.Fatalf("zone = %+v, want a secondary with its primaries", z)
+	}
+}
+
+// fakeZoneRefresher stands in for zones.Refresher. The real one transfers by
+// opening a TCP connection to a primary and speaking AXFR; what this handler
+// owes is the plumbing around that — which zone it asks for, what it does
+// with the answer, and what it does with the error — and none of that needs
+// a primary to be standing up. internal/zones/refresh_test.go is where the
+// transfer itself is tested.
+type fakeZoneRefresher struct {
+	mu     sync.Mutex
+	calls  []int64
+	result zones.TransferResult
+	err    error
+}
+
+func (f *fakeZoneRefresher) Refresh(_ context.Context, zoneID int64) (zones.TransferResult, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, zoneID)
+	return f.result, f.err
+}
+
+func (f *fakeZoneRefresher) called() []int64 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]int64(nil), f.calls...)
+}
+
+// newRefreshTestServer is newTestServer with a ZoneRefresher wired in. The
+// default harness deliberately leaves that dependency nil — see Deps.
+func newRefreshTestServer(t *testing.T, fake *fakeZoneRefresher) *zoneTestServer {
+	t.Helper()
+	srv, s, rl := testServer(t, func(d *Deps) { d.ZoneRefresher = fake })
+	return &zoneTestServer{srv: srv, store: s, rl: rl, cookie: login(t, srv, s)}
+}
+
+// createSecondary makes a secondary zone through the API and returns its id.
+func createSecondary(t *testing.T, srv *zoneTestServer, name, primaries string) int64 {
+	t.Helper()
+	rec := srv.do(t, "POST", "/api/v1/zones",
+		fmt.Sprintf(`{"name":%q,"type":"secondary","primaries":%q}`, name, primaries))
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create secondary %q: status = %d body = %s", name, rec.Code, rec.Body)
+	}
+	return createdID(t, rec)
+}
+
+// The response is the outcome, not an acknowledgement — see
+// handleZoneRefresh on why this endpoint is synchronous. `primary` and
+// `records` are the two fields the zone row cannot supply afterwards, so
+// they are the ones worth asserting on.
+func TestZoneRefreshReportsTheTransferOutcome(t *testing.T) {
+	fake := &fakeZoneRefresher{result: zones.TransferResult{
+		Primary:     netip.MustParseAddrPort("203.0.113.9:53"),
+		Serial:      2026080601,
+		Records:     17,
+		RefreshedAt: 1754000000000,
+		ExpiresAt:   1754604800000,
+	}}
+	srv := newRefreshTestServer(t, fake)
+	id := createSecondary(t, srv, "e412.in", "203.0.113.9")
+
+	rec := srv.do(t, "POST", fmt.Sprintf("/api/v1/zones/%d/refresh", id), "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s; want 200", rec.Code, rec.Body)
+	}
+	var got zoneRefreshResult
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal %s: %v", rec.Body, err)
+	}
+	want := zoneRefreshResult{
+		Primary:     "203.0.113.9:53",
+		Serial:      2026080601,
+		Records:     17,
+		RefreshedAt: 1754000000000,
+		ExpiresAt:   1754604800000,
+	}
+	if got != want {
+		t.Errorf("body = %+v, want %+v", got, want)
+	}
+	if calls := fake.called(); len(calls) != 1 || calls[0] != id {
+		t.Errorf("refreshed %v, want exactly [%d]", calls, id)
+	}
+}
+
+// The error text is the only account of a failed transfer the API ever gives
+// — the scheduler's own record of one is process-local and does not survive a
+// restart — so it goes through verbatim rather than being replaced with a
+// generic message. 502 because nothing here is broken: a server this one
+// depends on could not be reached.
+func TestZoneRefreshPassesTheTransferErrorThrough(t *testing.T) {
+	fake := &fakeZoneRefresher{err: errors.New(
+		"203.0.113.9:53: dial tcp 203.0.113.9:53: connect: connection refused")}
+	srv := newRefreshTestServer(t, fake)
+	id := createSecondary(t, srv, "e412.in", "203.0.113.9")
+
+	rec := srv.do(t, "POST", fmt.Sprintf("/api/v1/zones/%d/refresh", id), "")
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d body = %s; want 502", rec.Code, rec.Body)
+	}
+	var got struct {
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal %s: %v", rec.Body, err)
+	}
+	if got.Error != fake.err.Error() {
+		t.Errorf("error = %q, want the transfer's own text %q", got.Error, fake.err)
+	}
+}
+
+// A primary has nowhere to pull from. Refused here rather than left to come
+// back as a 502 from Transfer's own type check, which would read as "the
+// other server failed" about a transfer that was never attempted.
+func TestZoneRefreshRefusesANonSecondaryZone(t *testing.T) {
+	fake := &fakeZoneRefresher{}
+	srv := newRefreshTestServer(t, fake)
+	id := srv.createZone(t, "e412.in")
+
+	rec := srv.do(t, "POST", fmt.Sprintf("/api/v1/zones/%d/refresh", id), "")
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d body = %s; want 400", rec.Code, rec.Body)
+	}
+	if calls := fake.called(); len(calls) != 0 {
+		t.Errorf("refreshed %v, want no transfer attempted at all", calls)
+	}
+}
+
+func TestZoneRefreshOnAnUnknownZoneIs404(t *testing.T) {
+	fake := &fakeZoneRefresher{}
+	srv := newRefreshTestServer(t, fake)
+
+	if rec := srv.do(t, "POST", "/api/v1/zones/999999/refresh", ""); rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d body = %s; want 404", rec.Code, rec.Body)
+	}
+	if calls := fake.called(); len(calls) != 0 {
+		t.Errorf("refreshed %v, want no transfer attempted at all", calls)
+	}
+}
+
+// A server built without the scheduler (every test server, and any future
+// mode that runs the API without the DNS side) answers rather than panicking
+// on a nil dependency. 503, not 404: the zone exists, this server just is not
+// the thing that transfers it.
+func TestZoneRefreshWithoutASchedulerIsUnavailable(t *testing.T) {
+	srv := newTestServer(t)
+	id := createSecondary(t, srv, "e412.in", "203.0.113.9")
+
+	rec := srv.do(t, "POST", fmt.Sprintf("/api/v1/zones/%d/refresh", id), "")
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d body = %s; want 503", rec.Code, rec.Body)
 	}
 }

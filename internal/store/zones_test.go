@@ -417,3 +417,154 @@ func assertZoneUnchanged(t *testing.T, s Store, zoneID int64, wantZone Zone, wan
 		t.Errorf("records changed despite the failure:\n got %+v\nwant %+v", gotRecs, wantRecs)
 	}
 }
+
+// NoteTransferAttempt is the only write allowed to touch last_error and
+// last_attempt, and it must touch nothing else. That narrowness is what stops
+// a transfer outcome — written every retry interval for as long as a primary
+// is down — from carrying a stale copy of any other column back over an
+// operator's concurrent edit. Asserted as a whole-struct comparison rather
+// than field by field, so a column added later is covered without anyone
+// remembering to add it here.
+func TestNoteTransferAttemptWritesOnlyItsOwnColumns(t *testing.T) {
+	forEachDriver(t, func(t *testing.T, s Store) {
+		ctx := context.Background()
+		id, err := s.Zones().AddZone(ctx, Zone{
+			Name: testGroupName("e412.in"), Type: "secondary", Enabled: true,
+			SOANS: "ns1.e412.in", SOAMbox: "hostadmin.e412.in",
+			SOASerial: 7, SOARefresh: 900, SOARetry: 300,
+			SOAExpire: 604800, SOAMinimum: 900, SOATTL: 900,
+			Primaries: "203.0.113.9", TSIGKeyID: 0,
+			ExpiresAt: 1754604800000, RefreshedAt: 1754000000000,
+			CreatedAt: 1753000000000, ModifiedAt: 1753500000000,
+		})
+		if err != nil {
+			t.Fatalf("AddZone: %v", err)
+		}
+		before, err := s.Zones().Zone(ctx, id)
+		if err != nil {
+			t.Fatalf("Zone: %v", err)
+		}
+
+		const msg = "203.0.113.9:53: dial tcp: connect: connection refused"
+		if err := s.Zones().NoteTransferAttempt(ctx, id, 1754111111000, msg); err != nil {
+			t.Fatalf("NoteTransferAttempt: %v", err)
+		}
+		after, err := s.Zones().Zone(ctx, id)
+		if err != nil {
+			t.Fatalf("Zone: %v", err)
+		}
+
+		if after.LastError != msg {
+			t.Errorf("last_error = %q, want %q", after.LastError, msg)
+		}
+		if after.LastAttempt != 1754111111000 {
+			t.Errorf("last_attempt = %d, want 1754111111000", after.LastAttempt)
+		}
+		// Everything else, unchanged. refreshed_at especially: a failed
+		// attempt must not read as a success, and modified_at, which is the
+		// column an operator reads to find out what happened to a zone.
+		want := before
+		want.LastError, want.LastAttempt = msg, 1754111111000
+		if !reflect.DeepEqual(after, want) {
+			t.Errorf("NoteTransferAttempt changed more than its own columns:\n got %+v\nwant %+v", after, want)
+		}
+
+		// Cleared on success, so a zone that recovered stops reporting a
+		// problem that is over.
+		if err := s.Zones().NoteTransferAttempt(ctx, id, 1754222222000, ""); err != nil {
+			t.Fatalf("NoteTransferAttempt(success): %v", err)
+		}
+		recovered, err := s.Zones().Zone(ctx, id)
+		if err != nil {
+			t.Fatalf("Zone: %v", err)
+		}
+		if recovered.LastError != "" {
+			t.Errorf("last_error = %q after a successful attempt, want it cleared", recovered.LastError)
+		}
+	})
+}
+
+// The other direction of the same rule, and the one a doc comment alone was
+// guarding: nothing but NoteTransferAttempt may write these two columns.
+//
+// The danger is not hypothetical. Every ordinary zone write binds the row
+// entire from a struct the caller read some time earlier, so if last_error
+// were in that statement, an API PATCH that read the zone before a transfer
+// failed and committed after it would silently erase the failure — and the
+// zone would go back to reading as healthy while its primary stayed down. A
+// zone-file import (ReplaceRecords, which shares updateZoneArgs) would do the
+// same.
+//
+// Both paths are exercised with a deliberately *stale* struct: exactly what a
+// handler that read the row before the failure would hold.
+func TestOrdinaryZoneWritesCannotEraseARecordedFailure(t *testing.T) {
+	forEachDriver(t, func(t *testing.T, s Store) {
+		ctx := context.Background()
+		id, err := s.Zones().AddZone(ctx, Zone{
+			Name: testGroupName("e412.in"), Type: "secondary", Enabled: true,
+			SOANS: "ns1.e412.in", SOAMbox: "hostadmin.e412.in",
+			SOASerial: 7, SOARefresh: 900, SOARetry: 300,
+			SOAExpire: 604800, SOAMinimum: 900, SOATTL: 900,
+			Primaries: "203.0.113.9",
+		})
+		if err != nil {
+			t.Fatalf("AddZone: %v", err)
+		}
+		// The copy a handler read before anything failed: no error, no attempt.
+		stale, err := s.Zones().Zone(ctx, id)
+		if err != nil {
+			t.Fatalf("Zone: %v", err)
+		}
+		if stale.LastError != "" || stale.LastAttempt != 0 {
+			t.Fatalf("setup: fresh zone already carries an attempt: %+v", stale)
+		}
+
+		const msg = "203.0.113.9:53: dial tcp: connect: connection refused"
+		if err := s.Zones().NoteTransferAttempt(ctx, id, 1754111111000, msg); err != nil {
+			t.Fatalf("NoteTransferAttempt: %v", err)
+		}
+
+		// A PATCH lands, built from the copy read before the failure.
+		patched := stale
+		patched.Enabled = false
+		if err := s.Zones().UpdateZone(ctx, patched); err != nil {
+			t.Fatalf("UpdateZone: %v", err)
+		}
+		afterPatch, err := s.Zones().Zone(ctx, id)
+		if err != nil {
+			t.Fatalf("Zone: %v", err)
+		}
+		if afterPatch.LastError != msg || afterPatch.LastAttempt != 1754111111000 {
+			t.Errorf("UpdateZone erased the recorded failure: last_error = %q last_attempt = %d, want %q / 1754111111000.\n"+
+				"These columns must not be in updateZoneSQL — a handler that read the row before a failure "+
+				"would carry an empty error over it and the zone would read as healthy while its primary stayed down.",
+				afterPatch.LastError, afterPatch.LastAttempt, msg)
+		}
+		// The PATCH itself still applied; the failure surviving must not be
+		// the write having been lost.
+		if afterPatch.Enabled {
+			t.Errorf("the patch did not apply at all")
+		}
+
+		// And the same through ReplaceRecords, which shares updateZoneArgs —
+		// a zone-file import, again built from the stale copy.
+		replaced := stale
+		replaced.SOASerial = 9
+		if err := s.Zones().ReplaceRecords(ctx, replaced, nil, nil, []ZoneRecord{
+			{ZoneID: id, Name: "@", Type: "NS", TTL: 3600, RData: "ns1.e412.in.", Enabled: true},
+		}); err != nil {
+			t.Fatalf("ReplaceRecords: %v", err)
+		}
+		afterImport, err := s.Zones().Zone(ctx, id)
+		if err != nil {
+			t.Fatalf("Zone: %v", err)
+		}
+		if afterImport.LastError != msg || afterImport.LastAttempt != 1754111111000 {
+			t.Errorf("ReplaceRecords erased the recorded failure: last_error = %q last_attempt = %d, want %q / 1754111111000",
+				afterImport.LastError, afterImport.LastAttempt, msg)
+		}
+		if afterImport.SOASerial != 9 {
+			t.Errorf("the replace did not apply at all")
+		}
+	})
+}

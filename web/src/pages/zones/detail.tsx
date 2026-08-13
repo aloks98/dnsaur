@@ -2,12 +2,14 @@ import { useEffect, useId, useMemo, useRef, useState, type ReactNode } from "rea
 import { Link, useNavigate, useParams } from "react-router";
 import {
   AlertCircle,
+  ArrowDownToLine,
   ChevronLeft,
   ChevronRight,
   Download,
   Lock,
   Pencil,
   Plus,
+  RotateCw,
   Trash2,
   TriangleAlert,
   Upload,
@@ -59,6 +61,8 @@ import {
   useDeleteZoneRecord,
   useExportZoneFile,
   useImportZoneFile,
+  useRecordsFollowTransfers,
+  useRefreshZone,
   useUpdateZone,
   useUpdateZoneRecord,
   useZone,
@@ -67,8 +71,17 @@ import {
   type ZoneFileDiff,
   type ZoneRecordChange,
 } from "../../hooks/use-zones";
+import { useTSIGKeys } from "../../hooks/use-tsig-keys";
 import { StaleDataAlert } from "../../components/stale-data-alert";
-import { formatBytes } from "../../lib/format";
+import { formatBytes, formatDuration, relativeTime } from "../../lib/format";
+import {
+  isServing,
+  lastTransferError,
+  nextRefreshAt,
+  retryIntervalMs,
+  transferErrorLead,
+  transferState,
+} from "../../lib/zones";
 
 // The nine record types the create/edit row's select offers — this list is
 // the union dns.NewRR (the server's own validator, see
@@ -902,6 +915,258 @@ function SoaBand({ zone }: { zone: Zone }) {
   );
 }
 
+/**
+ * The transfer band — everything about a secondary that a primary's SOA band
+ * would have said, plus the two things only a copy has: where it comes from
+ * and when it was last confirmed current.
+ *
+ * It *replaces* the SOA band for a secondary rather than sitting beside it,
+ * per the artboard, and the reason is not space: a secondary's SOA is its
+ * primary's, arriving with each transfer and overwritten by the next one, so
+ * an editable SOA form here would offer to write values that the next
+ * transfer silently discards.
+ *
+ * The last transfer error is shown verbatim, as the artboard draws it, and it
+ * is read off the zone row rather than remembered from a request this page
+ * made. That distinction is the whole of why `zones.last_error` exists: the
+ * scheduler's own record of a failed attempt is process-local
+ * (zones.Refresher.Status), so a page built on it would show a zone that had
+ * been failing for a week as healthy until its next attempt after a restart.
+ * The column is written and cleared by the scheduler on every attempt, so
+ * what is on screen here is the last thing that actually happened — whether
+ * it happened because of the schedule or because someone pressed the button
+ * above, and whether or not this browser was open at the time.
+ *
+ * It is never shown without its date. `last_attempt` is what makes the
+ * difference between "connection refused" four minutes ago and the same words
+ * four days ago, and only one of those is worth acting on now.
+ */
+function TransferBand({ zone }: { zone: Zone }) {
+  const keys = useTSIGKeys();
+  const state = transferState(zone);
+  const failure = lastTransferError(zone);
+  /**
+   * A disabled zone is outside all of this, and has to be checked before any
+   * of it — the same order the zones list checks it in.
+   *
+   * The scheduler skips a disabled zone outright (RefreshDue in
+   * internal/zones/refresh.go), and the resolver skips it again at answer time
+   * (Index.Find). So for one of these, *nothing is retrying* and *nothing is
+   * being served*, and a band that reported its transfer state would say both
+   * — while the badge one row above said Disabled.
+   *
+   * Its transfer state is still true and still shown: primaries, key, serial
+   * and the last refresh are all facts, and a recorded failure is a dated
+   * account of the last thing that actually happened. What changes is the two
+   * forward-looking claims, which are consequences of the switch rather than
+   * of the transfer.
+   */
+  const disabled = !zone.enabled;
+  const serving = !disabled && state !== "never" && state !== "expired";
+
+  // The key's own name, which is what the peer's config calls it and so the
+  // only useful thing to show. An id that resolves to nothing — a key deleted
+  // out from under the zone, which the API refuses but a hand-written row
+  // could still produce — says so rather than rendering a bare number.
+  let tsigLabel = "none";
+  if (zone.tsig_key_id !== 0) {
+    const key = keys.data?.find((k) => k.id === zone.tsig_key_id);
+    tsigLabel = key ? key.name : `#${zone.tsig_key_id} (missing)`;
+  }
+
+  /**
+   * When the schedule next comes round.
+   *
+   * A failing zone gets the interval rather than a moment, and that is a
+   * limit rather than a preference: the exact time of the next retry lives in
+   * the scheduler's in-memory back-off, so naming one would be a guess. The
+   * interval itself is the zone's own soa_retry, clamped by the same floor
+   * the scheduler clamps it by, and is true whenever the process is running.
+   */
+  let nextRefresh: string;
+  if (disabled) {
+    // Not "due now", and not an interval: the scheduler will not look at this
+    // zone at all until it is enabled again.
+    nextRefresh = "not while disabled";
+  } else if (state === "never") {
+    nextRefresh = "due now";
+  } else if (state === "fresh") {
+    nextRefresh = `in ${formatDuration(nextRefreshAt(zone) - Date.now())}`;
+  } else {
+    nextRefresh = `retrying every ${formatDuration(retryIntervalMs(zone))}`;
+  }
+
+  // A disabled zone's transfer state is a consequence of the switch, so it is
+  // reported plainly rather than in the colours of a problem to solve — the
+  // same reasoning that makes the zones list show it as a muted "Disabled"
+  // instead of "Expired".
+  const bad = !disabled && (state === "never" || state === "expired");
+  const warn = !disabled && (state === "failing" || state === "overdue");
+
+  const fields: { label: string; value: string; strong?: boolean; tone?: string }[] = [
+    { label: "Primaries", value: zone.primaries || "none" },
+    { label: "TSIG key", value: tsigLabel },
+    { label: "Serial", value: String(zone.soa_serial) },
+    {
+      label: "Last refresh",
+      value: relativeTime(zone.refreshed_at),
+      strong: !disabled && state !== "fresh",
+      tone: bad ? "text-destructive-foreground" : warn ? "text-warning-foreground" : undefined,
+    },
+    {
+      label: "Next refresh",
+      value: nextRefresh,
+      tone: bad || warn ? "text-warning-foreground" : "text-muted-foreground",
+    },
+  ];
+
+  // What the zone is doing about it right now, stated as a consequence rather
+  // than a diagnosis — the cause is the error beside it, in the server's own
+  // words.
+  const note = disabled
+    ? // Not "answers nothing", which is the one behaviour a disabled zone does
+      // not have. Index.Find skips it entirely (internal/zones/zone.go), so
+      // the zone stops being *consulted* rather than starting to refuse, and
+      // names under it fall through to the forwarder — which for a
+      // split-horizon zone means an internal name is now resolved by a public
+      // server, the very leak the zone was holding closed. That is worth a
+      // sentence, and "answers nothing" would have hidden it.
+      "This zone is disabled: nothing transfers, and names under it are forwarded upstream."
+    : serving
+      ? `Still serving the copy from ${relativeTime(zone.refreshed_at)}.`
+      : state === "never"
+        ? "Answering nothing until the first transfer succeeds."
+        : "Answering nothing until a transfer succeeds.";
+  // "LAST ATTEMPT · 4m ago" when there is a failure to date, and otherwise the
+  // reason there is nothing to date: the zone is switched off, or it is behind
+  // with nothing recorded against it (a process that has only just started).
+  const noteLabel = failure
+    ? `Last attempt · ${relativeTime(failure.at)}`
+    : disabled
+      ? // Not "Disabled": the badge one row above already says that, and a
+        // label that repeats it wastes the one line this band has for saying
+        // what the *transfers* are doing.
+        "Not transferring"
+      : state === "overdue"
+        ? "Overdue"
+        : state;
+  // A disabled zone always explains itself, whatever its transfer state:
+  // "nothing is happening here" is the one thing the five fields above cannot
+  // say on their own.
+  const showNote = disabled || state !== "fresh";
+  // One tone for the whole note line, so the icon, the label, the error and
+  // the tint cannot disagree. Muted is the disabled case and is deliberately
+  // neither of the alarm colours: nothing here needs fixing.
+  const noteTone = bad
+    ? "text-destructive-foreground"
+    : warn
+      ? "text-warning-foreground"
+      : "text-muted-foreground";
+  // What to lead the error line with. A verbatim tail of the message, never a
+  // rewrite of it, and equal to the whole message whenever the message has no
+  // shape to take a tail from — see transferErrorLead.
+  const lead = failure ? transferErrorLead(failure.message) : "";
+
+  return (
+    <div
+      className={cn(
+        "shrink-0 border-b border-border",
+        bad
+          ? "bg-destructive/5 shadow-[inset_3px_0_0_var(--destructive)]"
+          : warn
+            ? "bg-warning/5 shadow-[inset_3px_0_0_var(--warning)]"
+            : "bg-card",
+      )}
+    >
+      <div className="grid grid-cols-5 gap-[18px] px-4 py-3">
+        {fields.map((field) => (
+          <div key={field.label} className="flex min-w-0 flex-col gap-1">
+            <span className="font-mono text-[9.5px] font-semibold tracking-[0.14em] text-muted-foreground uppercase">
+              {field.label}
+            </span>
+            <span
+              className={cn(
+                "truncate font-mono text-sm",
+                field.strong && "font-semibold",
+                field.tone,
+              )}
+              title={field.value}
+            >
+              {field.value}
+            </span>
+          </div>
+        ))}
+      </div>
+      {/* Two lines on one grid rather than one flex row of four things, and
+          the reason is that the error is the longest string on the page and
+          was getting the least structure: it ran straight into the neutral
+          note beside it with nothing between them, and neither line shared a
+          left edge with anything. The icon now has a column of its own, so
+          both lines start where the fields above do, and the rule closes the
+          five-column grid off rather than letting the error look like a sixth
+          field. */}
+      {showNote && (
+        <div className="grid grid-cols-[14px_1fr] gap-x-2 border-t border-border-muted px-4 pt-[9px] pb-2.5">
+          <AlertCircle aria-hidden="true" className={cn("mt-0.5 size-3.5", noteTone)} />
+          <div className="flex min-w-0 flex-col gap-0.5">
+            {/* Wraps rather than overflows: the note is short and authored
+                here, the error is not, so when the two cannot share a line the
+                note drops to its own rather than being pushed off the end. */}
+            <div className="flex min-w-0 flex-wrap items-baseline gap-x-2.5">
+              <span
+                className={cn(
+                  "shrink-0 font-mono text-[9.5px] font-semibold tracking-[0.14em] uppercase",
+                  noteTone,
+                )}
+              >
+                {noteLabel}
+              </span>
+              {/* The innermost part of the transfer's own words — see
+                  transferErrorLead. Not a rewrite of the error: it is a
+                  verbatim tail of it, and the whole message is on the line
+                  below (and in `title` here) whenever the two differ. Leading
+                  with it is what makes a truncated error still worth reading,
+                  since the part that says what went wrong is the part an
+                  ellipsis at the end would eat first. */}
+              {failure && (
+                <span
+                  data-testid="transfer-error"
+                  title={failure.message}
+                  className={cn("min-w-0 truncate font-mono text-sm font-semibold", noteTone)}
+                >
+                  {lead}
+                </span>
+              )}
+              {/* Never shrinks. What the zone is doing about it is the one
+                  thing on this line that an operator has to be able to read
+                  without hovering anything, and an unbounded error string is
+                  exactly what would have crowded it out. */}
+              <span
+                data-testid="transfer-note"
+                className="shrink-0 text-[12.5px] text-muted-foreground"
+              >
+                {note}
+              </span>
+            </div>
+            {/* The message in full, dim, on its own line — omitted when the
+                lead already is the whole of it, since a short error would
+                otherwise be printed twice. */}
+            {failure && lead !== failure.message && (
+              <span
+                data-testid="transfer-error-raw"
+                title={failure.message}
+                className="truncate font-mono text-[11px] text-muted-foreground/70"
+              >
+                {failure.message}
+              </span>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 /** The most rows any one diff group lists before the rest collapse into a
  * "+ N more" line — the artboard's own truncation. A whole-zone replace can
  * delete hundreds of records, and a dialog that scrolls for a minute to show
@@ -1118,10 +1383,13 @@ function ZoneFileActions({ zone }: { zone: Zone }) {
   const exportFile = useExportZoneFile();
   const importFile = useImportZoneFile();
 
-  // The RFC 6303 zones are readable but not writable — the server 409s an
-  // import into one — so Import is omitted for them rather than left to fail
-  // on click. Export is not: reading a built-in zone is allowed.
-  const canImport = zone.type !== "internal";
+  // The two kinds of zone this server refuses writes into: the RFC 6303
+  // built-ins (seeded infrastructure) and a secondary (someone else's zone,
+  // on loan). Both 409 an import, so Import is omitted rather than left to
+  // fail on click — and for a secondary an import is worse than refused, it
+  // is meaningless: the next transfer would replace whatever it wrote.
+  // Export is offered for both: reading either is allowed.
+  const canImport = zone.type !== "internal" && zone.type !== "secondary";
 
   // A dry run or a commit is actually on the wire. This is the window in
   // which a second file selection would buy a second full parse-and-diff of
@@ -1457,6 +1725,11 @@ export function ZoneDetail() {
 
   const zone = useZone(zoneId);
   const records = useZoneRecords(zoneId);
+  // A transfer replaces the whole record set, and the zone query is what
+  // notices one landed — whether it was the scheduler's or this page's own
+  // Refresh now. The record list is never polled; see
+  // useRecordsFollowTransfers.
+  useRecordsFollowTransfers(zone.data);
   const updateZone = useUpdateZone();
   const deleteZone = useDeleteZone();
   const deleteRecord = useDeleteZoneRecord();
@@ -1500,6 +1773,27 @@ export function ZoneDetail() {
   const [addCue, setAddCue] = useState(0);
   const [deleteZoneOpen, setDeleteZoneOpen] = useState(false);
   const [deleteRecordTarget, setDeleteRecordTarget] = useState<ZoneRecord | null>(null);
+  const refreshZone = useRefreshZone();
+
+  /**
+   * Ask for a transfer now.
+   *
+   * Nothing is kept about the failure here on purpose. A failed transfer
+   * writes `last_error`/`last_attempt` onto the zone row and the mutation
+   * refetches it either way (see useRefreshZone), so the band below is
+   * already showing the server's account of this very attempt by the time
+   * this returns. A second copy in component state could only ever disagree
+   * with it — and would vanish on reload, which is exactly the dishonesty the
+   * column exists to remove.
+   */
+  function onRefreshNow() {
+    refreshZone.mutate(zoneId, {
+      onSuccess: (result) =>
+        toast.success(`Transferred ${result.records} records from ${result.primary}`),
+      // A short toast to close the interaction; the band carries the detail.
+      onError: () => toast.error("The transfer failed"),
+    });
+  }
 
   const allRecords = useMemo(() => records.data ?? [], [records.data]);
   // The edited row filters like any other row — there is no carve-out
@@ -1626,6 +1920,18 @@ export function ZoneDetail() {
   // cannot be changed"), so every control that would produce that 409 is
   // omitted here rather than left to fail on click.
   const isInternal = z.type === "internal";
+  /**
+   * A secondary's records are its primary's. All four record-write routes
+   * answer 409 for one (POST/PUT/DELETE records, POST file — see Task 2's
+   * "refuse hand writes into a secondary zone"), so the same rule applies as
+   * for a built-in: the controls that would produce that 409 are not
+   * rendered. Unlike a built-in, the reason is worth saying out loud in the
+   * header, because a secondary *looks* like an ordinary zone the admin
+   * created — they did create it — and the read-only-ness is a property of
+   * where its contents come from, not of the zone itself.
+   */
+  const isSecondary = z.type === "secondary";
+  const recordsReadOnly = isInternal || isSecondary;
 
   let body: ReactNode;
   if (records.isPending) {
@@ -1647,11 +1953,15 @@ export function ZoneDetail() {
       </div>
     );
   } else if (shownRecords.length === 0) {
+    // An empty secondary is not an invitation to add a record — it cannot
+    // hold one — it is a zone whose first transfer has not landed, which is
+    // the same fact the transfer band above states in more detail.
+    const emptyMessage = isSecondary
+      ? "Nothing transferred yet. The records will arrive with the first transfer from the primary."
+      : "No records yet. Add one above and dnsaur will answer for this zone directly.";
     body = (
       <p className="p-6 text-center text-sm text-muted-foreground">
-        {allRecords.length === 0
-          ? "No records yet. Add one above and dnsaur will answer for this zone directly."
-          : "No records match this filter."}
+        {allRecords.length === 0 ? emptyMessage : "No records match this filter."}
       </p>
     );
   } else {
@@ -1672,7 +1982,7 @@ export function ZoneDetail() {
         <RecordRow
           key={record.id}
           record={record}
-          readOnly={isInternal}
+          readOnly={recordsReadOnly}
           actionsInert={editingRecord !== null}
           onEdit={() => openEdit(record)}
           onDelete={() => setDeleteRecordTarget(record)}
@@ -1695,9 +2005,18 @@ export function ZoneDetail() {
         <span aria-hidden="true" className="h-4 w-px bg-border" />
         <span className="truncate font-mono text-[17px] font-semibold">{z.name}</span>
         <Badge variant={ZONE_TYPE_VARIANT[z.type]}>{z.type}</Badge>
-        <Badge variant={z.enabled ? "success-light" : "secondary"}>
-          {z.enabled ? "Enabled" : "Disabled"}
-        </Badge>
+        {/* Three states, not two. A secondary that has never transferred, or
+            whose data has expired, is `enabled` in the database and answering
+            SERVFAIL to everything (Zone.Serving) — so an "Enabled" badge on
+            one would be the screen's single most misleading element. See
+            lib/zones.ts's isServing. */}
+        {!z.enabled ? (
+          <Badge variant="secondary">Disabled</Badge>
+        ) : isServing(z) ? (
+          <Badge variant="success-light">Enabled</Badge>
+        ) : (
+          <Badge variant="destructive-light">Not answering</Badge>
+        )}
         {/* The marker sits with the badges rather than in the actions cluster
             because it is no longer what stands in for them: a built-in zone
             has an action now (Export), and a label reading "built-in" from
@@ -1710,16 +2029,31 @@ export function ZoneDetail() {
             Built-in · Read-only
           </span>
         )}
+        {isSecondary && (
+          <span className="inline-flex shrink-0 items-center gap-1.5 font-mono text-[9.5px] tracking-[0.12em] text-muted-foreground uppercase">
+            <ArrowDownToLine className="size-3" aria-hidden="true" />
+            Pulled · Read-only
+          </span>
+        )}
         <div className="ml-auto flex shrink-0 items-center gap-2">
-          {!isInternal && (
+          {!recordsReadOnly && (
             <Button type="button" size="sm" onClick={openAdd}>
               <Plus />
               Add record
             </Button>
           )}
-          {/* Export renders for every zone, built-ins included — it is the
-              one action that reads rather than writes. Import and the rest
-              stay behind the guard; see ZoneFileActions. */}
+          {/* The primary action for a copy: not "write a record", which it
+              cannot do, but "go and get the current version now". */}
+          {isSecondary && (
+            <Button type="button" size="sm" onClick={onRefreshNow} disabled={refreshZone.isPending}>
+              <RotateCw />
+              {refreshZone.isPending ? "Transferring…" : "Refresh now"}
+            </Button>
+          )}
+          {/* Export renders for every zone, built-ins and secondaries
+              included — it is the one action that reads rather than writes.
+              Import and the rest stay behind the guard; see
+              ZoneFileActions. */}
           <ZoneFileActions zone={z} />
           {!isInternal && (
             <>
@@ -1746,8 +2080,10 @@ export function ZoneDetail() {
         </div>
       </div>
 
-      {/* SOA band */}
-      <SoaBand zone={z} />
+      {/* SOA band, or — for a copy, whose SOA is its primary's and is
+          overwritten by every transfer — the transfer band in its place. See
+          TransferBand's own comment. */}
+      {isSecondary ? <TransferBand zone={z} /> : <SoaBand zone={z} />}
 
       {/* Filter bar */}
       <div className="flex shrink-0 items-center gap-3 border-b border-border px-4 py-2.5">
@@ -1819,7 +2155,7 @@ export function ZoneDetail() {
           one, until Add record opens it: closed is the loaded state, not
           just a visual one — see addOpen's own comment above. Editing does
           not come through here; it happens in the record's own row below. */}
-      {!isInternal && addOpen && (
+      {!recordsReadOnly && addOpen && (
         <RecordFormRow
           key={addCue}
           zoneId={z.id}

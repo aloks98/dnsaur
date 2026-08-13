@@ -57,6 +57,28 @@ var (
 // can go behind this same interface then, on evidence.
 type tsigProvider struct{ keys TSIGKeys }
 
+// NewTSIGProvider returns the store-backed dns.TsigProvider this package
+// verifies incoming messages with, for a caller that has to sign outgoing
+// ones. It is the same object with the same lookup: Generate is what signs a
+// request, and RFC 8945 gives it no direction — dns.Server and dns.Transfer
+// take the same interface.
+//
+// It is exported for internal/zones, whose AXFR client (Milestone D2) signs
+// a transfer request under the key its zone names. Signing there with its own
+// HMAC code would be a second implementation of the one thing in this
+// codebase that must not have two: an outgoing signature this server would
+// not itself accept is a bug nothing in either half's tests would catch.
+//
+// A nil keys returns nil, so a caller with no key store gets "no provider"
+// rather than one that panics on first use — the same treatment WithTSIGKeys
+// gives it.
+func NewTSIGProvider(keys TSIGKeys) dns.TsigProvider {
+	if keys == nil {
+		return nil
+	}
+	return &tsigProvider{keys: keys}
+}
+
 // key resolves the TSIG RR's owner name to a stored key. An unknown name gives
 // dns.ErrSecret, matching what miekg's own tsigSecretProvider returns for a
 // name it does not hold (tsig.go:82). A store that failed gives that failure

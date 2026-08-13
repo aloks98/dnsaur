@@ -145,11 +145,69 @@ yet.
 Zones are checked before the cache and upstream, same as the old local
 records were — the miss behaviour above is the whole point of the change.
 
-Milestone A serves **primary** zones only. `secondary`, `stub` and
-`forwarder` exist in the type list for zones to come but are refused on
-create or edit with `400` until transfers are built. A fifth type,
-`internal`, also exists — see Built-in zones below; it's never created
-through this UI, only seeded.
+Two types can be created: **primary**, a zone you author here, and
+**secondary**, a copy of one held elsewhere (see Secondary zones below).
+`stub` and `forwarder` exist in the type list for zones to come but are
+refused on create or edit with `400`. A fifth type, `internal`, also
+exists — see Built-in zones below; it's never created through this UI, only
+seeded.
+
+### Secondary zones
+
+A secondary is not yours to edit. It is pulled whole from another server
+over AXFR and re-pulled on the schedule that server's SOA asks for, so the
+records, the SOA and the serial are all its primary's. The zone page
+reflects that: no **Add record**, no per-row edit or delete, no **Import**,
+and the SOA form is replaced by a transfer band. **Export** stays, because
+reading a secondary is fine.
+
+Creating one needs **Primary servers** — one or more `host[:port]`,
+comma-separated, port 53 assumed — and optionally a **TSIG key** to sign the
+transfer requests with (see the TSIG keys page). A hostname is stored as
+written and resolved at transfer time, so a primary that moves keeps
+working.
+
+The transfer band across the top says where the zone comes from and how
+current it is: its primaries, its key, the serial it last adopted, when it
+last refreshed and when it next will. **Refresh now** pulls immediately
+rather than waiting for the schedule.
+
+Status on a secondary is not the same question as enabled/disabled, and the
+list says so:
+
+- **Refreshed 2h ago** — transferred within its schedule.
+- **Transfer failing** — the last attempt failed. The row underneath says
+  what failed, in the server's own words, and that it keeps serving the copy
+  it has.
+- **Serving, transfer overdue** — its refresh came and went with nothing
+  recorded against it. Usually the zone is disabled, so nothing is trying.
+- **Not answering** — either it has never transferred, or it is past the
+  SOA expiry. Both mean the same thing: it holds nothing it can vouch for,
+  so it answers `SERVFAIL` for its whole suffix rather than claiming names
+  don't exist.
+
+The failure reason is stored, not merely remembered, so restarting dnsaur
+does not make a zone that has been failing for a week look healthy. It is
+always shown with when the attempt was made — "connection refused" four
+minutes ago and the same words four days ago are not the same situation.
+
+A transfer error is one long line from the server, and it usually repeats
+the zone's name and the primary's address before getting to what actually
+went wrong. So the zone page leads with the end of it — the failure itself —
+and prints the whole message under it, dim, hover for any of it that doesn't
+fit. The zones list shows the same short form with the full text on hover.
+Nothing is rewritten: the short form is a piece of the message, not a
+paraphrase of it, and a message with no such shape is shown whole.
+
+None of this needs a reload. A secondary's state is the one thing here that
+changes with nobody touching it, so while one is on screen the zones list and
+the zone page re-read it every 30 seconds — the same tick the scheduler
+decides what is due on, so the screen is never more than one of its decisions
+behind — and again when you come back to the tab. A zone that recovers, starts
+failing or crosses its expiry says so on its own. The record list is not on a
+timer: it is re-read when a transfer actually lands, which is the only thing
+that changes it. A screen showing only primary zones does not poll at all,
+since nothing on it can change unless you change it.
 
 ### Records
 
@@ -435,11 +493,13 @@ file can too.
 Changes take effect on the next signed message; nothing here needs a
 restart.
 
-Nothing references a key yet. Zones carry a `tsig_key_id` field, but no zone
-can be pointed at a key and no transfer runs against one — that arrives with
-zone transfers, along with the "in use by N zones" column and the guard that
-stops you deleting a key some zone still depends on. Today, deleting a key
-just deletes it.
+**Used by** counts the secondary zones that sign their transfers with each
+key. A key nothing uses reads `—` and can be deleted; a key some zone still
+depends on cannot, and the delete confirmation says how many zones to
+release it from first. Deleting it would leave those secondaries unable to
+authenticate their transfers with nothing on the zone to say why, so the
+server refuses it outright — the disabled button is only the polite version
+of the same answer.
 
 ---
 

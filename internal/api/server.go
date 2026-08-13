@@ -17,6 +17,7 @@ import (
 	"github.com/aloks98/dnsaur/internal/filter"
 	"github.com/aloks98/dnsaur/internal/qlog"
 	"github.com/aloks98/dnsaur/internal/store"
+	"github.com/aloks98/dnsaur/internal/zones"
 )
 
 //go:embed openapi.yaml
@@ -28,14 +29,34 @@ type Reloader interface {
 	RefreshFilters(ctx context.Context) error
 }
 
+// ZoneRefresher transfers one secondary zone on demand — the manual path
+// behind POST /zones/{id}/refresh, as opposed to the SOA schedule the same
+// component runs on its own.
+//
+// An interface rather than *zones.Refresher (which is what Deps.Refresher
+// does for filter lists) because this one is reachable from a handler, and a
+// handler that can only be exercised by standing up a real Transferrer with
+// a real primary to pull from is a handler nothing tests. The concrete type
+// satisfies it as written.
+type ZoneRefresher interface {
+	Refresh(ctx context.Context, zoneID int64) (zones.TransferResult, error)
+}
+
 type Deps struct {
-	Store     store.Store
-	Auth      *auth.Service
-	Engine    *filter.Engine
-	Reloader  Reloader
-	Logger    *qlog.Logger
+	Store    store.Store
+	Auth     *auth.Service
+	Engine   *filter.Engine
+	Reloader Reloader
+	Logger   *qlog.Logger
+	// Refresher keeps filter lists current; ZoneRefresher keeps secondary
+	// zones current. Different schedules, different stores, same shape — see
+	// App's own pair in internal/app/app.go.
 	Refresher *filter.Refresher
-	Version   string
+	// ZoneRefresher may be nil, and is in every test server that has no
+	// business transferring zones. The handler answers 503 rather than
+	// panicking; see handleZoneRefresh.
+	ZoneRefresher ZoneRefresher
+	Version       string
 	// Static serves the embedded web dashboard on non-/api paths. Nil
 	// disables it (e.g. tests that don't care about the SPA).
 	Static fs.FS

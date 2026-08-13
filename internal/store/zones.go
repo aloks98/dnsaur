@@ -32,12 +32,26 @@ type Zone struct {
 	// separately settable for that minimum to mean anything.
 	SOATTL uint32 `json:"soa_ttl"`
 
-	Primaries   string `json:"primaries"`
-	TSIGKeyID   int64  `json:"tsig_key_id"`
-	ExpiresAt   int64  `json:"expires_at"`
-	RefreshedAt int64  `json:"refreshed_at"`
-	CreatedAt   int64  `json:"created_at"`
-	ModifiedAt  int64  `json:"modified_at"`
+	Primaries string `json:"primaries"`
+	TSIGKeyID int64  `json:"tsig_key_id"`
+	ExpiresAt int64  `json:"expires_at"`
+	// RefreshedAt is the last transfer that *succeeded*, unix ms; 0 = never.
+	RefreshedAt int64 `json:"refreshed_at"`
+
+	// LastError and LastAttempt are how the most recent transfer attempt
+	// went, as opposed to the most recent one that worked. Written only by
+	// NoteTransferAttempt — see the 0010 migration for the whole reasoning,
+	// and for why there is no stored status beside them.
+	//
+	// LastError is "" when that attempt succeeded, so a zone that recovered
+	// stops reporting one. LastAttempt dates it, successful or not; 0 = never
+	// attempted. The pair is only meaningful read together: an error with no
+	// date is a claim about now made by an unknown past.
+	LastError   string `json:"last_error"`
+	LastAttempt int64  `json:"last_attempt"`
+
+	CreatedAt  int64 `json:"created_at"`
+	ModifiedAt int64 `json:"modified_at"`
 }
 
 // ZoneRecord is one RR, named relative to its zone's apex.
@@ -94,15 +108,39 @@ type ZoneStore interface {
 	// The caller supplies z whole, serial included, because what the new
 	// serial should be is a question about DNS (RFC 1982 arithmetic, never
 	// going backwards), not about storage.
+	//
+	// It does not write last_error/last_attempt: those belong to
+	// NoteTransferAttempt alone. See its doc comment.
 	ReplaceRecords(ctx context.Context, z Zone, deleteIDs []int64, updates, adds []ZoneRecord) error
+	// NoteTransferAttempt records how one transfer attempt went: at is when
+	// it finished (unix ms) and errText is the transfer's own error, or ""
+	// when it succeeded.
+	//
+	// It is a two-column UPDATE, and that narrowness is the whole design
+	// rather than an optimisation. The *whole-row* writes to this table —
+	// updateZoneSQL, and ReplaceRecords through it — bind every column from a
+	// struct the caller read some time earlier, so a transfer outcome
+	// recorded through one of those would silently revert any concurrent edit
+	// to enabled, primaries or tsig_key_id: the exact defect the transfer
+	// install itself had to be fixed for, reached again through a second
+	// door. It is also why neither of them may write these two columns —
+	// were last_error in updateZoneSQL, an API PATCH that read the row before
+	// a failure and committed after it would erase the failure.
+	//
+	// It is not the only narrow write here (BumpSerial is another, for a
+	// related reason: a serial must be incremented in SQL rather than
+	// read-modify-written). What matters is that the column sets are
+	// disjoint — this statement owns last_error and last_attempt and touches
+	// nothing else, and nothing else touches them.
+	NoteTransferAttempt(ctx context.Context, zoneID int64, at int64, errText string) error
 }
 
 type zoneStore struct{ s *sqlStore }
 
-const zoneColumns = `id, name, type, enabled, soa_ns, soa_mbox, soa_serial, soa_refresh, soa_retry, soa_expire, soa_minimum, soa_ttl, primaries, tsig_key_id, expires_at, refreshed_at, created_at, modified_at`
+const zoneColumns = `id, name, type, enabled, soa_ns, soa_mbox, soa_serial, soa_refresh, soa_retry, soa_expire, soa_minimum, soa_ttl, primaries, tsig_key_id, expires_at, refreshed_at, last_error, last_attempt, created_at, modified_at`
 
 func scanZone(row interface{ Scan(...any) error }, z *Zone) error {
-	return row.Scan(&z.ID, &z.Name, &z.Type, &z.Enabled, &z.SOANS, &z.SOAMbox, &z.SOASerial, &z.SOARefresh, &z.SOARetry, &z.SOAExpire, &z.SOAMinimum, &z.SOATTL, &z.Primaries, &z.TSIGKeyID, &z.ExpiresAt, &z.RefreshedAt, &z.CreatedAt, &z.ModifiedAt)
+	return row.Scan(&z.ID, &z.Name, &z.Type, &z.Enabled, &z.SOANS, &z.SOAMbox, &z.SOASerial, &z.SOARefresh, &z.SOARetry, &z.SOAExpire, &z.SOAMinimum, &z.SOATTL, &z.Primaries, &z.TSIGKeyID, &z.ExpiresAt, &z.RefreshedAt, &z.LastError, &z.LastAttempt, &z.CreatedAt, &z.ModifiedAt)
 }
 
 func (z *zoneStore) Zones(ctx context.Context) ([]Zone, error) {
@@ -172,6 +210,15 @@ func updateRecordArgs(r ZoneRecord) []any {
 
 func (z *zoneStore) UpdateZone(ctx context.Context, zn Zone) error {
 	return z.s.execOne(ctx, updateZoneSQL, updateZoneArgs(zn)...)
+}
+
+// noteTransferAttemptSQL names the only two columns any transfer outcome is
+// allowed to write. See ZoneStore.NoteTransferAttempt for why it is separate
+// from updateZoneSQL rather than folded into it.
+const noteTransferAttemptSQL = `UPDATE zones SET last_error = ?, last_attempt = ? WHERE id = ?`
+
+func (z *zoneStore) NoteTransferAttempt(ctx context.Context, zoneID int64, at int64, errText string) error {
+	return z.s.execOne(ctx, noteTransferAttemptSQL, errText, at, zoneID)
 }
 
 func (z *zoneStore) DeleteZone(ctx context.Context, id int64) error {

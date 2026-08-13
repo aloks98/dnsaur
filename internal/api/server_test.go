@@ -55,7 +55,11 @@ func (f *fakeReloader) counts() (clients, records, filters int) {
 
 // testServer builds a Server on a real sqlite store; helpers reused by all
 // later handler-task tests in this package.
-func testServer(t *testing.T) (*Server, store.Store, *fakeReloader) {
+// opts adjust Deps before the Server is built, for the few tests that need a
+// dependency the default harness deliberately leaves nil (see
+// Deps.ZoneRefresher). Variadic so every existing testServer(t) call site
+// keeps meaning "the default server".
+func testServer(t *testing.T, opts ...func(*Deps)) (*Server, store.Store, *fakeReloader) {
 	t.Helper()
 	s, err := store.Open(context.Background(), "sqlite", t.TempDir()+"/t.db")
 	if err != nil {
@@ -64,7 +68,11 @@ func testServer(t *testing.T) (*Server, store.Store, *fakeReloader) {
 	t.Cleanup(func() { _ = s.Close() })
 	svc := auth.New(s.Users(), s.Tokens())
 	rl := &fakeReloader{}
-	srv := New(Deps{Store: s, Auth: svc, Engine: filter.NewEngine(), Reloader: rl, Version: "test"})
+	d := Deps{Store: s, Auth: svc, Engine: filter.NewEngine(), Reloader: rl, Version: "test"}
+	for _, opt := range opts {
+		opt(&d)
+	}
+	srv := New(d)
 	return srv, s, rl
 }
 

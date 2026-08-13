@@ -555,13 +555,23 @@ D is too large to land as one plan. Each of these ships something that works:
 | | Scope | Depends on |
 |---|---|---|
 | **D1** | TSIG keys: table, CRUD, dynamic provider, and the `TsigStatus` helper transfers call | — |
-| **D2** | Outbound AXFR: `primaries` format, scheduling, expiry, atomic install, per-zone reload, **and ownership of `zones.tsig_key_id`** — the column, its foreign key, and the guard against deleting a key a zone still references | D1 |
+| **D2** | Outbound AXFR: `primaries` format, scheduling, expiry, atomic install, per-zone reload, **and ownership of `zones.tsig_key_id`** — the column and the guard against deleting a key a zone still references. D2 declined the schema-level foreign key with reasoning recorded in migration 0009: the column is `NOT NULL DEFAULT 0` where 0 means "no key", a FK skips NULL rather than zero, and making it nullable is a whole-table rebuild on SQLite where `zones` is the parent of `zone_records … ON DELETE CASCADE`. The guard is a single-statement delete instead | D1 |
 | **D3** | Inbound AXFR: the `dnssrv` intercept, ACL, envelope batching | D1 |
 | **D4** | NOTIFY both directions | D2, D3 |
 | **D5** | IXFR: journal, deltas, serial arithmetic | D2, D3 |
 | **D6** | `forwarder` zone type and the `Conditional` migration | — |
 
 D1 is the foundation both directions need. D6 is independent of all of it.
+
+**Disabled is not expired, and that is deliberate (decided 2026-08-13).** A
+secondary that cannot vouch for its data answers SERVFAIL rather than falling
+through, because a public record would otherwise shadow the internal one. A
+*disabled* zone does fall through — the resolver skips it, the query reaches the
+forwarder, and the public answer wins. Disabling means dnsaur gives up the name,
+so the internet's answer applies. It matches Technitium, and §1's scope line is
+full Technitium parity. The consequence worth knowing: disabling a split-horizon
+zone exposes its names to public answers rather than making them fail. The UI
+says so rather than implying the zone goes quiet.
 
 **Enforcement is deliberately not D1's.** D1 ships the mechanism — a provider
 that verifies, and a helper that reports the result — but nothing in D1 rejects

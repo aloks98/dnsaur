@@ -21,6 +21,7 @@ of truth — if it's not listed as shipped, it doesn't work yet.
 | Blocking resolver (forward + cache, hosts/plain/ABP-subset blocklists) | Shipped |
 | Per-client groups (IP/CIDR matchers, per-group lists & rules) | Shipped |
 | Authoritative DNS zones (primary) | Shipped |
+| Secondary zones (AXFR in, TSIG, SOA-scheduled refresh) | Shipped |
 | Reverse DNS (PTR, RFC 6303 built-in zones, auto-PTR from A/AAAA) | Shipped |
 | Caching with TTL clamps, negative caching, serve-stale | Shipped |
 | Query log (SQLite/Postgres, buffered writes, retention pruning) | Shipped |

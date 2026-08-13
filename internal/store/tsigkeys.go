@@ -92,6 +92,71 @@ func (t *tsigKeyStore) Update(ctx context.Context, k TSIGKey) error {
 		k.Name, k.Algorithm, k.Secret, k.ID)
 }
 
+// Delete removes a key unless a zone still names it, in which case it
+// returns ErrInUse and the API answers 409. A secondary that lost its key
+// would keep trying to transfer and keep being refused by its primary, with
+// nothing on the zone to say why — so the refusal belongs at the moment the
+// key would go, where there is still something to say.
+//
+// This is the whole enforcement of zones.tsig_key_id: there is no foreign
+// key on the column, for the reasons the 0009 migration records at length.
+//
+// What the single statement buys, stated narrowly because the obvious
+// stronger claim is false. The NOT EXISTS is evaluated inside the DELETE,
+// which removes the window between a separate SELECT and this DELETE. That
+// is worth having and costs nothing. It does not close the window that
+// actually matters, and that window is not in this function: the API checks
+// the key exists (checkZoneTransferConfig, zones_handlers.go) and inserts
+// the zone as two separate statements, and no statement here can observe a
+// row that has not been written yet. Measured rather than assumed — on
+// postgres, concurrent AddZone and Delete leave a zone naming a deleted key
+// in the large majority of attempts.
+//
+// **sqlite narrows that window; it does not escape it.**
+// SetMaxOpenConns(1) serialises individual statements, not the handler's
+// check-then-insert sequence — the connection goes back to the pool between
+// the two, and the handler spends that gap on SOA defaults and name
+// normalisation. Measured there too: a few attempts in sixty land wrong
+// with a deliberate pause in the gap, none in four hundred without one. So
+// it is a narrower race on sqlite and a likely one on postgres, not a
+// postgres-only bug.
+//
+// It is not fixable from here, and not cheaply fixable anywhere. Putting
+// the check and the insert in one transaction does not help by itself: at
+// READ COMMITTED the check takes no lock, so the two still interleave.
+// Three things would actually close it, and each costs more than it saves
+// here — a schema-level foreign key (which 0009 declines, and this is that
+// decision's concrete cost); SELECT ... FOR UPDATE around the check, which
+// is not sqlite syntax and would move the reference rule into the
+// zone-insert path, leaving two owners of one rule; or SERIALIZABLE
+// isolation on postgres, which does detect this write skew and would abort
+// one of the two transactions, at the price of retry handling on a path
+// that has none and an isolation level nothing else in this codebase uses.
+//
+// What the residual costs when it happens: the zone names an id nothing
+// answers to, and its next transfer fails to find a key to sign with. That
+// is a named failure reported against the attempt that suffered it, the
+// same way an unreachable primary surfaces — not silent breakage.
 func (t *tsigKeyStore) Delete(ctx context.Context, id int64) error {
-	return t.s.execOne(ctx, `DELETE FROM tsig_keys WHERE id = ?`, id)
+	res, err := t.s.db.ExecContext(ctx, t.s.q(
+		`DELETE FROM tsig_keys WHERE id = ? AND NOT EXISTS (SELECT 1 FROM zones WHERE zones.tsig_key_id = tsig_keys.id)`), id)
+	if err != nil {
+		return wrapDBErr(err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n > 0 {
+		return nil
+	}
+	// Nothing was deleted, and the two reasons for that are different
+	// answers to the caller: the key never existed (404), or it is spoken
+	// for (409).
+	if _, found, err := t.Get(ctx, id); err != nil {
+		return err
+	} else if !found {
+		return ErrNotFound
+	}
+	return ErrInUse
 }

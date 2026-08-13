@@ -88,6 +88,8 @@ function defaultZones(): Zone[] {
       tsig_key_id: 0,
       expires_at: 0,
       refreshed_at: 0,
+      last_error: "",
+      last_attempt: 0,
       created_at: Date.now() - 30 * 24 * 60 * 60 * 1000,
       modified_at: Date.now() - 15 * 60 * 1000,
     },

@@ -107,8 +107,22 @@ export interface Zone {
   tsig_key_id: number;
   /** Unix ms; secondary only, 0 otherwise. */
   expires_at: number;
-  /** Unix ms; secondary only, 0 otherwise. */
+  /** Unix ms of the last transfer that **succeeded**; secondary only, 0 = never. */
   refreshed_at: number;
+  /**
+   * Why the most recent transfer attempt failed, verbatim — `""` when it
+   * succeeded. The server clears it on success, so a zone that recovered
+   * stops reporting one, and it survives a restart (unlike the scheduler's
+   * own in-memory view of the same thing). See lib/zones.ts, which is the one
+   * place this and the three stamps are read together.
+   */
+  last_error: string;
+  /**
+   * Unix ms of that attempt, successful or not; 0 = never attempted. Only
+   * meaningful beside `last_error`: an error with no date says nothing about
+   * whether it is still true.
+   */
+  last_attempt: number;
   created_at: number;
   modified_at: number;
 }

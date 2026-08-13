@@ -1,4 +1,4 @@
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
 import {
   Eye,
   EyeOff,
@@ -40,6 +40,7 @@ import {
   useTSIGKeys,
   useUpdateTSIGKey,
 } from "../hooks/use-tsig-keys";
+import { useZones } from "../hooks/use-zones";
 import { StaleDataAlert } from "../components/stale-data-alert";
 import {
   algorithmLabel,
@@ -62,16 +63,11 @@ import {
 export const MASK = "•".repeat(24);
 
 /** One declaration of the column geometry, shared by the header, the create
- * row and every key row.
- *
- * Four columns, not the artboard's five: USED BY is deliberately absent.
- * `zones.tsig_key_id` exists in the schema but nothing reads or writes it
- * yet — no handler accepts it, nothing references a key, and deleting a
- * referenced key succeeds silently — so the column would read "—" on every
- * row forever. It lands with Milestone D2, together with the in-use delete
- * guard the artboard pairs it with ("In use by 3 zones. Remove it from them
- * first."), which today could never fire. */
-const GRID = "grid grid-cols-[1fr_132px_316px_116px] items-center gap-3.5 px-4";
+ * row and every key row — the artboard's five, USED BY included. That column
+ * was held back in Milestone D1 because nothing could yet reference a key:
+ * no handler accepted `zones.tsig_key_id`, so it would have read "—" on every
+ * row forever. D2 is what gives it something to count. */
+const GRID = "grid grid-cols-[1fr_132px_316px_108px_116px] items-center gap-3.5 px-4";
 
 /**
  * Mirrors the server's own check (normalizeTSIGName in
@@ -276,6 +272,10 @@ function NewKeyRow({ onClose }: { onClose: () => void }) {
             secretPlaceholder={pasting ? "base64 secret from the other server" : undefined}
             onRegenerate={fillGenerated}
           />
+          {/* USED BY: a key that does not exist yet is used by nothing, and
+              the cell holds the column open rather than letting the actions
+              slide left. */}
+          <span />
           <div className="flex items-center justify-end gap-1.5">
             <Button type="submit" size="sm" disabled={createKey.isPending}>
               {createKey.isPending ? "Adding…" : "Add"}
@@ -326,6 +326,7 @@ function NewKeyRow({ onClose }: { onClose: () => void }) {
             )}
           </span>
           <span />
+          <span />
         </div>
       </form>
     </Form>
@@ -335,7 +336,15 @@ function NewKeyRow({ onClose }: { onClose: () => void }) {
 /** The same row, in place, for an existing key. PUT is a full replace — the
  * server has no partial-patch shape for a TSIG key — so all three fields are
  * sent whether they were touched or not. */
-function EditKeyRow({ tsigKey, onClose }: { tsigKey: TSIGKey; onClose: () => void }) {
+function EditKeyRow({
+  tsigKey,
+  usedBy,
+  onClose,
+}: {
+  tsigKey: TSIGKey;
+  usedBy: number;
+  onClose: () => void;
+}) {
   const updateKey = useUpdateTSIGKey();
   const form = useForm<KeyFormValues>({
     resolver: zodResolver(keyFormSchema),
@@ -377,6 +386,10 @@ function EditKeyRow({ tsigKey, onClose }: { tsigKey: TSIGKey; onClose: () => voi
               form.clearErrors("secret");
             }}
           />
+          {/* Kept visible while editing, deliberately: it is the count of
+              zones whose next transfer this Save is about to change, which is
+              exactly what someone rotating a secret needs in front of them. */}
+          <UsedByCell count={usedBy} />
           <div className="flex items-center justify-end gap-1.5">
             <Button type="submit" size="sm" disabled={updateKey.isPending}>
               {updateKey.isPending ? "Saving…" : "Save"}
@@ -407,10 +420,35 @@ function EditKeyRow({ tsigKey, onClose }: { tsigKey: TSIGKey; onClose: () => voi
               )}
             </span>
             <span />
+            <span />
           </div>
         )}
       </form>
     </Form>
+  );
+}
+
+/**
+ * How many zones sign their transfers with this key — the USED BY column.
+ *
+ * Counted client-side from the zones list rather than served as a field on
+ * the key, because it already is one: every zone carries `tsig_key_id`, so
+ * the answer is a fold over a list this dashboard fetches anyway, and an
+ * endpoint for it would be a second source of the same truth to keep in step.
+ *
+ * "—" for an unused key rather than "0": the column is answering "what
+ * depends on this", and nothing is not a quantity.
+ */
+function UsedByCell({ count }: { count: number }) {
+  return (
+    <span
+      className={cn(
+        "text-right font-mono text-sm",
+        count > 0 ? "text-foreground" : "text-muted-foreground",
+      )}
+    >
+      {count === 0 ? "—" : `${count} ${count === 1 ? "zone" : "zones"}`}
+    </span>
   );
 }
 
@@ -430,6 +468,7 @@ function EditKeyRow({ tsigKey, onClose }: { tsigKey: TSIGKey; onClose: () => voi
  */
 function KeyRow({
   tsigKey,
+  usedBy,
   revealed,
   onReveal,
   onEdit,
@@ -437,6 +476,8 @@ function KeyRow({
   dimActions,
 }: {
   tsigKey: TSIGKey;
+  /** Zones whose tsig_key_id names this key — see UsedByCell. */
+  usedBy: number;
   revealed: boolean;
   onReveal: () => void;
   onEdit: () => void;
@@ -475,6 +516,7 @@ function KeyRow({
             row stays masked. */}
         <CopyButton value={tsigKey.secret} label={`Copy the secret for ${tsigKey.name}`} />
       </span>
+      <UsedByCell count={usedBy} />
       <span
         className={cn(
           "flex items-center justify-end gap-1",
@@ -513,22 +555,40 @@ function KeyRow({
  * The thing being deleted stays on screen and in place while the question is
  * asked — which is the whole argument for an inline confirm over a dialog
  * that covers the list and names the key in prose.
+ *
+ * A key some zone signs with cannot be deleted at all: the server answers 409
+ * (store.ErrInUse — tsigKeyStore.Delete refuses while any zone's tsig_key_id
+ * names it), because removing it would leave that secondary unable to
+ * authenticate its transfers with nothing on the zone to say why. So this
+ * strip asks a different question in that case — it states the obstacle and
+ * what to do about it — and the Delete button is disabled rather than left to
+ * produce a 409 on click.
  */
 function DeleteConfirm({
   tsigKey,
+  usedBy,
   pending,
   onCancel,
   onConfirm,
 }: {
   tsigKey: TSIGKey;
+  usedBy: number;
   pending: boolean;
   onCancel: () => void;
   onConfirm: () => void;
 }) {
+  const inUse = usedBy > 0;
   return (
     <div className="flex items-center gap-3 border-t border-border-muted px-4 pt-2 pb-2.5">
-      <TriangleAlert aria-hidden="true" className="size-4 shrink-0" />
-      <span className="text-sm">Delete {tsigKey.name}?</span>
+      <TriangleAlert
+        aria-hidden="true"
+        className={cn("size-4 shrink-0", inUse && "text-destructive-foreground")}
+      />
+      <span className={cn("text-sm", inUse && "text-destructive-foreground")}>
+        {inUse
+          ? `In use by ${usedBy} ${usedBy === 1 ? "zone" : "zones"}. Remove it from them first.`
+          : `Delete ${tsigKey.name}?`}
+      </span>
       <span className="ml-auto flex items-center gap-2">
         <Button type="button" size="sm" variant="ghost" onClick={onCancel}>
           Cancel
@@ -537,7 +597,7 @@ function DeleteConfirm({
           type="button"
           size="sm"
           variant="destructive"
-          disabled={pending}
+          disabled={pending || inUse}
           onClick={onConfirm}
         >
           {pending ? "Deleting…" : "Delete"}
@@ -565,7 +625,31 @@ function countLabel(count: number): string {
  */
 export function TSIGKeys() {
   const keys = useTSIGKeys();
+  const zones = useZones();
   const deleteKey = useDeleteTSIGKey();
+
+  /**
+   * How many zones name each key — the USED BY column, and the in-use delete
+   * guard that reads the same number.
+   *
+   * The guard is an affordance, not the enforcement. The server refuses the
+   * delete with 409 whichever way this map came out (tsigKeyStore.Delete does
+   * it in one statement, so there is no check-then-act window there), which
+   * matters because this map can be wrong in one direction: if /zones failed
+   * to load, every key reads "—" and every Delete button is enabled. The
+   * onError below is what covers that case, so a key that turns out to be in
+   * use says so rather than reporting a generic failure.
+   */
+  const usageByKeyID = useMemo(() => {
+    const counts = new Map<number, number>();
+    for (const zone of zones.data ?? []) {
+      if (zone.tsig_key_id !== 0) {
+        counts.set(zone.tsig_key_id, (counts.get(zone.tsig_key_id) ?? 0) + 1);
+      }
+    }
+    return counts;
+  }, [zones.data]);
+  const usedBy = (id: number) => usageByKeyID.get(id) ?? 0;
 
   const [addOpen, setAddOpen] = useState(false);
   const [editingId, setEditingId] = useState<number | null>(null);
@@ -600,7 +684,19 @@ export function TSIGKeys() {
         setDeletingId(null);
         if (revealedId === target.id) setRevealedId(null);
       },
-      onError: () => toast.error(`Couldn't delete ${target.name}`),
+      onError: (err) => {
+        // The guard above should have caught this, and does whenever the
+        // zones list is in hand — but a 409 can still arrive: /zones may have
+        // failed to load, or a zone may have started using this key since it
+        // did. The server's own message for it is "resource in use", which is
+        // true and says nothing about what to do, so this one is written
+        // here. Anything else keeps the generic failure.
+        if (err instanceof ApiError && err.status === 409) {
+          toast.error(`${target.name} is in use by a zone. Remove it from them first.`);
+          return;
+        }
+        toast.error(`Couldn't delete ${target.name}`);
+      },
     });
   }
 
@@ -658,10 +754,15 @@ export function TSIGKeys() {
         )}
       >
         {editingId === tsigKey.id ? (
-          <EditKeyRow tsigKey={tsigKey} onClose={() => setEditingId(null)} />
+          <EditKeyRow
+            tsigKey={tsigKey}
+            usedBy={usedBy(tsigKey.id)}
+            onClose={() => setEditingId(null)}
+          />
         ) : (
           <KeyRow
             tsigKey={tsigKey}
+            usedBy={usedBy(tsigKey.id)}
             revealed={revealedId === tsigKey.id}
             onReveal={() => setRevealedId(revealedId === tsigKey.id ? null : tsigKey.id)}
             onEdit={() => openEdit(tsigKey.id)}
@@ -672,6 +773,7 @@ export function TSIGKeys() {
         {deletingId === tsigKey.id && (
           <DeleteConfirm
             tsigKey={tsigKey}
+            usedBy={usedBy(tsigKey.id)}
             pending={deleteKey.isPending}
             onCancel={() => setDeletingId(null)}
             onConfirm={() => onConfirmDelete(tsigKey)}
@@ -718,6 +820,7 @@ export function TSIGKeys() {
           <span>Name</span>
           <span>Algorithm</span>
           <span>Secret</span>
+          <span className="text-right">Used by</span>
           <span className="text-right">Actions</span>
         </div>
       )}

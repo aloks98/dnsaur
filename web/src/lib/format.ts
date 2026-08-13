@@ -26,6 +26,30 @@ export function formatBytes(bytes: number): string {
   return `${(kb / 1024).toFixed(1)} MB`;
 }
 
+/**
+ * A forward-looking duration as `1h 14m` / `42m` / `2d 6h` — how long until
+ * a secondary zone's next scheduled transfer.
+ *
+ * Two units at most, and never a smaller one beside a larger: "2d 6h 13m"
+ * reads as a measurement when the thing being said is "some time on
+ * Thursday". Under a minute has no useful number left in it at this
+ * resolution, so it says so in words rather than counting down seconds a
+ * reader would have to watch.
+ */
+export function formatDuration(ms: number): string {
+  const totalMin = Math.floor(Math.max(0, ms) / 60_000);
+  if (totalMin < 1) return "under a minute";
+  if (totalMin < 60) return `${totalMin}m`;
+  const totalHour = Math.floor(totalMin / 60);
+  if (totalHour < 24) {
+    const minutes = totalMin % 60;
+    return minutes === 0 ? `${totalHour}h` : `${totalHour}h ${minutes}m`;
+  }
+  const days = Math.floor(totalHour / 24);
+  const hours = totalHour % 24;
+  return hours === 0 ? `${days}d` : `${days}d ${hours}h`;
+}
+
 /** A duration in milliseconds as `m:ss` — the pause control's countdown to
  * `paused_until`. Never negative (clamps to `0:00` once the pause has
  * technically expired but the 30s status poll hasn't caught up yet). */

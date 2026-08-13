@@ -1,0 +1,59 @@
+-- +goose Up
+-- How the last zone transfer attempt went, so that a secondary whose primary
+-- is refusing connections says so instead of being indistinguishable from one
+-- that simply has not come round to its next refresh yet.
+--
+-- Before this, `zones` recorded only successes. refreshed_at is the last
+-- transfer that *worked* and expires_at is the deadline that success bought;
+-- a failure left no trace in the database at all. The scheduler did know —
+-- zones.Refresher keeps the consecutive failure count, the pending retry
+-- back-off and the error text per zone — but every bit of that is in memory
+-- and dies with the process. So a zone that had been failing for a week came
+-- back from a restart looking healthy until its next attempt, up to a retry
+-- interval later, and the dashboard had no honest way to say otherwise.
+--
+-- These two columns are the durable half of that state, and they are
+-- deliberately the same pair `lists` already carries for the same job (see
+-- 0003_list_status.sql):
+--
+-- last_error is '' when the most recent attempt succeeded and the transfer's
+-- own error text when it did not. Cleared on success, not merely written on
+-- failure — a column that is only ever written when something breaks becomes
+-- a permanent tombstone of a problem that was fixed weeks ago.
+--
+-- last_attempt is unix ms of that attempt, successful or not; 0 = never
+-- attempted. It is what keeps last_error honest: an error with no date is a
+-- claim about the present made by an unknown past, and "this failed" is worth
+-- much less than "this failed four minutes ago". It is also what orders the
+-- two columns against refreshed_at, so a reader can always tell which of the
+-- last success and the last failure came first.
+--
+-- There is deliberately no last_status to go with them, which is where this
+-- pair stops mirroring `lists`. That column exists on lists because its four
+-- outcomes genuinely are not recoverable from the numbers — 'failed' and
+-- 'empty' both leave entry_count 0. A zone's are: never attempted is
+-- last_attempt = 0, the last attempt failed is last_error <> '', and whether
+-- the zone can still answer is refreshed_at/expires_at, which is a different
+-- question from how the last attempt went and is already asked separately
+-- (zones.Zone.Serving). A stored status here would be a fifth thing to keep
+-- in step with four that already agree.
+--
+-- Who writes them: only zones.Refresher, through ZoneStore.NoteTransferAttempt,
+-- which is a two-column UPDATE and touches nothing else. Not the zone's
+-- ordinary whole-row update (updateZoneSQL), and not ReplaceRecords, both of
+-- which bind every other column — a transfer outcome written through either
+-- would be a write that can revert an operator's concurrent edit to the same
+-- row, which is precisely the defect the transfer install already had to be
+-- fixed for once.
+-- BIGINT here, INTEGER on sqlite — matching refreshed_at/expires_at in 0004
+-- and last_attempt on lists in 0003. Postgres INTEGER is 32-bit and a unix
+-- millisecond timestamp passed that in 1970 + 24.8 days; sqlite's INTEGER is
+-- a variable-width signed 64-bit value regardless of the keyword.
+ALTER TABLE zones ADD COLUMN last_error TEXT NOT NULL DEFAULT '';
+ALTER TABLE zones ADD COLUMN last_attempt BIGINT NOT NULL DEFAULT 0;
+
+-- A zone that has transferred successfully did make an attempt, whatever this
+-- column was not there to record at the time. Seeding it from that success
+-- keeps "never attempted" meaning only that — the same backfill, for the same
+-- reason, as 0003 did for lists.
+UPDATE zones SET last_attempt = refreshed_at WHERE refreshed_at > 0;

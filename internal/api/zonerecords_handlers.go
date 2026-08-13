@@ -1,6 +1,7 @@
 package api
 
 import (
+	"errors"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -24,12 +25,6 @@ func pathRID(r *http.Request) (int64, bool) {
 	return id, err == nil && id > 0
 }
 
-// maxRecordTTL is the largest TTL RFC 2181 §8 allows a record to carry: the
-// top of a signed 32-bit range. A resolver reads anything above this as its
-// two's-complement wraparound — for a value with the high bit set, that
-// wraps to zero, meaning "never cache", the opposite of what was typed.
-const maxRecordTTL uint32 = 2147483647
-
 // zoneRecordWrite is the request body for both creating and replacing a
 // zone record.
 type zoneRecordWrite struct {
@@ -43,152 +38,68 @@ type zoneRecordWrite struct {
 	Comment string `json:"comment"`
 }
 
-// normalizeRecordName lowercases a record name and resolves it to
-// zoneName-relative form. "" and the zone apex both fold to "@" — the
-// convention zone_records.name and internal/zones already use
-// (zones.apexName).
+// recordWriteRefusal reports why zone's records may not be written through
+// the API, or "" when they may. Reads are never refused by it — a built-in
+// and a secondary are both listable and exportable.
 //
-// A name that already carries the zone's own apex as a suffix — a fully
-// qualified name typed out of habit, e.g. "www.e412.in" (or
-// "www.e412.in.") in zone "e412.in" — has that suffix stripped so it lands
-// on the same relative name as "www". Left un-stripped, absoluteRecordName
-// would silently double it into "www.e412.in.e412.in": it parses (ToRR
-// doesn't know any better), so nothing else would catch it.
-func normalizeRecordName(raw, zoneName string) string {
-	name := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(raw), "."))
-	zoneName = strings.ToLower(strings.TrimSuffix(zoneName, "."))
-	if name == "" || name == zoneName {
-		return "@"
+// Two zone types own their contents somewhere other than here:
+//
+//   - internal is seeded infrastructure (RFC 6303, internal/store/builtins.go),
+//     authored by a migration.
+//   - secondary is its primary's. A record written into one is not merged
+//     with what the next transfer sends and is not preserved by it — the
+//     transfer is a whole-zone replace (Transferrer.install), so the write
+//     is deleted at the next refresh. Until then the server answers it
+//     authoritatively, which is the part that makes silently accepting it
+//     worse than refusing it: the operator is told nothing, and the zone
+//     serves an answer that disagrees with its primary.
+//
+// 409 rather than 403 or 405: the request is well-formed and the caller is
+// permitted, and the same route accepts it for another zone. What refuses it
+// is the state of this zone — which is what 409 means, and what the built-in
+// refusal has always answered.
+func recordWriteRefusal(zone store.Zone) string {
+	switch strings.ToLower(zone.Type) {
+	case "internal":
+		return "built-in zones cannot be changed"
+	case "secondary":
+		return "a secondary zone's records come from its primary; change them there"
 	}
-	if suffix := "." + zoneName; strings.HasSuffix(name, suffix) {
-		if rel := strings.TrimSuffix(name, suffix); rel != "" {
-			return rel
-		}
-	}
-	return name
+	return ""
 }
 
-// absoluteRecordName rebuilds a record's owner FQDN from its zone-relative
-// name — the same "relative + apex" construction internal/zones/answer.go
-// uses when it builds an owner name to hand to ToRR.
-func absoluteRecordName(zoneName, relName string) string {
-	if relName == "@" {
-		return zoneName
-	}
-	return relName + "." + zoneName
-}
-
-// buildZoneRecord validates body against zone and its existing records and
-// returns the store.ZoneRecord ready to write. existing is every record
-// already in the zone (the full set, not pre-filtered by name); selfID and
-// hasSelf identify the record being replaced by a PUT so it is excluded
-// from the sibling/RRSet checks below — otherwise replacing a record would
-// always conflict with itself.
+// buildZoneRecord is the HTTP face of zones.BuildRecord: it validates body
+// against zone and its existing records and returns the store.ZoneRecord
+// ready to write, or the status and message to answer a refusal with.
 //
-// Check order is part of the contract, not an implementation detail: parse
-// (400), TTL range (400), apex CNAME (409), CNAME siblings both directions
-// (409), RRSet TTL match (409). See
+// The rules themselves live in internal/zones (record.go) because the AXFR
+// transfer has to enforce exactly these and cannot import this package. All
+// that is left here is the mapping from a refusal's kind to a status code:
+// a value that is wrong on its own terms is 400, a record that cannot
+// coexist with one already in the zone is 409. See
 // docs/superpowers/specs/2026-08-08-zones-design.md §6.
 func buildZoneRecord(zone store.Zone, body zoneRecordWrite, existing []store.ZoneRecord, selfID int64, hasSelf bool) (store.ZoneRecord, int, string, bool) {
-	name := normalizeRecordName(body.Name, zone.Name)
-	recType := strings.ToUpper(strings.TrimSpace(body.Type))
-	enabled := true
-	if body.Enabled != nil {
-		enabled = *body.Enabled
-	}
-	rec := store.ZoneRecord{
-		ZoneID:  zone.ID,
-		Name:    name,
-		Type:    recType,
+	rec, err := zones.BuildRecord(zone, zones.RecordWrite{
+		Name:    body.Name,
+		Type:    body.Type,
 		TTL:     body.TTL,
 		RData:   body.RData,
-		Enabled: enabled,
+		Enabled: body.Enabled,
 		Comment: body.Comment,
+	}, existing, selfID, hasSelf)
+	if err == nil {
+		return rec, 0, "", true
 	}
-
-	// Validation is dns.NewRR itself, via the same ToRR the resolver uses to
-	// build the RR it serves. One validator, so an accepted record is by
-	// construction a servable one — there is no second copy to drift from
-	// the parser.
-	rr, err := zones.ToRR(absoluteRecordName(zone.Name, name), rec)
-	if err != nil {
-		return store.ZoneRecord{}, http.StatusBadRequest, err.Error(), false
+	// Anything that is not a *RecordProblem would be a bug in BuildRecord
+	// rather than a caller error, so it falls to 400 with its own message
+	// rather than being swallowed: the alternative is a 500 that says
+	// nothing about a record the caller can see.
+	code := http.StatusBadRequest
+	var problem *zones.RecordProblem
+	if errors.As(err, &problem) && problem.Conflict {
+		code = http.StatusConflict
 	}
-
-	// What gets stored is the rdata that parse produced, not the text that
-	// was typed. The two are not interchangeable, because rdata is read back
-	// in two places that do not agree about what a given string means:
-	// ToRR reads it under no origin, where "nas.e412.in" is already
-	// absolute, and Render writes it into a master file under
-	// "$ORIGIN <zone>.", where that identical text is *relative* and means
-	// nas.e412.in.<zone>. Keeping the raw text let one record be served at
-	// one target and exported pointing at another — and a dotless absolute
-	// target is the spelling users arrive with, since Cloudflare and Route
-	// 53 both accept it.
-	//
-	// Every type is normalised, not just the ones whose rdata embeds a
-	// domain name, because origin ambiguity is not the only way raw text
-	// says more than the RR does: dns.NewRR reads one RR and silently
-	// discards whatever follows it, so an A record's rdata can carry a
-	// trailing newline and a second record's worth of text that validates,
-	// serves as nothing, and lands verbatim in the exported file. Scoping
-	// this to name-valued types would leave that standing, and would need a
-	// type list that goes stale as miekg/dns gains types. The cost is that
-	// a spelling with no ambiguity in it is still rewritten to the server's
-	// own ("hello" gains its quotes, an expanded IPv6 address contracts) —
-	// a change to how the value is written down, never to what it answers.
-	//
-	// This is a no-op on the import path. zones.Parse already derives
-	// ParsedRecord.RData through exactly this call (classify), so a record
-	// arriving from a zone file is normalised before it gets here, and
-	// spec §8's objection to normalising an imported file does not reach
-	// it — there is nothing left to normalise.
-	rec.RData = zones.RDataOf(rr)
-
-	// An rdata that parses to nothing is not a record. It gets this far
-	// because a value that is entirely a ';' comment, or only whitespace,
-	// is not a parse error for every type — dns.NewRR reads "TXT ; note" as
-	// a TXT whose rdata is simply absent, and says nothing. Stored, that row
-	// renders as "note 300 IN TXT " with nothing after the type, which no
-	// parser reads back, so the zone would export to a file it cannot
-	// reimport — the round trip spec §8 rests on. Still part of "the parser
-	// decides", just the half of its answer that is carried in the rdata it
-	// produced rather than in an error.
-	if rec.RData == "" {
-		return store.ZoneRecord{}, http.StatusBadRequest, "rdata is empty: it must carry the record's value, not only a comment", false
-	}
-
-	// RFC 2181 §8: reject a TTL a resolver would not read back as typed.
-	if rec.TTL > maxRecordTTL {
-		return store.ZoneRecord{}, http.StatusBadRequest, "ttl must not exceed 2147483647", false
-	}
-
-	// RFC 1912 §2.4: no CNAME at the zone apex. The zone's SOA lives on the
-	// zones row, not a zone_records row, so the sibling check below would
-	// see an apex with nothing recorded there and miss this on its own.
-	if name == "@" && recType == "CNAME" {
-		return store.ZoneRecord{}, http.StatusConflict, "CNAME is not allowed at the zone apex", false
-	}
-
-	for _, sib := range existing {
-		if sib.Name != name || (hasSelf && sib.ID == selfID) {
-			continue
-		}
-		// RFC 1034 §3.6.2: a CNAME must be the only record at its name, in
-		// both write orders — a CNAME landing beside an existing record, or
-		// a record landing beside an existing CNAME.
-		if recType == "CNAME" || sib.Type == "CNAME" {
-			return store.ZoneRecord{}, http.StatusConflict, "CNAME cannot coexist with another record at the same name", false
-		}
-		// RFC 2181 §5.2: every RR in an RRSet (same name, same type) must
-		// share one TTL, or the zone answers differently depending on which
-		// row a lookup happens to read first.
-		if sib.Type == recType && sib.TTL != rec.TTL {
-			return store.ZoneRecord{}, http.StatusConflict, "records in the same RRSet must share one TTL", false
-		}
-	}
-
-	return rec, 0, "", true
+	return store.ZoneRecord{}, code, err.Error(), false
 }
 
 // bumpZoneSerial increments the zone's SOA serial after a record mutation.
@@ -249,10 +160,8 @@ func (s *Server) handleZoneRecordCreate(w http.ResponseWriter, r *http.Request) 
 		storeErr(w, err)
 		return
 	}
-	// A built-in zone is seeded infrastructure (RFC 6303), not user content —
-	// see internal/store/builtins.go. Reads are fine; writes are not.
-	if zone.Type == "internal" {
-		errJSON(w, http.StatusConflict, "built-in zones cannot be changed")
+	if msg := recordWriteRefusal(zone); msg != "" {
+		errJSON(w, http.StatusConflict, msg)
 		return
 	}
 	body, err := decode[zoneRecordWrite](r)
@@ -300,10 +209,8 @@ func (s *Server) handleZoneRecordUpdate(w http.ResponseWriter, r *http.Request) 
 		storeErr(w, err)
 		return
 	}
-	// A built-in zone is seeded infrastructure (RFC 6303), not user content —
-	// see internal/store/builtins.go. Reads are fine; writes are not.
-	if zone.Type == "internal" {
-		errJSON(w, http.StatusConflict, "built-in zones cannot be changed")
+	if msg := recordWriteRefusal(zone); msg != "" {
+		errJSON(w, http.StatusConflict, msg)
 		return
 	}
 	body, err := decode[zoneRecordWrite](r)
@@ -356,10 +263,8 @@ func (s *Server) handleZoneRecordDelete(w http.ResponseWriter, r *http.Request) 
 		storeErr(w, err)
 		return
 	}
-	// A built-in zone is seeded infrastructure (RFC 6303), not user content —
-	// see internal/store/builtins.go. Reads are fine; writes are not.
-	if zone.Type == "internal" {
-		errJSON(w, http.StatusConflict, "built-in zones cannot be changed")
+	if msg := recordWriteRefusal(zone); msg != "" {
+		errJSON(w, http.StatusConflict, msg)
 		return
 	}
 	existing, err := s.deps.Store.Zones().Records(r.Context(), zid)

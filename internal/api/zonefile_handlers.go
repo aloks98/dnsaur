@@ -77,15 +77,6 @@ type zoneFileImport struct {
 	DryRun  *bool  `json:"dry_run"`
 }
 
-// zoneRecordChange is one record an import replaces in place: same name,
-// type and rdata, different TTL or enabled state. Both sides are reported
-// because making a destructive replace legible before it happens is the
-// dry run's entire job — "3 changed" with no values is not that.
-type zoneRecordChange struct {
-	From store.ZoneRecord `json:"from"`
-	To   store.ZoneRecord `json:"to"`
-}
-
 // zoneFileImportResult is what an import answers with, dry run or not: the
 // three-way diff between the zone as it is and the file as it would
 // replace it, or — when the file is rejected — one message per problem and
@@ -95,10 +86,13 @@ type zoneRecordChange struct {
 // marshals to `[]` rather than `null`, the convention the rest of the API's
 // list-shaped responses follow (see clientStore.Groups in store/sql.go).
 type zoneFileImportResult struct {
-	Add    []store.ZoneRecord `json:"add"`
-	Change []zoneRecordChange `json:"change"`
-	Delete []store.ZoneRecord `json:"delete"`
-	Errors []string           `json:"errors"`
+	// The three-way diff, spelled out field by field rather than embedding
+	// zones.RecordDiff, so the wire shape this endpoint answers with stays a
+	// property of this file and cannot be changed from another package.
+	Add    []store.ZoneRecord   `json:"add"`
+	Change []zones.RecordChange `json:"change"`
+	Delete []store.ZoneRecord   `json:"delete"`
+	Errors []string             `json:"errors"`
 	// Error is a one-line summary present only on a rejection, so this
 	// response still satisfies the API-wide rule that an error is a flat
 	// {"error": "<message>"} envelope (docs/api.md, "Conventions") — a
@@ -117,39 +111,10 @@ const errZoneFileRejected = "the zone file was rejected; nothing was written. Se
 func newZoneFileImportResult() zoneFileImportResult {
 	return zoneFileImportResult{
 		Add:    []store.ZoneRecord{},
-		Change: []zoneRecordChange{},
+		Change: []zones.RecordChange{},
 		Delete: []store.ZoneRecord{},
 		Errors: []string{},
 	}
-}
-
-// recordIdentity is what makes two rows the same record for diffing: the
-// RR itself. TTL and Enabled are the two attributes an import can change
-// on a record that stays; a different name, type or rdata is a different
-// record, and shows up as a delete plus an add.
-type recordIdentity struct{ name, recType, rdata string }
-
-// identify keys rec by its canonical RR. The rdata is normalized through
-// zones.ToRR — the same round trip zones.Parse's records have been through
-// (classify), and, since the rdata-normalisation fix, the one every new
-// write is stored in too. It is still done here rather than assumed,
-// because the store holds rows written before that fix and no migration
-// rewrote them: "ns.e412.in" and "ns.e412.in.", or a bare `hello` and a
-// quoted `"hello"`, are one RR spelled two ways, and compared literally
-// they would come out as a delete and an add of the same record on every
-// single import, churning row ids and burying the one real change in a
-// page of noise.
-//
-// A row ToRR cannot parse falls back to its literal rdata rather than
-// failing the import: it can only mean a record already in the store is
-// unservable, which is not this request's fault and not something a diff
-// can fix. It compares equal to nothing, so the import replaces it.
-func identify(zoneName string, rec store.ZoneRecord) recordIdentity {
-	rdata := rec.RData
-	if rr, err := zones.ToRR(absoluteRecordName(zoneName, rec.Name), rec); err == nil {
-		rdata = zones.RDataOf(rr)
-	}
-	return recordIdentity{name: rec.Name, recType: rec.Type, rdata: rdata}
 }
 
 // importRecordError names the record a validation failure is about. Line
@@ -242,11 +207,13 @@ func (s *Server) handleZoneFileImport(w http.ResponseWriter, r *http.Request) {
 		storeErr(w, err)
 		return
 	}
-	// A built-in zone is seeded infrastructure (RFC 6303), not user content —
-	// see internal/store/builtins.go. Reads are fine; writes are not, and an
-	// import is the largest write there is.
-	if zone.Type == "internal" {
-		errJSON(w, http.StatusConflict, "built-in zones cannot be changed")
+	// An import is the largest write there is, so the zones whose contents
+	// are authored elsewhere refuse it exactly as they refuse a single
+	// record — see recordWriteRefusal (zonerecords_handlers.go). For a
+	// secondary this is the write that mattered most: a file import replaces
+	// the whole zone, and the next transfer replaces it right back.
+	if msg := recordWriteRefusal(zone); msg != "" {
+		errJSON(w, http.StatusConflict, msg)
 		return
 	}
 	body, code, msg := readZoneFileImport(r)
@@ -332,63 +299,14 @@ func (s *Server) handleZoneFileImport(w http.ResponseWriter, r *http.Request) {
 // diffZoneRecords fills result's add/change/delete lists with what turning
 // existing into want would do.
 //
-// Records are matched by identity (name, type, rdata) rather than by row
-// id — the file carries no ids — and matched one for one, because nothing
-// in the schema stops a zone holding two identical rows: zone_records has
-// an index on (zone_id, name, type) but no uniqueness constraint anywhere
-// (migration 0004). Counting matches rather than testing membership is
-// what keeps two copies of a record in the zone and one in the file from
-// looking like no change at all.
+// The diff itself is zones.DiffRecords — the same one a zone transfer
+// installs through, for the reason record.go states: an automatic write path
+// with its own copy of the rules is this project's most repeated defect, and
+// that argument covers what a replace *does* as much as what it accepts.
+// All this adds is the import response's shape.
 func diffZoneRecords(zoneName string, existing, want []store.ZoneRecord, result zoneFileImportResult) zoneFileImportResult {
-	unmatched := map[recordIdentity][]store.ZoneRecord{}
-	for _, rec := range existing {
-		key := identify(zoneName, rec)
-		unmatched[key] = append(unmatched[key], rec)
-	}
-
-	matched := map[int64]bool{}
-	for _, rec := range want {
-		key := identify(zoneName, rec)
-		pool := unmatched[key]
-		if len(pool) == 0 {
-			result.Add = append(result.Add, rec)
-			continue
-		}
-		old := pool[0]
-		unmatched[key] = pool[1:]
-		matched[old.ID] = true
-
-		// The record survives, so it keeps its row id, and its comment: a
-		// master file has no way to carry one, so treating the file's
-		// silence as "no comment" would delete a note the file could never
-		// have preserved in the first place. Enabled comes from the file
-		// unconditionally — a record present in a master file is a record
-		// that is served (zones.Render omits disabled ones for exactly that
-		// reason), so importing a file that lists a currently-disabled
-		// record enables it.
-		rec.ID = old.ID
-		rec.Comment = old.Comment
-		if rec.TTL != old.TTL || rec.Enabled != old.Enabled {
-			result.Change = append(result.Change, zoneRecordChange{From: old, To: rec})
-		}
-	}
-
-	// Whatever no record in the file claimed. Tested by row id rather than
-	// by re-counting identities, because with duplicate rows the two are
-	// not the same question: recounting would name the first row carrying a
-	// leftover identity, which is the row the loop above just matched and
-	// may be about to update. Deleting that one and keeping its twin leaves
-	// the right number of records standing, so the zone still looks
-	// correct — but the update lands on a row that is already gone.
-	//
-	// existing is iterated rather than the map so deletes come back in the
-	// zone's own row order, the order every other endpoint lists records
-	// in; ranging a Go map would shuffle them on every request.
-	for _, rec := range existing {
-		if !matched[rec.ID] {
-			result.Delete = append(result.Delete, rec)
-		}
-	}
+	diff := zones.DiffRecords(zoneName, existing, want)
+	result.Add, result.Change, result.Delete = diff.Add, diff.Change, diff.Delete
 	return result
 }
 
@@ -418,19 +336,9 @@ func (s *Server) applyZoneFile(r *http.Request, zone store.Zone, pz zones.Parsed
 	// neither the file nor what it was.
 	ctx := context.WithoutCancel(r.Context())
 
-	// The store deletes by row id and nothing else, so that is what it is
-	// handed: a whole record here would carry five other fields it must not
-	// act on.
-	deleteIDs := make([]int64, 0, len(diff.Delete))
-	for _, rec := range diff.Delete {
-		deleteIDs = append(deleteIDs, rec.ID)
-	}
-	// Only the "to" side of each change is written. The "from" side exists
-	// for the caller's diff, not for the store.
-	updates := make([]store.ZoneRecord, 0, len(diff.Change))
-	for _, ch := range diff.Change {
-		updates = append(updates, ch.To)
-	}
+	// The two halves of the diff in the form ReplaceRecords takes them:
+	// deletes by row id, changes as their "to" side only.
+	rd := zones.RecordDiff{Add: diff.Add, Change: diff.Change, Delete: diff.Delete}
 
 	// The file's SOA becomes the zone's (RFC 1034 §3.6.1) — its NS, mbox,
 	// timers and its own TTL — with one exception. Taking the file's serial
@@ -457,5 +365,5 @@ func (s *Server) applyZoneFile(r *http.Request, zone store.Zone, pz zones.Parsed
 	zone.SOASerial = max(pz.SOA.Serial, zone.SOASerial) + 1
 	zone.ModifiedAt = time.Now().UnixMilli()
 
-	return s.deps.Store.Zones().ReplaceRecords(ctx, zone, deleteIDs, updates, diff.Add)
+	return s.deps.Store.Zones().ReplaceRecords(ctx, zone, rd.DeleteIDs(), rd.Updates(), rd.Add)
 }

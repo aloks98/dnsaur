@@ -31,10 +31,9 @@ type Option func(*Server)
 // letting a signed message through unchecked.
 func WithTSIGKeys(keys TSIGKeys) Option {
 	return func(s *Server) {
-		if keys == nil {
-			return
+		if p := NewTSIGProvider(keys); p != nil {
+			s.tsig = p
 		}
-		s.tsig = &tsigProvider{keys: keys}
 	}
 }
 
@@ -152,30 +151,10 @@ func (s *Server) serve(w dns.ResponseWriter, m *dns.Msg) {
 		sig = replyTSIG(resp.Msg, key, m.IsTsig())
 	}
 
+	// TCP is never truncated: it has no datagram limit to fit inside, and a
+	// zone transfer only ever arrives there.
 	if _, isUDP := w.RemoteAddr().(*net.UDPAddr); isUDP {
-		size := 512
-		if opt := m.IsEdns0(); opt != nil {
-			size = int(opt.UDPSize())
-		}
-		// RFC 6891 §6.2.5: clamp UDP size to minimum 512.
-		// miekg's Truncate also floors at MinMsgSize (512); kept as defense-in-depth
-		// against dependency behavior changes.
-		if size < 512 {
-			size = 512
-		}
-		// Truncate refuses outright to touch a message that already carries a
-		// TSIG (msg_truncate.go:30), so the signature has to be attached
-		// afterwards — and its bytes taken out of the budget first, or a
-		// signed reply overshoots the size the client advertised. Truncate
-		// floors at 512 itself, so there is nothing to reserve from a budget
-		// that small; a client that wants signed answers over UDP without
-		// risking a drop should advertise EDNS room for them.
-		if sig != nil {
-			if reserved := size - (dns.Len(sig) + maxTSIGMACLen); reserved >= 512 {
-				size = reserved
-			}
-		}
-		resp.Msg.Truncate(size)
+		fitUDP(resp.Msg, udpBudget(m), sig)
 	}
 	if sig != nil {
 		resp.Msg.Extra = append(resp.Msg.Extra, sig)
@@ -183,4 +162,146 @@ func (s *Server) serve(w dns.ResponseWriter, m *dns.Msg) {
 	if err := w.WriteMsg(resp.Msg); err != nil {
 		slog.Error("write response error", "err", err)
 	}
+}
+
+// udpBudget reports how many bytes a UDP reply to req may occupy on the wire.
+func udpBudget(req *dns.Msg) int {
+	size := dns.MinMsgSize
+	if opt := req.IsEdns0(); opt != nil {
+		size = int(opt.UDPSize())
+	}
+	// RFC 6891 §6.2.3: "Values lower than 512 MUST be treated as equal to 512."
+	// Msg.Truncate floors there too, but fitUDP subtracts the signature's bytes
+	// from this number before Truncate ever sees it, so the floor has to be
+	// applied here as well or the reservation would come out of a budget that
+	// was never real — and a client advertising 256 would get a TC for an
+	// answer that fits.
+	if size < dns.MinMsgSize {
+		size = dns.MinMsgSize
+	}
+	return size
+}
+
+// fitUDP trims reply so that what finally goes on the wire fits budget,
+// including the TSIG that sig will grow into if there is one.
+//
+// The order is the fix. Msg.Truncate silently does nothing at all to a message
+// that already carries a TSIG (msg_truncate.go:30, "to simplify this
+// implementation"), so the signature cannot be attached first; and its bytes
+// have to leave the budget before truncating, or the signature puts the reply
+// straight back over the size the client can receive. Truncating to 512 and
+// then attaching the stub is what answered a 512-byte client with 564 bytes and
+// no TC bit — an over-size packet with nothing telling the client to retry.
+func fitUDP(reply *dns.Msg, budget int, sig *dns.TSIG) {
+	if sig == nil {
+		reply.Truncate(budget)
+		return
+	}
+	// The stub carries no MAC yet; WriteMsg fills one in, at most 64 bytes. The
+	// signed RR is appended to the packed message whole and uncompressed
+	// (tsig.go:207-211), so dns.Len is its exact contribution.
+	budget -= dns.Len(sig) + maxTSIGMACLen
+	if budget >= dns.MinMsgSize {
+		reply.Truncate(budget)
+		return
+	}
+
+	// Below 512 Truncate is no help: it raises any smaller size back up to 512
+	// (msg_truncate.go:40), the number already overshot. A client that
+	// advertised no EDNS size has a bare 512-byte budget, so for a signed reply
+	// this is the ordinary case rather than a corner.
+	if fitsIn(reply, budget) {
+		return
+	}
+	// It does not fit, and RFC 8945 §5.3 mandates exactly what to send instead:
+	//
+	//	"If addition of the TSIG record will cause the message to be
+	//	truncated, the server MUST alter the response so that a TSIG can be
+	//	included. This response contains only the question and a TSIG record,
+	//	has the TC bit set, and has an RCODE of 0 (NOERROR). At this point,
+	//	the client SHOULD retry the request using TCP (as per Section 4.2.2
+	//	of [RFC1035])."
+	//
+	// So: no records, TC set, NOERROR, still signed. Nothing is salvaged from
+	// the sections, and RFC 2181 §9 is why that costs the client nothing — on
+	// a TC reply it "should ignore that response, and query again" over a
+	// transport that permits larger replies, so any records left behind are
+	// bytes it discards. That also settles the alternative of re-implementing
+	// the library's compression-aware record fitting to keep a partial answer:
+	// the spec does not permit it here, and the client would not use it.
+	//
+	// The rcode reset is the part that looks wrong and is not. An NXDOMAIN
+	// whose authority section overflows goes out as NOERROR+TC; the client
+	// learns the real rcode when it asks again over TCP, and §5.3 requires the
+	// reply that fits to make no claim it cannot carry the records for.
+	//
+	// The signature still goes on below, which §5.3 is the whole point of: an
+	// unsigned instruction to switch transports is one an off-path attacker can
+	// forge, and a peer that required authentication would be right to reject
+	// it.
+	reply.Rcode = dns.RcodeSuccess
+	reply.Truncated = true
+	reply.Answer = nil
+	reply.Ns = nil
+	reply.Extra = ednsOnly(reply.Extra)
+	// Setting Rcode is enough to cover an extended rcode too, including one a
+	// kept OPT is already carrying in its TTL: Msg.Pack rewrites that field
+	// from Rcode whenever an OPT is present rather than only for rcodes above
+	// 15, "to allow resetting the extended rcode bits if they need to"
+	// (msg.go:744-747). Pinned end to end, because it is a property of the
+	// library rather than of anything here.
+	//
+	// A question and a key name long enough that even this overshoots would
+	// still go out over-size. It is unreachable while dns.Server.UDPSize keeps
+	// miekg's default: unset, it becomes MinMsgSize (server.go:287-288), so no
+	// more than 512 bytes of query are ever read, and an empty reply is the
+	// question and the TSIG that arrived with it plus the MAC. Raising UDPSize
+	// would make it reachable — and it stays accepted rather than guarded even
+	// then, because there is no smaller correct reply: dropping the signature
+	// would answer a peer that required authentication with something it must
+	// refuse, and refusing outright would lose the retry-over-TCP signal, which
+	// by that point is the only useful thing left to say.
+}
+
+// fitsIn reports whether reply packs into n bytes, leaving reply.Compress set
+// to whatever made that true. It mirrors the order Msg.Truncate uses:
+// uncompressed first, because compressing a reply that already fits is wasted
+// work, then compressed.
+//
+// The size is measured by packing rather than estimated, because dns.Len is the
+// uncompressed length only. Guessing high would send a client to TCP for an
+// answer that would have fit — the 479-byte reply that started this is 269
+// bytes compressed, and comfortably inside a signed 512.
+func fitsIn(reply *dns.Msg, n int) bool {
+	reply.Compress = false
+	if reply.Len() <= n {
+		return true
+	}
+	reply.Compress = true
+	b, err := reply.Pack()
+	return err == nil && len(b) <= n
+}
+
+// ednsOnly reduces an additional section to its OPT record, if it has one.
+//
+// This is a real conflict between two MUSTs, resolved rather than overlooked.
+// RFC 8945 §5.3 says the truncated response "contains only the question and a
+// TSIG record". RFC 6891 §6.1.1 says "if an OPT record is present in a received
+// request, compliant responders MUST include an OPT record in their respective
+// responses". Both cannot hold for a signed, truncated answer to an EDNS query.
+//
+// The OPT is kept. It is 11 bytes that cannot push any reply over any budget;
+// §5.3's sentence is describing the minimal response, in a document about TSIG,
+// rather than legislating about a pseudo-RR that carries transport parameters
+// and no answer data; and an EDNS query answered without EDNS is a result some
+// resolvers read as a broken server and downgrade against, which would make the
+// TC unusable for the retry it exists to prompt. A reader who weighs it the
+// other way should know this is a deliberate reading of §5.3, not an omission.
+func ednsOnly(extra []dns.RR) []dns.RR {
+	for _, rr := range extra {
+		if opt, ok := rr.(*dns.OPT); ok {
+			return []dns.RR{opt}
+		}
+	}
+	return nil
 }

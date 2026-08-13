@@ -364,7 +364,7 @@ func TestZoneFileRoundTripPreservesNameValuedAnswers(t *testing.T) {
 
 			seedRecords(t, srv, zid, []roundTripSeed{{name: c.name, recType: c.recType, ttl: c.ttl, rdata: c.rdata}})
 			assertRoundTripPreservesAnswers(t, srv, res, zid, []roundTripAsk{{
-				qname: absoluteRecordName(c.zone, normalizeRecordName(c.name, c.zone)),
+				qname: zones.RecordFQDN(c.zone, zones.RelRecordName(c.name, c.zone)),
 				qtype: c.qtype,
 				want:  c.want,
 			}})
