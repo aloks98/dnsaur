@@ -153,6 +153,22 @@ test("first-run setup, login, create a zone and add a record, dark mode persists
   // Adding leaves the row empty and ready for the next record.
   await expect(page.getByLabel("Zone record name")).toHaveValue("");
 
+  // --- set an allow transfer, through the real handler -------------------
+  // allow_transfer is default-deny — a zone created with none set answers
+  // every transfer REFUSED — so this field is the only door into letting a
+  // secondary pull it at all. Worth a real round trip through the actual
+  // PATCH handler and its own store write (Task 10's own D3 field), not
+  // just the mocked one the Vitest suite exercises; persistence across a
+  // reload (below, alongside dark mode's own) is what proves it was really
+  // written rather than only held in this tab's state.
+  // Read is the default state; the pencil opens the field.
+  await expect(page.getByText("No peer may transfer this zone.")).toBeVisible();
+  await page.getByRole("button", { name: "Edit allow transfer" }).click();
+  await page.getByLabel("Allow transfer", { exact: true }).fill("10.0.0.0/24");
+  await page.getByRole("button", { name: "Save", exact: true }).click();
+  await expect(page.getByText("No peer may transfer this zone.")).toBeHidden();
+  await expect(page.getByText("10.0.0.0/24")).toBeVisible();
+
   // --- export the zone, then re-import the file it produced -------------
   // A round trip, so the imported file is guaranteed to be one this
   // server's own renderer emits rather than a fixture hand-written against
@@ -202,6 +218,10 @@ test("first-run setup, login, create a zone and add a record, dark mode persists
   ).toHaveAttribute("aria-current", "page");
   await expect(page.locator("html")).toHaveClass(/dark/);
   await expect(row).toBeVisible(); // the record survived the reload too
+  // …and so did the allow transfer — read back from the server, not the tab,
+  // and shown in read mode (the default on a fresh load) rather than the
+  // input a click on the pencil would have to open first.
+  await expect(page.getByText("10.0.0.0/24")).toBeVisible();
 
   // --- create a TSIG key against the real handler -----------------------
   // Last, because it navigates away from the zone the assertions above are

@@ -87,16 +87,22 @@ type App struct {
 	// current. Different schedules, different stores, same shape.
 	refresher   *filter.Refresher
 	zoneRefresh *zones.Refresher
-	logger      *qlog.Logger
-	fwd         *swappable
-	servers     []*dnssrv.Server
-	apiSrv      *http.Server
-	apiAddr     string
-	apiCancel   context.CancelFunc
-	bg          []func(context.Context)
-	cancel      context.CancelFunc
-	ready       chan struct{}
-	wg          sync.WaitGroup
+	// xfrOut answers AXFR and IXFR from a.st.Zones() — the D3 counterpart of
+	// zoneRefresh's D2 client. Constructed once here and attached to every
+	// listener in Start via dnssrv.WithTransfers, the same way the key store
+	// is: live, not a snapshot, so a zone's allow_transfer edited through the
+	// API governs the next transfer rather than the next restart.
+	xfrOut    *zones.TransferServer
+	logger    *qlog.Logger
+	fwd       *swappable
+	servers   []*dnssrv.Server
+	apiSrv    *http.Server
+	apiAddr   string
+	apiCancel context.CancelFunc
+	bg        []func(context.Context)
+	cancel    context.CancelFunc
+	ready     chan struct{}
+	wg        sync.WaitGroup
 }
 
 func New(ctx context.Context, cfg *config.Config, version string) (*App, error) {
@@ -135,6 +141,12 @@ func New(ctx context.Context, cfg *config.Config, version string) (*App, error) 
 	// signs the next transfer, not the next restart.
 	a.zoneRefresh = zones.NewRefresher(st.Zones(),
 		zones.NewTransferrer(st.Zones(), st.TSIGKeys(), zones.WithReload(a.resolver.Reload)))
+	// The other direction: what a.zoneRefresh's Transferrer pulls from
+	// someone else's TransferServer, this one serves to a peer pulling from
+	// us. It reads a.resolver's live snapshot, so a zone this server
+	// authors is transferred as of its last reload, the same data an
+	// ordinary query would get.
+	a.xfrOut = zones.NewTransferServer(a.resolver, st.Zones())
 	return a, nil
 }
 
@@ -286,7 +298,12 @@ func (a *App) Start(ctx context.Context) error {
 	for _, addr := range a.cfg.DNSListen {
 		// The key store, not a snapshot of it: a key created through the API
 		// is live on the next signed message rather than the next restart.
-		s := dnssrv.NewServer(addr, handler, dnssrv.WithTSIGKeys(a.st.TSIGKeys()))
+		// a.xfrOut is the same TransferServer on every listener, so a
+		// transfer answers identically regardless of which address a peer
+		// dials.
+		s := dnssrv.NewServer(addr, handler,
+			dnssrv.WithTSIGKeys(a.st.TSIGKeys()),
+			dnssrv.WithTransfers(a.xfrOut))
 		if err := s.Start(); err != nil {
 			return err
 		}

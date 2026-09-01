@@ -62,12 +62,12 @@ const (
 	zoneTypeSecondary = "secondary"
 )
 
-// checkZoneTransferConfig validates the (type, primaries, tsig_key_id)
-// triple as the zone would be stored, for create and patch alike — a rule
-// enforced on POST and not on PATCH is a rule with a way around it. It
-// returns the status code and message to answer with, or 0 when the
-// configuration is sound.
-func (s *Server) checkZoneTransferConfig(ctx context.Context, zoneType, primaries string, tsigKeyID int64) (int, string) {
+// checkZoneTransferConfig validates the (type, primaries, tsig_key_id,
+// allow_transfer) quad as the zone would be stored, for create and patch
+// alike — a rule enforced on POST and not on PATCH is a rule with a way
+// around it. It returns the status code and message to answer with, or 0
+// when the configuration is sound.
+func (s *Server) checkZoneTransferConfig(ctx context.Context, zoneType, primaries string, tsigKeyID int64, allowTransfer string) (int, string) {
 	if zoneType == zoneTypeSecondary {
 		// Syntax only, deliberately: zones.ValidatePrimaries does not
 		// resolve, so a primary named by hostname is stored as written and
@@ -98,7 +98,43 @@ func (s *Server) checkZoneTransferConfig(ctx context.Context, zoneType, primarie
 			return http.StatusBadRequest, "tsig_key_id does not name an existing TSIG key"
 		}
 	}
+	if allowTransfer != "" {
+		if err := zones.ValidateACL(allowTransfer); err != nil {
+			return http.StatusBadRequest, err.Error()
+		}
+		// A key: entry that names nothing is an ACL entry that can never
+		// match, so the transfer it was written to permit would be refused
+		// with no indication why. Caught here, exactly as tsig_key_id is, and
+		// guarded from the other end by tsigKeyStore.Delete.
+		for _, name := range zones.ACLKeys(allowTransfer) {
+			if _, found, err := s.deps.Store.TSIGKeys().ByName(ctx, name); err != nil {
+				return http.StatusServiceUnavailable, "storage unavailable"
+			} else if !found {
+				return http.StatusBadRequest, "allow_transfer names TSIG key " + name + ", which does not exist"
+			}
+		}
+	}
 	return 0, ""
+}
+
+// canonicalAllowTransfer parses input and returns it in zones.FormatACL's
+// canonical spelling — the form Task 2's TSIG-key delete guard matches
+// key:<name> against in SQL. input == "" (deny) returns "" without parsing.
+//
+// Called after checkZoneTransferConfig has already validated the same
+// string via zones.ValidateACL, so the error here is unreachable in
+// practice; it is checked rather than discarded because errcheck cannot
+// know that, and because a re-parse that silently swallowed a failure would
+// be one call away from storing whatever ParseACL gave up on.
+func canonicalAllowTransfer(input string) (string, error) {
+	if input == "" {
+		return "", nil
+	}
+	parsed, err := zones.ParseACL(input)
+	if err != nil {
+		return "", err
+	}
+	return zones.FormatACL(parsed), nil
 }
 
 // normalizeZoneName lowercases name, strips a trailing dot, and validates
@@ -163,6 +199,12 @@ type zoneCreate struct {
 	// Optional (0 means the transfer is unsigned), but when set it must name
 	// a key that exists.
 	TSIGKeyID int64 `json:"tsig_key_id"`
+	// AllowTransfer is who may pull this zone by AXFR: a comma-separated
+	// list of address, CIDR, or key:<tsig name> — see zones.ParseACL for the
+	// format. Optional; empty means deny every transfer, which is the
+	// default. Unlike Primaries, this applies to both primary and secondary
+	// zones — a secondary re-serves what it pulled (§9.5.3).
+	AllowTransfer string `json:"allow_transfer"`
 	// Enabled is a pointer so "not sent" differs from "false".
 	Enabled *bool `json:"enabled"`
 	// SOA fields, all optional: omitted means the generated default, so a
@@ -194,8 +236,13 @@ func (s *Server) handleZoneCreate(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusBadRequest, "only primary and secondary zones are supported")
 		return
 	}
-	if code, msg := s.checkZoneTransferConfig(r.Context(), zoneType, body.Primaries, body.TSIGKeyID); code != 0 {
+	if code, msg := s.checkZoneTransferConfig(r.Context(), zoneType, body.Primaries, body.TSIGKeyID, body.AllowTransfer); code != 0 {
 		errJSON(w, code, msg)
+		return
+	}
+	allowTransfer, err := canonicalAllowTransfer(body.AllowTransfer)
+	if err != nil {
+		errJSON(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	enabled := true
@@ -244,10 +291,13 @@ func (s *Server) handleZoneCreate(w http.ResponseWriter, r *http.Request) {
 		SOATTL: defaultSOATTL,
 		// Empty and 0 for a primary, both already checked by
 		// checkZoneTransferConfig above.
-		Primaries:  body.Primaries,
-		TSIGKeyID:  body.TSIGKeyID,
-		CreatedAt:  now,
-		ModifiedAt: now,
+		Primaries: body.Primaries,
+		TSIGKeyID: body.TSIGKeyID,
+		// The canonical spelling, not body.AllowTransfer — see
+		// canonicalAllowTransfer.
+		AllowTransfer: allowTransfer,
+		CreatedAt:     now,
+		ModifiedAt:    now,
 	})
 	if err != nil {
 		storeErrDup(w, err, "a zone with that name already exists")
@@ -305,6 +355,9 @@ type zonePatch struct {
 	// checkZoneTransferConfig.
 	Primaries *string `json:"primaries"`
 	TSIGKeyID *int64  `json:"tsig_key_id"`
+	// AllowTransfer, unlike Primaries and TSIGKeyID, applies to both
+	// primary and secondary zones — see zoneCreate.AllowTransfer.
+	AllowTransfer *string `json:"allow_transfer"`
 }
 
 func (s *Server) handleZonePatch(w http.ResponseWriter, r *http.Request) {
@@ -373,14 +426,27 @@ func (s *Server) handleZonePatch(w http.ResponseWriter, r *http.Request) {
 	if body.TSIGKeyID != nil {
 		z.TSIGKeyID = *body.TSIGKeyID
 	}
+	if body.AllowTransfer != nil {
+		z.AllowTransfer = *body.AllowTransfer
+	}
 	// Checked on the merged zone rather than on the body: a patch that sets
 	// type without primaries, or clears primaries without changing type,
 	// leaves a secondary with nowhere to pull from either way, and only the
 	// result says which.
-	if code, msg := s.checkZoneTransferConfig(r.Context(), z.Type, z.Primaries, z.TSIGKeyID); code != 0 {
+	if code, msg := s.checkZoneTransferConfig(r.Context(), z.Type, z.Primaries, z.TSIGKeyID, z.AllowTransfer); code != 0 {
 		errJSON(w, code, msg)
 		return
 	}
+	// The canonical spelling, not whatever was sent — see
+	// canonicalAllowTransfer. A no-op when AllowTransfer wasn't in the
+	// request: the value just read back from the store is already
+	// canonical.
+	allowTransfer, err := canonicalAllowTransfer(z.AllowTransfer)
+	if err != nil {
+		errJSON(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	z.AllowTransfer = allowTransfer
 	z.ModifiedAt = time.Now().UnixMilli()
 
 	if err := s.deps.Store.Zones().UpdateZone(r.Context(), z); err != nil {

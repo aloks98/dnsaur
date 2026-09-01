@@ -92,6 +92,20 @@ func (t *tsigKeyStore) Update(ctx context.Context, k TSIGKey) error {
 		k.Name, k.Algorithm, k.Secret, k.ID)
 }
 
+// aclKeyRef reports the SQL that finds a zone whose allow_transfer names
+// tsig_keys.name. Both halves are wrapped in commas so a name cannot match a
+// longer one that contains it, and the substring function is dialect-specific
+// because LIKE would treat an underscore in a key name -- legal in a domain
+// name -- as a wildcard, silently refusing to delete unrelated keys.
+func aclKeyRef(dialect string) string {
+	fn := "instr"
+	if dialect == "postgres" {
+		fn = "strpos"
+	}
+	return `SELECT 1 FROM zones WHERE ` + fn +
+		`(',' || replace(zones.allow_transfer, ' ', '') || ',', ',key:' || tsig_keys.name || ',') > 0`
+}
+
 // Delete removes a key unless a zone still names it, in which case it
 // returns ErrInUse and the API answers 409. A secondary that lost its key
 // would keep trying to transfer and keep being refused by its primary, with
@@ -139,7 +153,9 @@ func (t *tsigKeyStore) Update(ctx context.Context, k TSIGKey) error {
 // same way an unreachable primary surfaces — not silent breakage.
 func (t *tsigKeyStore) Delete(ctx context.Context, id int64) error {
 	res, err := t.s.db.ExecContext(ctx, t.s.q(
-		`DELETE FROM tsig_keys WHERE id = ? AND NOT EXISTS (SELECT 1 FROM zones WHERE zones.tsig_key_id = tsig_keys.id)`), id)
+		`DELETE FROM tsig_keys WHERE id = ?
+		   AND NOT EXISTS (SELECT 1 FROM zones WHERE zones.tsig_key_id = tsig_keys.id)
+		   AND NOT EXISTS (`+aclKeyRef(t.s.dialect)+`)`), id)
 	if err != nil {
 		return wrapDBErr(err)
 	}

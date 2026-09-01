@@ -27,7 +27,8 @@ function key(overrides: Partial<TSIGKey> = {}): TSIGKey {
   };
 }
 
-/** A zone that names a TSIG key — the only field of it this screen reads. */
+/** A zone that names a TSIG key — the only fields of it this screen reads
+ * are tsig_key_id and allow_transfer. */
 function zone(overrides: Partial<Zone> = {}): Zone {
   return {
     id: 1,
@@ -48,6 +49,10 @@ function zone(overrides: Partial<Zone> = {}): Zone {
     refreshed_at: 0,
     last_error: "",
     last_attempt: 0,
+    allow_transfer: "",
+    last_xfr_at: 0,
+    last_xfr_peer: "",
+    last_xfr_error: "",
     created_at: Date.now() - 86_400_000,
     modified_at: Date.now() - 60_000,
     ...overrides,
@@ -406,6 +411,65 @@ test("the USED BY column counts the zones that name each key", async () => {
   // "—", not "0": the column answers "what depends on this", and nothing is
   // not a quantity.
   expect(within(rows()[2]).getByText("—")).toBeInTheDocument();
+});
+
+// D3: a key can also be referenced from the other direction — named in a
+// zone's allow_transfer rather than held as that zone's own tsig_key_id
+// (which is who a *secondary* signs its own pulls with; allow_transfer is
+// who may pull *this* zone). Both are real dependents, so both must count.
+test("a key named only by a zone's allow_transfer counts as in use too", async () => {
+  mockKeys([key({ id: 1, name: "xfer.e412.in." }), key({ id: 2, name: "solo.e412.in." })]);
+  mockZones([
+    // Names key 1 as its own signing key, and key 2 in its allow_transfer —
+    // one zone, two different kinds of reference, two different keys.
+    zone({ id: 10, tsig_key_id: 1, allow_transfer: "key:solo.e412.in." }),
+  ]);
+  renderWithProviders(<TSIGKeys />);
+  await waitFor(() => expect(rows()).toHaveLength(2));
+
+  expect(within(rows()[0]).getByText("1 zone")).toBeInTheDocument();
+  expect(within(rows()[1]).getByText("1 zone")).toBeInTheDocument();
+});
+
+// A key can be referenced both ways by the same zone, or by different
+// zones, without being double-counted from one and undercounted from the
+// other — each zone contributes at most one to a key's count.
+test("a key named by both tsig_key_id and allow_transfer on the same zone counts once", async () => {
+  mockKeys([key({ id: 1, name: "xfer.e412.in." })]);
+  mockZones([zone({ id: 10, tsig_key_id: 1, allow_transfer: "key:xfer.e412.in." })]);
+  renderWithProviders(<TSIGKeys />);
+  await waitFor(() => expect(rows()).toHaveLength(1));
+
+  expect(within(rows()[0]).getByText("1 zone")).toBeInTheDocument();
+});
+
+// The store refuses to delete a key an ACL names, on the same terms as one
+// named by tsig_key_id — so the screen has to say so before the click, not
+// let it 409. Reuses the existing disabled-delete affordance and copy.
+test("a key an allow_transfer names cannot be deleted, and the confirm says why", async () => {
+  const user = userEvent.setup();
+  let deleted = false;
+  mockKeys([key({ id: 5, name: "solo.e412.in." })]);
+  mockZones([zone({ id: 10, allow_transfer: "key:solo.e412.in." })]);
+  server.use(
+    http.delete("/api/v1/tsig-keys/5", () => {
+      deleted = true;
+      return new HttpResponse(null, { status: 204 });
+    }),
+  );
+  renderWithProviders(<TSIGKeys />);
+  await waitFor(() => expect(rows()).toHaveLength(1));
+
+  await user.click(screen.getByRole("button", { name: /delete solo\.e412\.in\./i }));
+  expect(
+    await screen.findByText("In use by 1 zone. Remove it from them first."),
+  ).toBeInTheDocument();
+  const confirm = screen.getByRole("button", { name: /^delete$/i });
+  expect(confirm).toBeDisabled();
+
+  await user.click(confirm);
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  expect(deleted).toBe(false);
 });
 
 // The server refuses this delete with 409 (tsigKeyStore.Delete, one

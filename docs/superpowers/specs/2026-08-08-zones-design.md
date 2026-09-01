@@ -468,6 +468,17 @@ clear, so the DB file is now credential material.**
 **`zone_acl`** — which peers may transfer which zone. No ACL concept exists
 anywhere today. Default deny.
 
+**D3 declined the `zone_acl` table (decided 2026-08-13).** What shipped is a
+single `allow_transfer` column on `zones`, in the shape `primaries` already
+has, parsed by `zones.ParseACL` into the same `[]ACLEntry` a table would have
+produced. An entry carries no per-entry state worth a row — no timestamp, no
+status, nothing that changes without the operator editing it — so a table
+would have bought per-entry comments in exchange for a migration, four routes,
+an OpenAPI section and a list editor, while the column rides `PATCH
+/zones/{id}` and the field beside Primaries. If per-entry metadata ever earns
+its keep, moving to a table is a data move rather than a redesign, because the
+parsed form is already what the table would hold. See §9.5.4 for the format.
+
 **`zone_journal`** — IXFR deltas: per zone, per serial, the RRs added and
 removed. Greenfield; miekg gives no journal, no delta computation and no serial
 history, and `BumpSerial` (`store/zones.go:183`) increments while recording
@@ -514,12 +525,433 @@ path or accepts a measured cost — decide with a benchmark, not by assertion.
 
 ### 9.5 Inbound: dnsaur as primary
 
-The hardest item, and entirely greenfield.
+The hardest item, and entirely greenfield. Designed 2026-08-13. Every library
+claim below was read out of `miekg/dns@v1.1.72` before it was written, and
+every RFC sentence is quoted from the RFC rather than recalled.
 
-- The intercept of 9.1 is what gives `Transfer.Out` the raw writer.
-- **Envelope batching is ours.** `xfr.go:229` reads "assume it fits
-  TODO(miek): fix" — the library does not split a zone into messages that fit.
-- The allow-transfer ACL gates it, default deny, TSIG-or-address.
+A note on vocabulary, because the two halves of Milestone D invert it. §9.4's
+"outbound" and this section's "inbound" name the direction the *zone data*
+moves relative to dnsaur. The code says what it does instead: `Transferrer`
+pulls a zone (D2), `TransferServer` serves one (D3).
+
+#### 9.5.1 The intercept
+
+§9.1 established that this cannot be a middleware. The branch goes in
+`Server.serve` (`dnssrv/server.go:112`), taken on qtype AXFR or IXFR before
+the `Request` is built, handing the raw `dns.ResponseWriter` to a handler
+supplied at construction:
+
+```go
+// dnssrv
+type Transfers interface {
+	ServeTransfer(ctx context.Context, w dns.ResponseWriter, q *dns.Msg, key string, tsigErr error)
+}
+
+func WithTransfers(t Transfers) Option
+```
+
+The TSIG verdict is passed in rather than recomputed. `serve` already asks
+`RequireTSIG` once (`dnssrv/tsig.go:199`), and a transfer must act on the same
+answer the rest of the server would have acted on — two callers of the same
+check are two chances for them to disagree. `internal/zones` implements the
+interface, so `dnssrv` learns nothing about zones, exactly as `WithTSIGKeys`
+taught it nothing about the store beyond one lookup.
+
+With no handler attached the branch is not taken and an AXFR falls through the
+pipeline as it does today. That is a test-only configuration — `app.go` always
+attaches one — and leaving it alone keeps this change from altering behaviour
+it is not about.
+
+The three hazards the intercept exists to route around, all named in §9.1: the
+5-second handler context (`dnssrv/server.go:113`) that would abort a large
+transfer, the OPT force-add (`dnssrv/server.go:140`) that would stamp OPT onto
+every envelope, and qlog, the filter, the cache and the forwarder, none of
+which mean anything for a transfer.
+
+#### 9.5.2 Where the zone comes from
+
+The served snapshot, not the store: the handler reads the same
+`atomic.Pointer[Index]` the query path reads (`zones/resolver.go:118`).
+
+Three consequences, all of them wanted. A transfer costs no database read, so
+a peer cannot drive store load. What a secondary receives is by construction
+what a querier is being answered from — disabled records were already dropped
+at snapshot build (`zones/zone.go:37`), and a disabled zone is already not
+served. And a transfer that overlaps a `Reload` sees one consistent zone
+rather than a mixture, which is what the atomic swap is for.
+
+The cost is that a write becomes transferable only once `Reload` has run.
+Every write path already calls it (`app.go`, `ReloadZones`), so it is the same
+lag queries have, and a secondary is a cache with an SOA refresh timer rather
+than a synchronous replica.
+
+`Index.Find` walks suffixes for the closest enclosing zone
+(`zones/zone.go:135`), which is the wrong lookup here: an AXFR names an apex
+and nothing else, and a query for `sub.e412.in` must not transfer `e412.in`.
+D3 adds `Index.Apex(name)`, an exact match on the `byApex` map already built.
+
+#### 9.5.3 What may be transferred
+
+| Zone type | Answer |
+|---|---|
+| `primary` | the zone |
+| `secondary` | the zone, but only while `Serving()` (`zones/answer.go:92`) — never before its first transfer, never past `expires_at` |
+| `internal` | refused: the RFC 6303 built-ins are empty by construction |
+| `forwarder`, `stub` | refused: they hold no data to send |
+
+A secondary re-serving what it pulled is deliberate and nearly free — the
+`Serving()` gate D2 built is the whole of it. Refusing while not serving is
+the same judgement §9.8 records for queries: a copy this server cannot vouch
+for is one it does not hand on.
+
+#### 9.5.4 `allow_transfer`: the format and the gate
+
+Comma-separated, whitespace tolerated, empty means deny every transfer. Each
+entry is one of:
+
+- an IP address — `192.168.1.5`, `2001:db8::5` — matched as `/32` or `/128`
+- a CIDR prefix — `10.0.0.0/24`
+- `key:<name>` — the request must carry a TSIG that verified under that key
+
+```
+allow_transfer = "10.0.0.0/24, 192.168.1.5, key:secondary-ns2"
+```
+
+Entries are OR'd: any one match allows the transfer. The peer address matched
+against them comes from `w.RemoteAddr()` and **must be unmapped first**, the
+way `serve` already unmaps it (`dnssrv/server.go:122`): a v4-mapped
+`::ffff:10.0.0.5` arriving on a dual-stack socket does not match
+`10.0.0.0/24`, and the failure mode is an ACL that looks right and denies
+everything.
+
+Unlike `primaries`, parsing needs no context and no resolver
+(`zones/primaries.go:80` takes both, because a primary may be named by
+hostname) — an ACL is matched against a socket address on every request, so a
+hostname here would mean a DNS lookup inside the gate of the server answering
+DNS.
+
+There are no negation entries. A default-deny list has nothing to subtract
+from, and adding `!` syntax would create an ordering question the OR above
+does not have.
+
+The API validates on write, so a stored value always parses. A value that
+nonetheless fails to parse — a hand-edited database — **fails closed**: the
+whole ACL is treated as deny and the parse error is logged once per attempt,
+rather than the entries before the bad one being honoured.
+
+A `key:` entry names a TSIG key that must exist at write time, validated the
+way D2 validates `tsig_key_id`, and it joins that column under the same
+in-use guard: deleting a key some zone's `allow_transfer` names is refused
+with the dependants named, because the alternative is a secondary that
+silently stops being able to transfer.
+
+#### 9.5.5 Refusals, and what each one says
+
+The gate runs in this order, and each failure has its own rcode and its own
+log reason. Nothing below is a judgement call left to implementation.
+
+| Condition | Rcode | Reply carries |
+|---|---|---|
+| not exactly one question, class not IN, or qtype neither AXFR nor IXFR | FORMERR | |
+| AXFR arrived over UDP (checked after the rows below — see the bullet) | NOTIMP | |
+| no zone at that apex, zone disabled, or type `internal`/`forwarder`/`stub` | NOTAUTH | |
+| `secondary` that is not `Serving()` | SERVFAIL | |
+| TSIG present, key unknown or algorithm mismatched (`dns.ErrSecret`, `dns.ErrKeyAlg`) | NOTAUTH | TSIG RR, BADKEY (17), **unsigned** |
+| TSIG present, MAC did not verify (`dns.ErrSig`) | NOTAUTH | TSIG RR, BADSIG (16), **unsigned** |
+| TSIG present, outside the fudge window (`dns.ErrTime`) | NOTAUTH | TSIG RR, BADTIME (18) with our time in Other Data and the client's echoed in Time Signed, **signed** |
+| TSIG lookup failed because the store failed | SERVFAIL | never a TSIG error |
+| `allow_transfer` empty, or no entry matched | REFUSED | |
+| already at the concurrency cap | SERVFAIL | |
+
+Where each of these comes from:
+
+- **NOTAUTH for an apex we do not hold** is RFC 5936 §2.2.1: "If a server is
+  not authoritative for the queried zone, the server SHOULD set the value to
+  NotAuth(9)." REFUSED is kept for the ACL denial, where it means what it
+  says — a policy refusal by a server that does hold the zone.
+- **NOTIMP for AXFR over UDP** is ours, and the RFC is explicit that it has to
+  be: §4.2 says "this document does not update RFC 1035 in this respect: AXFR
+  sessions over UDP transport are not defined", and offers no rcode. NOTIMP is
+  the honest one for a transport we do not implement. It is listed second
+  because that is where it belongs in the reading order, but it is *checked*
+  after every row below it, and the difference matters: a peer outside the ACL
+  asking for AXFR over UDP gets REFUSED, and an apex we do not hold gets
+  NOTAUTH, rather than either being told about the transport. Authorisation is
+  decided in one place for every transport, and the transport then decides only
+  how a peer that may be told anything is answered. The concurrency cap is the
+  one row this puts a constraint on: a UDP AXFR is answered NOTIMP without
+  streaming anything, so the cap has to be taken *after* the transport branch,
+  or a transport we do not implement would hold one of the four slots and be
+  answered SERVFAIL rather than NOTIMP. (Recorded 2026-09-01, when D3's task 6
+  implemented both branches and the two orders turned out to differ.)
+- **The TSIG error codes** are RFC 8945's, including that the reply "MUST be
+  unsigned" for BADKEY and BADSIG. That is the same conclusion
+  `dnssrv/server.go` already reached for the ordinary path — "signing it would
+  assert an authenticity the server was unable to establish" — so D3 adds the
+  error RR that names the failure without changing the signing rule.
+- **BADTIME is signed, and the other two are not.** This looks like an
+  inconsistency and is the rule; it follows from what the server managed to
+  establish before it answered. For BADKEY and BADSIG there is nothing to sign
+  with — the key is unknown, or the MAC did not verify — and RFC 8945 says of
+  each of them "This response MUST be unsigned", where each error is raised:
+  §5.2.1 for BADKEY and §5.2.2 for BADSIG, both pointing at §5.3.2 for the
+  shape of an error return rather than for the sentence itself. For BADTIME the
+  key and the MAC *did* verify and only the two clocks disagree, so the server
+  both can sign and must: §5.2.3, "A response indicating a BADTIME error MUST be signed
+  by the same key as the request. It MUST include the client's current time in
+  the Time Signed field, the server's current time (an unsigned 48-bit
+  integer) in the Other Data field, and 6 in the Other Len field." Echoing the
+  client's own time is what makes the reply checkable by the peer whose clock
+  is wrong — its own clock is the one thing it can verify against — and an
+  unsigned clock report is one an off-path attacker could forge, which would
+  turn the mechanism for fixing skew into a mechanism for causing it. (This
+  table said "unsigned" for all three until 2026-09-01, when implementing it
+  turned up the difference; the bullet above was always careful to claim the
+  MUST for BADKEY and BADSIG only. All three sentences were attributed to
+  §5.3.2 until the same day, when they were checked against the RFC and found
+  to live in §5.2.1, §5.2.2 and §5.2.3; the quoted text was right throughout.)
+- **miekg can sign a BADTIME reply and cannot verify one**, which is worth
+  knowing before reading a peer's logs: `stripTsig` (`tsig.go:341-343`)
+  rejects any message whose rcode is NOTAUTH with `ErrAuth` before it looks at
+  the signature, and every TSIG error reply is NOTAUTH by definition. A
+  dnsaur secondary therefore reports a BADTIME from its primary as "bad
+  authentication" rather than as a clock problem. That is the library's
+  verification path, not ours, and it is not a reason to send the reply in a
+  shape the RFC forbids — a BIND peer checks it and reads the clock out of it.
+- **A store failure is never a TSIG error.** `tsigProvider.key` wraps a failed
+  lookup rather than collapsing it into "no such key" (`dnssrv/tsig.go:87`),
+  and the distinction must survive to the wire: telling a correctly configured
+  peer its key is bad, because our database was briefly unavailable, sends the
+  operator to the wrong end of the system.
+- **An unsigned request is not a TSIG failure.** It is an ACL outcome: if
+  every entry is a `key:` entry, an unsigned request matches nothing and gets
+  REFUSED. `ErrTSIGUnsigned` exists precisely so these two cannot blur.
+
+**IXFR is answered with a full AXFR**, which RFC 1995 §2 permits — "the server
+may choose to transfer the entire zone just as in a normal full zone transfer"
+— and is what dnsaur does until D5 builds the journal (§9.6).
+
+**An IXFR over UDP that passes the gate is answered with a single SOA.** RFC
+1995 §2: "If the UDP reply does not fit, the query is responded to with a
+single SOA record of the server's current version to inform the client that a
+TCP query should be initiated." Since our IXFR answer is the whole zone, it
+does not fit by construction for any zone worth transferring, so the single
+SOA is the answer for every UDP IXFR rather than a size-dependent branch. It
+is signed like any reply to a request that verified, and it goes out through
+the existing `fitUDP` reservation (`dnssrv/server.go:195`), so a signed reply
+that would overshoot 512 becomes RFC 8945 §5.3's TC reply rather than an
+over-size packet.
+
+#### 9.5.6 Envelopes, and why `dns.Transfer.Out` is not used
+
+`Out` (`xfr.go:223`) is nineteen lines, six of which do anything: `SetReply`,
+`Authoritative`, append the RRs, sign if the request was signed, write, then
+`TsigTimersOnly(true)`. It cannot be used here, for a reason beyond the
+`xfr.go:229` "assume it fits TODO(miek): fix" that §9.5 has always cited:
+
+RFC 5936 §2.2.5 — "If the client has supplied an EDNS OPT RR in the AXFR query
+and if the server supports EDNS as well, it SHOULD include one OPT RR in the
+first response message and MAY do so in subsequent response messages." `Out`
+builds each message itself and only ever appends to `Answer`, so there is no
+seam at which an OPT could be added. It also leaves `Compress` unset — the
+source comment is literally `// Compress?` — which costs bytes on every
+envelope of every transfer.
+
+Writing the loop ourselves gives up nothing, because the TSIG stream state
+does not live in `Transfer`. The running MAC and the timers-only flag are
+fields on miekg's `response` (`server.go:755`, `server.go:824-827`), threaded
+through `WriteMsg` and `TsigTimersOnly` on the `ResponseWriter` — the same two
+methods `Out` calls. The chaining stays the library's:
+
+```go
+for i, batch := range batches {
+	m := new(dns.Msg)
+	m.SetReply(q)
+	m.Authoritative = true
+	m.Compress = true
+	m.Answer = batch
+	if i == 0 && q.IsEdns0() != nil {
+		m.SetEdns0(dns.DefaultMsgSize, false)   // RFC 5936 §2.2.5
+	}
+	if reqTSIG != nil {
+		// RFC 8945: every message in the response is signed.
+		m.SetTsig(reqTSIG.Hdr.Name, reqTSIG.Algorithm, tsigFudge, time.Now().Unix())
+	}
+	if err := w.WriteMsg(m); err != nil {
+		return err
+	}
+	w.TsigTimersOnly(true)       // after the first, per RFC 8945
+}
+```
+
+**Batching.** SOA first, every record, the same SOA last, and never an SOA in
+between — RFC 5936 §2.2: "The first message MUST begin with the SOA resource
+record of the zone, and the last message MUST conclude with the same SOA
+resource record. Intermediate messages MUST NOT contain the SOA resource
+record." A batch is closed when adding the next RR would pass a 16 KiB target,
+well under TCP's 65535 ceiling and comfortably inside §2.2's "sufficient
+number of RRs to reasonably amortize the per-message overhead, up to the
+largest number that will fit within a DNS message".
+
+Size is accumulated with `dns.Len`, which measures the record **uncompressed**,
+against a target the compressed message is then packed into. The estimate is
+therefore an upper bound and the message always fits, at the cost of slightly
+under-filled envelopes — which §2.2 permits, since it asks for amortisation
+rather than a maximum. The alternative, packing after each record to measure
+exactly, is quadratic in a zone's record count to recover bytes nobody counts.
+When the request is signed, the signature's room comes off the target first:
+`dns.Len` of the stub plus `maxTSIGMACLen` (`dnssrv/tsig.go:257`), the same
+reservation `fitUDP` makes.
+
+Every record is rendered through `ToRR` (`zones/zone.go:92`), the renderer the
+query path uses. A row that will not render aborts the transfer with SERVFAIL
+rather than being skipped: a zone silently missing a record is worse on a
+secondary than a transfer that visibly failed, because nothing downstream will
+ever notice.
+
+**A `zone_records` row typed SOA is left out of the body**, and it is the one
+exclusion. The zone's SOA comes from the zone row, and §2.2 gives the stream
+exactly two places for one: in the body such a row would be an intermediate
+message's SOA, which is forbidden outright, and at the ends it would contradict
+the SOA already there. Leaving it out loses the peer nothing, since the zone
+row's SOA is transferred for that same name. Nothing writes such a row today —
+its provenance is a hand-edited database, the same one `ParseACL`'s fail-closed
+branch is written for.
+
+#### 9.5.7 Runtime bounds
+
+**Its own deadline.** A 2-minute transfer context replaces the pipeline's 5
+seconds, checked between envelopes.
+
+**A cap of 4 concurrent outbound transfers**, and the reason is a library
+finding rather than caution. `dns.Server.WriteTimeout` is documented at
+`server.go:220-221` as "the net.Conn.SetWriteTimeout value for new
+connections, defaults to 2 * time.Second" — and nothing in the server ever
+applies it; there is no `SetWriteDeadline` call on the serve path, and
+`dns.ResponseWriter` exposes no connection to set one on. A peer that stops
+reading therefore blocks `WriteMsg` indefinitely, holding a goroutine and that
+zone's built RR slice. Bounding how many such transfers can exist at once is
+the only lever the library leaves. Over the cap is SERVFAIL and a log line;
+the peer retries on its own SOA schedule.
+
+**The zone is rendered inside the slot**, once it has been taken and never
+before. The built RR slice, and the `dns.NewRR` per record that produces it,
+are half of what the sentence above says the cap bounds; `dns.Server` bounds
+concurrent TCP connections at nothing, so a render ahead of the slot would be
+one whole zone built per connection the ACL admits, with everything over the
+cap built, refused and discarded. The one behaviour this settles: a zone
+holding an unrenderable row, asked for while the cap is full, is refused by
+the cap rather than by the row — the same SERVFAIL, a different reason in the
+log and in `last_xfr_error`. (Recorded 2026-09-01, when the whole-branch
+review found the build sitting outside the cap it is part of.)
+
+No outbound twin of `DefaultMaxTransferRecords` (`zones/transfer.go`). That
+limit exists because an inbound transfer's size is chosen by a remote peer; an
+outbound one is chosen by this server's own zone, already resident in the
+snapshot.
+
+#### 9.5.8 What the operator sees
+
+Migration `0011` (next free — 1 through 10 are taken, 5 and 7 being the Go
+migrations `migrate.go` claims without SQL files) adds four columns to
+`zones`: `allow_transfer`, `last_xfr_at`, `last_xfr_peer`, `last_xfr_error`.
+
+The write is `NoteTransferRequest`, a single UPDATE touching only the three
+state columns — `allow_transfer` is configuration, written by the API like any
+other zone field — mirroring `NoteTransferAttempt` (`store/zones.go:220`) for the
+same reason D2 needed it: a full-row `UpdateZone` racing a transfer would
+erase what the transfer recorded, and D2 already pins that property in a store
+test — this mirrors it for the outbound side.
+
+It mirrors that method's *name* for a second reason. Both record a refused
+attempt as readily as a successful one, so neither can be named for an
+outcome. (It was `NoteTransferServed` until 2026-09-01, when the whole-branch
+review pointed out that the name left its own doc comment arguing with it.)
+
+Both outcomes are recorded, refusals included, because "ns2 is not updating"
+is usually "ns2 is not in `allow_transfer`" and the log is not where an
+operator looks first. Since a remote peer therefore triggers a write, state
+writes are **throttled to one per zone per 10 seconds** — an unauthenticated
+peer in a loop must not become an UPDATE loop against sqlite's single
+connection (`store/store.go`, `SetMaxOpenConns(1)`). The log line is never
+throttled.
+
+**Only a request that arrived over TCP is recorded** (decided 2026-09-02,
+after a UDP AXFR probe was watched live overwriting a real transfer's row —
+`Last served 2m ago to 192.168.150.40` replaced by `Refused
+192.168.150.40 — AXFR over UDP is not defined`, the same peer and zone, the
+line an operator actually needed gone). A zone transfer is a TCP protocol;
+a UDP arrival — the `NOTIMP` a UDP AXFR gets, the single-SOA reply a UDP
+IXFR gets (below), or a UDP peer the gate refuses before either of those is
+reached — is not a transfer attempt, it is a peer using the wrong
+transport, so none of it writes `last_xfr_at`/`last_xfr_peer`/
+`last_xfr_error`. It is still logged, at the same level (`slog.Warn` for a
+refusal, `slog.Info` for the IXFR probe) and never throttled — the log is
+now the only record a UDP arrival gets. The gate itself, its rcodes and
+their ordering are unchanged; only whether the outcome reaches
+`NoteTransferRequest` is affected, and the check lives in `refuse`, at the
+point that already decides whether there is a row to write to at all (`z !=
+nil`) — not inside `note`, which stays an unconditional write once called,
+and not repeated at `refuse`'s three call sites.
+
+This buys two things:
+
+- **`last_xfr_peer` becomes non-spoofable.** A UDP source address is
+  trivial to forge; a TCP handshake off-path is not. Before this, the
+  column had to be documented with a caveat — a UDP AXFR's refusal, peer
+  address included, was recorded like any other outcome, so `docs/api.md`
+  warned that the address was not proof of who asked. After this, every
+  recorded peer completed a TCP handshake, and the caveat is gone rather
+  than repeated.
+- **The IXFR-over-UDP probe stops being a special case.** RFC 1995 §2's
+  single-SOA reply to a UDP IXFR was, before this, the one refusal-shaped
+  outcome that was logged but deliberately never recorded — recording it
+  would have used `reason == ""`, indistinguishable from a served transfer,
+  and `last_xfr_at` would then point at a probe rather than at a transfer.
+  That exclusion needed its own justification. Now it needs none: it is a
+  UDP arrival like any other, covered by the one rule above rather than
+  carved out from the general one of "both outcomes are recorded".
+
+The throttle has one override, and it is narrower than "a changed outcome":
+**a served↔refused transition writes anyway**, whichever direction. A run of
+refusals followed by a success would otherwise leave the screen saying
+"refused" for up to ten seconds after the thing started working, which is
+exactly when somebody is watching it — and that is the only transition
+worth breaking the throttle for. Two different refusal reasons for the same
+zone and peer are still both refusals, not a change an operator watching
+the screen is waiting for; overriding on *any* differing reason would let a
+peer that alternates between two refusal shapes (say, an unsigned request
+and one signed under a key this server does not hold) write on every
+request, at packet rate — the exact UPDATE loop the throttle exists to
+prevent, reopened by its own escape hatch.
+
+#### 9.5.9 Test posture
+
+D2's posture inverted: a real client against a real server against a real
+store, no fakes at the seams.
+
+- `dns.Transfer.In` against a real `dnssrv.Server` on `127.0.0.1:0` — the zone
+  arrives whole, SOA first and last and nowhere else, a zone large enough to
+  force several envelopes, OPT on the first message only, and a signed stream
+  that verifies end to end.
+- **The loopback test**: D2's `Transferrer` pulling from D3's `TransferServer`
+  — one dnsaur secondary transferring from a dnsaur primary. Both halves exist
+  now, and neither was written against the other.
+- One test per row of §9.5.5, asserting the rcode *and* the TSIG error code
+  where there is one — including that a store failure is SERVFAIL carrying no
+  TSIG error at all.
+- The ACL parser gets `primaries_test.go`'s table treatment, including the
+  fails-closed case for an unparseable stored value.
+- Store tests under `forEachDriver`; API tests for `allow_transfer`
+  validation and the extended key-in-use guard; web tests; the e2e smoke
+  extended to set an ACL and transfer through it.
+
+#### 9.5.10 Deliberately not in D3
+
+NOTIFY in either direction (D4). The journal, deltas and real IXFR (D5).
+Per-record or per-view ACLs, which nothing has asked for. Transferring the
+built-in RFC 6303 zones. And TSIG enforcement on ordinary queries, which stays
+non-enforcing by design (§9.3) — D3 enforces it on the one path RFC 8945 gates.
 
 ### 9.6 IXFR, and whether it belongs here
 
@@ -556,7 +988,7 @@ D is too large to land as one plan. Each of these ships something that works:
 |---|---|---|
 | **D1** | TSIG keys: table, CRUD, dynamic provider, and the `TsigStatus` helper transfers call | — |
 | **D2** | Outbound AXFR: `primaries` format, scheduling, expiry, atomic install, per-zone reload, **and ownership of `zones.tsig_key_id`** — the column and the guard against deleting a key a zone still references. D2 declined the schema-level foreign key with reasoning recorded in migration 0009: the column is `NOT NULL DEFAULT 0` where 0 means "no key", a FK skips NULL rather than zero, and making it nullable is a whole-table rebuild on SQLite where `zones` is the parent of `zone_records … ON DELETE CASCADE`. The guard is a single-statement delete instead | D1 |
-| **D3** | Inbound AXFR: the `dnssrv` intercept, ACL, envelope batching | D1 |
+| **D3** | Inbound AXFR: the `dnssrv` intercept, the `allow_transfer` ACL (a column, not the table §9.2 sketched), envelope batching written here rather than through `dns.Transfer.Out`, TSIG enforcement with RFC 8945 error codes, and last-served state on the zone | D1 |
 | **D4** | NOTIFY both directions | D2, D3 |
 | **D5** | IXFR: journal, deltas, serial arithmetic | D2, D3 |
 | **D6** | `forwarder` zone type and the `Conditional` migration | — |
@@ -583,9 +1015,9 @@ be wrong.
 
 | RFC | Rule |
 |---|---|
-| **5936** | AXFR is TCP-only; SOA first and last; the transfer is a sequence of messages |
-| **1995** | IXFR falls back to a full AXFR when no delta is available (§2) |
+| **5936** | AXFR is TCP-only (§4.2 leaves UDP undefined); SOA first and last, never in between (§2.2); messages carry enough RRs to amortize the overhead (§2.2); NOTAUTH when not authoritative (§2.2.1); OPT echoed in the first response message (§2.2.5) |
+| **1995** | IXFR falls back to a full AXFR when no delta is available (§2); a UDP IXFR whose reply does not fit is answered with a single SOA (§2) |
 | **1996** | NOTIFY is a hint, not an instruction — the secondary still checks the SOA before transferring |
-| **8945** | TSIG: signed request, signed reply, time-window enforcement, and an unsigned request rejected rather than ignored |
+| **8945** | TSIG: signed request, signed reply, time-window enforcement, and an unsigned request rejected rather than ignored; every message of a multi-message response signed, timers-only after the first; BADKEY and BADSIG reported in an unsigned reply (§5.2.1 and §5.2.2, each "This response MUST be unsigned", both pointing at §5.3.2 for the shape of an error return rather than for that sentence), BADTIME in a *signed* one carrying the client's time in Time Signed and ours in Other Data (§5.2.3) |
 | **1982** | Serial arithmetic is circular — comparison is not `<` |
 | **1034 §4.3.5** | A secondary past its SOA expire must stop answering for the zone |

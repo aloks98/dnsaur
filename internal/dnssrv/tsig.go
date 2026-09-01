@@ -232,12 +232,26 @@ func (r *Request) RequireTSIG() (string, error) {
 	return r.tsig.key, r.tsig.err
 }
 
-// replyTSIG builds the stub TSIG that makes miekg sign a reply. It is a stub
+// ReplyTSIG builds the stub TSIG that makes miekg sign a reply. It is a stub
 // on purpose: WriteMsg passes it to TsigGenerateWithProvider, which fills in
 // the MAC (server.go:753-761). RFC 8945 §5.3 answers a signed request under
 // the same key and algorithm, and the fudge is echoed so a peer configured
 // with a wide window is not narrowed to ours.
-func replyTSIG(reply *dns.Msg, keyName string, req *dns.TSIG) *dns.TSIG {
+//
+// The caller appends the returned record to the reply's Extra section. It is
+// returned rather than attached because a UDP reply has to be trimmed to size
+// *before* the signature goes on — see FitUDPReply.
+//
+// It is exported for the zone-transfer handler, which signs a reply this
+// package never sees: every message of a transfer stream carries one of these
+// (RFC 8945 §5.3.1). That handler used to build its own, which was the same
+// fudge default and the same canonicalisation written twice with nothing
+// keeping the two in step.
+//
+// TimeSigned is time.Now and deliberately not any injected clock: the peer
+// checks it against its own inside the fudge window, so a test clock here
+// would produce signatures a real peer rejects.
+func ReplyTSIG(reply *dns.Msg, keyName string, req *dns.TSIG) *dns.TSIG {
 	fudge := req.Fudge
 	if fudge == 0 {
 		fudge = 300 // RFC 8945 §5.2.3's usual default, and miekg's.
@@ -252,6 +266,6 @@ func replyTSIG(reply *dns.Msg, keyName string, req *dns.TSIG) *dns.TSIG {
 }
 
 // maxTSIGMACLen is the largest MAC any algorithm above produces (SHA-512, 64
-// bytes). replyTSIG's stub carries no MAC yet, so reserving UDP room for a
-// signed reply has to allow for one.
+// bytes). ReplyTSIG's stub carries no MAC yet, so reserving room for a signed
+// reply has to allow for one.
 const maxTSIGMACLen = 64

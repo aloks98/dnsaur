@@ -67,6 +67,73 @@ Stages implement a small `Handler`/`Middleware` Go interface
 (`internal/dnssrv`), so each one is unit-testable in isolation and new
 stages are purely additive — no rewiring of existing ones.
 
+## Zone transfers (AXFR out)
+
+Serving a zone to another nameserver does not go through the pipeline
+above. `dnssrv.Handler` returns exactly one `*Response`, and `serve` writes
+exactly one message — but an AXFR answer is a *sequence* of messages on one
+TCP connection, which that one-response shape cannot express. So
+`Server.serve` branches on qtype AXFR/IXFR before a `Request` is even
+built, and hands the raw `dns.ResponseWriter` straight to a `Transfers`
+handler (`internal/zones.TransferServer`, wired in via `dnssrv.WithTransfers`
+in `internal/app`). This is an intercept ahead of the chain, not a
+pipeline stage.
+
+It's also correct on the merits, not just a shape workaround: none of
+qlog's per-query accounting, the filter, the cache or the upstream
+forwarder mean anything for a transfer, and a transfer needs its own
+multi-minute deadline (2 minutes, checked between envelopes) rather than
+the pipeline's 5-second one.
+
+**A transfer never appears in the query log**, as a direct consequence.
+qlog wraps the whole middleware chain (step 1 above); the intercept runs
+before that chain is ever entered, so nothing about an AXFR or IXFR —
+served or refused — reaches it. An operator hunting a secondary's transfer
+in `GET /queries` will not find it there: `last_xfr_at`/`last_xfr_peer`/
+`last_xfr_error` on the zone ([`docs/api.md`](api.md)) and the server's own
+log lines (`"zone transfer served"` / `"zone transfer refused"`) are where
+it shows up instead — except that the zone fields record only a request
+that arrived over TCP; a UDP arrival (an AXFR answered `NOTIMP`, an IXFR
+answered a single SOA, or a UDP peer the ACL refuses) only ever reaches the
+log line, never the zone row. A zone transfer is a TCP protocol, so that is
+the whole of what a UDP arrival is: a peer using the wrong transport, not a
+transfer attempt.
+
+What can be transferred: an enabled `primary` zone in full, or an enabled
+`secondary` zone while it is currently serving — never before its first
+successful pull, and never past its SOA `expires_at`. `internal`, `stub`
+and `forwarder` zones hold nothing to send and refuse every request. The
+zone handed over is read from the same served snapshot the query path
+answers from, not a fresh database read, so a peer can't drive store load,
+and a transfer racing a reload sees one consistent zone rather than a
+mixture.
+
+The gate answers with one of five rcodes, and the first three are what an
+operator debugging a secondary that has stopped updating actually needs to
+read:
+
+| Rcode | Means |
+|---|---|
+| `NOTAUTH` | dnsaur doesn't hold that zone — wrong or disabled apex, or a type (`internal`/`stub`/`forwarder`) that holds no data to send — or the request's TSIG didn't verify |
+| `REFUSED` | dnsaur holds the zone, but the peer's address or key isn't in its `allow_transfer` |
+| `SERVFAIL` | the zone is a `secondary` dnsaur can't currently vouch for (nothing transferred yet, or past `expires_at`), or the server is already at its concurrent-transfer limit |
+| `NOTIMP` | the AXFR arrived over UDP, which RFC 5936 §4.2 leaves undefined. Checked *after* every row above, so a peer outside the ACL is still told `REFUSED` rather than told about the transport |
+| `FORMERR` | the query isn't a well-formed transfer request — in practice, a class other than IN. The other half of that rule, a question count other than one, is answered `FORMERR` by miekg's own accept function before dnsaur sees the message at all |
+
+A TSIG failure is a `NOTAUTH` with a TSIG error record attached naming
+which check failed — BADKEY (unknown key or algorithm), BADSIG (signature
+didn't verify), or BADTIME (outside the fudge window) — and the three
+don't get signed alike. RFC 8945 requires the BADKEY and BADSIG replies to
+go back **unsigned**: there's no verified key to sign with, so signing one
+would assert an authenticity the server never established. BADTIME goes
+back **signed**, because there the key and MAC *did* verify and only the
+two clocks disagree — an unsigned clock report is something an off-path
+attacker could forge to move a peer's clock the wrong way rather than fix
+it.
+
+See `docs/superpowers/specs/2026-08-08-zones-design.md` §9.5.5 for the
+full gate, in order, with every row's reasoning.
+
 ## Package map
 
 | Package | Responsibility |
@@ -74,10 +141,10 @@ stages are purely additive — no rewiring of existing ones.
 | `cmd/dnsaur` | Entry point: flag/config parsing, wiring, graceful shutdown |
 | `internal/app` | Top-level app object: builds the pipeline, owns settings hot-reload and background jobs |
 | `internal/config` | Bootstrap YAML + env config loading and validation |
-| `internal/dnssrv` | DNS listeners, the `Handler`/`Middleware` pipeline abstraction, panic recovery, and TSIG (RFC 8945): a `dns.TsigProvider` that verifies signed messages against the stored keys on every message, plus `RequireTSIG` for the paths that must refuse an unsigned one |
+| `internal/dnssrv` | DNS listeners, the `Handler`/`Middleware` pipeline abstraction, panic recovery, and TSIG (RFC 8945): a `dns.TsigProvider` that verifies signed messages against the stored keys on every message, plus `RequireTSIG` for the paths that must refuse an unsigned one; also the AXFR/IXFR intercept that routes a transfer's raw `ResponseWriter` to a `Transfers` handler ahead of the pipeline (see Zone transfers above) |
 | `internal/clients` | Client registry: IP/CIDR matching to client + group |
 | `internal/filter` | Blocklist/allowlist engine, list parsing, per-client-group rules, background refresh |
-| `internal/zones` | Authoritative zones: zone cut and deepest-match lookup, apex-relative names, RR construction from stored presentation-format rdata, and the NODATA/NXDOMAIN/wildcard/CNAME/referral answering rules |
+| `internal/zones` | Authoritative zones: zone cut and deepest-match lookup, apex-relative names, RR construction from stored presentation-format rdata, and the NODATA/NXDOMAIN/wildcard/CNAME/referral answering rules; also `TransferServer`, which answers AXFR/IXFR requests the `allow_transfer` ACL permits |
 | `internal/cache` | In-memory DNS response cache (TTL clamps, negative caching, serve-stale) |
 | `internal/upstream` | Upstream forwarders and selection strategy |
 | `internal/qlog` | Async query logging and retention pruning |

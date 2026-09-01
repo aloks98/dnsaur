@@ -55,6 +55,7 @@ import {
 } from "@e412/rnui-react";
 import { ApiError } from "../../api/client";
 import type { Zone, ZoneRecord } from "../../api/types";
+import { parseACL } from "../../lib/acl";
 import {
   useCreateZoneRecord,
   useDeleteZone,
@@ -769,146 +770,163 @@ function SoaBand({ zone }: { zone: Zone }) {
 
   const summary = `${zone.soa_ns} · ${zone.soa_mbox} · ${zone.soa_refresh}/${zone.soa_retry}/${zone.soa_expire}/${zone.soa_minimum}`;
 
+  // A primary zone's AllowTransferBand rides immediately beneath this one,
+  // sharing this same 152px gutter (see that component's own comment) — it
+  // supplies its own top rule and the group's trailing one, so a bottom
+  // rule here too would double it. Every other zone type that reaches this
+  // band (internal, stub, forwarder) has nothing following it, and keeps
+  // the rule so the band still closes itself off from the filter bar below.
+  const closesGroup = zone.type !== "primary";
+
   return (
     <Form {...form}>
       <form
         onSubmit={(e) => void form.handleSubmit(onSubmit)(e)}
         noValidate
-        className="shrink-0 border-b border-border bg-card"
+        className={cn("shrink-0 bg-card", closesGroup && "border-b border-border")}
       >
         <Collapsible open={open} onOpenChange={setOpen}>
-          <div className="flex items-center gap-2.5 px-4 py-2">
-            <CollapsibleTrigger
-              type="button"
-              // gap-1 matches the header's back link above, so the SOA label
-              // and "Zones" start at the same x. Both rows are px-4 with a
-              // size-3.5 chevron, so the gap is the only thing that can
-              // misalign them. cursor-pointer explicitly: Tailwind v4
-              // preflight sets no cursor on <button>.
-              className="flex min-w-0 flex-1 cursor-pointer items-center gap-1 text-left"
-            >
-              <ChevronRight
-                aria-hidden="true"
-                className={cn(
-                  "size-3.5 shrink-0 text-muted-foreground transition-transform",
-                  open && "rotate-90",
-                )}
-              />
-              <span className="shrink-0 font-mono text-[9.5px] tracking-[0.14em] text-muted-foreground uppercase">
-                SOA
-              </span>
+          {/* 152px/1fr: the label column AllowTransferBand's own row shares
+              below, so the two captions ("SOA" here, "TRANSFERS OUT" there)
+              land on one edge. items-start on the label cell pins the
+              chevron and caption to the top rather than centering them
+              against the taller, open state's height — the grid's default
+              stretch is what makes the border-right span that full height. */}
+          <div className="grid grid-cols-[152px_1fr]">
+            <div className="flex items-start border-r border-border-muted px-3.5 py-[11px]">
+              <CollapsibleTrigger
+                type="button"
+                // cursor-pointer explicitly: Tailwind v4 preflight sets no
+                // cursor on <button>.
+                className="flex min-w-0 cursor-pointer items-center gap-1 text-left"
+              >
+                <ChevronRight
+                  aria-hidden="true"
+                  className={cn(
+                    "size-3.5 shrink-0 text-muted-foreground transition-transform",
+                    open && "rotate-90",
+                  )}
+                />
+                <span className="shrink-0 font-mono text-[9.5px] tracking-[0.14em] text-muted-foreground uppercase">
+                  SOA
+                </span>
+              </CollapsibleTrigger>
+            </div>
+            <div className="min-w-0 px-4 py-[10px]">
               {!open && (
                 <span className="truncate font-mono text-xs text-muted-foreground">{summary}</span>
               )}
-            </CollapsibleTrigger>
-            {open && (
-              <Button
-                type="submit"
-                size="sm"
-                variant="ghost"
-                disabled={!form.formState.isDirty || updateZone.isPending}
-              >
-                {updateZone.isPending ? "Saving…" : "Save SOA"}
-              </Button>
-            )}
-          </div>
-          <CollapsibleContent>
-            <div className="grid grid-cols-4 gap-x-[18px] gap-y-4 px-4 pb-4">
-              <FormField
-                control={form.control}
-                name="soa_ns"
-                render={({ field }) => (
-                  <SoaFieldShell label="Primary NS">
-                    <Input {...field} aria-label="Primary NS" className="font-mono" />
-                    <FormMessage />
-                  </SoaFieldShell>
-                )}
-              />
-              <FormField
-                control={form.control}
-                name="soa_mbox"
-                render={({ field }) => (
-                  <SoaFieldShell label="Responsible">
-                    <Input {...field} aria-label="Responsible" className="font-mono" />
-                    <FormMessage />
-                  </SoaFieldShell>
-                )}
-              />
-              {/* Not editable, but the value IS shown (Task 12 fix round 1:
+              <CollapsibleContent>
+                <div className="flex items-center justify-end pb-2.5">
+                  <Button
+                    type="submit"
+                    size="sm"
+                    variant="ghost"
+                    disabled={!form.formState.isDirty || updateZone.isPending}
+                  >
+                    {updateZone.isPending ? "Saving…" : "Save SOA"}
+                  </Button>
+                </div>
+                <div className="grid grid-cols-4 gap-x-[18px] gap-y-4 pb-4">
+                  <FormField
+                    control={form.control}
+                    name="soa_ns"
+                    render={({ field }) => (
+                      <SoaFieldShell label="Primary NS">
+                        <Input {...field} aria-label="Primary NS" className="font-mono" />
+                        <FormMessage />
+                      </SoaFieldShell>
+                    )}
+                  />
+                  <FormField
+                    control={form.control}
+                    name="soa_mbox"
+                    render={({ field }) => (
+                      <SoaFieldShell label="Responsible">
+                        <Input {...field} aria-label="Responsible" className="font-mono" />
+                        <FormMessage />
+                      </SoaFieldShell>
+                    )}
+                  />
+                  {/* Not editable, but the value IS shown (Task 12 fix round 1:
                   an earlier draft of the artboard notes said only "AUTO",
                   omitting the number — corrected). The serial itself is the
                   box's content; AUTO is pushed to the right edge as an
                   annotation that the server, not this form, owns the number. */}
-              <SoaFieldShell label="Serial">
-                <div className="flex h-8 items-center rounded-lg border border-input bg-muted px-2.5">
-                  <span className="font-mono text-sm text-muted-foreground">{zone.soa_serial}</span>
-                  <span className="ml-auto font-mono text-[9.5px] tracking-[0.14em] text-muted-foreground/70 uppercase">
-                    AUTO
-                  </span>
+                  <SoaFieldShell label="Serial">
+                    <div className="flex h-8 items-center rounded-lg border border-input bg-muted px-2.5">
+                      <span className="font-mono text-sm text-muted-foreground">
+                        {zone.soa_serial}
+                      </span>
+                      <span className="ml-auto font-mono text-[9.5px] tracking-[0.14em] text-muted-foreground/70 uppercase">
+                        AUTO
+                      </span>
+                    </div>
+                  </SoaFieldShell>
+                  <FormField
+                    control={form.control}
+                    name="soa_refresh"
+                    render={({ field }) => (
+                      <SoaFieldShell label="Refresh" unit="s">
+                        <Input
+                          {...field}
+                          aria-label="Refresh"
+                          inputMode="numeric"
+                          className="font-mono"
+                        />
+                        <FormMessage />
+                      </SoaFieldShell>
+                    )}
+                  />
+                  <FormField
+                    control={form.control}
+                    name="soa_retry"
+                    render={({ field }) => (
+                      <SoaFieldShell label="Retry" unit="s">
+                        <Input
+                          {...field}
+                          aria-label="Retry"
+                          inputMode="numeric"
+                          className="font-mono"
+                        />
+                        <FormMessage />
+                      </SoaFieldShell>
+                    )}
+                  />
+                  <FormField
+                    control={form.control}
+                    name="soa_expire"
+                    render={({ field }) => (
+                      <SoaFieldShell label="Expire" unit="s">
+                        <Input
+                          {...field}
+                          aria-label="Expire"
+                          inputMode="numeric"
+                          className="font-mono"
+                        />
+                        <FormMessage />
+                      </SoaFieldShell>
+                    )}
+                  />
+                  <FormField
+                    control={form.control}
+                    name="soa_minimum"
+                    render={({ field }) => (
+                      <SoaFieldShell label="Minimum" unit="s">
+                        <Input
+                          {...field}
+                          aria-label="Minimum"
+                          inputMode="numeric"
+                          className="font-mono"
+                        />
+                        <FormMessage />
+                      </SoaFieldShell>
+                    )}
+                  />
                 </div>
-              </SoaFieldShell>
-              <FormField
-                control={form.control}
-                name="soa_refresh"
-                render={({ field }) => (
-                  <SoaFieldShell label="Refresh" unit="s">
-                    <Input
-                      {...field}
-                      aria-label="Refresh"
-                      inputMode="numeric"
-                      className="font-mono"
-                    />
-                    <FormMessage />
-                  </SoaFieldShell>
-                )}
-              />
-              <FormField
-                control={form.control}
-                name="soa_retry"
-                render={({ field }) => (
-                  <SoaFieldShell label="Retry" unit="s">
-                    <Input
-                      {...field}
-                      aria-label="Retry"
-                      inputMode="numeric"
-                      className="font-mono"
-                    />
-                    <FormMessage />
-                  </SoaFieldShell>
-                )}
-              />
-              <FormField
-                control={form.control}
-                name="soa_expire"
-                render={({ field }) => (
-                  <SoaFieldShell label="Expire" unit="s">
-                    <Input
-                      {...field}
-                      aria-label="Expire"
-                      inputMode="numeric"
-                      className="font-mono"
-                    />
-                    <FormMessage />
-                  </SoaFieldShell>
-                )}
-              />
-              <FormField
-                control={form.control}
-                name="soa_minimum"
-                render={({ field }) => (
-                  <SoaFieldShell label="Minimum" unit="s">
-                    <Input
-                      {...field}
-                      aria-label="Minimum"
-                      inputMode="numeric"
-                      className="font-mono"
-                    />
-                    <FormMessage />
-                  </SoaFieldShell>
-                )}
-              />
+              </CollapsibleContent>
             </div>
-          </CollapsibleContent>
+          </div>
         </Collapsible>
       </form>
     </Form>
@@ -1069,8 +1087,12 @@ function TransferBand({ zone }: { zone: Zone }) {
 
   return (
     <div
+      // No trailing border: AllowTransferBand always follows a secondary's
+      // TransferBand (the gate is `isSecondary` alone — see its own
+      // comment) and supplies the group's bottom rule itself, the same
+      // reason SoaBand's own border is conditional.
       className={cn(
-        "shrink-0 border-b border-border",
+        "shrink-0",
         bad
           ? "bg-destructive/5 shadow-[inset_3px_0_0_var(--destructive)]"
           : warn
@@ -1164,6 +1186,243 @@ function TransferBand({ zone }: { zone: Zone }) {
         </div>
       )}
     </div>
+  );
+}
+
+// ── The allow-transfer band ───────────────────────────────────────────────
+
+const allowTransferFormSchema = z.object({
+  // No static shape (regex, length, …): "valid" here means "parses as an
+  // ACL", which only parseACL itself can answer — the same reason
+  // recordFormSchema's rdata carries no client-side rule (see that field's
+  // comment) does not apply, because unlike a DNS RR's rdata the ACL
+  // grammar is small and stable enough to be worth the client-side port
+  // (see lib/acl.ts's own comment on why, and on the server remaining the
+  // one that actually decides).
+  allow_transfer: z.string().superRefine((value, ctx) => {
+    const result = parseACL(value);
+    if (!result.ok) ctx.addIssue({ code: "custom", message: result.error });
+  }),
+});
+type AllowTransferFormValues = z.infer<typeof allowTransferFormSchema>;
+
+/**
+ * What the last inbound transfer *request* did, as one line — this band's
+ * own dated fact, on the same terms TransferBand documents for
+ * `last_error`: read off the zone row rather than remembered from a request
+ * this page happened to make, so it is current whether the last attempt was
+ * a minute ago or came in while nobody had this page open.
+ *
+ * `last_xfr_error` is shown verbatim, the way TransferBand already shows
+ * `last_error` verbatim — it is the server's own reason, not this band's
+ * words for it.
+ */
+function xfrServedLine(zone: Zone): string {
+  if (zone.last_xfr_at === 0) return "Never asked for.";
+  if (zone.last_xfr_error === "") {
+    return `Last served ${relativeTime(zone.last_xfr_at)} to ${zone.last_xfr_peer}`;
+  }
+  return `Refused ${zone.last_xfr_peer} — ${zone.last_xfr_error}`;
+}
+
+/**
+ * Who may take this zone from here, and who last did — a row of the SOA
+ * band's own gutter rather than a band of its own: unlike every SOA field,
+ * allow_transfer is one value, so it rides the SOA row instead of owning a
+ * band. The 152px label column is SoaBand's (see its own comment); this row
+ * shares it rather than inventing a second one, so the two captions ("SOA"
+ * above, "TRANSFERS OUT" here) land on one edge.
+ *
+ * Serving transfers applies to both a primary and a secondary — a secondary
+ * re-serves what it pulled (§9.5.3) — so it cannot live inside SoaBand
+ * (primary-only) or TransferBand (secondary-only, and about the transfers
+ * *this* zone pulls, not the ones it serves). Mounted directly below
+ * whichever one is showing: SoaBand (or, for a secondary, TransferBand)
+ * says what this zone's copy of itself is and how current it is; this row
+ * says who is allowed to take a copy of it and who last did. Its own
+ * "TRANSFERS OUT" caption (SoaBand's "SOA" is the model) keeps the two from
+ * blurring into one continuous section.
+ *
+ * Mounted only for a primary or a secondary — never internal, stub or
+ * forwarder. §9.5.3 refuses those with NOTAUTH regardless of their ACL, and
+ * a built-in zone's every PATCH 409s outright (handleZonePatch), so an
+ * editable field here for either would be exactly the kind of control the
+ * header above already omits rather than lets fail on click. See the call
+ * site's own comment on why the gate is the positive set.
+ *
+ * Read is the default and the state almost every zone shows: the saved ACL
+ * (or, muted, the fact that none is set) beside the one-line result of the
+ * last inbound request. Editing is opt-in behind its own pencil, rather than
+ * a permanently open input — `allow_transfer` is default-deny and rarely
+ * touched, so an always-live field was more control surface than the value
+ * earns. `allow_transfer` itself is default-deny: a zone created with none
+ * set answers every transfer request REFUSED, and this row is the only
+ * place in the app that opens it up. The field's own client-side check
+ * (allowTransferFormSchema) is a convenience, not the gate — the server
+ * validates independently and is what a real request is ever matched
+ * against (see lib/acl.ts's own comment).
+ */
+function AllowTransferBand({ zone }: { zone: Zone }) {
+  const [editing, setEditing] = useState(false);
+  const updateZone = useUpdateZone();
+  const form = useForm<AllowTransferFormValues>({
+    resolver: zodResolver(allowTransferFormSchema),
+    defaultValues: { allow_transfer: zone.allow_transfer },
+  });
+
+  // Reset only when the *saved* value changes — SoaBand's own rule, and for
+  // the same reason: an unrelated refetch (the transfer poll, a record
+  // write bumping the serial) must not wipe an in-progress, unsaved edit.
+  const { allow_transfer } = zone;
+  useEffect(() => {
+    form.reset({ allow_transfer });
+  }, [allow_transfer, form]);
+
+  // Focus the field the moment editing opens — RecordFormRow's own habit
+  // for a form that has just appeared.
+  useEffect(() => {
+    if (editing) form.setFocus("allow_transfer");
+  }, [editing, form]);
+
+  function onStartEdit() {
+    // Always the saved value, never a previous attempt's abandoned draft —
+    // the pencil opens onto what is actually set, every time.
+    form.reset({ allow_transfer: zone.allow_transfer });
+    setEditing(true);
+  }
+
+  function onCancelEdit() {
+    form.reset({ allow_transfer: zone.allow_transfer });
+    setEditing(false);
+  }
+
+  function onSubmit(values: AllowTransferFormValues) {
+    updateZone.mutate(
+      { id: zone.id, allow_transfer: values.allow_transfer.trim() },
+      {
+        onSuccess: () => {
+          toast.success("Allow transfer saved");
+          setEditing(false);
+        },
+        onError: (err) =>
+          toast.error(err instanceof ApiError ? err.message : "Couldn't save allow transfer"),
+      },
+    );
+  }
+
+  const hasAcl = zone.allow_transfer !== "";
+
+  return (
+    <Form {...form}>
+      <form
+        onSubmit={(e) => void form.handleSubmit(onSubmit)(e)}
+        noValidate
+        // No trailing border of its own: this row always closes off
+        // whichever band sits above it (SoaBand or TransferBand, whose own
+        // bottom border is conditional/removed for exactly this reason), so
+        // its bottom rule is the group's, and its top rule the internal
+        // divider between the two.
+        className="grid shrink-0 grid-cols-[152px_1fr] border-t border-border-muted border-b border-border bg-card"
+      >
+        {/* Distinct from SoaBand's "SOA", so this row reads as its own
+            question rather than a continuation of the band above it. The
+            blank first cell of the inner grid is what lines the caption's
+            text up with SOA's own chevron, not a caret this row lacks. */}
+        <div className="flex items-center border-r border-border-muted px-3.5 py-[9px]">
+          <span className="grid grid-cols-[12px_auto] items-center gap-[7px] font-mono text-[9.5px] leading-[1.3] font-semibold tracking-[0.14em] text-muted-foreground uppercase">
+            <span aria-hidden="true" />
+            <span>
+              Transfers
+              <br />
+              out
+            </span>
+          </span>
+        </div>
+        <FormField
+          control={form.control}
+          name="allow_transfer"
+          render={({ field }) => (
+            <div className="min-w-0">
+              <div className="flex min-w-0 items-center gap-2.5 px-4 py-2">
+                {editing ? (
+                  <>
+                    <Input
+                      {...field}
+                      aria-label="Allow transfer"
+                      placeholder="10.0.0.0/24, key:ns2"
+                      autoComplete="off"
+                      spellCheck={false}
+                      className="h-7 w-[236px] shrink-0 font-mono"
+                    />
+                    <div className="ml-auto flex shrink-0 items-center gap-1.5">
+                      <Button type="submit" size="sm" disabled={updateZone.isPending}>
+                        {updateZone.isPending ? "Saving…" : "Save"}
+                      </Button>
+                      <Button
+                        type="button"
+                        size="icon-sm"
+                        variant="ghost"
+                        aria-label="Cancel editing allow transfer"
+                        onClick={onCancelEdit}
+                      >
+                        <X />
+                      </Button>
+                    </div>
+                  </>
+                ) : (
+                  <>
+                    {/* The saved value, mono — muted when there is none, so
+                        an empty ACL reads as a stated fact rather than a
+                        blank field waiting to be filled in. */}
+                    <span
+                      className={cn(
+                        "min-w-0 shrink truncate font-mono text-[12.5px]",
+                        hasAcl ? "text-foreground" : "text-muted-foreground",
+                      )}
+                      title={hasAcl ? zone.allow_transfer : undefined}
+                    >
+                      {hasAcl ? zone.allow_transfer : "No peer may transfer this zone."}
+                    </span>
+                    {/* What the last inbound *request* did — independent of
+                        the ACL beside it: a peer can be refused today under
+                        a value that used to admit it, so the history stays
+                        on screen either way. Long, it truncates rather than
+                        pushing the pencil off the row; `title` keeps the
+                        full text reachable. */}
+                    <span
+                      className="min-w-0 shrink truncate font-mono text-[11px] text-muted-foreground"
+                      title={xfrServedLine(zone)}
+                    >
+                      {xfrServedLine(zone)}
+                    </span>
+                    <Button
+                      type="button"
+                      size="icon-sm"
+                      variant="ghost"
+                      title="Edit allow transfer"
+                      aria-label="Edit allow transfer"
+                      className="ml-auto shrink-0"
+                      onClick={onStartEdit}
+                    >
+                      <Pencil />
+                    </Button>
+                  </>
+                )}
+              </div>
+              {/* The artboard has no slot for this — a malformed entry has
+                  to say where the user typed it regardless of the one-line
+                  layout above, so it gets its own line under the row rather
+                  than being dropped. */}
+              {editing && (
+                <div className="px-4 pb-2">
+                  <FormMessage />
+                </div>
+              )}
+            </div>
+          )}
+        />
+      </form>
+    </Form>
   );
 }
 
@@ -2084,6 +2343,21 @@ export function ZoneDetail() {
           overwritten by every transfer — the transfer band in its place. See
           TransferBand's own comment. */}
       {isSecondary ? <TransferBand zone={z} /> : <SoaBand zone={z} />}
+
+      {/* Who may transfer this zone, and who last did — applies to both a
+          primary and a secondary (a secondary re-serves what it pulled), so
+          it is mounted for both rather than folded into either band above.
+          Gated on the *positive* set, not just !isInternal: §9.5.3 refuses
+          internal/stub/forwarder zones with NOTAUTH regardless of their ACL,
+          and handleZonePatch 409s every PATCH to a built-in zone outright —
+          an editable field here for one of those would be exactly the kind
+          of control this header already omits rather than lets fail on
+          click (see isInternal's own comment above). stub/forwarder aren't
+          reachable through the create form today (CREATABLE_TYPES,
+          list.tsx), but gating on the allowed set rather than the excluded
+          one keeps this correct if that ever changes. See
+          AllowTransferBand's own comment. */}
+      {(z.type === "primary" || isSecondary) && <AllowTransferBand zone={z} />}
 
       {/* Filter bar */}
       <div className="flex shrink-0 items-center gap-3 border-b border-border px-4 py-2.5">

@@ -11,12 +11,13 @@ import (
 )
 
 type Server struct {
-	addr    string
-	handler Handler
-	tsig    dns.TsigProvider
-	udp     *dns.Server
-	tcp     *dns.Server
-	bound   string
+	addr      string
+	handler   Handler
+	tsig      dns.TsigProvider
+	transfers Transfers
+	udp       *dns.Server
+	tcp       *dns.Server
+	bound     string
 }
 
 // Option configures a Server before Start. Nothing here can be changed
@@ -110,6 +111,25 @@ func (s *Server) Shutdown(ctx context.Context) error {
 }
 
 func (s *Server) serve(w dns.ResponseWriter, m *dns.Msg) {
+	// Verification has already happened by the time this runs: miekg checked
+	// the message against the provider attached in Start and recorded the
+	// outcome on w (server.go:673). Ask once, here, before either branch
+	// below, and carry the answer into whichever one runs -- a handler on
+	// either side can then require a valid signature without asking again,
+	// which would be two chances for the two calls to disagree.
+	key, tsigErr := s.RequireTSIG(w, m)
+
+	if s.transfers != nil && isTransferQuery(m) {
+		// Its own deadline, its own writer, and none of the pipeline: qlog's
+		// per-query accounting, the filter, the cache and the forwarder have
+		// no meaning for a transfer, and the OPT force-add below would stamp
+		// OPT onto every envelope.
+		ctx, cancel := context.WithTimeout(context.Background(), TransferTimeout)
+		defer cancel()
+		s.transfers.ServeTransfer(ctx, w, m, key, tsigErr)
+		return
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	var ip netip.Addr
@@ -120,13 +140,9 @@ func (s *Server) serve(w dns.ResponseWriter, m *dns.Msg) {
 		ip, _ = netip.AddrFromSlice(a.IP)
 	}
 	req := &Request{Msg: m, ClientIP: ip.Unmap()}
-	// Verification has already happened by the time this runs: miekg checked
-	// the message against the provider attached in Start and recorded the
-	// outcome on w (server.go:673). Ask once and carry the answer, so a
-	// handler can require a valid signature via req.RequireTSIG(). Nothing is
-	// refused here — verification is non-enforcing by design, and no path in
-	// the pipeline is transfer-only yet.
-	key, tsigErr := s.RequireTSIG(w, m)
+	// Nothing is refused here -- verification is non-enforcing by design, and
+	// no path in the pipeline is transfer-only. key and tsigErr are what was
+	// computed above, before the branch; see req.RequireTSIG().
 	req.tsig = &tsigState{key: key, err: tsigErr}
 
 	resp, err := s.handler.ServeDNS(ctx, req)
@@ -148,13 +164,15 @@ func (s *Server) serve(w dns.ResponseWriter, m *dns.Msg) {
 	// the server was unable to establish.
 	var sig *dns.TSIG
 	if tsigErr == nil && key != "" {
-		sig = replyTSIG(resp.Msg, key, m.IsTsig())
+		sig = ReplyTSIG(resp.Msg, key, m.IsTsig())
 	}
 
-	// TCP is never truncated: it has no datagram limit to fit inside, and a
-	// zone transfer only ever arrives there.
+	// TCP is never truncated: it has no datagram limit to fit inside. A
+	// transfer does not reach this line on either transport — the intercept
+	// above owns both, and answers the UDP one itself rather than by
+	// streaming a zone into a datagram.
 	if _, isUDP := w.RemoteAddr().(*net.UDPAddr); isUDP {
-		fitUDP(resp.Msg, udpBudget(m), sig)
+		FitUDPReply(resp.Msg, m, sig)
 	}
 	if sig != nil {
 		resp.Msg.Extra = append(resp.Msg.Extra, sig)
@@ -162,6 +180,22 @@ func (s *Server) serve(w dns.ResponseWriter, m *dns.Msg) {
 	if err := w.WriteMsg(resp.Msg); err != nil {
 		slog.Error("write response error", "err", err)
 	}
+}
+
+// FitUDPReply trims reply so that what finally goes on the wire fits the
+// datagram budget req advertised, leaving room for the signature sig will
+// grow into. sig is nil for an unsigned reply, and is attached by the caller
+// *after* this returns — see fitUDP for why that order is the whole point.
+//
+// It is exported for the zone-transfer handler, whose one UDP case is RFC 1995
+// §2's single-SOA answer to an IXFR: that reply is signed like any other, and
+// a signed reply that would overshoot 512 has to become RFC 8945 §5.3's TC
+// reply rather than an over-size packet. The budget is not the caller's to
+// pass, which is why req is: it comes from the request's own OPT, floored at
+// 512, and getting that wrong is how a reservation comes out of a number that
+// was never real.
+func FitUDPReply(reply, req *dns.Msg, sig *dns.TSIG) {
+	fitUDP(reply, udpBudget(req), sig)
 }
 
 // udpBudget reports how many bytes a UDP reply to req may occupy on the wire.

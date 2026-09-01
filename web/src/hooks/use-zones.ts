@@ -89,6 +89,14 @@ interface ZoneCreateInput {
    * `primaries`, and validated to name a key that exists.
    */
   tsig_key_id?: number;
+  /**
+   * Who may pull this zone by AXFR: a comma-separated list of address,
+   * CIDR, or key:<tsig name> — see lib/acl.ts for the format. Optional;
+   * omitted or "" means deny every transfer, which is the default. Unlike
+   * `primaries` and `tsig_key_id`, this applies to both primary and
+   * secondary zones — a secondary re-serves what it pulled.
+   */
+  allow_transfer?: string;
   soa_ns?: string;
   soa_mbox?: string;
   soa_refresh?: number;

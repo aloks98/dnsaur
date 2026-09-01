@@ -49,6 +49,10 @@ function secondary(): Zone {
     refreshed_at: NOW - HOUR,
     last_error: "",
     last_attempt: NOW - HOUR,
+    allow_transfer: "",
+    last_xfr_at: 0,
+    last_xfr_peer: "",
+    last_xfr_error: "",
     created_at: NOW - 30 * DAY,
     modified_at: NOW - 30 * DAY,
   } satisfies Zone;

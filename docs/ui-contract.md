@@ -334,16 +334,17 @@ Real capture, `POST /zones {"name":"home.lan"}` then `GET /zones`:
   "refreshed_at":0,"created_at":1786219213980,"modified_at":1786219213980}]
 ```
 
-`type` omitted on create defaults to `primary`. **`primary` is the only type
-this milestone's API will create or patch** — real-captured: `POST /zones`
-with `"type":"internal"` 400s `only primary zones are supported`, the exact
-same message as `"secondary"`. The check
-(`internal/api/zones_handlers.go`'s `zoneTypePrimary`) is an equality test
-against `"primary"`, not an allowlist that happens to include it — so
-`internal` isn't a quiet exception, it 400s like every other non-`primary`
-value. `internal`, `secondary`, `stub` and `forwarder` all exist in the
-schema and are rendered by the zone list/detail badges (§3.6, §8) for zones
-however they come to exist — API-created zones just can't be one yet.
+`type` omitted on create defaults to `primary`. **`primary` and `secondary`
+are the two types the API will create or patch** — Milestone D2 added the
+second. `POST /zones` with `"type":"internal"` 400s `only primary and
+secondary zones are supported`, and so do `stub` and `forwarder`; the check
+(`internal/api/zones_handlers.go`) is an equality test against those two
+values, not an allowlist that happens to include them, so `internal` isn't a
+quiet exception. A `secondary` additionally requires a non-empty
+`primaries`, and `primaries`/`tsig_key_id` are rejected on any other type.
+`stub` and `forwarder` exist in the schema and are rendered by the zone
+list/detail badges (§3.6, §8) for zones however they come to exist —
+API-created zones just can't be one.
 
 Creating a zone also inserts its apex NS record (`name: "@"`, pointed at
 `soa_ns`) — RFC 2181 §10.1 requires apex NS on every authoritative zone.
@@ -359,7 +360,7 @@ Zone create/patch errors:
 | 400 | `invalid json` |
 | 400 | `bad id` |
 | 400 | `name must be a valid domain name` |
-| 400 | `only primary zones are supported` |
+| 400 | `only primary and secondary zones are supported` |
 | 404 | `not found` |
 | 409 | `a zone with that name already exists` |
 | 503 | `storage unavailable` |
@@ -809,7 +810,7 @@ unmatched clients fall back to it.
 |---|---|---|
 | `id` | int64 | |
 | `name` | string | apex, lowercase, no trailing dot |
-| `type` | string | `primary` \| `secondary` \| `stub` \| `forwarder` \| `internal`; only `primary` is creatable/patchable this milestone (§2.6) |
+| `type` | string | `primary` \| `secondary` \| `stub` \| `forwarder` \| `internal`; only `primary` and `secondary` are creatable/patchable (§2.6) |
 | `enabled` | bool | a disabled zone is skipped by lookup entirely — it neither answers nor claims the name, so queries under it fall through to a shallower enabled zone or upstream, exactly as if the zone didn't exist (`internal/zones/zone.go`'s `Index.Find`) |
 | `soa_ns`, `soa_mbox` | string | default to `ns.<name>` / `hostadmin.<name>` on create |
 | `soa_serial` | uint32 | starts at `1`; bumped by one on every record create/update/delete in the zone — **and on a reverse zone whose PTR auto-PTR just wrote, moved or retired**, so one write addressed to a forward zone can move two zones' serials, and a reverse zone's serial can move with no request ever naming it (`BumpSerial`, best-effort — logged, not surfaced, on failure) |
@@ -817,6 +818,7 @@ unmatched clients fall back to it.
 | `soa_minimum` | uint32 (seconds) | negative-cache TTL advertised for this zone's NXDOMAINs (RFC 2308), not a floor on positive answers; default 900 |
 | `soa_ttl` | uint32 (seconds) | the SOA record's own header TTL, independent of `soa_minimum` — RFC 2308 §5 needs both to express `min(minimum, ttl)`. Fixed at `900`; **no request field sets it**, on create or patch |
 | `primaries`, `tsig_key_id`, `expires_at`, `refreshed_at` | string / int64 | secondary/stub/forwarder only (Milestone D); always empty/`0` for `primary`/`internal` |
+| `allow_transfer`, `last_xfr_at`, `last_xfr_peer`, `last_xfr_error` | string / int64 | the outbound AXFR ACL and the last inbound transfer *request*'s outcome — `primary` and `secondary` only. See [`docs/api.md`](api.md)'s `allow_transfer` entry for the format and what each read-only field means (and why `last_xfr_peer` is not proof of who asked) |
 | `created_at`, `modified_at` | int64 (unix ms) | |
 
 ### 3.7 Zone record
@@ -1191,7 +1193,7 @@ typing in an input.
 | **404 / unknown route** | renders a dedicated not-found screen inside the shell, no group marked in row 2 (`pages/not-found.tsx`) — this table is stale on this point in older captures; `path="*"` no longer redirects |
 | **DHCP** | nothing exists (§3.11) |
 | **Encrypted DNS (DoH/DoT)** | no code |
-| **Zone transfers (secondary/stub/forwarder), DNSSEC** | schema and UI badges exist for the non-`primary` zone types (§3.6), but create/patch reject anything but `primary` with `400`; no transfer client/server, no signing — Milestones D–E. **Reverse zones are no longer on this list**: `PTR` is a normal record type, a reverse zone is an ordinary `primary` zone ending in `.arpa`, the RFC 6303 §4 built-ins (`internal/store/builtins.go`'s `BuiltinZones`) are seeded as `type: internal` (read-only, `409` on any write), and an A/AAAA write maintains the matching PTR server-side in the same request |
+| **Zone transfers (stub/forwarder), DNSSEC** | `secondary` is done: Milestone D2 ships the transfer client (dnsaur pulls a zone from a primary, TSIG and all) and D3 the server (dnsaur serves AXFR to its own secondaries, gated by `allow_transfer`), both with UI. `stub` and `forwarder` are still schema and badges only — create/patch reject them with `400` — and there is no DNSSEC signing. **Reverse zones are no longer on this list**: `PTR` is a normal record type, a reverse zone is an ordinary `primary` zone ending in `.arpa`, the RFC 6303 §4 built-ins (`internal/store/builtins.go`'s `BuiltinZones`) are seeded as `type: internal` (read-only, `409` on any write), and an A/AAAA write maintains the matching PTR server-side in the same request |
 | **HA / cluster UI** | no code; the spec anticipated a health-strip stub, which does not exist |
 
 The nav contains exactly the nine implemented leaf routes, in four groups
@@ -1287,6 +1289,20 @@ Collected because each one has already caused, or would cause, a wrong UI.
     a silently-wrong record is the result. The zone detail row (`/zones/{id}`)
     labels both columns for this reason: the apex sits in a chip beside Name,
     and the name-valued types get a `FULL NAME` chip beside Data.
+17. **The allow-transfer band shows four states**, not one. Shown on
+    `/zones/{id}` for `primary` and `secondary` zones only —
+    `internal`/`stub`/`forwarder` refuse every transfer outright and get no
+    editable ACL. A blank `allow_transfer` renders an explicit **"No peer
+    may transfer this zone."** line rather than leaving the field looking
+    merely unset; independent of that, the *last inbound transfer
+    request* — whatever the ACL says now — is one of **"Never asked
+    for."** (`last_xfr_at` is `0`), **"Last served `<time>` to `<peer>`"**
+    (`last_xfr_error` is `""`), or **"Refused `<peer>` — `<reason>`"**
+    (`last_xfr_error` is set). **`last_xfr_peer` is not proof of who
+    asked**: a UDP AXFR is answered `NOTIMP` only after the zone has
+    already resolved, so that refusal — spoofable UDP source address
+    included — is what gets recorded (see [`docs/api.md`](api.md)'s
+    `allow_transfer` field).
 
 ---
 
@@ -1346,12 +1362,15 @@ Go source. **The code is the source of truth.**
     implemented** — no such string exists in the client.
 13. The spec's "keeps retrying" behaviour for the API-unreachable banner is
     **not implemented**: recovery requires the manual Retry button.
-14. `openapi.yaml`'s `POST /zones` and `PATCH /zones/{id}` request bodies
-    describe `type` as "primary | secondary | stub | forwarder | internal;
-    defaults to primary", reading as if all five are accepted input values.
-    Real-captured: only `primary` (or omitting the field) succeeds — every
-    other value, `internal` included, 400s `only primary zones are
-    supported`, identically to `secondary`. See §2.6.
+14. **Was backwards until Milestone D3's review.** `openapi.yaml` is the
+    correct one here: its `POST /zones` and `PATCH /zones/{id}` request
+    bodies give `type` an `enum: [primary, secondary]` and say `stub`,
+    `forwarder` and `internal` are rejected with 400, which is what the code
+    does. The five-value list it also carries belongs to the *Zone schema*'s
+    `type` — the set a stored zone may have, not the set an API caller may
+    send. This document's §2.6 and §3.6 claimed `primary` alone was
+    creatable, and quoted an error string (`only primary zones are
+    supported`) the code stopped emitting in D2; both are corrected.
 15. `openapi.yaml`'s 404 responses on the `/zones/{id}/records*` routes
     describe the situation ("zone not found", "rid is not a record of this
     zone") rather than the response body, which is always the flat

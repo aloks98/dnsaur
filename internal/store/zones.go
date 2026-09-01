@@ -50,6 +50,17 @@ type Zone struct {
 	LastError   string `json:"last_error"`
 	LastAttempt int64  `json:"last_attempt"`
 
+	// AllowTransfer is who may pull this zone: a comma-separated list of
+	// address, CIDR, or key:<tsig name>, in zones.FormatACL's canonical
+	// spelling. Empty means deny, and that is the default.
+	AllowTransfer string `json:"allow_transfer"`
+	// The outbound twin of LastAttempt/LastError: when a peer last asked for
+	// this zone, which peer, and why it was refused if it was. Written only by
+	// NoteTransferRequest.
+	LastXfrAt    int64  `json:"last_xfr_at"`
+	LastXfrPeer  string `json:"last_xfr_peer"`
+	LastXfrError string `json:"last_xfr_error"`
+
 	CreatedAt  int64 `json:"created_at"`
 	ModifiedAt int64 `json:"modified_at"`
 }
@@ -133,14 +144,27 @@ type ZoneStore interface {
 	// disjoint — this statement owns last_error and last_attempt and touches
 	// nothing else, and nothing else touches them.
 	NoteTransferAttempt(ctx context.Context, zoneID int64, at int64, errText string) error
+	// NoteTransferRequest records one *outbound* transfer request: a peer
+	// asking this server for the zone, rather than this server asking a
+	// primary. errText is "" when the zone was served and the refusal reason
+	// when it was not — a refusal is recorded like a success, which is why
+	// this is named for the request rather than for one of its outcomes,
+	// exactly as its inbound twin NoteTransferAttempt is.
+	//
+	// It is a three-column UPDATE for the same reason NoteTransferAttempt is
+	// a two-column one — see that method's doc comment — and its column set
+	// is disjoint from both other writers of this row: updateZoneSQL (and
+	// ReplaceRecords through it) never binds last_xfr_at/last_xfr_peer/
+	// last_xfr_error, and this statement never binds anything else.
+	NoteTransferRequest(ctx context.Context, zoneID, at int64, peer, errText string) error
 }
 
 type zoneStore struct{ s *sqlStore }
 
-const zoneColumns = `id, name, type, enabled, soa_ns, soa_mbox, soa_serial, soa_refresh, soa_retry, soa_expire, soa_minimum, soa_ttl, primaries, tsig_key_id, expires_at, refreshed_at, last_error, last_attempt, created_at, modified_at`
+const zoneColumns = `id, name, type, enabled, soa_ns, soa_mbox, soa_serial, soa_refresh, soa_retry, soa_expire, soa_minimum, soa_ttl, primaries, tsig_key_id, expires_at, refreshed_at, last_error, last_attempt, allow_transfer, last_xfr_at, last_xfr_peer, last_xfr_error, created_at, modified_at`
 
 func scanZone(row interface{ Scan(...any) error }, z *Zone) error {
-	return row.Scan(&z.ID, &z.Name, &z.Type, &z.Enabled, &z.SOANS, &z.SOAMbox, &z.SOASerial, &z.SOARefresh, &z.SOARetry, &z.SOAExpire, &z.SOAMinimum, &z.SOATTL, &z.Primaries, &z.TSIGKeyID, &z.ExpiresAt, &z.RefreshedAt, &z.LastError, &z.LastAttempt, &z.CreatedAt, &z.ModifiedAt)
+	return row.Scan(&z.ID, &z.Name, &z.Type, &z.Enabled, &z.SOANS, &z.SOAMbox, &z.SOASerial, &z.SOARefresh, &z.SOARetry, &z.SOAExpire, &z.SOAMinimum, &z.SOATTL, &z.Primaries, &z.TSIGKeyID, &z.ExpiresAt, &z.RefreshedAt, &z.LastError, &z.LastAttempt, &z.AllowTransfer, &z.LastXfrAt, &z.LastXfrPeer, &z.LastXfrError, &z.CreatedAt, &z.ModifiedAt)
 }
 
 func (z *zoneStore) Zones(ctx context.Context) ([]Zone, error) {
@@ -175,9 +199,11 @@ func (z *zoneStore) Zone(ctx context.Context, id int64) (Zone, error) {
 }
 
 func (z *zoneStore) AddZone(ctx context.Context, zn Zone) (int64, error) {
-	return z.s.insert(ctx, `INSERT INTO zones (name, type, enabled, soa_ns, soa_mbox, soa_serial, soa_refresh, soa_retry, soa_expire, soa_minimum, soa_ttl, primaries, tsig_key_id, expires_at, refreshed_at, created_at, modified_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		zn.Name, zn.Type, zn.Enabled, zn.SOANS, zn.SOAMbox, zn.SOASerial, zn.SOARefresh, zn.SOARetry, zn.SOAExpire, zn.SOAMinimum, zn.SOATTL, zn.Primaries, zn.TSIGKeyID, zn.ExpiresAt, zn.RefreshedAt, zn.CreatedAt, zn.ModifiedAt)
+	// The three last_xfr_* columns are deliberately absent here — they
+	// default, and are written only by NoteTransferRequest.
+	return z.s.insert(ctx, `INSERT INTO zones (name, type, enabled, soa_ns, soa_mbox, soa_serial, soa_refresh, soa_retry, soa_expire, soa_minimum, soa_ttl, primaries, tsig_key_id, expires_at, refreshed_at, allow_transfer, created_at, modified_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		zn.Name, zn.Type, zn.Enabled, zn.SOANS, zn.SOAMbox, zn.SOASerial, zn.SOARefresh, zn.SOARetry, zn.SOAExpire, zn.SOAMinimum, zn.SOATTL, zn.Primaries, zn.TSIGKeyID, zn.ExpiresAt, zn.RefreshedAt, zn.AllowTransfer, zn.CreatedAt, zn.ModifiedAt)
 }
 
 // The four write statements below are each written once and used twice:
@@ -188,7 +214,7 @@ func (z *zoneStore) AddZone(ctx context.Context, zn Zone) (int64, error) {
 // could see, and the zone would silently keep whatever the import didn't
 // write.
 const (
-	updateZoneSQL   = `UPDATE zones SET name = ?, type = ?, enabled = ?, soa_ns = ?, soa_mbox = ?, soa_serial = ?, soa_refresh = ?, soa_retry = ?, soa_expire = ?, soa_minimum = ?, soa_ttl = ?, primaries = ?, tsig_key_id = ?, expires_at = ?, refreshed_at = ?, modified_at = ? WHERE id = ?`
+	updateZoneSQL   = `UPDATE zones SET name = ?, type = ?, enabled = ?, soa_ns = ?, soa_mbox = ?, soa_serial = ?, soa_refresh = ?, soa_retry = ?, soa_expire = ?, soa_minimum = ?, soa_ttl = ?, primaries = ?, tsig_key_id = ?, expires_at = ?, refreshed_at = ?, allow_transfer = ?, modified_at = ? WHERE id = ?`
 	insertRecordSQL = `INSERT INTO zone_records (zone_id, name, type, ttl, rdata, enabled, comment) VALUES (?, ?, ?, ?, ?, ?, ?)`
 	// zone_id is deliberately not in the SET list: a record is deleted and
 	// recreated to move between zones, not updated in place.
@@ -197,7 +223,7 @@ const (
 )
 
 func updateZoneArgs(zn Zone) []any {
-	return []any{zn.Name, zn.Type, zn.Enabled, zn.SOANS, zn.SOAMbox, zn.SOASerial, zn.SOARefresh, zn.SOARetry, zn.SOAExpire, zn.SOAMinimum, zn.SOATTL, zn.Primaries, zn.TSIGKeyID, zn.ExpiresAt, zn.RefreshedAt, zn.ModifiedAt, zn.ID}
+	return []any{zn.Name, zn.Type, zn.Enabled, zn.SOANS, zn.SOAMbox, zn.SOASerial, zn.SOARefresh, zn.SOARetry, zn.SOAExpire, zn.SOAMinimum, zn.SOATTL, zn.Primaries, zn.TSIGKeyID, zn.ExpiresAt, zn.RefreshedAt, zn.AllowTransfer, zn.ModifiedAt, zn.ID}
 }
 
 func insertRecordArgs(r ZoneRecord) []any {
@@ -219,6 +245,15 @@ const noteTransferAttemptSQL = `UPDATE zones SET last_error = ?, last_attempt = 
 
 func (z *zoneStore) NoteTransferAttempt(ctx context.Context, zoneID int64, at int64, errText string) error {
 	return z.s.execOne(ctx, noteTransferAttemptSQL, errText, at, zoneID)
+}
+
+// noteTransferRequestSQL names the only three columns an outbound transfer
+// outcome may write. Disjoint from updateZoneSQL and from
+// noteTransferAttemptSQL — see ZoneStore.NoteTransferRequest.
+const noteTransferRequestSQL = `UPDATE zones SET last_xfr_at = ?, last_xfr_peer = ?, last_xfr_error = ? WHERE id = ?`
+
+func (z *zoneStore) NoteTransferRequest(ctx context.Context, zoneID, at int64, peer, errText string) error {
+	return z.s.execOne(ctx, noteTransferRequestSQL, at, peer, errText, zoneID)
 }
 
 func (z *zoneStore) DeleteZone(ctx context.Context, id int64) error {

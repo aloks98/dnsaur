@@ -213,6 +213,40 @@ components:
             0 = never attempted. Only meaningful read beside last_error,
             which without a date is a claim about the present made by an
             unknown past. Read-only. Secondary only.
+        allow_transfer:
+          type: string
+          description: >
+            Who may pull this zone by AXFR: a comma-separated list where
+            each entry is an IP address, a CIDR prefix, or key:<tsig-name>
+            (a request signed under that TSIG key) — e.g.
+            "10.0.0.0/24, 192.168.1.5, key:secondary-ns2.". Empty means
+            deny every transfer, which is the default. Applies to both
+            primary and secondary zones — a secondary re-serves what it
+            pulled — unlike primaries, which is secondary-only.
+
+
+            Stored and read back in its canonical spelling (lowercase key
+            names, fully qualified, ", "-separated), which may differ from
+            what was written even though it means the same thing. A
+            key:<name> entry must name a TSIG key that exists.
+        last_xfr_at:
+          type: integer
+          format: int64
+          description: >
+            unix ms of the last time a peer asked this server to transfer
+            the zone, successful or not; 0 = never. The outbound twin of
+            last_attempt. Read-only.
+        last_xfr_peer:
+          type: string
+          description: >
+            The address of the peer from the most recent outbound transfer
+            request, "" when none has ever been made. Read-only.
+        last_xfr_error:
+          type: string
+          description: >
+            Why the most recent outbound transfer request was refused, in
+            the server's own words, or "" when it was served. The outbound
+            twin of last_error. Read-only.
         created_at: { type: integer, format: int64 }
         modified_at: { type: integer, format: int64 }
     ZoneRecord:
@@ -1554,6 +1588,13 @@ paths:
                   description: >
                     secondary only; optional, and when set must name an
                     existing TSIG key
+                allow_transfer:
+                  type: string
+                  description: >
+                    optional; empty (the default) means deny every AXFR
+                    request. Applies to both primary and secondary — see
+                    the Zone schema's allow_transfer field for the format;
+                    a key:<name> entry must name an existing TSIG key.
                 soa_ns: { type: string, description: 'defaults to "ns.<name>"' }
                 soa_mbox: { type: string, description: 'defaults to "hostadmin.<name>"' }
                 soa_refresh: { type: integer, format: int64, description: seconds; defaults to 900 }
@@ -1575,8 +1616,9 @@ paths:
             to something other than primary or secondary ("only primary
             and secondary zones are supported"); a secondary's primaries
             is missing or malformed; primaries or tsig_key_id is set on a
-            zone that is not a secondary; or tsig_key_id names no
-            existing key
+            zone that is not a secondary; tsig_key_id names no existing
+            key; allow_transfer is malformed; or allow_transfer names a
+            TSIG key that does not exist
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -1672,6 +1714,7 @@ paths:
                 soa_minimum: { type: integer, format: int64, description: seconds }
                 primaries: { type: string, description: 'see the Zone schema''s primaries field' }
                 tsig_key_id: { type: integer, format: int64 }
+                allow_transfer: { type: string, description: 'see the Zone schema''s allow_transfer field' }
       responses:
         "204":
           description: No Content
@@ -1681,8 +1724,10 @@ paths:
             is set to something other than primary or secondary ("only
             primary and secondary zones are supported"), the zone would
             be left a secondary without valid primaries, primaries or
-            tsig_key_id is set on a zone that is not a secondary, or
-            tsig_key_id names no existing key
+            tsig_key_id is set on a zone that is not a secondary,
+            tsig_key_id names no existing key, allow_transfer is
+            malformed, or allow_transfer names a TSIG key that does not
+            exist
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }

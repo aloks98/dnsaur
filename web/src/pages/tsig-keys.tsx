@@ -42,6 +42,7 @@ import {
 } from "../hooks/use-tsig-keys";
 import { useZones } from "../hooks/use-zones";
 import { StaleDataAlert } from "../components/stale-data-alert";
+import { aclKeyNames } from "../lib/acl";
 import {
   algorithmLabel,
   algorithmOptions,
@@ -632,6 +633,19 @@ export function TSIGKeys() {
    * How many zones name each key — the USED BY column, and the in-use delete
    * guard that reads the same number.
    *
+   * A zone can depend on a key two ways, and D2 only ever counted one of
+   * them: `tsig_key_id` is what a *secondary* signs its own pulls with, and
+   * (D3) `allow_transfer` is who may pull *this* zone — a `key:` entry
+   * names a key the same way, and the store's delete guard refuses either
+   * reference on the same terms (see tsigKeyStore.Delete /
+   * internal/store/tsigkeys.go's aclKeyRef). `allow_transfer` names keys by
+   * their canonical *name*, not id, so `idByName` is what turns
+   * `aclKeyNames`'s output back into the id this map is keyed by — the
+   * zones list carries names nowhere else. Both references are folded
+   * through one `Set` per zone before being added to the running counts, so
+   * a zone that names the same key both ways still counts once: one 409 is
+   * one dependent, not two.
+   *
    * The guard is an affordance, not the enforcement. The server refuses the
    * delete with 409 whichever way this map came out (tsigKeyStore.Delete does
    * it in one statement, so there is no check-then-act window there), which
@@ -641,14 +655,21 @@ export function TSIGKeys() {
    * use says so rather than reporting a generic failure.
    */
   const usageByKeyID = useMemo(() => {
+    const idByName = new Map<string, number>();
+    for (const k of keys.data ?? []) idByName.set(k.name, k.id);
+
     const counts = new Map<number, number>();
     for (const zone of zones.data ?? []) {
-      if (zone.tsig_key_id !== 0) {
-        counts.set(zone.tsig_key_id, (counts.get(zone.tsig_key_id) ?? 0) + 1);
+      const ids = new Set<number>();
+      if (zone.tsig_key_id !== 0) ids.add(zone.tsig_key_id);
+      for (const name of aclKeyNames(zone.allow_transfer)) {
+        const id = idByName.get(name);
+        if (id !== undefined) ids.add(id);
       }
+      for (const id of ids) counts.set(id, (counts.get(id) ?? 0) + 1);
     }
     return counts;
-  }, [zones.data]);
+  }, [zones.data, keys.data]);
   const usedBy = (id: number) => usageByKeyID.get(id) ?? 0;
 
   const [addOpen, setAddOpen] = useState(false);

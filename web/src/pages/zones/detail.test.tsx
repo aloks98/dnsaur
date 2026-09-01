@@ -29,6 +29,10 @@ function zone(overrides: Partial<Zone> = {}): Zone {
     refreshed_at: 0,
     last_error: "",
     last_attempt: 0,
+    allow_transfer: "",
+    last_xfr_at: 0,
+    last_xfr_peer: "",
+    last_xfr_error: "",
     created_at: Date.now() - 86_400_000,
     modified_at: Date.now() - 60_000,
     ...overrides,
@@ -982,6 +986,13 @@ test("a built-in zone offers no way to change it", async () => {
   expect(screen.queryByRole("button", { name: /disable zone/i })).not.toBeInTheDocument();
   // Its records are still listed — reading is the point of showing it at all.
   expect(await screen.findByText(/built-in · read-only/i)).toBeInTheDocument();
+  // §9.5.3 refuses a transfer of a built-in zone with NOTAUTH regardless of
+  // its ACL, and handleZonePatch 409s every PATCH to one outright — so the
+  // allow-transfer row, whose only content is an editable field with a
+  // working-looking Save, must not be offered here at all, on the same
+  // terms as Add record/Delete zone/Disable zone above.
+  expect(screen.queryByRole("button", { name: /^edit allow transfer$/i })).not.toBeInTheDocument();
+  expect(screen.queryByLabelText(/^allow transfer$/i)).not.toBeInTheDocument();
 });
 
 // ── Zone file export and import ───────────────────────────────────────────
@@ -1701,4 +1712,169 @@ test("Refresh now brings the new records in, in one read of them", async () => {
 
   expect(await screen.findByText("heimdall")).toBeInTheDocument();
   expect(paths.filter((p) => p === "/api/v1/zones/1/records")).toHaveLength(2);
+});
+
+// ── The allow-transfer row ────────────────────────────────────────────────
+// Serving transfers applies to both primary and secondary zones — a
+// secondary re-serves what it pulled — so this is neither part of SoaBand
+// (primary-only) nor TransferBand (secondary-only, and about the transfers
+// this zone *pulls*). It answers a different question from both: who may
+// take this zone from us, and who last did. Read is the default; the pencil
+// opens editing, and the row returns to read on Save or Cancel.
+
+/** Opens the row's editing state the way a user does — the input is closed
+ * until the pencil is clicked. */
+async function openAllowTransferEdit(user: ReturnType<typeof userEvent.setup>) {
+  await user.click(await screen.findByRole("button", { name: /^edit allow transfer$/i }));
+  await screen.findByLabelText(/^allow transfer$/i);
+}
+
+test("shows who may transfer the zone, and editing seeds the field with it", async () => {
+  const user = userEvent.setup();
+  renderZoneDetail({ zone: zone({ id: 1, allow_transfer: "10.0.0.0/24, key:ns2." }) });
+  await screen.findByText("example.com");
+
+  expect(screen.getByText("10.0.0.0/24, key:ns2.")).toBeInTheDocument();
+  expect(screen.queryByLabelText(/^allow transfer$/i)).not.toBeInTheDocument();
+
+  await openAllowTransferEdit(user);
+  expect(screen.getByLabelText(/^allow transfer$/i)).toHaveValue("10.0.0.0/24, key:ns2.");
+});
+
+test("says plainly when no peer may", async () => {
+  const user = userEvent.setup();
+  renderZoneDetail({ zone: zone({ id: 1, allow_transfer: "" }) });
+  await screen.findByText("example.com");
+
+  expect(screen.getByText("No peer may transfer this zone.")).toBeInTheDocument();
+
+  await openAllowTransferEdit(user);
+  expect(screen.getByLabelText(/^allow transfer$/i)).toHaveValue("");
+});
+
+test("Cancel returns to read mode and writes nothing", async () => {
+  const user = userEvent.setup();
+  let patched = false;
+  renderZoneDetail({ zone: zone({ id: 1, allow_transfer: "10.0.0.0/24" }) });
+  server.use(
+    http.patch("/api/v1/zones/1", () => {
+      patched = true;
+      return new HttpResponse(null, { status: 204 });
+    }),
+  );
+  await screen.findByText("example.com");
+  await openAllowTransferEdit(user);
+  await user.type(screen.getByLabelText(/^allow transfer$/i), ",typed-but-abandoned");
+
+  await user.click(screen.getByRole("button", { name: /^cancel editing allow transfer$/i }));
+
+  expect(screen.queryByLabelText(/^allow transfer$/i)).not.toBeInTheDocument();
+  expect(screen.getByText("10.0.0.0/24")).toBeInTheDocument();
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  expect(patched).toBe(false);
+});
+
+test("rejects a malformed entry before sending it", async () => {
+  const user = userEvent.setup();
+  let patched = false;
+  renderZoneDetail({ zone: zone({ id: 1, allow_transfer: "" }) });
+  server.use(
+    http.patch("/api/v1/zones/1", () => {
+      patched = true;
+      return new HttpResponse(null, { status: 204 });
+    }),
+  );
+  await screen.findByText("example.com");
+  await openAllowTransferEdit(user);
+
+  const field = screen.getByLabelText(/^allow transfer$/i);
+  await user.type(field, "not-an-ip");
+  await user.click(screen.getByRole("button", { name: /^save$/i }));
+
+  expect(
+    await screen.findByText(
+      'allow_transfer "not-an-ip": expected an IP address, a CIDR prefix, or key:<name>',
+    ),
+  ).toBeInTheDocument();
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  expect(patched).toBe(false);
+});
+
+test("saving a valid allow transfer PATCHes the zone and returns to read mode", async () => {
+  const user = userEvent.setup();
+  let body: unknown;
+  renderZoneDetail({ zone: zone({ id: 1, allow_transfer: "" }) });
+  server.use(
+    http.patch("/api/v1/zones/1", async ({ request }) => {
+      body = await request.json();
+      return new HttpResponse(null, { status: 204 });
+    }),
+  );
+  await screen.findByText("example.com");
+  await openAllowTransferEdit(user);
+
+  const field = screen.getByLabelText(/^allow transfer$/i);
+  await user.type(field, "10.0.0.0/24");
+  await user.click(screen.getByRole("button", { name: /^save$/i }));
+
+  await waitFor(() => expect(body).toEqual({ allow_transfer: "10.0.0.0/24" }));
+  await waitFor(() => expect(screen.queryByLabelText(/^allow transfer$/i)).not.toBeInTheDocument());
+});
+
+test("shows the last peer served and when", async () => {
+  renderZoneDetail({
+    zone: zone({
+      id: 1,
+      allow_transfer: "10.0.0.0/24",
+      last_xfr_at: Date.now() - 2 * 60_000,
+      last_xfr_peer: "10.0.0.5",
+      last_xfr_error: "",
+    }),
+  });
+  await screen.findByText("example.com");
+
+  expect(screen.getByText("Last served 2m ago to 10.0.0.5")).toBeInTheDocument();
+});
+
+test("shows a refusal with its reason", async () => {
+  renderZoneDetail({
+    zone: zone({
+      id: 1,
+      allow_transfer: "10.0.0.0/24",
+      last_xfr_at: Date.now() - 60_000,
+      last_xfr_peer: "10.0.0.9",
+      last_xfr_error: "not in allow transfer",
+    }),
+  });
+  await screen.findByText("example.com");
+
+  expect(screen.getByText("Refused 10.0.0.9 — not in allow transfer")).toBeInTheDocument();
+});
+
+test("says nothing has asked when last_xfr_at is 0", async () => {
+  renderZoneDetail({
+    zone: zone({ id: 1, last_xfr_at: 0, last_xfr_peer: "", last_xfr_error: "" }),
+  });
+  await screen.findByText("example.com");
+
+  expect(screen.getByText("Never asked for.")).toBeInTheDocument();
+});
+
+test("shows the band for a secondary too", async () => {
+  renderZoneDetail({
+    zone: secondary({
+      allow_transfer: "key:ns2.",
+      last_xfr_at: Date.now() - 5 * 60_000,
+      last_xfr_peer: "203.0.113.20",
+      last_xfr_error: "",
+    }),
+  });
+  await screen.findByText("e412.in");
+
+  // Both bands render for a secondary: TransferBand (about what it pulls)
+  // and this row (about who may take it from here), and they must not be
+  // confused with each other.
+  expect(screen.getByText("Primaries")).toBeInTheDocument();
+  expect(screen.getByText("key:ns2.")).toBeInTheDocument();
+  expect(screen.getByText("Last served 5m ago to 203.0.113.20")).toBeInTheDocument();
 });

@@ -171,6 +171,45 @@ Full parameter/response detail lives in `internal/api/openapi.yaml`
   written together and survive a restart — the scheduler's own view of a
   failure does not — so they are the honest answer to "is this zone
   working", and `last_error` should always be read beside `last_attempt`.
+- **Zone transfers (outbound)** — any zone dnsaur holds, `primary` or
+  `secondary`, can be transferred to another nameserver over AXFR (and
+  IXFR, answered with a full AXFR — there is no journal yet to compute a
+  delta from). `allow_transfer` on `POST /zones` and `PATCH /zones/{id}` is
+  the ACL: a comma-separated list where each entry is an IP address
+  (`192.168.1.5`), a CIDR prefix (`10.0.0.0/24`), or `key:<tsig-name>` (the
+  request must carry a TSIG that verified under that key) — e.g.
+  `"10.0.0.0/24, 192.168.1.5, key:secondary-ns2."`. Entries are OR'd; any
+  one match allows the transfer. **Empty is the default and means deny
+  every transfer** — a zone created without setting it answers every AXFR
+  `REFUSED`. Unlike `primaries`/`tsig_key_id`, `allow_transfer` is not
+  secondary-only: a secondary re-serves what it pulled, so its own copy can
+  be transferred onward too. A `key:` entry must name a TSIG key that
+  exists at write time — checked the same way `tsig_key_id` is — and `400`s
+  otherwise. **What's stored is the canonical spelling, not what was
+  typed**: on write the value is re-parsed and re-formatted (lowercase,
+  fully-qualified key names, `", "`-separated), so a later `GET` can read
+  back a string that differs from the one sent while still matching the
+  same peers.
+
+  Three read-only fields record the most recent transfer *request* —
+  distinct from `refreshed_at`/`last_attempt`/`last_error` above, which
+  record this zone's own attempts to pull from *its* primary:
+  `last_xfr_at` (unix ms of the last time any peer asked, `0` = never),
+  `last_xfr_peer` (the address that asked, `""` when none has), and
+  `last_xfr_error` (why that request was refused, in the server's own
+  words, or `""` when it was served). **Only a request that arrived over
+  TCP is recorded.** A zone transfer is a TCP protocol, so a UDP arrival —
+  the `NOTIMP` a UDP AXFR gets, the single-SOA reply a UDP IXFR gets, or a
+  UDP peer the `allow_transfer` gate refuses — is not a transfer attempt,
+  it is a peer using the wrong transport, and none of it touches these
+  three columns; it is logged and nothing more. That makes `last_xfr_peer`
+  what it looks like: a UDP source address is trivial to spoof, a TCP
+  handshake off-path is not, so recording only what arrived over TCP is
+  what lets this column be read as proof of who last asked rather than a
+  claim that has to be caveated. The column is still throttled, to bound
+  how fast a peer that *did* complete a TCP handshake can make the server
+  write it. See [`docs/architecture.md`](architecture.md) for what each
+  rcode a refused transfer carries actually means.
 - **Zone records** — `GET /zones/{id}/records`, `POST /zones/{id}/records`,
   `PUT /zones/{id}/records/{rid}`, `DELETE /zones/{id}/records/{rid}` —
   records within a zone, named relative to its apex (`@`, `bifrost`, `*`,

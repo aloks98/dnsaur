@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -75,6 +76,61 @@ func TestDeleteTSIGKeyInUseIsRefused(t *testing.T) {
 		}
 		if err := st.TSIGKeys().Delete(ctx, 999999); !errors.Is(err, ErrNotFound) {
 			t.Fatalf("delete of a missing key = %v, want ErrNotFound", err)
+		}
+	})
+}
+
+// A `key:` entry in allow_transfer is the same reference by a different
+// spelling as tsig_key_id, and gets the same treatment: the key it names
+// cannot be deleted out from under it. Key and zone names are made unique per
+// run (testGroupName) rather than the fixed "ns2."/"e412.in" of the design —
+// tsig_keys.name is UNIQUE and postgres here is one database shared across
+// this whole package's test run, so a literal name reused across test
+// functions would collide with itself.
+func TestDeleteRefusesAKeyNamedByAllowTransfer(t *testing.T) {
+	forEachDriver(t, func(t *testing.T, st Store) {
+		ctx := context.Background()
+		name := testGroupName("ns2") + "."
+		keyID, err := st.TSIGKeys().Create(ctx, TSIGKey{
+			Name: name, Algorithm: "hmac-sha256.", Secret: "c2VjcmV0",
+		})
+		if err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+		if _, err := st.Zones().AddZone(ctx, Zone{
+			Name: testGroupName("e412.in"), Type: "primary", Enabled: true,
+			AllowTransfer: "10.0.0.0/24, key:" + name,
+		}); err != nil {
+			t.Fatalf("AddZone: %v", err)
+		}
+		if err := st.TSIGKeys().Delete(ctx, keyID); !errors.Is(err, ErrInUse) {
+			t.Fatalf("Delete = %v, want ErrInUse: a key an ACL names must not vanish under it", err)
+		}
+	})
+}
+
+// The delimiters in the guard are what make it exact. Without them, a key
+// named "ns2." would be found inside "xns2." and "ns2extra." too, and every
+// key merely resembled by an ACL entry would be undeletable.
+func TestDeleteAllowsAKeyOnlyResembledByAnACLEntry(t *testing.T) {
+	forEachDriver(t, func(t *testing.T, st Store) {
+		ctx := context.Background()
+		name := testGroupName("ns2") + "."
+		keyID, err := st.TSIGKeys().Create(ctx, TSIGKey{
+			Name: name, Algorithm: "hmac-sha256.", Secret: "c2VjcmV0",
+		})
+		if err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+		bare := strings.TrimSuffix(name, ".")
+		if _, err := st.Zones().AddZone(ctx, Zone{
+			Name: testGroupName("e412.in"), Type: "primary", Enabled: true,
+			AllowTransfer: "key:x" + name + ", key:" + bare + "extra.",
+		}); err != nil {
+			t.Fatalf("AddZone: %v", err)
+		}
+		if err := st.TSIGKeys().Delete(ctx, keyID); err != nil {
+			t.Fatalf("Delete = %v, want nil: no ACL entry names this key", err)
 		}
 	})
 }

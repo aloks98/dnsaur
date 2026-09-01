@@ -568,3 +568,96 @@ func TestOrdinaryZoneWritesCannotEraseARecordedFailure(t *testing.T) {
 		}
 	})
 }
+
+func TestZoneAllowTransferRoundTrips(t *testing.T) {
+	forEachDriver(t, func(t *testing.T, s Store) {
+		ctx := context.Background()
+		zs := s.Zones()
+		id, err := zs.AddZone(ctx, Zone{
+			Name: testGroupName("e412.in"), Type: "primary", Enabled: true,
+			AllowTransfer: "10.0.0.0/24, key:ns2.",
+		})
+		if err != nil {
+			t.Fatalf("AddZone: %v", err)
+		}
+		got, err := zs.Zone(ctx, id)
+		if err != nil {
+			t.Fatalf("Zone: %v", err)
+		}
+		if got.AllowTransfer != "10.0.0.0/24, key:ns2." {
+			t.Fatalf("allow_transfer = %q after insert", got.AllowTransfer)
+		}
+		got.AllowTransfer = "192.168.1.5"
+		if err := zs.UpdateZone(ctx, got); err != nil {
+			t.Fatalf("UpdateZone: %v", err)
+		}
+		got, err = zs.Zone(ctx, id)
+		if err != nil {
+			t.Fatalf("Zone: %v", err)
+		}
+		if got.AllowTransfer != "192.168.1.5" {
+			t.Fatalf("allow_transfer = %q after update", got.AllowTransfer)
+		}
+	})
+}
+
+func TestNoteTransferRequestWritesOnlyItsOwnColumns(t *testing.T) {
+	forEachDriver(t, func(t *testing.T, s Store) {
+		ctx := context.Background()
+		zs := s.Zones()
+		name := testGroupName("e412.in")
+		id, err := zs.AddZone(ctx, Zone{Name: name, Type: "primary", Enabled: true})
+		if err != nil {
+			t.Fatalf("AddZone: %v", err)
+		}
+		if err := zs.NoteTransferRequest(ctx, id, 1700000000000, "10.0.0.5", ""); err != nil {
+			t.Fatalf("NoteTransferRequest: %v", err)
+		}
+		got, err := zs.Zone(ctx, id)
+		if err != nil {
+			t.Fatalf("Zone: %v", err)
+		}
+		if got.LastXfrAt != 1700000000000 || got.LastXfrPeer != "10.0.0.5" || got.LastXfrError != "" {
+			t.Fatalf("served state = (%d, %q, %q)", got.LastXfrAt, got.LastXfrPeer, got.LastXfrError)
+		}
+		if got.Name != name || !got.Enabled {
+			t.Fatalf("NoteTransferRequest changed the zone's configuration: %+v", got)
+		}
+	})
+}
+
+// The mirror of TestNoteTransferAttemptSurvivesAZoneWrite on the outbound
+// side: a whole-row UpdateZone binds every configuration column from a struct
+// the caller read earlier, so if last_xfr_* were in that statement, an
+// operator's edit would erase what a transfer recorded a moment before.
+func TestOrdinaryZoneWritesCannotEraseServedState(t *testing.T) {
+	forEachDriver(t, func(t *testing.T, s Store) {
+		ctx := context.Background()
+		zs := s.Zones()
+		id, err := zs.AddZone(ctx, Zone{Name: testGroupName("e412.in"), Type: "primary", Enabled: true})
+		if err != nil {
+			t.Fatalf("AddZone: %v", err)
+		}
+		stale, err := zs.Zone(ctx, id) // read before the transfer
+		if err != nil {
+			t.Fatalf("Zone: %v", err)
+		}
+		if err := zs.NoteTransferRequest(ctx, id, 1700000000000, "10.0.0.5", "refused"); err != nil {
+			t.Fatalf("NoteTransferRequest: %v", err)
+		}
+		stale.SOARefresh = 7200 // an edit made from the stale read
+		if err := zs.UpdateZone(ctx, stale); err != nil {
+			t.Fatalf("UpdateZone: %v", err)
+		}
+		got, err := zs.Zone(ctx, id)
+		if err != nil {
+			t.Fatalf("Zone: %v", err)
+		}
+		if got.SOARefresh != 7200 {
+			t.Fatalf("the edit did not land: soa_refresh = %d", got.SOARefresh)
+		}
+		if got.LastXfrAt != 1700000000000 || got.LastXfrError != "refused" {
+			t.Fatalf("the zone write erased the served state: (%d, %q)", got.LastXfrAt, got.LastXfrError)
+		}
+	})
+}

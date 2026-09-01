@@ -22,6 +22,7 @@ of truth — if it's not listed as shipped, it doesn't work yet.
 | Per-client groups (IP/CIDR matchers, per-group lists & rules) | Shipped |
 | Authoritative DNS zones (primary) | Shipped |
 | Secondary zones (AXFR in, TSIG, SOA-scheduled refresh) | Shipped |
+| Zone transfers out (AXFR to secondaries, TSIG-authenticated, allow-transfer ACL) | Shipped |
 | Reverse DNS (PTR, RFC 6303 built-in zones, auto-PTR from A/AAAA) | Shipped |
 | Caching with TTL clamps, negative caching, serve-stale | Shipped |
 | Query log (SQLite/Postgres, buffered writes, retention pruning) | Shipped |
@@ -32,7 +33,7 @@ of truth — if it's not listed as shipped, it doesn't work yet.
 | HA config sync (primary/replica) | Planned |
 | DHCP | Planned |
 | Encrypted DNS (DoH/DoT upstream and serving) | Planned |
-| Zone transfers + DNSSEC | Planned |
+| DNSSEC | Planned |
 
 There's no published Docker image yet, but you no longer need to hand-edit
 the database or shell out to curl for everyday admin: a React dashboard

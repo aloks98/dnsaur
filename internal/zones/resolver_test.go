@@ -44,6 +44,9 @@ func (f *fakeZoneStore) ReplaceRecords(ctx context.Context, z store.Zone, delete
 func (f *fakeZoneStore) NoteTransferAttempt(ctx context.Context, zoneID, at int64, errText string) error {
 	return nil
 }
+func (f *fakeZoneStore) NoteTransferRequest(ctx context.Context, zoneID, at int64, peer, errText string) error {
+	return nil
+}
 
 // resolverWith builds a Resolver whose only zone is the enabled primary zone
 // e412.in, holding recs, reloaded once so its snapshot is populated.

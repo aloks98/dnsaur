@@ -123,6 +123,23 @@ export interface Zone {
    * whether it is still true.
    */
   last_attempt: number;
+  /**
+   * Who may pull this zone: a comma-separated list of address, CIDR, or
+   * key:<tsig name>, in FormatACL's canonical spelling. "" means deny, and
+   * that is the default. Applies to both primary and secondary zones — a
+   * secondary re-serves what it pulled.
+   */
+  allow_transfer: string;
+  /**
+   * The outbound twin of last_attempt: unix ms of the last inbound transfer
+   * request this zone answered, served or refused; 0 = never asked.
+   */
+  last_xfr_at: number;
+  /** The address that asked, no port. Only meaningful beside last_xfr_at. */
+  last_xfr_peer: string;
+  /** Why that request was refused, verbatim; "" when it was served — the
+   * outbound twin of last_error. */
+  last_xfr_error: string;
   created_at: number;
   modified_at: number;
 }

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"strings"
 	"sync"
 	"testing"
 
@@ -510,6 +511,78 @@ func TestPatchToSecondaryRequiresPrimaries(t *testing.T) {
 	}
 	if z := srv.zone(t, got.ID); z.Type != "secondary" || z.Primaries != "192.168.150.5" {
 		t.Fatalf("zone = %+v, want a secondary with its primaries", z)
+	}
+}
+
+// allow_transfer joins checkZoneTransferConfig's (type, primaries,
+// tsig_key_id) triple for the same reason primaries and tsig_key_id do — "a
+// rule enforced on POST and not on PATCH is a rule with a way around it".
+// What's stored is zones.FormatACL's canonical spelling, never the raw
+// input: Task 2's TSIG-key delete guard matches key:<name> inside the
+// stored string in SQL and depends on that spelling exactly.
+func TestZoneCreateStoresAllowTransferCanonically(t *testing.T) {
+	srv := newTestServer(t)
+	createTSIGKey(t, srv, "NS2")
+	body := `{"name":"e412.in","allow_transfer":" 10.0.0.5 , KEY:NS2 "}`
+	rec := srv.do(t, "POST", "/api/v1/zones", body)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body)
+	}
+	id := createdID(t, rec)
+	if got := srv.zone(t, id).AllowTransfer; got != "10.0.0.5, key:ns2." {
+		t.Fatalf("allow_transfer stored as %q, want the canonical spelling", got)
+	}
+}
+
+func TestZoneCreateRejectsAMalformedAllowTransfer(t *testing.T) {
+	srv := newTestServer(t)
+	rec := srv.do(t, "POST", "/api/v1/zones", `{"name":"e412.in","allow_transfer":"not-an-ip"}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "allow_transfer") {
+		t.Fatalf("error does not name the field: %s", rec.Body)
+	}
+}
+
+func TestZoneCreateRejectsAnACLKeyThatDoesNotExist(t *testing.T) {
+	srv := newTestServer(t)
+	rec := srv.do(t, "POST", "/api/v1/zones", `{"name":"e412.in","allow_transfer":"key:nobody"}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "nobody") {
+		t.Fatalf("error does not name the missing key: %s", rec.Body)
+	}
+}
+
+func TestZonePatchValidatesAllowTransferToo(t *testing.T) {
+	srv := newTestServer(t)
+	id := srv.createZone(t, "e412.in")
+	path := fmt.Sprintf("/api/v1/zones/%d", id)
+
+	if rec := srv.do(t, "PATCH", path, `{"allow_transfer":"10.0.0.0/33"}`); rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 — a rule enforced on POST only has a way around it", rec.Code)
+	}
+	if rec := srv.do(t, "PATCH", path, `{"allow_transfer":"10.0.0.0/24"}`); rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body)
+	}
+	if z := srv.zone(t, id); z.AllowTransfer != "10.0.0.0/24" {
+		t.Fatalf("allow_transfer = %q", z.AllowTransfer)
+	}
+}
+
+// A secondary re-serves what it pulled (§9.5.3), so allow_transfer is not
+// secondary-only the way primaries is.
+func TestAllowTransferIsAcceptedOnBothServingTypes(t *testing.T) {
+	srv := newTestServer(t)
+	for _, body := range []string{
+		`{"name":"a.e412.in","type":"primary","allow_transfer":"10.0.0.0/24"}`,
+		`{"name":"b.e412.in","type":"secondary","primaries":"192.0.2.1","allow_transfer":"10.0.0.0/24"}`,
+	} {
+		if rec := srv.do(t, "POST", "/api/v1/zones", body); rec.Code != http.StatusCreated {
+			t.Fatalf("POST %s = %d, body %s", body, rec.Code, rec.Body)
+		}
 	}
 }
 

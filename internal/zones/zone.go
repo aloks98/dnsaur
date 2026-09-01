@@ -125,6 +125,24 @@ func NewIndex(zs []Zone) *Index {
 	return idx
 }
 
+// Apex returns a pointer into the Index's own zone slice, or nil — the
+// served zone itself and not a copy, so it is to be read and never written
+// (see Resolver.Snapshot for what writing through it costs).
+//
+// Unlike Find it does not walk suffixes, and unlike Find it does not skip a
+// disabled zone: a transfer names one zone, so answering an AXFR for
+// sub.e412.in with e412.in would hand over a zone the peer did not ask for
+// and may not be permitted, and "we hold this zone but it is disabled" is a
+// different refusal from "we do not hold it" that the caller has to be able
+// to tell apart.
+func (idx *Index) Apex(name string) *Zone {
+	i, ok := idx.byApex[normalizeName(name)]
+	if !ok {
+		return nil
+	}
+	return &idx.zones[i]
+}
+
 // Find returns the most specific enabled zone authoritative for qname, or
 // nil if no zone claims it. It walks qname's labels right-to-left — the
 // full name first, then each successively shorter suffix — so a nested
@@ -132,6 +150,9 @@ func NewIndex(zs []Zone) *Index {
 // zone is skipped rather than treated as a match, so a shallower enabled
 // zone (or nothing at all, sending the query upstream) can still claim the
 // name.
+//
+// Like Apex, the Zone it points at belongs to the served snapshot: read it,
+// never write it.
 func (idx *Index) Find(qname string) *Zone {
 	labels := dns.SplitDomainName(normalizeName(qname))
 	for i := range labels {

@@ -110,6 +110,23 @@ func (r *Resolver) Reload(ctx context.Context) error {
 	return nil
 }
 
+// Snapshot returns the Index currently being served — the same one
+// Middleware answers queries from, and the whole of what a zone transfer
+// reads. Serving a transfer from here rather than from the store is what
+// makes what a secondary receives, by construction, what a querier is being
+// answered from: disabled records were dropped at snapshot build, and a
+// transfer that overlaps a Reload sees one consistent zone rather than a
+// mixture.
+//
+// **The Index and everything reachable from it are read-only.** It is shared
+// by every goroutine answering a query and every goroutine serving a
+// transfer, and the only synchronisation it has is the atomic swap that
+// installed it: a caller that writes through it (assigning to a Zone's
+// Records, say) corrupts what is being served, with no lock anywhere to
+// notice. Reload replaces the whole Index rather than editing the one in
+// place, which is the pattern every caller has to hold to.
+func (r *Resolver) Snapshot() *Index { return r.snap.Load() }
+
 // Middleware finds the zone authoritative for the queried name and answers
 // from it. A name outside every zone we hold falls through to next — that is
 // the only case in which this middleware forwards anything. A name inside a

@@ -239,3 +239,98 @@ func TestTSIGKeyFromAPIVerifiesOnTheDNSServer(t *testing.T) {
 		t.Fatal("reply still signed after the key was deleted through the API")
 	}
 }
+
+// TestZoneTransferIsServedForAZoneCreatedOverTheAPI is the D3 counterpart of
+// TestTSIGKeyFromAPIVerifiesOnTheDNSServer: a seam that only exists where a
+// real store meets a real dnssrv.Server, so it can only be tested here, not
+// in internal/zones (which builds its own TransferServer against its own
+// server, never through App) or internal/api (which never opens a DNS
+// socket).
+//
+// It proves the wiring itself — that App.New's a.xfrOut reaches
+// dnssrv.WithTransfers on every listener App.Start opens — as distinct from
+// internal/zones/loopback_test.go, which proves D2's client and D3's server
+// agree with each other regardless of how either is wired into a process.
+// Before this wiring, s.transfers is nil (dnssrv/server.go), a transfer
+// query never reaches TransferServer at all, and falls through to the
+// ordinary pipeline instead — which is what "the app's own server refuses"
+// means for this test: not a TSIG or ACL refusal, but the intercept never
+// firing.
+func TestZoneTransferIsServedForAZoneCreatedOverTheAPI(t *testing.T) {
+	ctx := t.Context()
+	var upstreamHits atomic.Int64
+	upAddr := mockUpstream(t, &upstreamHits)
+
+	dir := t.TempDir()
+	a, err := New(ctx, testConfig(dir), "e2e")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Store().Settings().SetInternal(ctx, "upstreams", upAddr); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = a.Shutdown(context.Background()) }()
+	a.WaitReady(5 * time.Second)
+
+	jar, _ := cookiejar.New(nil)
+	c := &http.Client{Jar: jar}
+	resp := postJSON(t, c, apiURL(a, "/api/v1/setup"), `{"username":"admin","password":"password123"}`)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("setup: %d", resp.StatusCode)
+	}
+	resp = postJSON(t, c, apiURL(a, "/api/v1/auth/login"), `{"username":"admin","password":"password123"}`)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("login: %d", resp.StatusCode)
+	}
+
+	const zoneName = "xfer-wire.test"
+	resp = postJSON(t, c, apiURL(a, "/api/v1/zones"),
+		`{"name":"`+zoneName+`","allow_transfer":"127.0.0.0/8"}`)
+	var zoneCreated struct{ ID int64 }
+	derr := json.NewDecoder(resp.Body).Decode(&zoneCreated)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated || derr != nil {
+		t.Fatalf("zone create: status=%d decode=%v", resp.StatusCode, derr)
+	}
+	resp = postJSON(t, c, apiURL(a, fmt.Sprintf("/api/v1/zones/%d/records", zoneCreated.ID)),
+		`{"name":"bifrost","type":"A","ttl":300,"rdata":"10.30.0.1"}`)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("zone record create: %d", resp.StatusCode)
+	}
+
+	// AXFR the zone straight off the running server's own DNS listener — the
+	// same address ordinary queries answer on, since a transfer arrives on
+	// both listeners the same way a query does (dnssrv/server.go's serve is
+	// the handler for each).
+	q := new(dns.Msg)
+	q.SetAxfr(dns.Fqdn(zoneName))
+	tr := new(dns.Transfer)
+	ch, err := tr.In(q, a.DNSAddr())
+	if err != nil {
+		t.Fatalf("AXFR dial: %v", err)
+	}
+	var rrs []dns.RR
+	for env := range ch {
+		if env.Error != nil {
+			t.Fatalf("AXFR: %v (nothing wires WithTransfers, or allow_transfer was not honoured)", env.Error)
+		}
+		rrs = append(rrs, env.RR...)
+	}
+
+	found := false
+	for _, rr := range rrs {
+		arec, ok := rr.(*dns.A)
+		if ok && arec.Hdr.Name == "bifrost."+zoneName+"." && arec.A.String() == "10.30.0.1" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("AXFR did not carry the record created through the API: %v", rrs)
+	}
+}
