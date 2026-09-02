@@ -169,6 +169,28 @@ test("first-run setup, login, create a zone and add a record, dark mode persists
   await expect(page.getByText("No peer may transfer this zone.")).toBeHidden();
   await expect(page.getByText("10.0.0.0/24")).toBeVisible();
 
+  // --- set a notify target, through the real handler ---------------------
+  // notify_to is empty by default — nobody is told when this zone changes
+  // — the same shape as allow_transfer above, and worth the same real round
+  // trip through the actual PATCH handler (Task 12's own D4 field) rather
+  // than only the mocked one the Vitest suite exercises.
+  await expect(page.getByText("No targets are notified.")).toBeVisible();
+  await page.getByRole("button", { name: "Edit notify targets" }).click();
+  await page.getByLabel("Notify to", { exact: true }).fill("10.0.0.6:5353");
+  await page.getByRole("button", { name: "Save", exact: true }).click();
+  await expect(page.getByText("No targets are notified.")).toBeHidden();
+  await expect(page.getByText("10.0.0.6:5353")).toBeVisible();
+  // The roll-up itself is not asserted more precisely than this: the real
+  // background notifier starts trying this (unreachable) target the moment
+  // the server reconciles it, so its exact state is a race this test must
+  // not depend on — only that a target now exists to have one at all. All
+  // four of notifyRollup's own branches are legal outcomes of that race,
+  // including the freshly-added, not-yet-tried "0 of 1 current, 1 never
+  // notified" one — the reconcile hasn't necessarily run at all yet.
+  await expect(
+    page.getByText(/^(no targets|all 1 current|1 of 1 behind|0 of 1 current, 1 never notified)$/),
+  ).toBeVisible();
+
   // --- export the zone, then re-import the file it produced -------------
   // A round trip, so the imported file is guaranteed to be one this
   // server's own renderer emits rather than a fixture hand-written against
@@ -222,6 +244,8 @@ test("first-run setup, login, create a zone and add a record, dark mode persists
   // and shown in read mode (the default on a fresh load) rather than the
   // input a click on the pencil would have to open first.
   await expect(page.getByText("10.0.0.0/24")).toBeVisible();
+  // …and the notify target too, on the same terms.
+  await expect(page.getByText("10.0.0.6:5353")).toBeVisible();
 
   // --- create a TSIG key against the real handler -----------------------
   // Last, because it navigates away from the zone the assertions above are

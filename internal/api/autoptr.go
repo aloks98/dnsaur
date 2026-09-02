@@ -307,4 +307,5 @@ func (s *Server) bumpPTRZoneSerial(ctx context.Context, rev store.Zone) {
 	if err := s.deps.Store.Zones().BumpSerial(ctx, rev.ID); err != nil {
 		slog.Error("auto-ptr: bumping reverse zone serial failed", "zone", rev.Name, "err", err)
 	}
+	s.notifyZones()
 }

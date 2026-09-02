@@ -1,0 +1,394 @@
+package zones
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"time"
+
+	"github.com/aloks98/dnsaur/internal/store"
+)
+
+// The outbound half of NOTIFY: deciding who to tell when a zone this server
+// owns has changed, and driving the durable queue that tracks it.
+//
+// **Pending-ness is derived, never stored.** zone_notifies (the 0012
+// migration) carries no "pending" column. Whether a target needs telling is
+// computed, every pass, by comparing the zone's current soa_serial against
+// what that target last acknowledged (notified_serial). That is what makes
+// the trigger self-healing: any code path that bumps a serial — the API, an
+// import, auto-PTR, a transfer install, or one nobody has written yet — is
+// picked up by the next pass, with no call site to forget. §9.4 names the
+// failure this is the deliberate answer to: an automatic path that skips a
+// rule the human path enforces. There is no enqueue call for a future
+// mutation path to forget, and there must never be one.
+//
+// A round is the set of attempts made while a given serial is the one being
+// chased (row.pending_serial). Attempts accumulate and back off within a
+// round; giving up is scoped to that round, so the next serial bump — the
+// next round — resets the count and tries the target again with no operator
+// action.
+
+// MaxNotifyAttempts is how many times one round is tried before it rests.
+//
+// Five, backing off 5s → 10 → 20 → 40 → 80: about two and a half minutes,
+// against a secondary refresh interval measured in hours. The budget can be
+// this small precisely because it is not load-bearing — the target's own
+// refresh timer picks the zone up regardless, which is what keeps NOTIFY a
+// delivery optimisation rather than a correctness dependency.
+const MaxNotifyAttempts = 5
+
+const notifyBaseBackoff = 5 * time.Second
+
+// notifyTick is how often the pass runs without a Wake. It bounds how late a
+// notify can be, not how often one happens, and it is also the coalescer: a
+// burst of edits inside one tick is one round at the newest serial.
+const notifyTick = 5 * time.Second
+
+// Sender is the one message-sending step, taken as an interface so the pass
+// can be tested without a socket. notifysend.go's udpSender is the real
+// implementation, and NewNotifier defaults to it — WithNotifySender is for
+// tests, so production never has to remember to supply one.
+type Sender interface {
+	Send(ctx context.Context, target NotifyTarget, zone string, key *store.TSIGKey) error
+}
+
+// Notifier decides who to tell when a zone changes, and drives the durable
+// zone_notifies queue that tracks it. The structure mirrors Refresher: a Run
+// that passes immediately then ticks, an injected clock, and — because the
+// queue is durable — no process-local state at all beyond the clock, the
+// sender and the wake channel.
+type Notifier struct {
+	zs   store.ZoneStore
+	ns   store.NotifyStore
+	keys TSIGKeys
+
+	// now is the clock the pass is decided against, injected for the same
+	// reason Refresher's is: a test that cannot move time can only test a
+	// schedule by waiting for it.
+	now    func() time.Time
+	sender Sender
+
+	// wake is buffered to exactly one, which is what makes Wake both
+	// non-blocking and coalescing: a pending wake already in the channel
+	// absorbs every further Wake until Run drains it.
+	wake chan struct{}
+}
+
+// NotifyOption configures a Notifier at construction.
+type NotifyOption func(*Notifier)
+
+// WithNotifyNow replaces the clock the pass is decided against.
+func WithNotifyNow(now func() time.Time) NotifyOption {
+	return func(n *Notifier) { n.now = now }
+}
+
+// WithNotifySender replaces how a NOTIFY is actually sent. Production never
+// calls this — NewNotifier's default is the real Sender — it exists so a
+// test can observe what would have gone on the wire without a socket.
+func WithNotifySender(s Sender) NotifyOption {
+	return func(n *Notifier) { n.sender = s }
+}
+
+// NewNotifier returns a Notifier that reads zones from zs, tracks delivery
+// in ns, and resolves per-target signing keys through keys.
+func NewNotifier(zs store.ZoneStore, ns store.NotifyStore, keys TSIGKeys, opts ...NotifyOption) *Notifier {
+	n := &Notifier{
+		zs:     zs,
+		ns:     ns,
+		keys:   keys,
+		now:    time.Now,
+		sender: newUDPSender(nil),
+		wake:   make(chan struct{}, 1),
+	}
+	for _, opt := range opts {
+		opt(n)
+	}
+	return n
+}
+
+// Run drives the pass until ctx is cancelled, starting with one pass
+// immediately — Refresher.Run's shape, and for the same reason: the first
+// thing this owes is whatever changed while the process was not running.
+func (n *Notifier) Run(ctx context.Context) {
+	t := time.NewTicker(notifyTick)
+	defer t.Stop()
+	n.pass(ctx)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			n.pass(ctx)
+		case <-n.wake:
+			n.pass(ctx)
+		}
+	}
+}
+
+func (n *Notifier) pass(ctx context.Context) {
+	if err := n.Pass(ctx); err != nil {
+		if ctx.Err() != nil {
+			// Shutting down. The pass failing because the process is going
+			// away is not a fault to report as one.
+			return
+		}
+		slog.Error("notify pass failed", "err", err)
+	}
+}
+
+// Wake asks for a pass now rather than at the next tick.
+//
+// **It is promptness, never correctness, and that distinction is the
+// design.** Whether there is anything to send is derived by comparing
+// serials (see maybeSend), so a caller that forgets to Wake makes a notify
+// late by one tick and cannot lose one. Do not turn this into a mandatory
+// call on every mutation path: that is exactly the shape — an automatic path
+// that has to remember a rule — that §9.4 records as this project's most
+// repeated defect, and avoiding it is why the queue has no pending flag.
+//
+// Non-blocking, and coalescing: a thousand Wakes between two passes are one
+// pass.
+func (n *Notifier) Wake() {
+	select {
+	case n.wake <- struct{}{}:
+	default:
+	}
+}
+
+// Pass reconciles every zone's rows and sends whatever is due.
+//
+// **Two phases, and the order is a correctness requirement rather than
+// tidiness.** Every zone is parsed and reconciled first; only once every
+// zone's rows are settled is the queue read back, in one query, to decide
+// what to send. Reading it earlier — before a zone's own reconcile has run —
+// would hand maybeSend a zero-value row for a target Reconcile is about to
+// insert, and a send decided against a row with no id can only fail to
+// record itself: the send happens, NoteDelivered/NoteAttempt addresses
+// `WHERE id = 0` and matches nothing, and because notified_at stays 0 the
+// target looks "never told" again on the very next pass too.
+//
+// The error reported is a failure to *read* — the zone list, or the queue
+// itself. A zone whose notify_to will not parse, or whose reconcile failed,
+// is recorded against that zone and does not fail the pass, because one bad
+// zone must not stop the others being told.
+func (n *Notifier) Pass(ctx context.Context) error {
+	all, err := n.zs.Zones(ctx)
+	if err != nil {
+		return err
+	}
+	nowMs := n.now().UnixMilli()
+
+	parsed := make(map[int64][]NotifyTarget, len(all))
+	for _, z := range all {
+		// A disabled zone tells nobody, for the mirror of the reason
+		// refresh.go skips one: it answers nothing (Zone.Serving), so this
+		// server would REFUSE the transfer its own NOTIFY had just invited.
+		// Telling a third party's secondary to come fetch a zone we will
+		// then refuse is worse than silence — it is someone else's retry
+		// loop.
+		//
+		// The rows are left in place rather than deleted — reconcile is
+		// simply not called for this zone this pass — so delivery history
+		// survives a disable/enable cycle, and re-enabling notifies only if
+		// the serial actually moved while it was down. Same shape as
+		// refresh.go's "puts it back in the ordinary schedule".
+		if !z.Enabled {
+			continue
+		}
+		targets, err := ParseNotifyTo(z.NotifyTo)
+		if err != nil {
+			// Fails closed, and loudly enough to fix: an unparseable stored
+			// value notifies nobody. The API validates on write, so reaching
+			// this means a hand-edited row.
+			slog.Warn("zone notify_to will not parse; notifying nobody",
+				"zone", z.Name, "err", err)
+			continue
+		}
+		if err := n.reconcile(ctx, z, targets, nowMs); err != nil {
+			slog.Warn("reconciling notify targets failed", "zone", z.Name, "err", err)
+			continue
+		}
+		parsed[z.ID] = targets
+	}
+
+	// One query, after every row that should exist does.
+	rowsByZone, err := n.rowsByZone(ctx)
+	if err != nil {
+		return err
+	}
+	for _, z := range all {
+		// Deduped by address: ParseNotifyTo does not dedupe, and Reconcile
+		// deliberately creates one row for a repeated target — so without
+		// this both copies resolve to that row, pass the gates against the
+		// same stale snapshot, and put two packets on the wire per pass. A
+		// five-attempt round would cost ten sends.
+		seen := make(map[string]bool, len(parsed[z.ID]))
+		for _, t := range parsed[z.ID] {
+			addr := t.Addr()
+			if seen[addr] {
+				continue
+			}
+			seen[addr] = true
+			row, ok := rowsByZone[z.ID][addr]
+			if !ok {
+				// Reconcile just created it, so this means a concurrent
+				// delete. Skipping is right: there is nothing to record
+				// against, and the next pass will recreate it.
+				continue
+			}
+			n.maybeSend(ctx, z, t, row, nowMs)
+		}
+	}
+	return nil
+}
+
+// reconcile makes zone_notifies match z's current notify_to exactly.
+func (n *Notifier) reconcile(ctx context.Context, z store.Zone, targets []NotifyTarget, nowMs int64) error {
+	addrs := make([]string, len(targets))
+	for i, t := range targets {
+		addrs[i] = t.Addr()
+	}
+	return n.ns.Reconcile(ctx, z.ID, addrs, nowMs)
+}
+
+// rowsByZone reads the whole queue in one query and groups it by zone and
+// target address — the row identity NotifyTarget.Addr defines. One read for
+// the whole pass, mirroring why Resolver's reload reads AllRecords once
+// rather than per zone.
+func (n *Notifier) rowsByZone(ctx context.Context) (map[int64]map[string]store.ZoneNotify, error) {
+	all, err := n.ns.All(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[int64]map[string]store.ZoneNotify, len(all))
+	for _, r := range all {
+		m, ok := out[r.ZoneID]
+		if !ok {
+			m = map[string]store.ZoneNotify{}
+			out[r.ZoneID] = m
+		}
+		m[r.Target] = r
+	}
+	return out, nil
+}
+
+// maybeSend applies the pass's decision to one target and sends when it says
+// to:
+//
+//	want := zone.soa_serial
+//	if notified_at != 0 && !SerialNewer(want, notified_serial) { continue } // nothing to say
+//	attempts := row.attempts
+//	if row.pending_serial != want { attempts = 0 }                          // a new round
+//	if attempts >= MaxNotifyAttempts { continue }                           // this round gave up
+//	if now < row.next_attempt_at { continue }
+//	send
+//
+// row is this pass's snapshot of the target's queue row, taken after every
+// zone's reconcile has run — see Pass. For a target Reconcile has just
+// inserted it is the zero value, which carries the same meaning a freshly
+// inserted row does: never delivered, no round in flight, no back-off
+// pending, so the decision above sends to it exactly as it would to a row
+// read fresh from the store.
+//
+// The key is looked up by name through n.keys here, at send time, rather
+// than stored on the row — so re-keying a target keeps its delivery history
+// instead of orphaning it.
+func (n *Notifier) maybeSend(ctx context.Context, z store.Zone, t NotifyTarget, row store.ZoneNotify, nowMs int64) {
+	want := z.SOASerial
+	if row.NotifiedAt != 0 && !SerialNewer(want, row.NotifiedSerial) {
+		return // nothing to say
+	}
+	attempts := row.Attempts
+	if row.PendingSerial != want {
+		attempts = 0 // a new round
+	}
+	if attempts >= MaxNotifyAttempts {
+		return // this round gave up
+	}
+	if nowMs < row.NextAttemptAt {
+		return
+	}
+
+	key, err := n.lookupKey(ctx, t.Key)
+	if err == nil {
+		err = n.sender.Send(ctx, t, z.Name, key)
+	}
+	// The bookkeeping writes use a context stripped of cancellation, exactly
+	// as Refresher.recordAttempt's do: the send has already happened — a
+	// packet may already be on the wire, or NOTIFY already answered — by the
+	// time this runs, so the caller going away (process shutdown mid-pass)
+	// must not abandon the local record of what just happened.
+	writeCtx := context.WithoutCancel(ctx)
+
+	switch {
+	case err == nil:
+		if nerr := n.ns.NoteDelivered(writeCtx, row.ID, want, nowMs); nerr != nil {
+			slog.Warn("recording a delivered notify failed",
+				"zone", z.Name, "target", t.Addr(), "err", nerr)
+		}
+	case errors.Is(err, ErrNotifyDelivered), errors.Is(err, ErrNotifyUnreachable):
+		// RFC 1996 §3.6/§4.8: the round is over either way — one because the
+		// peer answered (whatever its rcode), the other because nothing is
+		// there to answer. MaxNotifyAttempts is written directly, rather than
+		// attempts+1, so this round is done: reusing the give-up marker is
+		// what stops the next pass picking it back up without inventing a
+		// fourth state. Still logged and still recorded to last_error — ending
+		// the round and being satisfied with the outcome are different
+		// things, and only the second one is what the operator sees.
+		slog.Warn("notify send failed", "zone", z.Name, "target", t.Addr(), "err", err)
+		if nerr := n.ns.NoteAttempt(writeCtx, row.ID, want, MaxNotifyAttempts, 0, err.Error()); nerr != nil {
+			slog.Warn("recording a failed notify attempt failed",
+				"zone", z.Name, "target", t.Addr(), "err", nerr)
+		}
+	default:
+		// Logged here, not just on a bookkeeping failure: a send that fails
+		// writes last_error to the row and would otherwise say nothing in
+		// the log at all. refresh.go's failures get exactly this treatment,
+		// for the reason its own comment gives — an outage needs a
+		// beginning in the log. The round budget caps this at
+		// MaxNotifyAttempts lines per round, so there is no unbounded-outage
+		// case here to throttle the way refresh.go's retry-forever does.
+		slog.Warn("notify send failed", "zone", z.Name, "target", t.Addr(), "err", err)
+		if nerr := n.ns.NoteAttempt(writeCtx, row.ID, want, attempts+1,
+			nowMs+backoffFor(attempts).Milliseconds(), err.Error()); nerr != nil {
+			slog.Warn("recording a failed notify attempt failed",
+				"zone", z.Name, "target", t.Addr(), "err", nerr)
+		}
+	}
+}
+
+// lookupKey resolves a target's TSIG key by name, or returns (nil, nil) for
+// an unsigned target. A name that does not resolve to an existing key is
+// reported as an error — the same as a send that failed on the wire — so it
+// takes part in the same round-and-backoff accounting rather than being
+// silently skipped or retried with no back-off at all.
+func (n *Notifier) lookupKey(ctx context.Context, name string) (*store.TSIGKey, error) {
+	if name == "" {
+		return nil, nil
+	}
+	// Mirrors Transferrer.zoneKey's guard: a nil key store is a wiring bug,
+	// and failing this one attempt is the answer to it, not a panic inside
+	// Run's goroutine.
+	if n.keys == nil {
+		return nil, fmt.Errorf("notify target names TSIG key %q but no key store is attached", name)
+	}
+	k, found, err := n.keys.ByName(ctx, name)
+	if err != nil {
+		return nil, err
+	}
+	if !found {
+		return nil, fmt.Errorf("TSIG key %q not found", name)
+	}
+	return &k, nil
+}
+
+// backoffFor returns the delay before the next attempt within a round, given
+// how many attempts it has already had. Doubling from notifyBaseBackoff: 5s,
+// 10s, 20s, 40s, 80s for attempts 0..4 — the fifth failure is the one that
+// reaches MaxNotifyAttempts and ends the round, so this is never called with
+// an attempts value that would shift past it.
+func backoffFor(attempts int) time.Duration {
+	return notifyBaseBackoff * time.Duration(1<<attempts)
+}

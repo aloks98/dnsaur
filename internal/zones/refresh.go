@@ -158,6 +158,13 @@ func NewRefresher(zs store.ZoneStore, tr *Transferrer, opts ...RefreshOption) *R
 	return r
 }
 
+// Transferrer returns the *Transferrer this Refresher schedules against —
+// the same component a scheduled transfer takes st.xfer's lock around. It is
+// what NotifyServer's SOA probe (WithNotifyProbes) is built from in
+// production, so a notify-triggered transfer takes that same per-zone lock
+// rather than racing a scheduled one.
+func (r *Refresher) Transferrer() *Transferrer { return r.tr }
+
 // defaultJitter spreads uniformly over [0, d).
 func defaultJitter(d time.Duration) time.Duration {
 	if d <= 0 {

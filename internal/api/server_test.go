@@ -24,8 +24,8 @@ import (
 // uniformity and because a future async reload there would silently start
 // racing otherwise.
 type fakeReloader struct {
-	mu                        sync.Mutex
-	clients, records, filters int
+	mu                                  sync.Mutex
+	clients, records, filters, notifies int
 }
 
 func (f *fakeReloader) ReloadClients(ctx context.Context) error {
@@ -47,10 +47,22 @@ func (f *fakeReloader) RefreshFilters(ctx context.Context) error {
 	return nil
 }
 
+func (f *fakeReloader) NotifyZones() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.notifies++
+}
+
 func (f *fakeReloader) counts() (clients, records, filters int) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.clients, f.records, f.filters
+}
+
+func (f *fakeReloader) notifyCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.notifies
 }
 
 // testServer builds a Server on a real sqlite store; helpers reused by all

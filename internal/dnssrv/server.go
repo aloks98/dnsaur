@@ -15,6 +15,7 @@ type Server struct {
 	handler   Handler
 	tsig      dns.TsigProvider
 	transfers Transfers
+	notifies  Notifies
 	udp       *dns.Server
 	tcp       *dns.Server
 	bound     string
@@ -127,6 +128,17 @@ func (s *Server) serve(w dns.ResponseWriter, m *dns.Msg) {
 		ctx, cancel := context.WithTimeout(context.Background(), TransferTimeout)
 		defer cancel()
 		s.transfers.ServeTransfer(ctx, w, m, key, tsigErr)
+		return
+	}
+
+	if s.notifies != nil && isNotify(m) {
+		// Its own deadline and its own writer, and none of the pipeline —
+		// which for a NOTIFY is not merely inapplicable but actively wrong:
+		// before this branch existed, a NOTIFY for an apex this server does
+		// not hold reached the terminal forwarder and was sent upstream.
+		ctx, cancel := context.WithTimeout(context.Background(), NotifyTimeout)
+		defer cancel()
+		s.notifies.ServeNotify(ctx, w, m, key, tsigErr)
 		return
 	}
 

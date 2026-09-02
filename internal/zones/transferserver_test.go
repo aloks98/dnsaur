@@ -12,6 +12,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -78,15 +79,25 @@ func xfrBigRecords(n int) []store.ZoneRecord {
 // xfrFixture is a running dnsaur that serves transfers: a store, a resolver
 // reloaded from it, a TransferServer, and a dnssrv.Server on 127.0.0.1:0.
 type xfrFixture struct {
-	st   store.Store
-	res  *zones.Resolver
-	addr string
+	st     store.Store
+	res    *zones.Resolver
+	addr   string
+	zoneID int64
+	// probeQueries counts queries this fixture answered through the ordinary
+	// resolver pipeline rather than a transfer or notify intercept. Non-nil
+	// only with withResolvingPipeline; see its own comment for what this is
+	// for.
+	probeQueries *atomic.Int64
 }
 
 type xfrConfig struct {
 	server []zones.TransferServerOption
 	keys   dnssrv.TSIGKeys // nil means the store's own key store
 	noKeys bool            // attach no key store at all
+	// resolving swaps the fixture's terminal pipeline handler for one that
+	// actually answers through the resolver, rather than failing the test on
+	// any reach. See withResolvingPipeline.
+	resolving bool
 }
 
 type xfrOption func(*xfrConfig)
@@ -129,6 +140,22 @@ func withKeyStore(keys dnssrv.TSIGKeys) xfrOption {
 // message, signed or not.
 func withoutKeyStore() xfrOption {
 	return func(c *xfrConfig) { c.noKeys = true }
+}
+
+// withResolvingPipeline swaps the fixture's terminal pipeline handler for one
+// that actually answers ordinary queries through the resolver, instead of
+// failing the test on any reach.
+//
+// Every other xfrFixture test sends only transfer queries, so for them
+// reaching the pipeline at all means the transfer intercept did not fire —
+// the strict default stays. But Transferrer.ProbeSerial (the notify loopback
+// tests) sends the primary a plain SOA question, which is not a transfer
+// query and is never intercepted by dnssrv.WithTransfers; a real dnsaur
+// primary answers it from its ordinary pipeline; res.Middleware() is that
+// pipeline's own zone-answering half, chained ahead of the strict stub so a
+// name this fixture's zone does not cover still fails loudly.
+func withResolvingPipeline() xfrOption {
+	return func(c *xfrConfig) { c.resolving = true }
 }
 
 func newXFRFixture(t *testing.T, z store.Zone, records []store.ZoneRecord, opts ...xfrOption) *xfrFixture {
@@ -176,14 +203,34 @@ func newXFRFixture(t *testing.T, z store.Zone, records []store.ZoneRecord, opts 
 	// The pipeline handler answers NOTIMP and fails the test: every query
 	// below is a transfer query, so reaching the pipeline at all means the
 	// intercept did not fire, and NOTIMP is a rcode the gate never produces.
-	srv := dnssrv.NewServer("127.0.0.1:0", dnssrv.HandlerFunc(
+	var terminal dnssrv.Handler = dnssrv.HandlerFunc(
 		func(_ context.Context, req *dnssrv.Request) (*dnssrv.Response, error) {
 			t.Errorf("the pipeline answered a transfer query for %s: the intercept did not fire", req.QName())
 			m := new(dns.Msg)
 			m.SetRcode(req.Msg, dns.RcodeNotImplemented)
 			return &dnssrv.Response{Msg: m}, nil
-		}),
-		srvOpts...)
+		})
+	var probeQueries atomic.Int64
+	if cfg.resolving {
+		// Counts every query answered here rather than by a transfer
+		// intercept. In the notify loopback tests nothing else reaches this
+		// primary through its ordinary pipeline — AXFR is intercepted by
+		// dnssrv.WithTransfers and NOTIFY never arrives here at all — so this
+		// is, by construction, a count of Transferrer.ProbeSerial's SOA
+		// questions: the signal a test uses to prove WithNotifyProbes is
+		// actually wired rather than silently skipped (see notifyserver.go's
+		// own comment on why that failure mode produces no error, only a
+		// needless transfer).
+		resolving := res.Middleware()
+		terminal = dnssrv.Chain(terminal, func(next dnssrv.Handler) dnssrv.Handler {
+			wrapped := resolving(next)
+			return dnssrv.HandlerFunc(func(ctx context.Context, req *dnssrv.Request) (*dnssrv.Response, error) {
+				probeQueries.Add(1)
+				return wrapped.ServeDNS(ctx, req)
+			})
+		})
+	}
+	srv := dnssrv.NewServer("127.0.0.1:0", terminal, srvOpts...)
 	if err := srv.Start(); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
@@ -200,7 +247,7 @@ func newXFRFixture(t *testing.T, z store.Zone, records []store.ZoneRecord, opts 
 			t.Errorf("Shutdown: %v", err)
 		}
 	})
-	return &xfrFixture{st: st, res: res, addr: srv.Addr()}
+	return &xfrFixture{st: st, res: res, addr: srv.Addr(), zoneID: id, probeQueries: &probeQueries}
 }
 
 // setACL writes allow_transfer onto a zone the fixture did not create — the

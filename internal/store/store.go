@@ -57,6 +57,7 @@ type Store interface {
 	Tokens() TokenStore
 	Zones() ZoneStore
 	TSIGKeys() TSIGKeyStore
+	Notifies() NotifyStore
 	Close() error
 }
 

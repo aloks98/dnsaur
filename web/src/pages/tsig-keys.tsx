@@ -43,6 +43,7 @@ import {
 import { useZones } from "../hooks/use-zones";
 import { StaleDataAlert } from "../components/stale-data-alert";
 import { aclKeyNames } from "../lib/acl";
+import { notifyKeyNames } from "../lib/notify";
 import {
   algorithmLabel,
   algorithmOptions,
@@ -633,18 +634,20 @@ export function TSIGKeys() {
    * How many zones name each key — the USED BY column, and the in-use delete
    * guard that reads the same number.
    *
-   * A zone can depend on a key two ways, and D2 only ever counted one of
-   * them: `tsig_key_id` is what a *secondary* signs its own pulls with, and
-   * (D3) `allow_transfer` is who may pull *this* zone — a `key:` entry
-   * names a key the same way, and the store's delete guard refuses either
-   * reference on the same terms (see tsigKeyStore.Delete /
-   * internal/store/tsigkeys.go's aclKeyRef). `allow_transfer` names keys by
-   * their canonical *name*, not id, so `idByName` is what turns
-   * `aclKeyNames`'s output back into the id this map is keyed by — the
-   * zones list carries names nowhere else. Both references are folded
-   * through one `Set` per zone before being added to the running counts, so
-   * a zone that names the same key both ways still counts once: one 409 is
-   * one dependent, not two.
+   * A zone can depend on a key three ways now. `tsig_key_id` is what a
+   * *secondary* signs its own pulls with; `allow_transfer` (D3) is who may
+   * pull *this* zone — a `key:` entry names a key the same way; and (D4,
+   * Task 12) `notify_to` is who this zone signs its own outbound NOTIFYs
+   * for, a third `key:`-shaped reference with its own grammar
+   * (lib/notify.ts). The store's delete guard refuses any of the three on
+   * the same terms (see tsigKeyStore.Delete / internal/store/tsigkeys.go's
+   * aclKeyRef and notifyKeyRef). `allow_transfer` and `notify_to` both name
+   * keys by their canonical *name*, not id, so `idByName` is what turns
+   * `aclKeyNames`'s and `notifyKeyNames`'s output back into the id this map
+   * is keyed by — the zones list carries names nowhere else. All three
+   * references are folded through one `Set` per zone before being added to
+   * the running counts, so a zone that names the same key more than one way
+   * still counts once: one 409 is one dependent, not two or three.
    *
    * The guard is an affordance, not the enforcement. The server refuses the
    * delete with 409 whichever way this map came out (tsigKeyStore.Delete does
@@ -662,7 +665,7 @@ export function TSIGKeys() {
     for (const zone of zones.data ?? []) {
       const ids = new Set<number>();
       if (zone.tsig_key_id !== 0) ids.add(zone.tsig_key_id);
-      for (const name of aclKeyNames(zone.allow_transfer)) {
+      for (const name of [...aclKeyNames(zone.allow_transfer), ...notifyKeyNames(zone.notify_to)]) {
         const id = idByName.get(name);
         if (id !== undefined) ids.add(id);
       }

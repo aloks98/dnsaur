@@ -56,6 +56,7 @@ import {
 import { ApiError } from "../../api/client";
 import type { Zone, ZoneRecord } from "../../api/types";
 import { parseACL } from "../../lib/acl";
+import { isNotifyBehind, notifyRestLabel, notifyRollup, parseNotifyTo } from "../../lib/notify";
 import {
   useCreateZoneRecord,
   useDeleteZone,
@@ -67,9 +68,11 @@ import {
   useUpdateZone,
   useUpdateZoneRecord,
   useZone,
+  useZoneNotifies,
   useZoneRecords,
   zoneFileErrors,
   type ZoneFileDiff,
+  type ZoneNotify,
   type ZoneRecordChange,
 } from "../../hooks/use-zones";
 import { useTSIGKeys } from "../../hooks/use-tsig-keys";
@@ -1426,6 +1429,380 @@ function AllowTransferBand({ zone }: { zone: Zone }) {
   );
 }
 
+// ── The notify-out band ───────────────────────────────────────────────────
+
+const notifyToFormSchema = z.object({
+  // Same reasoning as allow_transfer's own schema above: "valid" means
+  // "parses as notify_to", which only parseNotifyTo can answer — see
+  // lib/notify.ts's own top comment on why the client-side port is worth
+  // having and why it is never the last word.
+  notify_to: z.string().superRefine((value, ctx) => {
+    const result = parseNotifyTo(value);
+    if (!result.ok) ctx.addIssue({ code: "custom", message: result.error });
+  }),
+});
+type NotifyToFormValues = z.infer<typeof notifyToFormSchema>;
+
+/**
+ * Presentation for one target's delivery state — the state column is the
+ * only column carrying colour, so this table is the whole of the row's
+ * colour budget and the reason a glance down it is the scan path. Serial,
+ * when and target stay neutral; the error column borrows the state's own
+ * tone only because it is that state's own explanation, not a second signal
+ * competing with it.
+ *
+ * `gave_up` is drawn amber-on-hollow (a ring, no fill) — distinguishable
+ * from `retrying`'s filled amber dot without reading as a failure. It isn't
+ * one: a round rests after MaxNotifyAttempts and starts fresh on the zone's
+ * next edit, no operator action required, which is also why its label below
+ * is "not acknowledged" rather than "gave up".
+ */
+const NOTIFY_STATE_STYLES: Record<
+  ZoneNotify["state"],
+  { text: string; weight: string; dot: string }
+> = {
+  current: {
+    text: "text-muted-foreground",
+    weight: "font-normal",
+    dot: "border-success bg-success",
+  },
+  never: {
+    text: "text-muted-foreground",
+    weight: "font-normal",
+    dot: "border-border bg-transparent",
+  },
+  retrying: {
+    text: "text-warning-foreground",
+    weight: "font-semibold",
+    dot: "border-warning bg-warning",
+  },
+  gave_up: {
+    text: "text-warning-foreground",
+    weight: "font-semibold",
+    dot: "border-warning bg-transparent",
+  },
+};
+
+/** The word a target's row shows for its state — never "gave up" (see
+ * NOTIFY_STATE_STYLES's own comment on why). `retrying` carries its
+ * attempt count rather than hardcoding the budget, so a future change to
+ * MaxNotifyAttempts on the server shows up here without a redeploy — except
+ * at `attempts === 0`, which is not a retry that has happened yet. The API
+ * derives `retrying` from `notified_at != 0, attempts == 0` for any target
+ * that is behind, which is also the state of every previously-current
+ * target in the window between a serial bump and the pass's first attempt
+ * (the mutation's response returns before the async pass runs). "try 0/5"
+ * in that window reads as nonsense, so the counter is shown only once an
+ * attempt has actually been made. */
+function notifyStateLabel(row: ZoneNotify): string {
+  switch (row.state) {
+    case "current":
+      return "current";
+    case "never":
+      return "never notified";
+    case "retrying":
+      return row.attempts > 0 ? `retrying · try ${row.attempts}/${row.max_attempts}` : "retrying";
+    case "gave_up":
+      return "not acknowledged";
+  }
+}
+
+/** "—" for a target that has never been delivered — there is no serial to
+ * show — the last serial it actually acknowledged otherwise. */
+function notifySerial(row: ZoneNotify): string {
+  return row.state === "never" ? "—" : String(row.notified_serial);
+}
+
+/** What a target's row is dated by: `notified_at` for anything that has
+ * ever landed, `created_at` — when the target was added — for one that
+ * hasn't. `never`'s `notified_at` is always 0, and dating the row by it
+ * would read as "0 ago" rather than what it actually means. */
+function notifyWhen(row: ZoneNotify): string {
+  if (row.state === "never") return `added ${relativeTime(row.created_at)}`;
+  return relativeTime(row.notified_at);
+}
+
+/** One target's delivery state, in the grid AllowTransferBand's sibling row
+ * hands down — target, state, serial, when, error, exactly the artboard's
+ * five columns. */
+function NotifyTargetRow({ row }: { row: ZoneNotify }) {
+  const style = NOTIFY_STATE_STYLES[row.state];
+  return (
+    <div
+      data-testid="notify-target-row"
+      className="grid grid-cols-[minmax(0,1fr)_176px_104px_116px_minmax(0,150px)] items-baseline gap-3 py-[3px]"
+    >
+      <span
+        title={row.target}
+        className={cn(
+          "min-w-0 truncate font-mono text-xs",
+          row.state === "never" ? "text-muted-foreground" : "text-foreground",
+        )}
+      >
+        {row.target}
+      </span>
+      <span className="flex min-w-0 items-center gap-1.5">
+        <span aria-hidden="true" className={cn("size-1.5 shrink-0 border", style.dot)} />
+        <span className={cn("min-w-0 truncate font-mono text-[11.5px]", style.text, style.weight)}>
+          {notifyStateLabel(row)}
+        </span>
+      </span>
+      <span className="font-mono text-[11.5px] whitespace-nowrap text-muted-foreground">
+        {notifySerial(row)}
+      </span>
+      <span className="truncate font-mono text-[11px] text-muted-foreground">
+        {notifyWhen(row)}
+      </span>
+      <span
+        title={row.last_error || undefined}
+        className={cn("min-w-0 truncate text-right font-mono text-[11.5px]", style.text)}
+      >
+        {row.last_error}
+      </span>
+    </div>
+  );
+}
+
+/**
+ * Who this zone tells when it changes, and how each of them is doing — the
+ * outbound twin of AllowTransferBand's row, sharing its 152px label gutter
+ * so the two captions ("Transfers out" there, "Notify out" here) land on
+ * one edge, exactly as that component's own comment describes for the band
+ * above it.
+ *
+ * The read line is the saved `notify_to` value plus a roll-up — "no
+ * targets" / "all 4 current" / "3 of 4 current, 1 never notified" / "2 of 4
+ * behind" (`notifyRollup`, lib/notify.ts) — rather than one row per target:
+ * four identical "current" rows say nothing four times. Only a target that
+ * is *behind* (`retrying` or `gave_up` — deliberately not `never`, see
+ * `isNotifyBehind`'s own comment) earns a row without asking; the roll-up
+ * doubles as the disclosure that expands the rest, the same "click the
+ * summary to see everything" shape BuiltinsDisclosure already uses for the
+ * built-in zones row (list.tsx). A never-notified target is named rather
+ * than folded into "current" even when nothing is behind — see
+ * `notifyRollup`'s own comment for why, and `notifyRestLabel`'s for the
+ * collapsed "+N" hint below the row list, which has the identical risk.
+ *
+ * Mounted only for a primary or a secondary — the same *positive* set
+ * AllowTransferBand's own call site gates on, and for the same reason: a
+ * stub or a forwarder reaching this control would be a control that fails
+ * on click (notify_to is refused with 400 on either — see
+ * checkZoneTransferConfig, internal/api/zones_handlers.go) rather than one
+ * the screen declined to draw. The artboard gates this row on `!builtIn`
+ * alone, which would still draw it for those two types; the positive set is
+ * the deliberate correction, not a reading of the artboard.
+ */
+function NotifyBand({ zone }: { zone: Zone }) {
+  const [showAll, setShowAll] = useState(false);
+  const [editing, setEditing] = useState(false);
+  const updateZone = useUpdateZone();
+  const notifies = useZoneNotifies(zone.id);
+  const form = useForm<NotifyToFormValues>({
+    resolver: zodResolver(notifyToFormSchema),
+    defaultValues: { notify_to: zone.notify_to },
+  });
+
+  // Reset only when the *saved* value changes — AllowTransferBand's own
+  // rule, and for the same reason: an unrelated refetch (the notify poll
+  // below, a record write bumping the serial) must not wipe an in-progress,
+  // unsaved edit.
+  const { notify_to } = zone;
+  useEffect(() => {
+    form.reset({ notify_to });
+  }, [notify_to, form]);
+
+  useEffect(() => {
+    if (editing) form.setFocus("notify_to");
+  }, [editing, form]);
+
+  function onStartEdit() {
+    form.reset({ notify_to: zone.notify_to });
+    setEditing(true);
+  }
+
+  function onCancelEdit() {
+    form.reset({ notify_to: zone.notify_to });
+    setEditing(false);
+  }
+
+  function onSubmit(values: NotifyToFormValues) {
+    updateZone.mutate(
+      { id: zone.id, notify_to: values.notify_to.trim() },
+      {
+        onSuccess: () => {
+          toast.success("Notify targets saved");
+          setEditing(false);
+        },
+        onError: (err) =>
+          toast.error(err instanceof ApiError ? err.message : "Couldn't save notify targets"),
+      },
+    );
+  }
+
+  const hasValue = zone.notify_to !== "";
+  const rows = notifies.data ?? [];
+  const rollup = notifyRollup(rows);
+  // A query that hasn't landed yet (or never will) reads as zero targets
+  // above, which would otherwise flash "no targets" ahead of a value this
+  // page already knows is set — so pending/error get their own words
+  // instead of borrowing the empty state's.
+  const summaryLabel = notifies.isPending
+    ? "loading…"
+    : notifies.isError
+      ? "couldn't load targets"
+      : rollup.label;
+  const behindRows = rows.filter((r) => isNotifyBehind(r.state));
+  const restRows = rows.filter((r) => !isNotifyBehind(r.state));
+
+  return (
+    <Form {...form}>
+      <form
+        onSubmit={(e) => void form.handleSubmit(onSubmit)(e)}
+        noValidate
+        // No trailing border of its own, same reasoning as AllowTransferBand:
+        // this row always closes off whichever band sits above it.
+        className="grid shrink-0 grid-cols-[152px_1fr] border-t border-border-muted border-b border-border bg-card"
+      >
+        <div className="flex items-start border-r border-border-muted px-3.5 py-[9px]">
+          <span className="grid grid-cols-[12px_auto] items-center gap-[7px] font-mono text-[9.5px] leading-[1.3] font-semibold tracking-[0.14em] text-muted-foreground uppercase">
+            <span aria-hidden="true" />
+            <span>
+              Notify
+              <br />
+              out
+            </span>
+          </span>
+        </div>
+        <FormField
+          control={form.control}
+          name="notify_to"
+          render={({ field }) => (
+            <div className="min-w-0 px-4 py-2">
+              <div className="flex min-w-0 items-center gap-2.5">
+                {editing ? (
+                  <>
+                    <Input
+                      {...field}
+                      aria-label="Notify to"
+                      placeholder="10.0.0.2, 10.0.0.3 key:ns2"
+                      autoComplete="off"
+                      spellCheck={false}
+                      className="h-7 flex-1 font-mono"
+                    />
+                    <div className="ml-auto flex shrink-0 items-center gap-1.5">
+                      <Button type="submit" size="sm" disabled={updateZone.isPending}>
+                        {updateZone.isPending ? "Saving…" : "Save"}
+                      </Button>
+                      <Button
+                        type="button"
+                        size="icon-sm"
+                        variant="ghost"
+                        aria-label="Cancel editing notify targets"
+                        onClick={onCancelEdit}
+                      >
+                        <X />
+                      </Button>
+                    </div>
+                  </>
+                ) : (
+                  <>
+                    <span
+                      className={cn(
+                        "min-w-0 shrink truncate font-mono text-[12.5px]",
+                        hasValue ? "text-foreground" : "text-muted-foreground",
+                      )}
+                      title={hasValue ? zone.notify_to : undefined}
+                    >
+                      {hasValue ? zone.notify_to : "No targets are notified."}
+                    </span>
+                    {/* Doubles as the disclosure: with anything to expand it
+                        is a real button (Enter/Space-operable, aria-expanded
+                        carries the state); with nothing to show it is inert
+                        text rather than a control that does nothing on
+                        click. */}
+                    {rollup.total > 0 ? (
+                      <button
+                        type="button"
+                        onClick={() => setShowAll((v) => !v)}
+                        aria-expanded={showAll}
+                        title={showAll ? "Show only targets behind" : "Show every target"}
+                        className={cn(
+                          "flex shrink-0 cursor-pointer items-center gap-1 font-mono text-[11px] whitespace-nowrap hover:text-foreground",
+                          rollup.behind > 0 ? "text-warning-foreground" : "text-muted-foreground",
+                        )}
+                      >
+                        <ChevronRight
+                          aria-hidden="true"
+                          className={cn(
+                            "size-2.5 shrink-0 transition-transform",
+                            showAll && "rotate-90",
+                          )}
+                        />
+                        {summaryLabel}
+                      </button>
+                    ) : (
+                      <span className="shrink-0 font-mono text-[11px] whitespace-nowrap text-muted-foreground">
+                        {summaryLabel}
+                      </span>
+                    )}
+                    <Button
+                      type="button"
+                      size="icon-sm"
+                      variant="ghost"
+                      title="Edit notify targets"
+                      aria-label="Edit notify targets"
+                      className="ml-auto shrink-0"
+                      onClick={onStartEdit}
+                    >
+                      <Pencil />
+                    </Button>
+                  </>
+                )}
+              </div>
+              {editing && (
+                <div className="pt-2">
+                  <FormMessage />
+                </div>
+              )}
+              {/* Behind targets always show; the rest sit behind the caret
+                  above. Independent of read/edit — the delivery state of
+                  the *saved* targets stays worth showing while a new value
+                  is being typed, same as the artboard draws it. */}
+              {behindRows.length > 0 && (
+                <div className="mt-1.5 border-t border-border-muted pt-1">
+                  {behindRows.map((row) => (
+                    <NotifyTargetRow key={row.target} row={row} />
+                  ))}
+                  {!showAll && restRows.length > 0 && (
+                    <button
+                      type="button"
+                      onClick={() => setShowAll(true)}
+                      className="cursor-pointer py-[3px] font-mono text-[11px] text-muted-foreground hover:text-foreground"
+                    >
+                      {notifyRestLabel(restRows)}
+                    </button>
+                  )}
+                </div>
+              )}
+              {showAll && restRows.length > 0 && (
+                <div
+                  className={cn(
+                    behindRows.length === 0 && "mt-1.5 border-t border-border-muted pt-1",
+                  )}
+                >
+                  {restRows.map((row) => (
+                    <NotifyTargetRow key={row.target} row={row} />
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+        />
+      </form>
+    </Form>
+  );
+}
+
 /** The most rows any one diff group lists before the rest collapse into a
  * "+ N more" line — the artboard's own truncation. A whole-zone replace can
  * delete hundreds of records, and a dialog that scrolls for a minute to show
@@ -2358,6 +2735,12 @@ export function ZoneDetail() {
           one keeps this correct if that ever changes. See
           AllowTransferBand's own comment. */}
       {(z.type === "primary" || isSecondary) && <AllowTransferBand zone={z} />}
+
+      {/* Who this zone tells when it changes, and how each of them is
+          doing. Same positive gate as AllowTransferBand immediately above,
+          and for the same reason — see NotifyBand's own comment on why
+          that is a deliberate correction of the artboard's `!builtIn`. */}
+      {(z.type === "primary" || isSecondary) && <NotifyBand zone={z} />}
 
       {/* Filter bar */}
       <div className="flex shrink-0 items-center gap-3 border-b border-border px-4 py-2.5">

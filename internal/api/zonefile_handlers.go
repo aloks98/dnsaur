@@ -289,10 +289,12 @@ func (s *Server) handleZoneFileImport(w http.ResponseWriter, r *http.Request) {
 		// not knowable from here, and re-reading is cheap next to answering
 		// from records the store may no longer have.
 		s.reloadZones(r)
+		s.notifyZones()
 		storeErr(w, err)
 		return
 	}
 	s.reloadZones(r)
+	s.notifyZones()
 	writeJSON(w, http.StatusOK, result)
 }
 

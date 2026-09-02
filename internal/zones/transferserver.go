@@ -810,7 +810,7 @@ func (t *TransferServer) writeRefusal(w dns.ResponseWriter, q *dns.Msg, ref *ref
 	m := new(dns.Msg)
 	m.SetRcode(q, ref.rcode)
 	if ref.tsigCode != 0 {
-		if rr := t.errorTSIG(q, ref.tsigCode); rr != nil {
+		if rr := errorTSIG(q, ref.tsigCode, t.now()); rr != nil {
 			m.Extra = append(m.Extra, rr)
 			// Whether this one is signed is decided by which error it
 			// carries, and WriteMsg already applies exactly that rule:
@@ -834,8 +834,15 @@ func (t *TransferServer) writeRefusal(w dns.ResponseWriter, q *dns.Msg, ref *ref
 
 // errorTSIG builds the TSIG record that names why a signature was not
 // accepted, or nil if the request carried no TSIG to answer (unreachable
-// through the gate, which only sets a TSIG error code for a verdict that
+// through either gate, which only sets a TSIG error code for a verdict that
 // required a TSIG to reach).
+//
+// Shared by TransferServer.writeRefusal and NotifyServer.writeRefusal rather
+// than copied: the BADKEY/BADSIG-unsigned and BADTIME-signed rule below is
+// one rule, and two implementations of it would drift. now is the caller's
+// own clock (t.now() or n.now()) rather than time.Now(), for the same reason
+// every other timestamp in this file is injected — a test has to be able to
+// drive a BADTIME reply's Other Data without waiting on the wall clock.
 //
 // The three codes are deliberately not treated alike, and the difference is
 // the rule rather than an inconsistency to tidy away. It follows from what
@@ -867,12 +874,11 @@ func (t *TransferServer) writeRefusal(w dns.ResponseWriter, q *dns.Msg, ref *ref
 // The signing itself is WriteMsg's (see writeRefusal). For the unsigned pair
 // it also zeroes Time Signed on the way out (tsig.go:191), which is why
 // nothing here works to give those two a meaningful one.
-func (t *TransferServer) errorTSIG(q *dns.Msg, code uint16) *dns.TSIG {
+func errorTSIG(q *dns.Msg, code uint16, now time.Time) *dns.TSIG {
 	req := q.IsTsig()
 	if req == nil {
 		return nil
 	}
-	now := t.now()
 	rr := &dns.TSIG{
 		Hdr:        dns.RR_Header{Name: req.Hdr.Name, Rrtype: dns.TypeTSIG, Class: dns.ClassANY, Ttl: 0},
 		Algorithm:  req.Algorithm,

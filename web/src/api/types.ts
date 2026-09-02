@@ -140,6 +140,17 @@ export interface Zone {
   /** Why that request was refused, verbatim; "" when it was served — the
    * outbound twin of last_error. */
   last_xfr_error: string;
+  /**
+   * Who this zone tells when it changes (DNS NOTIFY, RFC 1996): a
+   * comma-separated list of host[:port] (port always explicit on read),
+   * each with an optional key:<tsig name> suffix to sign that target's
+   * NOTIFY. "" means notify nobody, which is the default. Applies to both
+   * primary and secondary zones — a secondary that re-serves what it
+   * pulled has its own downstream secondaries to tell — unlike primaries
+   * and tsig_key_id, which are secondary-only. See lib/notify.ts for the
+   * format, and GET /zones/{id}/notifies for each target's delivery state.
+   */
+  notify_to: string;
   created_at: number;
   modified_at: number;
 }

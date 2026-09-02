@@ -53,6 +53,7 @@ function secondary(): Zone {
     last_xfr_at: 0,
     last_xfr_peer: "",
     last_xfr_error: "",
+    notify_to: "",
     created_at: NOW - 30 * DAY,
     modified_at: NOW - 30 * DAY,
   } satisfies Zone;

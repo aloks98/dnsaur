@@ -661,3 +661,33 @@ func TestOrdinaryZoneWritesCannotEraseServedState(t *testing.T) {
 		}
 	})
 }
+
+// updateZoneSQL binds every configuration column, and notify_to is one, so a
+// PATCH that changes it has to persist. This is the positive half of the
+// disjoint-column-sets rule; the negative half is that it never binds
+// zone_notifies state, which it cannot, since that is a different table.
+func TestUpdateZonePersistsNotifyTo(t *testing.T) {
+	forEachDriver(t, func(t *testing.T, s Store) {
+		ctx := context.Background()
+		id := seedNotifyZone(t, s, "example.com")
+
+		z, err := s.Zones().Zone(ctx, id)
+		if err != nil {
+			t.Fatalf("Zone: %v", err)
+		}
+		if z.NotifyTo != "" {
+			t.Fatalf("a new zone has notify_to = %q, want empty", z.NotifyTo)
+		}
+		z.NotifyTo = "10.0.0.2:53 key:ns2-xfer., 10.0.0.3:53"
+		if err := s.Zones().UpdateZone(ctx, z); err != nil {
+			t.Fatalf("UpdateZone: %v", err)
+		}
+		got, err := s.Zones().Zone(ctx, id)
+		if err != nil {
+			t.Fatalf("Zone after update: %v", err)
+		}
+		if got.NotifyTo != z.NotifyTo {
+			t.Errorf("notify_to = %q, want %q", got.NotifyTo, z.NotifyTo)
+		}
+	})
+}

@@ -106,6 +106,27 @@ func aclKeyRef(dialect string) string {
 		`(',' || replace(zones.allow_transfer, ' ', '') || ',', ',key:' || tsig_keys.name || ',') > 0`
 }
 
+// notifyKeyRef reports the SQL that finds a zone whose notify_to names
+// tsig_keys.name. It is aclKeyRef's twin on the second column that can
+// reference a key, and the two are separate functions rather than one
+// parameterised by column name because each carries its own reasoning about
+// the format it is matching inside.
+//
+// The format differs from allow_transfer's in one way that matters here: an
+// entry is `host:port key:name`, so the key is preceded by a space rather
+// than by the entry separator. Stripping spaces as aclKeyRef does would join
+// the host to the key and stop `,key:` ever matching — so this strips nothing
+// and anchors on ' key:' instead, which the canonical spelling guarantees is
+// exactly how FormatNotifyTo writes it.
+func notifyKeyRef(dialect string) string {
+	fn := "instr"
+	if dialect == "postgres" {
+		fn = "strpos"
+	}
+	return `SELECT 1 FROM zones WHERE ` + fn +
+		`(zones.notify_to || ',', ' key:' || tsig_keys.name || ',') > 0`
+}
+
 // Delete removes a key unless a zone still names it, in which case it
 // returns ErrInUse and the API answers 409. A secondary that lost its key
 // would keep trying to transfer and keep being refused by its primary, with
@@ -155,7 +176,8 @@ func (t *tsigKeyStore) Delete(ctx context.Context, id int64) error {
 	res, err := t.s.db.ExecContext(ctx, t.s.q(
 		`DELETE FROM tsig_keys WHERE id = ?
 		   AND NOT EXISTS (SELECT 1 FROM zones WHERE zones.tsig_key_id = tsig_keys.id)
-		   AND NOT EXISTS (`+aclKeyRef(t.s.dialect)+`)`), id)
+		   AND NOT EXISTS (`+aclKeyRef(t.s.dialect)+`)
+		   AND NOT EXISTS (`+notifyKeyRef(t.s.dialect)+`)`), id)
 	if err != nil {
 		return wrapDBErr(err)
 	}

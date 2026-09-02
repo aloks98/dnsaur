@@ -190,6 +190,7 @@ func (s *Server) handleZoneRecordCreate(w http.ResponseWriter, r *http.Request) 
 	// reverse answer is live by the time this request is answered.
 	s.syncPTR(r.Context(), nil, &rec, zone.Name)
 	s.reloadZones(r)
+	s.notifyZones()
 	writeJSON(w, http.StatusCreated, map[string]int64{"id": id})
 }
 
@@ -244,6 +245,7 @@ func (s *Server) handleZoneRecordUpdate(w http.ResponseWriter, r *http.Request) 
 	// for why this runs before the reload.
 	s.syncPTR(r.Context(), &old, &rec, zone.Name)
 	s.reloadZones(r)
+	s.notifyZones()
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -287,5 +289,6 @@ func (s *Server) handleZoneRecordDelete(w http.ResponseWriter, r *http.Request) 
 	// the reload.
 	s.syncPTR(r.Context(), &old, nil, zone.Name)
 	s.reloadZones(r)
+	s.notifyZones()
 	w.WriteHeader(http.StatusNoContent)
 }

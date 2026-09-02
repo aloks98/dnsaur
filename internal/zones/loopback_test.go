@@ -8,7 +8,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aloks98/dnsaur/internal/dnssrv"
 	"github.com/aloks98/dnsaur/internal/store"
+	"github.com/aloks98/dnsaur/internal/zones"
 	"github.com/miekg/dns"
 )
 
@@ -321,5 +323,261 @@ func TestAZoneServedOverAXFRExcludesDisabledRecords(t *testing.T) {
 	m := sec.ask(t, "disabled."+transferApex, dns.TypeA)
 	if m.Rcode != dns.RcodeNameError {
 		t.Errorf("rcode = %s, want NXDOMAIN: a disabled record must not exist on the secondary either", dns.RcodeToString[m.Rcode])
+	}
+}
+
+// listenNotify stands the secondary's DNS listener up around a NotifyServer,
+// which newTransferFixture does not do — it asks its resolver's middleware
+// directly and never binds a socket. A real NOTIFY needs a real listener.
+//
+// Returns the address the primary's notify_to should name.
+func listenNotify(t *testing.T, f *transferFixture) string {
+	t.Helper()
+	ns := zones.NewNotifyServer(f.resolver, f.st.Zones(), f.refresher(),
+		zones.WithNotifyProbes(f.transferrer()))
+	// Reaching the pipeline means the intercept did not fire, and NOTIMP is
+	// an rcode the gate never produces — the same trick newXFRFixture uses.
+	srv := dnssrv.NewServer("127.0.0.1:0", dnssrv.HandlerFunc(
+		func(_ context.Context, req *dnssrv.Request) (*dnssrv.Response, error) {
+			t.Errorf("a NOTIFY reached the pipeline: %v", req.Msg.Question)
+			m := new(dns.Msg)
+			m.SetRcode(req.Msg, dns.RcodeNotImplemented)
+			return &dnssrv.Response{Msg: m}, nil
+		}),
+		dnssrv.WithTSIGKeys(f.st.TSIGKeys()),
+		dnssrv.WithNotifies(ns))
+	if err := srv.Start(); err != nil {
+		t.Fatalf("secondary listener: %v", err)
+	}
+	t.Cleanup(func() { _ = srv.Shutdown(context.Background()) })
+	return srv.Addr()
+}
+
+// awaitAnswer polls the secondary's resolver until qname resolves, or the
+// deadline passes. Polling rather than sleeping a fixed interval: the whole
+// point is that the transfer happens promptly, and a fixed sleep would either
+// be flaky or slow.
+func awaitAnswer(t *testing.T, f *transferFixture, qname string, qtype uint16) *dns.Msg {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if err := f.resolver.Reload(context.Background()); err != nil {
+			t.Fatalf("Reload: %v", err)
+		}
+		m := askResolver(t, f.resolver, qname, qtype)
+		if m.Rcode == dns.RcodeSuccess && len(m.Answer) > 0 {
+			return m
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("%s never resolved on the secondary within the deadline", qname)
+	return nil
+}
+
+// addRecordAndBump adds one A record to the primary and advances its serial,
+// the way an API write does — through the store, with no notifier call, so
+// what makes this reach the secondary is the pass noticing the serial.
+func addRecordAndBump(t *testing.T, f *xfrFixture, name, addr string) {
+	t.Helper()
+	ctx := context.Background()
+	if _, err := f.st.Zones().AddRecord(ctx, store.ZoneRecord{
+		ZoneID: f.zoneID, Name: name, Type: "A", TTL: 300, RData: addr, Enabled: true,
+	}); err != nil {
+		t.Fatalf("AddRecord: %v", err)
+	}
+	if err := f.st.Zones().BumpSerial(ctx, f.zoneID); err != nil {
+		t.Fatalf("BumpSerial: %v", err)
+	}
+	if err := f.res.Reload(ctx); err != nil {
+		t.Fatalf("primary Reload: %v", err)
+	}
+}
+
+// dnsaur notifying dnsaur, end to end: a record changes on the primary, the
+// primary notifies, the secondary probes, sees a newer serial, transfers, and
+// answers the new record — all before any refresh timer could have fired.
+//
+// **The secondary's refresh interval is set beyond the test's lifetime on
+// purpose.** Without that, this test would pass on a build where NOTIFY does
+// nothing at all, because the scheduler would eventually transfer anyway. The
+// only thing that can make the record appear inside the deadline is the
+// NOTIFY.
+func TestLoopbackNotifyDrivesTheTransfer(t *testing.T) {
+	ctx := context.Background()
+	primary := newXFRFixture(t, loopbackPrimaryZone("127.0.0.0/8"), loopbackRecords(), withResolvingPipeline())
+	sec := newTransferFixture(t, primary.addr, 0)
+	secAddr := listenNotify(t, sec)
+
+	// A first transfer, so refreshed_at != 0 and the rest of this exercises
+	// the probe path rather than Task 7's never-transferred shortcut.
+	if _, err := sec.transferrer().Transfer(ctx, sec.zone(t)); err != nil {
+		t.Fatalf("initial transfer: %v", err)
+	}
+
+	// The scheduler must not be able to explain what follows.
+	z := sec.zone(t)
+	z.SOARefresh = 86400
+	z.SOARetry = 86400
+	if err := sec.st.Zones().UpdateZone(ctx, z); err != nil {
+		t.Fatalf("UpdateZone: %v", err)
+	}
+
+	// The primary now names the secondary, and gains a record.
+	pz, err := primary.st.Zones().Zone(ctx, primary.zoneID)
+	if err != nil {
+		t.Fatalf("primary Zone: %v", err)
+	}
+	pz.NotifyTo = secAddr
+	if err := primary.st.Zones().UpdateZone(ctx, pz); err != nil {
+		t.Fatalf("primary UpdateZone: %v", err)
+	}
+	addRecordAndBump(t, primary, "notified", "10.20.0.99")
+
+	notifier := zones.NewNotifier(primary.st.Zones(), primary.st.Notifies(), primary.st.TSIGKeys())
+	if err := notifier.Pass(ctx); err != nil {
+		t.Fatalf("notifier pass: %v", err)
+	}
+
+	m := awaitAnswer(t, sec, "notified."+transferApex, dns.TypeA)
+	a, ok := m.Answer[0].(*dns.A)
+	if !ok || a.A.String() != "10.20.0.99" {
+		t.Fatalf("answer = %v, want the record added on the primary", m.Answer)
+	}
+
+	// The whole zone arrived, not a coincidence: the serials agree.
+	after := sec.zone(t)
+	pzAfter, _ := primary.st.Zones().Zone(ctx, primary.zoneID)
+	if after.SOASerial != pzAfter.SOASerial {
+		t.Errorf("secondary serial = %d, primary = %d", after.SOASerial, pzAfter.SOASerial)
+	}
+
+	// The mechanism, not just the outcome: WithNotifyProbes actually ran.
+	// Without it act skips straight to a transfer and this test would pass
+	// exactly the same way — the record still arrives, just with no SOA
+	// asked first — so this is what catches WithNotifyProbes quietly being
+	// dropped from the wiring, which nothing else here would notice.
+	if n := primary.probeQueries.Load(); n == 0 {
+		t.Error("the secondary never asked the primary for its SOA before transferring: WithNotifyProbes is not wired")
+	}
+}
+
+// The signed path, which is what a per-target key exists for: without it a
+// dnsaur primary sends unsigned, and a dnsaur secondary whose zone names a
+// key refuses it — dnsaur unable to notify itself through a configuration it
+// fully supports.
+//
+// The secondary's zone carries tsig_key_id, so Task 6's gate REFUSES an
+// unsigned NOTIFY. A transfer that happens here can only have been caused by
+// a signed one.
+func TestLoopbackNotifyIsSignedWhenTheTargetNamesAKey(t *testing.T) {
+	ctx := context.Background()
+	keyName := "ns2." + transferApex
+	primary := newXFRFixture(t, loopbackPrimaryZone("key:"+dns.CanonicalName(keyName)), loopbackRecords(), withResolvingPipeline())
+	sec := newTransferFixture(t, primary.addr, 0)
+	_, secKeyID := loopbackKey(t, primary.st, sec.st, keyName)
+	secAddr := listenNotify(t, sec)
+
+	z := sec.zone(t)
+	z.TSIGKeyID = secKeyID
+	z.SOARefresh = 86400
+	z.SOARetry = 86400
+	if err := sec.st.Zones().UpdateZone(ctx, z); err != nil {
+		t.Fatalf("UpdateZone: %v", err)
+	}
+	if _, err := sec.transferrer().Transfer(ctx, sec.zone(t)); err != nil {
+		t.Fatalf("initial signed transfer: %v", err)
+	}
+
+	pz, _ := primary.st.Zones().Zone(ctx, primary.zoneID)
+	pz.NotifyTo = secAddr + " key:" + dns.CanonicalName(keyName)
+	if err := primary.st.Zones().UpdateZone(ctx, pz); err != nil {
+		t.Fatalf("primary UpdateZone: %v", err)
+	}
+	addRecordAndBump(t, primary, "signed", "10.20.0.98")
+
+	notifier := zones.NewNotifier(primary.st.Zones(), primary.st.Notifies(), primary.st.TSIGKeys())
+	if err := notifier.Pass(ctx); err != nil {
+		t.Fatalf("notifier pass: %v", err)
+	}
+
+	m := awaitAnswer(t, sec, "signed."+transferApex, dns.TypeA)
+	if a, ok := m.Answer[0].(*dns.A); !ok || a.A.String() != "10.20.0.98" {
+		t.Fatalf("answer = %v, want the record added on the primary", m.Answer)
+	}
+}
+
+// The unsigned control for the test above: with the secondary's zone keyed
+// and the primary's notify_to naming no key, the NOTIFY is refused and
+// nothing transfers inside the window. Without this, the signed test could
+// pass on a build that ignores keys entirely.
+func TestLoopbackUnsignedNotifyToAKeyedSecondaryIsRefused(t *testing.T) {
+	ctx := context.Background()
+	keyName := "ns2." + transferApex
+	primary := newXFRFixture(t, loopbackPrimaryZone("key:"+dns.CanonicalName(keyName)), loopbackRecords(), withResolvingPipeline())
+	sec := newTransferFixture(t, primary.addr, 0)
+	_, secKeyID := loopbackKey(t, primary.st, sec.st, keyName)
+	secAddr := listenNotify(t, sec)
+
+	z := sec.zone(t)
+	z.TSIGKeyID = secKeyID
+	z.SOARefresh = 86400
+	z.SOARetry = 86400
+	if err := sec.st.Zones().UpdateZone(ctx, z); err != nil {
+		t.Fatalf("UpdateZone: %v", err)
+	}
+	if _, err := sec.transferrer().Transfer(ctx, sec.zone(t)); err != nil {
+		t.Fatalf("initial signed transfer: %v", err)
+	}
+
+	pz, _ := primary.st.Zones().Zone(ctx, primary.zoneID)
+	pz.NotifyTo = secAddr // deliberately no key:
+	if err := primary.st.Zones().UpdateZone(ctx, pz); err != nil {
+		t.Fatalf("primary UpdateZone: %v", err)
+	}
+	addRecordAndBump(t, primary, "unsigned", "10.20.0.97")
+
+	notifier := zones.NewNotifier(primary.st.Zones(), primary.st.Notifies(), primary.st.TSIGKeys())
+	if err := notifier.Pass(ctx); err != nil {
+		t.Fatalf("notifier pass: %v", err)
+	}
+
+	// Give it the same window the positive test gets, then assert nothing
+	// arrived. The refusal is the point.
+	time.Sleep(500 * time.Millisecond)
+	if err := sec.resolver.Reload(ctx); err != nil {
+		t.Fatalf("Reload: %v", err)
+	}
+	m := askResolver(t, sec.resolver, "unsigned."+transferApex, dns.TypeA)
+	if m.Rcode == dns.RcodeSuccess && len(m.Answer) > 0 {
+		t.Fatal("an unsigned NOTIFY to a keyed secondary caused a transfer")
+	}
+
+	// The absence above proves only that no transfer happened — which is
+	// also what a NOTIFY that never left the process, or never reached the
+	// secondary, would look like. Read the queue row back to prove the
+	// packet was actually sent, reached the secondary's gate, and was
+	// refused by policy: the secondary answers REFUSED, so maybeSend takes
+	// the ErrNotifyDelivered branch and writes attempts == MaxNotifyAttempts
+	// with a last_error naming it (notifier.go).
+	rows, err := primary.st.Notifies().ByZone(ctx, primary.zoneID)
+	if err != nil {
+		t.Fatalf("ByZone: %v", err)
+	}
+	var found bool
+	for _, row := range rows {
+		if row.Target != secAddr {
+			continue
+		}
+		found = true
+		if row.Attempts != zones.MaxNotifyAttempts {
+			t.Errorf("attempts = %d, want %d (the round should have ended on the REFUSED reply)",
+				row.Attempts, zones.MaxNotifyAttempts)
+		}
+		if !strings.Contains(row.LastError, "REFUSED") {
+			t.Errorf("last_error = %q, want it to contain REFUSED", row.LastError)
+		}
+	}
+	if !found {
+		t.Fatalf("no queue row for target %q", secAddr)
 	}
 }

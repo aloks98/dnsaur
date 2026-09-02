@@ -53,6 +53,7 @@ function zone(overrides: Partial<Zone> = {}): Zone {
     last_xfr_at: 0,
     last_xfr_peer: "",
     last_xfr_error: "",
+    notify_to: "",
     created_at: Date.now() - 86_400_000,
     modified_at: Date.now() - 60_000,
     ...overrides,
@@ -443,6 +444,43 @@ test("a key named by both tsig_key_id and allow_transfer on the same zone counts
   expect(within(rows()[0]).getByText("1 zone")).toBeInTheDocument();
 });
 
+// D4 Task 12: a third kind of reference, on the same terms as D3's
+// allow_transfer above — notify_to is who this zone signs its own outbound
+// NOTIFYs for, a `key:` entry in a different field with its own grammar
+// (lib/notify.ts) but the same underlying dependency.
+test("a key named only by a zone's notify_to counts as in use too", async () => {
+  mockKeys([key({ id: 1, name: "xfer.e412.in." }), key({ id: 2, name: "solo.e412.in." })]);
+  mockZones([
+    // Names key 1 as its own signing key, and key 2 in its notify_to — one
+    // zone, two different kinds of reference, two different keys.
+    zone({ id: 10, tsig_key_id: 1, notify_to: "10.0.0.2 key:solo.e412.in." }),
+  ]);
+  renderWithProviders(<TSIGKeys />);
+  await waitFor(() => expect(rows()).toHaveLength(2));
+
+  expect(within(rows()[0]).getByText("1 zone")).toBeInTheDocument();
+  expect(within(rows()[1]).getByText("1 zone")).toBeInTheDocument();
+});
+
+// A key can be named by allow_transfer and notify_to on the same zone
+// (e.g. a secondary that both re-serves and re-notifies under the same
+// key) without being double-counted — the union still folds through one
+// Set per zone.
+test("a key named by both allow_transfer and notify_to on the same zone counts once", async () => {
+  mockKeys([key({ id: 1, name: "xfer.e412.in." })]);
+  mockZones([
+    zone({
+      id: 10,
+      allow_transfer: "key:xfer.e412.in.",
+      notify_to: "10.0.0.2 key:xfer.e412.in.",
+    }),
+  ]);
+  renderWithProviders(<TSIGKeys />);
+  await waitFor(() => expect(rows()).toHaveLength(1));
+
+  expect(within(rows()[0]).getByText("1 zone")).toBeInTheDocument();
+});
+
 // The store refuses to delete a key an ACL names, on the same terms as one
 // named by tsig_key_id — so the screen has to say so before the click, not
 // let it 409. Reuses the existing disabled-delete affordance and copy.
@@ -451,6 +489,35 @@ test("a key an allow_transfer names cannot be deleted, and the confirm says why"
   let deleted = false;
   mockKeys([key({ id: 5, name: "solo.e412.in." })]);
   mockZones([zone({ id: 10, allow_transfer: "key:solo.e412.in." })]);
+  server.use(
+    http.delete("/api/v1/tsig-keys/5", () => {
+      deleted = true;
+      return new HttpResponse(null, { status: 204 });
+    }),
+  );
+  renderWithProviders(<TSIGKeys />);
+  await waitFor(() => expect(rows()).toHaveLength(1));
+
+  await user.click(screen.getByRole("button", { name: /delete solo\.e412\.in\./i }));
+  expect(
+    await screen.findByText("In use by 1 zone. Remove it from them first."),
+  ).toBeInTheDocument();
+  const confirm = screen.getByRole("button", { name: /^delete$/i });
+  expect(confirm).toBeDisabled();
+
+  await user.click(confirm);
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  expect(deleted).toBe(false);
+});
+
+// Same guard, the notify_to side of it — the store's own NOT EXISTS clause
+// against notifyKeyRef is what actually enforces this; this test is the
+// screen not letting the click reach that 409 in the first place.
+test("a key a notify_to names cannot be deleted, and the confirm says why", async () => {
+  const user = userEvent.setup();
+  let deleted = false;
+  mockKeys([key({ id: 5, name: "solo.e412.in." })]);
+  mockZones([zone({ id: 10, notify_to: "10.0.0.2 key:solo.e412.in." })]);
   server.use(
     http.delete("/api/v1/tsig-keys/5", () => {
       deleted = true;

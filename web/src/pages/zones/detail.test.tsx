@@ -7,6 +7,7 @@ import { Route, Routes } from "react-router";
 import { server } from "../../test/msw-server";
 import { renderWithProviders } from "../../test/render";
 import type { Zone, ZoneRecord } from "../../api/types";
+import type { ZoneNotify } from "../../hooks/use-zones";
 import { ZoneDetail } from "./detail";
 
 function zone(overrides: Partial<Zone> = {}): Zone {
@@ -33,6 +34,7 @@ function zone(overrides: Partial<Zone> = {}): Zone {
     last_xfr_at: 0,
     last_xfr_peer: "",
     last_xfr_error: "",
+    notify_to: "",
     created_at: Date.now() - 86_400_000,
     modified_at: Date.now() - 60_000,
     ...overrides,
@@ -59,6 +61,26 @@ function mockZone(z: Zone) {
 
 function mockRecords(zoneId: number, records: ZoneRecord[]) {
   server.use(http.get(`/api/v1/zones/${zoneId}/records`, () => HttpResponse.json(records)));
+}
+
+function mockNotifies(zoneId: number, rows: ZoneNotify[]) {
+  server.use(http.get(`/api/v1/zones/${zoneId}/notifies`, () => HttpResponse.json(rows)));
+}
+
+/** A `GET /notifies` row with sensible defaults for the fields a given test
+ * doesn't care about — mirrors `zone`/`record` above. */
+function notifyRow(overrides: Partial<ZoneNotify> = {}): ZoneNotify {
+  return {
+    target: "10.0.0.2:53",
+    state: "current",
+    notified_serial: 3,
+    notified_at: Date.now() - 4 * 60_000,
+    attempts: 0,
+    max_attempts: 5,
+    last_error: "",
+    created_at: Date.now() - 86_400_000,
+    ...overrides,
+  };
 }
 
 /** Renders under a real route so useParams() resolves ":id" the way the
@@ -993,6 +1015,11 @@ test("a built-in zone offers no way to change it", async () => {
   // terms as Add record/Delete zone/Disable zone above.
   expect(screen.queryByRole("button", { name: /^edit allow transfer$/i })).not.toBeInTheDocument();
   expect(screen.queryByLabelText(/^allow transfer$/i)).not.toBeInTheDocument();
+  // notify_to is refused with 400 on the same terms (checkZoneTransferConfig
+  // applies to both fields identically) — the NOTIFY OUT row must not be
+  // offered here either.
+  expect(screen.queryByRole("button", { name: /^edit notify targets$/i })).not.toBeInTheDocument();
+  expect(screen.queryByLabelText(/^notify to$/i)).not.toBeInTheDocument();
 });
 
 // ── Zone file export and import ───────────────────────────────────────────
@@ -1877,4 +1904,255 @@ test("shows the band for a secondary too", async () => {
   expect(screen.getByText("Primaries")).toBeInTheDocument();
   expect(screen.getByText("key:ns2.")).toBeInTheDocument();
   expect(screen.getByText("Last served 5m ago to 203.0.113.20")).toBeInTheDocument();
+});
+
+// ── The notify-out row (Task 12) ────────────────────────────────────────
+// Read is the default, the pencil opens editing, exactly as allow_transfer
+// works above — but the read line also carries a roll-up over GET
+// /zones/{id}/notifies (mockNotifies/notifyRow above), since "who" and "how
+// each of them is doing" are two different questions this row answers at
+// once.
+
+/** Opens the row's editing state the way a user does. */
+async function openNotifyEdit(user: ReturnType<typeof userEvent.setup>) {
+  await user.click(await screen.findByRole("button", { name: /^edit notify targets$/i }));
+  await screen.findByLabelText(/^notify to$/i);
+}
+
+test("shows who is notified, and editing seeds the field with it", async () => {
+  const user = userEvent.setup();
+  renderZoneDetail({ zone: zone({ id: 1, notify_to: "10.0.0.2:53, key:ns2." }) });
+  await screen.findByText("example.com");
+
+  expect(screen.getByText("10.0.0.2:53, key:ns2.")).toBeInTheDocument();
+  expect(screen.queryByLabelText(/^notify to$/i)).not.toBeInTheDocument();
+
+  await openNotifyEdit(user);
+  expect(screen.getByLabelText(/^notify to$/i)).toHaveValue("10.0.0.2:53, key:ns2.");
+});
+
+test("says plainly when nobody is notified, with no disclosure to click", async () => {
+  renderZoneDetail({ zone: zone({ id: 1, notify_to: "" }) });
+  await screen.findByText("example.com");
+
+  expect(screen.getByText("No targets are notified.")).toBeInTheDocument();
+  expect(await screen.findByText("no targets")).toBeInTheDocument();
+  // Nothing to disclose, so the roll-up is plain text, not a button that
+  // would do nothing on click.
+  expect(screen.queryByTitle("Show every target")).not.toBeInTheDocument();
+});
+
+test("all targets current rolls up to one line, with no rows shown by default", async () => {
+  mockNotifies(1, [
+    notifyRow({ target: "10.0.0.2:53", state: "current" }),
+    notifyRow({ target: "10.0.0.3:53", state: "current" }),
+  ]);
+  renderZoneDetail({ zone: zone({ id: 1, notify_to: "10.0.0.2, 10.0.0.3" }) });
+  await screen.findByText("example.com");
+
+  expect(await screen.findByText("all 2 current")).toBeInTheDocument();
+  // Two identical "current" rows would say nothing twice — the roll-up is
+  // the whole story until the caret is opened.
+  expect(screen.queryByTestId("notify-target-row")).not.toBeInTheDocument();
+});
+
+// Ruled 2026-09-02 by the design's author: nothing is behind here (never
+// doesn't count), so the artboard's own arithmetic would say "all 4
+// current" — a false statement about a target that has been told nothing
+// yet. The roll-up names it instead.
+test("a never-notified target with nothing behind is named, not folded into current", async () => {
+  const user = userEvent.setup();
+  mockNotifies(1, [
+    notifyRow({ target: "10.0.0.2:53", state: "current" }),
+    notifyRow({ target: "10.0.0.3:53", state: "current" }),
+    notifyRow({ target: "10.0.0.4:53", state: "current" }),
+    notifyRow({ target: "10.0.0.5:53", state: "never" }),
+  ]);
+  renderZoneDetail({ zone: zone({ id: 1, notify_to: "10.0.0.2, 10.0.0.3, 10.0.0.4, 10.0.0.5" }) });
+  await screen.findByText("example.com");
+
+  expect(await screen.findByText("3 of 4 current, 1 never notified")).toBeInTheDocument();
+  // Nothing is behind, so nothing gets a row until the caret is opened —
+  // same rule as the all-current case above.
+  expect(screen.queryByTestId("notify-target-row")).not.toBeInTheDocument();
+
+  await user.click(screen.getByTitle("Show every target"));
+  await waitFor(() => expect(screen.getAllByTestId("notify-target-row")).toHaveLength(4));
+  expect(screen.getByText("10.0.0.5:53")).toBeInTheDocument();
+});
+
+test("only the behind target gets a row by default; the caret expands the rest", async () => {
+  const user = userEvent.setup();
+  mockNotifies(1, [
+    notifyRow({ target: "10.0.0.2:53", state: "current", notified_serial: 7 }),
+    notifyRow({
+      target: "10.0.0.3:53",
+      state: "gave_up",
+      notified_serial: 4,
+      attempts: 5,
+      last_error: "connection refused",
+    }),
+  ]);
+  renderZoneDetail({ zone: zone({ id: 1, notify_to: "10.0.0.2, 10.0.0.3" }) });
+  await screen.findByText("example.com");
+
+  expect(await screen.findByText("1 of 2 behind")).toBeInTheDocument();
+  await waitFor(() => expect(screen.getAllByTestId("notify-target-row")).toHaveLength(1));
+  const behindRow = screen.getByTestId("notify-target-row");
+  expect(within(behindRow).getByText("10.0.0.3:53")).toBeInTheDocument();
+  // gave_up reads "not acknowledged", never "gave up" — it resolves itself
+  // on the next edit and must not read as something to act on.
+  expect(within(behindRow).getByText("not acknowledged")).toBeInTheDocument();
+  expect(within(behindRow).getByText("connection refused")).toBeInTheDocument();
+  expect(screen.getByText("+ 1 current")).toBeInTheDocument();
+
+  await user.click(screen.getByTitle("Show every target"));
+  await waitFor(() => expect(screen.getAllByTestId("notify-target-row")).toHaveLength(2));
+  expect(screen.getByText("10.0.0.2:53")).toBeInTheDocument();
+  expect(screen.queryByText("+ 1 current")).not.toBeInTheDocument();
+});
+
+// The "+N" hint under a behind row has the identical false-statement risk
+// the roll-up itself does when the collapsed rest is a mix — it must name
+// a never-notified target rather than lumping it in with "current" too.
+test("the collapsed hint names a never-notified target among the rest, not just current", async () => {
+  mockNotifies(1, [
+    notifyRow({ target: "10.0.0.2:53", state: "gave_up", attempts: 5, last_error: "REFUSED" }),
+    notifyRow({ target: "10.0.0.3:53", state: "current" }),
+    notifyRow({ target: "10.0.0.4:53", state: "never" }),
+  ]);
+  renderZoneDetail({ zone: zone({ id: 1, notify_to: "10.0.0.2, 10.0.0.3, 10.0.0.4" }) });
+  await screen.findByText("example.com");
+
+  expect(await screen.findByText("1 of 3 behind")).toBeInTheDocument();
+  expect(screen.getByText("+ 1 current, 1 never notified")).toBeInTheDocument();
+});
+
+test("retrying shows its attempt count, and a never-notified target shows — and when it was added", async () => {
+  const addedAt = Date.now() - 2 * 60_000;
+  mockNotifies(1, [
+    notifyRow({ target: "10.0.0.2:53", state: "retrying", attempts: 3, max_attempts: 5 }),
+    notifyRow({
+      target: "10.0.0.3:53",
+      state: "never",
+      notified_serial: 0,
+      notified_at: 0,
+      attempts: 0,
+      created_at: addedAt,
+    }),
+  ]);
+  renderZoneDetail({ zone: zone({ id: 1, notify_to: "10.0.0.2, 10.0.0.3" }) });
+  await screen.findByText("example.com");
+
+  // never doesn't count as behind, so only the retrying target earns a row
+  // by default — the roll-up says "1 of 2", not "2 of 2".
+  expect(await screen.findByText("1 of 2 behind")).toBeInTheDocument();
+  const row = await screen.findByTestId("notify-target-row");
+  expect(within(row).getByText("retrying · try 3/5")).toBeInTheDocument();
+
+  await userEvent.setup().click(screen.getByTitle("Show every target"));
+  const neverRow = screen.getByText("10.0.0.3:53").closest('[data-testid="notify-target-row"]');
+  expect(neverRow).not.toBeNull();
+  expect(within(neverRow as HTMLElement).getByText("never notified")).toBeInTheDocument();
+  expect(within(neverRow as HTMLElement).getByText("—")).toBeInTheDocument();
+  expect(within(neverRow as HTMLElement).getByText("added 2m ago")).toBeInTheDocument();
+});
+
+// notified_at != 0, attempts == 0 is also the state of every previously-
+// current target in the window between a serial bump and the notify pass's
+// first attempt (the mutation's response returns before the async pass
+// runs), so "try 0/5" there would read as nonsense on an ordinary record
+// edit. Drop the counter at attempts === 0 and leave plain "retrying".
+test("retrying with no attempts yet drops the try counter", async () => {
+  mockNotifies(1, [
+    notifyRow({ target: "10.0.0.2:53", state: "retrying", attempts: 0, max_attempts: 5 }),
+  ]);
+  renderZoneDetail({ zone: zone({ id: 1, notify_to: "10.0.0.2" }) });
+  await screen.findByText("example.com");
+
+  const row = await screen.findByTestId("notify-target-row");
+  expect(within(row).getByText("retrying")).toBeInTheDocument();
+  expect(within(row).queryByText(/try 0\/5/)).not.toBeInTheDocument();
+});
+
+test("Cancel returns to read mode and writes nothing", async () => {
+  const user = userEvent.setup();
+  let patched = false;
+  renderZoneDetail({ zone: zone({ id: 1, notify_to: "10.0.0.2" }) });
+  server.use(
+    http.patch("/api/v1/zones/1", () => {
+      patched = true;
+      return new HttpResponse(null, { status: 204 });
+    }),
+  );
+  await screen.findByText("example.com");
+  await openNotifyEdit(user);
+  await user.type(screen.getByLabelText(/^notify to$/i), ",typed-but-abandoned");
+
+  await user.click(screen.getByRole("button", { name: /^cancel editing notify targets$/i }));
+
+  expect(screen.queryByLabelText(/^notify to$/i)).not.toBeInTheDocument();
+  expect(screen.getByText("10.0.0.2")).toBeInTheDocument();
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  expect(patched).toBe(false);
+});
+
+test("rejects a malformed entry before sending it", async () => {
+  const user = userEvent.setup();
+  let patched = false;
+  renderZoneDetail({ zone: zone({ id: 1, notify_to: "" }) });
+  server.use(
+    http.patch("/api/v1/zones/1", () => {
+      patched = true;
+      return new HttpResponse(null, { status: 204 });
+    }),
+  );
+  await screen.findByText("example.com");
+  await openNotifyEdit(user);
+
+  const field = screen.getByLabelText(/^notify to$/i);
+  // A single token, no whitespace: "not a host" would trip the *key*
+  // branch instead ("expected `key:<name>` after the host", since a space
+  // is what separates a target from its key suffix) — this exercises the
+  // host-format check on its own.
+  await user.type(field, "not/a/host");
+  await user.click(screen.getByRole("button", { name: /^save$/i }));
+
+  expect(
+    await screen.findByText(
+      'notify target "not/a/host": host must be an IP address or a domain name',
+    ),
+  ).toBeInTheDocument();
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  expect(patched).toBe(false);
+});
+
+test("saving a valid notify_to PATCHes the zone and returns to read mode", async () => {
+  const user = userEvent.setup();
+  let body: unknown;
+  renderZoneDetail({ zone: zone({ id: 1, notify_to: "" }) });
+  server.use(
+    http.patch("/api/v1/zones/1", async ({ request }) => {
+      body = await request.json();
+      return new HttpResponse(null, { status: 204 });
+    }),
+  );
+  await screen.findByText("example.com");
+  await openNotifyEdit(user);
+
+  const field = screen.getByLabelText(/^notify to$/i);
+  await user.type(field, "10.0.0.2");
+  await user.click(screen.getByRole("button", { name: /^save$/i }));
+
+  await waitFor(() => expect(body).toEqual({ notify_to: "10.0.0.2" }));
+  await waitFor(() => expect(screen.queryByLabelText(/^notify to$/i)).not.toBeInTheDocument());
+});
+
+test("shows the row for a secondary too", async () => {
+  mockNotifies(1, [notifyRow({ target: "10.0.0.9:53", state: "current" })]);
+  renderZoneDetail({ zone: secondary({ notify_to: "10.0.0.9" }) });
+  await screen.findByText("e412.in");
+
+  expect(screen.getByText("10.0.0.9")).toBeInTheDocument();
+  expect(await screen.findByText("all 1 current")).toBeInTheDocument();
 });

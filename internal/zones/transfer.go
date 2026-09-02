@@ -98,6 +98,9 @@ type Transferrer struct {
 	// not being answered from yet.
 	reload     func(context.Context) error
 	maxRecords int
+	// notifyWake, when set, is called after every zone this Transferrer
+	// installs. See WithNotifyWake.
+	notifyWake func()
 }
 
 // TransferOption configures a Transferrer at construction.
@@ -133,6 +136,20 @@ func WithMaxRecords(n int) TransferOption {
 		}
 		t.maxRecords = n
 	}
+}
+
+// WithNotifyWake gives the Transferrer a callback to invoke after every zone
+// it installs — Notifier.Wake in production. It is the cascade: a secondary
+// that just pulled a zone may itself be a primary to further secondaries via
+// notify_to, and install writes the primary's serial verbatim, so the pass
+// that decides who to tell needs nothing cascade-specific — it compares
+// serials exactly as it does anywhere else, once woken.
+//
+// Optional, and deliberately so: without it, nothing calls Wake and the next
+// scheduled pass picks up the change instead. See Notifier.Wake — this is
+// promptness, never correctness.
+func WithNotifyWake(wake func()) TransferOption {
+	return func(t *Transferrer) { t.notifyWake = wake }
 }
 
 // NewTransferrer returns a Transferrer that installs into zs and signs with
@@ -375,6 +392,112 @@ func (t *Transferrer) fetch(ctx context.Context, zoneName string, ap netip.AddrP
 		return nil, errors.New("the primary sent no records at all")
 	}
 	return rrs, nil
+}
+
+// ProbeSerial asks z's primaries for the zone's current serial, and returns
+// the first answer with the address that gave it.
+//
+// It is the mechanism RFC 1996 §4.7 leaves when it says a notified secondary
+// "should enter the state it would if the zone's refresh timer had expired":
+// under RFC 1034 that means asking for the SOA and comparing serials, not
+// transferring outright. Without it a primary that edits ten records causes
+// ten full zone transfers.
+//
+// The primaries are tried in the order written and any failure moves to the
+// next, exactly as Transfer does and for the same reason — primaries are
+// meant to be replicas of each other, so one refusing is a reason to ask
+// another. The error names every attempt when they all fail.
+//
+// It is signed with the zone's key when it names one, through the same
+// t.tsig provider fetch signs an AXFR with — not a second implementation. A
+// primary that requires TSIG on ordinary queries would otherwise refuse the
+// probe and make a perfectly healthy zone look unreachable.
+func (t *Transferrer) ProbeSerial(ctx context.Context, z store.Zone) (uint32, netip.AddrPort, error) {
+	primaries, err := ParsePrimaries(ctx, t.res, z.Primaries)
+	if err != nil {
+		return 0, netip.AddrPort{}, fmt.Errorf("zone %q: %w", z.Name, err)
+	}
+	key, err := t.zoneKey(ctx, z)
+	if err != nil {
+		return 0, netip.AddrPort{}, err
+	}
+
+	var failures []error
+	for _, ap := range primaries {
+		if err := ctx.Err(); err != nil {
+			return 0, netip.AddrPort{}, fmt.Errorf("zone %q: %w", z.Name, err)
+		}
+		serial, err := t.probeOne(ctx, z.Name, ap, key)
+		if err != nil {
+			failures = append(failures, fmt.Errorf("%s: %w", ap, err))
+			continue
+		}
+		return serial, ap, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, netip.AddrPort{}, fmt.Errorf("zone %q: %w", z.Name, err)
+	}
+	return 0, netip.AddrPort{}, fmt.Errorf("zone %q: every primary failed: %w",
+		z.Name, errors.Join(failures...))
+}
+
+// probeOne runs one SOA query against one primary.
+func (t *Transferrer) probeOne(ctx context.Context, zoneName string, ap netip.AddrPort, key *store.TSIGKey) (uint32, error) {
+	m := new(dns.Msg).SetQuestion(dns.Fqdn(zoneName), dns.TypeSOA)
+	c := new(dns.Client)
+	if key != nil {
+		// The same provider and the same canonicalisation fetch signs an AXFR
+		// with (t.tsig, set from dnssrv.NewTSIGProvider(keys) at construction)
+		// — see fetch's own comment on why a second implementation here would
+		// be a bug that only shows up against a TSIG-requiring primary.
+		c.TsigProvider = t.tsig
+		m.SetTsig(dns.CanonicalName(key.Name), dns.CanonicalName(key.Algorithm), tsigFudge, time.Now().Unix())
+	}
+	reply, _, err := c.ExchangeContext(ctx, m, ap.String())
+	if err != nil {
+		return 0, err
+	}
+	// RFC 8945 §5.4: a signed request's response must be signed too.
+	// miekg's ExchangeContext verifies a TSIG only when the reply carries
+	// one ("if t := m.IsTsig(); t != nil" — client.go:267) — a reply with
+	// none skips verification entirely. Without this check, an off-path
+	// attacker who spoofs the primary's address and guesses the query ID
+	// and ephemeral port could hand back an unsigned SOA for the right
+	// owner name with a serial <= ours, and act would call the zone
+	// current — leaving it stale while reporting nothing wrong, the exact
+	// failure the owner-name check just below also exists to prevent.
+	// Mirrors notifysend.go's identical check on its read loop.
+	if key != nil && reply.IsTsig() == nil {
+		return 0, errors.New("SOA probe: signed request got an unsigned reply")
+	}
+	if reply.Rcode != dns.RcodeSuccess {
+		return 0, fmt.Errorf("SOA probe answered %s", dns.RcodeToString[reply.Rcode])
+	}
+	for _, rr := range reply.Answer {
+		soa, ok := rr.(*dns.SOA)
+		if !ok {
+			continue
+		}
+		// The SOA must name the zone we asked about. build() applies the
+		// identical check to a transferred SOA (transfer.go, "the transfer
+		// carries the SOA of %q, not of %q") and the reason is stronger
+		// here: a probe is a single unsigned UDP exchange for a keyless
+		// zone, so a misconfigured multi-tenant primary or an off-path
+		// forgery could hand back an unrelated zone's serial. Accepting it
+		// would make SerialNewer compare against the wrong number and, when
+		// that number happens to be higher, silently decline a transfer
+		// that should have happened — leaving a stale zone reporting
+		// nothing wrong, which is the exact failure this task exists to
+		// prevent.
+		if !strings.EqualFold(dns.CanonicalName(soa.Hdr.Name), dns.CanonicalName(dns.Fqdn(zoneName))) {
+			return 0, fmt.Errorf("SOA probe answered with the SOA of %q, not of %q", soa.Hdr.Name, zoneName)
+		}
+		return soa.Serial, nil
+	}
+	// A NOERROR with no SOA is a primary that answered the wrong question,
+	// which is a failure of this probe rather than of the zone — reported so
+	// the next primary is tried instead of the zone being called current.
+	return 0, errors.New("SOA probe answered NOERROR with no SOA record")
 }
 
 // maxNamedProblems bounds how many per-record refusals one error repeats.
@@ -642,6 +765,13 @@ func (t *Transferrer) install(ctx context.Context, z store.Zone, ap netip.AddrPo
 		if err := t.reload(ctx); err != nil {
 			slog.Error("zone reload after transfer failed", "zone", z.Name, "primary", ap.String(), "err", err)
 		}
+	}
+
+	// The cascade: this zone's serial just moved, verbatim from its primary,
+	// so anything this server in turn notifies may now be behind. See
+	// WithNotifyWake.
+	if t.notifyWake != nil {
+		t.notifyWake()
 	}
 
 	return TransferResult{

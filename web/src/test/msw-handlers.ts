@@ -94,6 +94,7 @@ function defaultZones(): Zone[] {
       last_xfr_at: 0,
       last_xfr_peer: "",
       last_xfr_error: "",
+      notify_to: "",
       created_at: Date.now() - 30 * 24 * 60 * 60 * 1000,
       modified_at: Date.now() - 15 * 60 * 1000,
     },
@@ -279,6 +280,17 @@ export const handlers = [
       return HttpResponse.json({ error: "not found" }, { status: 404 });
     }
     return HttpResponse.json(defaultZoneRecords(id));
+  }),
+
+  // Task 12's NOTIFY OUT row. Empty by default — the default fixture zone's
+  // notify_to is "" — so tests that care about actual delivery state
+  // register their own rows via server.use(), the same way records above do.
+  http.get("/api/v1/zones/:id/notifies", ({ params }) => {
+    const id = Number(params.id);
+    if (!defaultZones().some((z) => z.id === id)) {
+      return HttpResponse.json({ error: "not found" }, { status: 404 });
+    }
+    return HttpResponse.json([]);
   }),
 
   // TSIG keys (Milestone D1), GET-only like zones above: the mutation

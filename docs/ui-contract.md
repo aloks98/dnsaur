@@ -819,6 +819,7 @@ unmatched clients fall back to it.
 | `soa_ttl` | uint32 (seconds) | the SOA record's own header TTL, independent of `soa_minimum` — RFC 2308 §5 needs both to express `min(minimum, ttl)`. Fixed at `900`; **no request field sets it**, on create or patch |
 | `primaries`, `tsig_key_id`, `expires_at`, `refreshed_at` | string / int64 | secondary/stub/forwarder only (Milestone D); always empty/`0` for `primary`/`internal` |
 | `allow_transfer`, `last_xfr_at`, `last_xfr_peer`, `last_xfr_error` | string / int64 | the outbound AXFR ACL and the last inbound transfer *request*'s outcome — `primary` and `secondary` only. See [`docs/api.md`](api.md)'s `allow_transfer` entry for the format and what each read-only field means (and why `last_xfr_peer` is not proof of who asked) |
+| `notify_to` | string | who this zone tells when it changes (DNS NOTIFY, RFC 1996) — `primary` and `secondary` only, the same reach as `allow_transfer`. See [`docs/api.md`](api.md)'s `notify_to` entry for the format. Per-target delivery status is a separate read, `GET /zones/{id}/notifies`, not a field on the zone itself — see §9's Notify-out item |
 | `created_at`, `modified_at` | int64 (unix ms) | |
 
 ### 3.7 Zone record
@@ -1193,7 +1194,7 @@ typing in an input.
 | **404 / unknown route** | renders a dedicated not-found screen inside the shell, no group marked in row 2 (`pages/not-found.tsx`) — this table is stale on this point in older captures; `path="*"` no longer redirects |
 | **DHCP** | nothing exists (§3.11) |
 | **Encrypted DNS (DoH/DoT)** | no code |
-| **Zone transfers (stub/forwarder), DNSSEC** | `secondary` is done: Milestone D2 ships the transfer client (dnsaur pulls a zone from a primary, TSIG and all) and D3 the server (dnsaur serves AXFR to its own secondaries, gated by `allow_transfer`), both with UI. `stub` and `forwarder` are still schema and badges only — create/patch reject them with `400` — and there is no DNSSEC signing. **Reverse zones are no longer on this list**: `PTR` is a normal record type, a reverse zone is an ordinary `primary` zone ending in `.arpa`, the RFC 6303 §4 built-ins (`internal/store/builtins.go`'s `BuiltinZones`) are seeded as `type: internal` (read-only, `409` on any write), and an A/AAAA write maintains the matching PTR server-side in the same request |
+| **Zone transfers (stub/forwarder), DNSSEC** | `secondary` is done: Milestone D2 ships the transfer client (dnsaur pulls a zone from a primary, TSIG and all), D3 the server (dnsaur serves AXFR to its own secondaries, gated by `allow_transfer`), and D4 DNS NOTIFY in both directions (dnsaur tells its own secondaries a zone changed, and reacts promptly when told by its own primary — §9.18), all three with UI. `stub` and `forwarder` are still schema and badges only — create/patch reject them with `400` — and there is no DNSSEC signing. **Reverse zones are no longer on this list**: `PTR` is a normal record type, a reverse zone is an ordinary `primary` zone ending in `.arpa`, the RFC 6303 §4 built-ins (`internal/store/builtins.go`'s `BuiltinZones`) are seeded as `type: internal` (read-only, `409` on any write), and an A/AAAA write maintains the matching PTR server-side in the same request |
 | **HA / cluster UI** | no code; the spec anticipated a health-strip stub, which does not exist |
 
 The nav contains exactly the nine implemented leaf routes, in four groups
@@ -1303,6 +1304,38 @@ Collected because each one has already caused, or would cause, a wrong UI.
     already resolved, so that refusal — spoofable UDP source address
     included — is what gets recorded (see [`docs/api.md`](api.md)'s
     `allow_transfer` field).
+18. **The Notify out row shows a roll-up, not one row per target.** Shown on
+    `/zones/{id}` for `primary` and `secondary` zones only — the same
+    positive set the allow-transfer band above is gated on, and for the same
+    reason (`notify_to` 400s on any other type). A blank `notify_to` renders
+    an explicit **"No targets are notified."** line. When there are targets,
+    the saved value is followed by a roll-up computed from
+    `GET /zones/{id}/notifies` (`notifyRollup`, `web/src/lib/notify.ts`):
+    **"no targets"**, **"all N current"**, **"X of N current, Y never
+    notified"**, or **"M of N behind"** — `behind` (a target whose state is
+    `retrying` or `gave_up`) takes precedence over the other wordings
+    whenever any target is behind. Decided 2026-09-02 by the design's
+    author, overriding the artboard's own arithmetic, which conflated
+    "behind" and "never notified". A behind target earns a row of its own
+    without opening the disclosure; the rest collapse behind a "+N current"
+    / "+N never notified" hint.
+
+    The four states a target's own row can be in, and the exact word shown
+    for each (`notifyStateLabel`, `web/src/pages/zones/detail.tsx`) — **none
+    of the four requires operator action**, since a NOTIFY only ever changes
+    *when* a secondary refreshes, never *whether* it does, and the target's
+    own SOA refresh schedule is the correctness backstop regardless of how a
+    round ends:
+    - `never` → **"never notified"** — no round has ever been tried.
+    - `current` → **"current"** — the target has acknowledged the zone's
+      present serial.
+    - `retrying` → **"retrying · try X/Y"** — behind, and still within the
+      round's attempt budget.
+    - `gave_up` → **"not acknowledged"**, never rendered *"gave up"* — the
+      round rested after exhausting its attempt budget; it resolves itself,
+      with no operator action, on the zone's next edit. Drawn amber-on-hollow
+      (a ring, no fill) rather than `retrying`'s filled dot, so it reads as
+      "resting" rather than as a failure.
 
 ---
 

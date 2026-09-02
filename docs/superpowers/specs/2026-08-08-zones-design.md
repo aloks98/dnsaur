@@ -989,7 +989,7 @@ D is too large to land as one plan. Each of these ships something that works:
 | **D1** | TSIG keys: table, CRUD, dynamic provider, and the `TsigStatus` helper transfers call | — |
 | **D2** | Outbound AXFR: `primaries` format, scheduling, expiry, atomic install, per-zone reload, **and ownership of `zones.tsig_key_id`** — the column and the guard against deleting a key a zone still references. D2 declined the schema-level foreign key with reasoning recorded in migration 0009: the column is `NOT NULL DEFAULT 0` where 0 means "no key", a FK skips NULL rather than zero, and making it nullable is a whole-table rebuild on SQLite where `zones` is the parent of `zone_records … ON DELETE CASCADE`. The guard is a single-statement delete instead | D1 |
 | **D3** | Inbound AXFR: the `dnssrv` intercept, the `allow_transfer` ACL (a column, not the table §9.2 sketched), envelope batching written here rather than through `dns.Transfer.Out`, TSIG enforcement with RFC 8945 error codes, and last-served state on the zone | D1 |
-| **D4** | NOTIFY both directions | D2, D3 |
+| **D4** | NOTIFY both directions: the `dnssrv` opcode intercept, the inbound gate and its SOA probe, `notify_to` with per-target TSIG, and a `zone_notifies` queue whose pending-ness is derived from the serial rather than stored — **designed in §9.10** | D2, D3 |
 | **D5** | IXFR: journal, deltas, serial arithmetic | D2, D3 |
 | **D6** | `forwarder` zone type and the `Conditional` migration | — |
 
@@ -1017,7 +1017,544 @@ be wrong.
 |---|---|
 | **5936** | AXFR is TCP-only (§4.2 leaves UDP undefined); SOA first and last, never in between (§2.2); messages carry enough RRs to amortize the overhead (§2.2); NOTAUTH when not authoritative (§2.2.1); OPT echoed in the first response message (§2.2.5) |
 | **1995** | IXFR falls back to a full AXFR when no delta is available (§2); a UDP IXFR whose reply does not fit is answered with a single SOA (§2) |
-| **1996** | NOTIFY is a hint, not an instruction — the secondary still checks the SOA before transferring |
+| **1996** | NOTIFY is a hint, not an instruction — the secondary still checks the SOA before transferring (§4.7), and the answer-section SOA is never acted on: §3.7–3.8, "In no case shall the answer section of a NOTIFY request be used to update a slave's local data, or to indicate that a zone transfer needs to be undertaken, or to change the slave's zone refresh timers." The sender retransmits until a response, a timeout, or ICMP port unreachable (§3.6), and any response ends the round whatever its rcode (§4.8). **One deliberate divergence:** §3.10 says a NOTIFY from a host that is not a known master "should ignore the request"; dnsaur answers REFUSED instead — reasoning in §9.10.2 |
 | **8945** | TSIG: signed request, signed reply, time-window enforcement, and an unsigned request rejected rather than ignored; every message of a multi-message response signed, timers-only after the first; BADKEY and BADSIG reported in an unsigned reply (§5.2.1 and §5.2.2, each "This response MUST be unsigned", both pointing at §5.3.2 for the shape of an error return rather than for that sentence), BADTIME in a *signed* one carrying the client's time in Time Signed and ours in Other Data (§5.2.3) |
 | **1982** | Serial arithmetic is circular — comparison is not `<` |
 | **1034 §4.3.5** | A secondary past its SOA expire must stop answering for the zone |
+
+### 9.10 Milestone D4: NOTIFY, both directions
+
+Designed 2026-09-02, once D1–D3 had landed and the two halves could be costed
+against code that exists. Every RFC 1996 sentence below was fetched rather
+than recalled, and the one place this design knowingly disagrees with the RFC
+is named as a divergence in §9.9 rather than left for a reader to discover.
+
+The vocabulary inverts here exactly as it does across §9.4 and §9.5, and for
+the same reason. **Outbound NOTIFY** is dnsaur as a *primary*, telling
+secondaries the zone changed. **Inbound NOTIFY** is dnsaur as a *secondary*,
+being told. That is the opposite pairing to §9.4/§9.5, where outbound meant
+dnsaur pulling as a secondary — because a transfer is pulled and a NOTIFY is
+pushed, so the same word follows the data in one case and the message in the
+other. Read the direction off the zone type, never off the word.
+
+#### 9.10.1 The intercept, and the defect it closes
+
+`isTransferQuery` branches on qtype. NOTIFY is an *opcode*, so it is not
+caught by it, and there is no other branch: a NOTIFY arriving at dnsaur today
+falls into the ordinary pipeline.
+
+That is a live defect, and it is worth stating plainly because it exists on
+`main` independently of whether anyone ever configures a secondary.
+`DefaultMsgAcceptFunc` accepts opcode NOTIFY — `acceptfunc.go:40`, and it
+allows the answer-section SOA on purpose ("NOTIFY requests can have a SOA in
+the ANSWER section. See RFC 1996 Section 3.7 and 3.11") — so the message
+reaches `Server.serve`, carries one question of qtype SOA, and is handled as
+though it were an ordinary SOA query. It is counted in the query log,
+evaluated by the filter, eligible for the cache, and for an apex this server
+does not hold it is **forwarded upstream**: dnsaur asks Cloudflare an SOA
+question on behalf of a peer that was trying to notify it. D4 closes this,
+and the regression test for it fails on the commit before D4's first.
+
+So `serve` gains a third branch, beside the transfer one and ahead of the
+chain:
+
+```go
+// internal/dnssrv/notifies.go
+type Notifies interface {
+    ServeNotify(ctx context.Context, w dns.ResponseWriter, m *dns.Msg, key string, tsigErr error)
+}
+func WithNotifies(n Notifies) Option
+```
+
+Unlike a transfer, a NOTIFY reply *is* a single message, so it would fit
+`Handler` mechanically. It still must not go through it: the pipeline is
+precisely what has no meaning for it, and the forwarding above is what that
+costs. The branch is therefore an interception for the same reason §9.1's is,
+without the same justification — a transfer cannot be a `Handler`, a NOTIFY
+merely must not be one.
+
+`key` and `tsigErr` are what `Server.RequireTSIG` already concluded at the top
+of `serve`, passed rather than recomputed. The reasoning is `Transfers`' own:
+two callers of one check are two chances to disagree, and here the
+disagreement would be a NOTIFY acted on without the signature the zone
+requires.
+
+Without `WithNotifies` the branch is not taken and a NOTIFY falls through as
+it does now, which is what every server built before D4 did. That is the same
+shape `WithTransfers` uses and it keeps `dnssrv` free of any zones dependency.
+
+**Naming.** `zones.TransferServer` answers a peer pulling from us;
+`zones.NotifyServer` answers a peer notifying us. `zones.Notifier` is the
+outbound half. The two halves share `serialNewer` and nothing else.
+
+#### 9.10.2 Inbound: the gate, and what each refusal says
+
+`NotifyServer.decide` is pure — it takes the message, the peer, the parsed
+primaries, the key and the TSIG error, and returns a zone or a refusal — so
+the table below is directly a test table, one case per row, as §9.5.5's is.
+
+| Condition | Rcode | Reply carries |
+|---|---|---|
+| qtype is not SOA | FORMERR | |
+| no zone at that apex | NOTAUTH | |
+| zone is not type `secondary` | NOTAUTH | |
+| zone is disabled | NOTAUTH | |
+| source address matched no entry in `primaries` | REFUSED | |
+| zone names a TSIG key and the message is unsigned | REFUSED | |
+| TSIG present, key unknown or algorithm mismatched | REFUSED | TSIG RR, BADKEY (17), **unsigned** |
+| TSIG present, MAC did not verify | REFUSED | TSIG RR, BADSIG (16), **unsigned** |
+| TSIG present, outside the fudge window | REFUSED | TSIG RR, BADTIME (18), **signed** |
+| TSIG lookup failed because the store failed | SERVFAIL | never a TSIG error |
+| otherwise | NOERROR, AA set, question echoed | signed iff the request verified |
+
+Where these come from, and where they are ours:
+
+- **The TSIG rows follow §9.5.5 exactly**, including that BADKEY and BADSIG
+  are unsigned and BADTIME is signed. The rcode differs — D3 answers a
+  transfer NOTAUTH and this answers REFUSED — because the two are refusing
+  different things. A transfer refusal under RFC 5936 §2.2.1 is about
+  authority over the zone; a NOTIFY refusal is a policy statement by a server
+  that *does* hold the zone and declines to be told by this peer.
+- **NOTAUTH for a zone we do not hold, or hold as a primary**, is ours: RFC
+  1996 specifies no rcode for it. It is the honest one, and it matches what
+  §9.5.5 already chose for the same condition on the transfer path, so an
+  operator reads one rule rather than two.
+- **REFUSED for an unknown source is a deliberate divergence from RFC 1996
+  §3.10**, which says: "If a slave receives a NOTIFY request from a host that
+  is not a known master for the zone containing the QNAME, it should ignore
+  the request." Decided 2026-09-02 to answer instead, because silence is
+  indistinguishable from a firewall drop, and the overwhelmingly common cause
+  of this condition in a homelab is a `primaries` list that is one address
+  wrong — a case the operator can fix in seconds if told and may not diagnose
+  at all if not. The security argument for silence does not survive the
+  numbers: a NOTIFY is roughly 50 bytes and a REFUSED reply roughly the same,
+  so there is no amplification, and 1:1 reflection is not a useful attack
+  primitive. It is a SHOULD, not a MUST. Recorded in §9.9.
+- **Nothing here is rate-limited by rcode.** The throttle that matters is on
+  the work a NOTIFY causes, not on the reply, and it is §9.10.3's.
+
+**The reply goes out before any work happens.** RFC 1996 §4.7 has the slave
+"enter the state it would if the zone's refresh timer had expired", and §3.6
+has the master retransmitting until it gets a response — so a responder that
+waited for an AXFR before answering would earn itself a second NOTIFY for the
+transfer already in flight. `ServeNotify` writes its reply, then hands off.
+
+**The handoff does not inherit the request's context.** `serve`'s context is
+cancelled when it returns, and a transfer started under it would be cut off
+mid-zone. The goroutine takes a background context with its own timeout, for
+the reason `recordAttempt` already takes `context.WithoutCancel`: work that
+outlives the request that triggered it needs a lifetime that does too.
+
+#### 9.10.3 Inbound: what happens after the reply
+
+In this order.
+
+1. **Throttle, per zone.** A primary editing ten records sends ten NOTIFYs.
+   Each gets its own immediate NOERROR — that is the peer's business — but
+   they collapse to one SOA probe. Without this, "NOTIFY is cheap" becomes a
+   probe amplifier pointed at our own primary. The shape is
+   `transferStateThrottle`'s, which already exists for the same class of
+   problem on the transfer path.
+
+2. **`refreshed_at == 0` transfers unconditionally, with no probe.** A
+   secondary created through the API starts at `soa_serial = 1`
+   (`zones_handlers.go:285`). A primary that is also at serial 1 would make
+   every serial comparison say "not newer", and the zone would stay
+   permanently empty while reporting nothing wrong. Never-transferred is not a
+   serial question, and this row is why the probe is a step in a sequence
+   rather than a gate on the whole thing.
+
+3. **Otherwise, probe.** `Transferrer.ProbeSerial` queries SOA against the
+   zone's configured primaries in order — not the notifier's address. The two
+   sets are the same by the time this runs, since row 5 of §9.10.2 is what let
+   the message get here, so using the configured list costs nothing and keeps
+   one answer to "who is this zone's primary". Signed with the zone's key when
+   it has one, first answer wins, failures fall through to the next primary
+   exactly as `Transfer` does.
+
+4. **Compare, and transfer if newer.** `serialNewer(probed, local)` →
+   `Refresher.Refresh(ctx, zoneID)`, which already holds the per-zone transfer
+   lock correctly and is the same call the manual path makes. Not newer is a
+   debug log and nothing else: the NOTIFY was true, we were already current.
+
+**The answer-section SOA is ignored, and this is not an oversight.** RFC 1996
+§3.7 calls it "an unsecure hint at the new RRset", and §3.7–3.8 then forbid
+acting on it outright: "In no case shall the answer section of a NOTIFY
+request be used to update a slave's local data, or to indicate that a zone
+transfer needs to be undertaken, or to change the slave's zone refresh
+timers." Comparing against it to skip the probe would be exactly the second of
+those three. The probe is the mechanism the RFC leaves; the hint is not a
+shortcut through it.
+
+**The scheduled refresh path is unchanged.** D2's `RefreshDue` still AXFRs
+without probing. Probing there too would be less wasteful on large zones and
+is what BIND does, but it changes behaviour that has shipped and pulls D2's
+scheduling tests into a NOTIFY milestone. Recorded here as a candidate, not
+taken.
+
+#### 9.10.4 `serialNewer`, and the pair RFC 1982 leaves undefined
+
+Both halves need one comparison and the repo has none. `zonefile_handlers.go:352`
+reasons about wraparound in a comment and never compares; every other serial
+site assigns.
+
+```go
+// internal/zones/serial.go
+func serialNewer(a, b uint32) bool
+```
+
+RFC 1982 §3.2 defines the comparison over a circle, so `a > b` is wrong at the
+wrap and right everywhere else, which is the worst possible failure shape — it
+works for years and then strands a zone at 4294967295. The subtlety worth a
+test rather than a comment is that the comparison is **not total**: two serials
+exactly 2^31 apart have no defined ordering.
+
+**Policy: undefined compares as not-newer.** A transfer that does not happen
+is recovered by the refresh timer on the next tick. A transfer that should not
+have happened is a full AXFR of someone else's zone, and on the outbound side
+an undefined pair resolving to "newer" would notify every target on every pass
+forever. The asymmetry of the two mistakes is the whole argument, and the test
+pins the undefined pair explicitly so a later refactor cannot quietly flip it.
+
+#### 9.10.5 `notify_to`: the format
+
+A column on `zones`, `TEXT NOT NULL DEFAULT ''`, comma-separated, each entry
+`host[:port] [key:name]`. Empty means notify nobody and is the default, so
+nothing changes for an existing install. Port defaults to
+`DefaultPrimaryPort`. Stored in `FormatNotifyTo`'s canonical spelling rather
+than as typed, the rule `allow_transfer` and `primaries` both already follow.
+
+```go
+// internal/zones/notifyto.go
+type NotifyTarget struct {
+    Host string // as written — may be a hostname
+    Port uint16
+    Key  string // canonical TSIG name; "" means send unsigned
+}
+func ValidateNotifyTo(s string) error
+func ParseNotifyTo(s string) ([]NotifyTarget, error)
+func FormatNotifyTo(ts []NotifyTarget) string
+func NotifyToKeys(s string) []string
+```
+
+**Why this is neither `primaries.go` nor `acl.go` with different words**, since
+it borrows from both and a reader will assume it is a copy of one of them.
+`ParseACL` is pure because it is matched against a socket address on every
+request and a hostname there would mean a DNS lookup inside the gate of the
+server answering DNS. `ParsePrimaries` takes a context and a resolver because a
+primary named by hostname must be followed at transfer time. `ParseNotifyTo`
+needs **both properties, split**: it is pure, and resolution happens separately
+at send time. That is not a compromise between the two, it is forced by the
+queue — §9.10.6's row identity is the *written* host, and a parser that
+resolved would make the identity an address, so a hostname that moved would
+orphan its delivery history and start a new row every time it changed.
+
+**The per-target key is why the format is richer than `primaries`'.** A dnsaur
+primary has no key of its own to sign with: `zones_handlers.go:87` refuses
+`tsig_key_id` on a primary zone, because that column means "the key a
+*secondary* signs its transfer requests with". Without a per-target key, a
+dnsaur primary would send unsigned NOTIFYs to a dnsaur secondary whose zone
+has a key, and §9.10.2's row 6 would refuse them — dnsaur unable to notify
+itself through a configuration it fully supports. The alternatives were
+considered and rejected: relaxing row 6 loosens a rule to fit a gap, and
+overloading `tsig_key_id` to mean something different depending on zone type
+gives one column two meanings and still cannot give two secondaries two keys.
+
+**The TSIG delete guard extends again.** D3 widened the key-delete guard from
+`tsig_key_id` to `key:` references in `allow_transfer`. `notify_to` is a third
+reference, and without it deleting a key silently downgrades a signed NOTIFY to
+an unsigned one that the peer then refuses — a failure that shows up nowhere
+near the delete that caused it. `NotifyToKeys` exists for that guard and for
+the usage count on the TSIG keys screen.
+
+**Which zone types may carry it.** Primary and secondary both: a secondary
+needs it for the cascade (§9.10.7). Refused on `internal`, since the RFC 6303
+built-ins are not transferable — D3's rule, unchanged. This makes `notify_to` a
+both-types field like `allow_transfer`, unlike `primaries` and `tsig_key_id`,
+and `checkZoneTransferConfig` is where that is enforced.
+
+#### 9.10.6 Outbound: the queue, and why pending-ness is not stored
+
+Migration **0012** — the next free version. It cannot be read off the
+directory listing: 5 and 7 are Go migrations claimed in `migrate.go`
+(`zonemigrate.go`, `builtins.go`) with no SQL file, and a duplicate version
+fails goose at startup on both drivers. Both `sqlite/` and `postgres/`
+variants, `BIGINT` where sqlite has `INTEGER` for the unix-ms and serial
+columns, per 0010's note.
+
+```sql
+CREATE TABLE zone_notifies (
+  id              INTEGER PRIMARY KEY,
+  zone_id         INTEGER NOT NULL REFERENCES zones(id) ON DELETE CASCADE,
+  target          TEXT    NOT NULL,           -- 'ns2.example.com:53', as written
+  pending_serial  INTEGER NOT NULL DEFAULT 0, -- the round being attempted
+  notified_serial INTEGER NOT NULL DEFAULT 0, -- the last round that landed
+  notified_at     INTEGER NOT NULL DEFAULT 0, -- unix ms; 0 = never
+  attempts        INTEGER NOT NULL DEFAULT 0, -- within the current round
+  next_attempt_at INTEGER NOT NULL DEFAULT 0,
+  last_error      TEXT    NOT NULL DEFAULT '',
+  created_at      INTEGER NOT NULL DEFAULT 0, -- when this target was first seen
+  UNIQUE(zone_id, target)
+);
+```
+
+**`created_at` exists for one line on screen**, and is recorded here so it does
+not look like habit. A target in state `never` has no notify date to show — that
+is what the state means — so the artboard dates it by when it was *added*
+("added 2m ago") rather than leaving the column blank. Without this column the
+only honest rendering is an empty cell, and an empty cell in a row whose whole
+purpose is "nothing has happened yet" reads as missing data rather than as the
+answer. It is written by the reconciliation pass in §9.10.6 when it creates the
+row, and never updated afterwards.
+
+**This one takes a real foreign key, unlike `zones.tsig_key_id`.** Migration
+0009 declined one there with reasoning worth not re-deriving: that column is
+`NOT NULL DEFAULT 0` where 0 means "no key", a FK skips NULL rather than zero,
+and making it nullable is a whole-table rebuild on SQLite. None of that applies
+here — `zone_id` has no zero-means-none case — and `zone_records` already sets
+the `ON DELETE CASCADE` precedent, so deleting a zone needs no application code
+at all.
+
+**The key is not in the row.** `target` is host and port only. The key is read
+from the zone's current `notify_to` at send time, so re-keying a target keeps
+its delivery history instead of orphaning it — the same reasoning that keeps
+the hostname unresolved in §9.10.5, applied to the other half of the entry.
+
+**There is no `pending` column, and that is the design.** The serial already is
+one. A row records only what was *achieved*, and whether there is work is
+derived by comparing it against the zone:
+
+```
+want := zone.soa_serial
+if notified_at != 0 && !serialNewer(want, notified_serial) { continue } // nothing to say
+if pending_serial != want { pending_serial, attempts = want, 0 }        // a new round
+if attempts >= maxNotifyAttempts { continue }                           // this round gave up
+if now < next_attempt_at { continue }
+send
+```
+
+This is what makes the trigger self-healing, and it is the deliberate answer to
+the failure §9.4 names as this project's most repeated: an automatic path that
+skips a rule the human path enforces. There is no "remember to enqueue a
+notify" call for a future mutation path to forget. Any write that advances a
+serial — through the API, an import, auto-PTR, a transfer install, or one
+nobody has thought of yet — is picked up by the next pass because the serial is
+the only thing consulted.
+
+Three consequences that follow from it and are all wanted:
+
+- **A new target is notified at the current serial**, because `notified_at == 0`
+  is "never told". Adding a secondary tells it, rather than leaving it silent
+  until the next unrelated edit.
+- **Nothing fires at startup.** Every row already records delivery at the
+  current serial, so the first pass finds no work. A restart is not news.
+- **Giving up is per round, not per target.** The next serial bump resets
+  `attempts` and tries again, so a secondary that was down for an hour is
+  retried the moment there is something to say — without an operator clearing
+  a flag.
+
+**The same pass reconciles rows**: it creates any (zone, target) pair present in
+`notify_to` with no row, and deletes any row whose target has left the list. So
+nothing hooks zone PATCH, and a hand-edited `notify_to` converges on the next
+pass rather than depending on which code path wrote it.
+
+#### 9.10.7 Outbound: sending, retrying, and stopping
+
+`zones.Notifier`. `Run(ctx)` is `Refresher.Run`'s shape — one pass immediately,
+then on a ticker — and the pass is the loop in §9.10.6.
+
+```go
+func (n *Notifier) Wake() // non-blocking: run a pass now, not at the next tick
+```
+
+**`Wake` is promptness, never correctness.** It goes beside the existing
+`s.reloadZones(r)` calls and into `Transferrer`'s install through a new
+`WithNotifyWake` option. Missing a call site makes a notify late by one tick; it
+cannot lose one, because §9.10.6's detection does not depend on being told. This
+property is the point of the design and the spec says so here so that a later
+reader does not "fix" `Wake` into a mandatory call and quietly reintroduce the
+failure mode it was built to avoid.
+
+**The cascade** is that same `Wake`, from the secondary side: dnsaur transfers a
+zone from its upstream primary, the install writes the primary's serial
+verbatim (`transfer.go:610`), and the pass then finds every downstream target
+behind. No separate cascade logic exists, and `contentChanged` is not consulted
+— the serial decides, as it does everywhere else here.
+
+**Sending.** UDP, built with `dns.Msg.SetNotify(zone)`, which sets opcode,
+AA and the SOA question (`defaults.go:44`). Signed when the target names a key.
+A response ends the round, and RFC 1996 §3.6 is explicit that it does not matter
+which one: a master retransmits "until either too many copies have been sent (a
+'timeout'), an ICMP message indicating that the port is unreachable, or until a
+NOTIFY response is received from the slave with a matching query ID, QNAME, IP
+source address, and UDP source port number", and §4.8 adds "When a master server
+receives a NOTIFY response, it deletes this query from the retry queue." So a
+REFUSED ends the round exactly as a NOERROR does — the peer heard us, and
+retransmitting will not change its mind — but a non-NOERROR rcode is still
+written to `last_error`, because ending the round and being satisfied with the
+outcome are different things and the operator needs to see the second one.
+
+**Three stop conditions, all of them §3.6's.** A response, an attempt budget,
+and ICMP port unreachable — which in Go surfaces as `ECONNREFUSED` on the read
+from a connected UDP socket, and is worth handling as its own case rather than
+as one more timeout: it is positive evidence that nothing is listening, and
+burning four more attempts on it delays nothing but the truth.
+
+**The matching rule is §3.6's too**, and it is not free: query ID and QNAME must
+be checked against what was sent. A connected UDP socket gives the source
+address and port for nothing, but an off-path response with a guessed ID would
+otherwise end a round that never landed.
+
+**Retry budget**: 5 attempts, 5s → 10 → 20 → 40 → 80, then the round rests. Two
+and a half minutes, against a secondary refresh interval measured in hours. The
+secondary's own refresh timer is the backstop it always was, which is what keeps
+this a delivery optimisation rather than a correctness dependency — and is why
+the budget can be small.
+
+#### 9.10.8 What the operator sees
+
+`notify_to` rides the existing `POST /zones` and `PATCH /zones/{id}`. No new
+mutation route: a manual "notify now" button was considered and dropped, because
+§9.10.6's give-up-per-round already retries on the next edit, which is when
+there is something to say. Nothing to press means nothing to explain.
+
+One new read route, because per-target state on every row of the zone list
+would be a join nobody asked for:
+
+```
+GET /api/v1/zones/{id}/notifies
+→ [{ target, state, notified_serial, notified_at, attempts, max_attempts,
+     last_error, created_at }]
+```
+
+`state` is derived server-side — `never` | `current` | `retrying` | `gave_up` —
+rather than left to the dashboard to infer from the columns. Same rule D3
+applied to `last_xfr_*`: a status that two clients could compute differently is
+not a status. `max_attempts` ships beside `attempts` for the same reason: the
+retry budget is a server constant (§9.10.7), and the screen renders it as
+"try 3/5", so sending only the numerator would make the dashboard hardcode a
+number it does not own. `openapi.yaml` documents the fields and the route in
+the same commit that adds them.
+
+**The artboard settles the presentation** (Zone Detail, updated 2026-09-02), and
+what it decided is worth recording because two of its choices are not what the
+brief asked for and both are better:
+
+- **The resting state is one line, not N.** Four targets all `current` is four
+  identical rows saying nothing, so the row collapses to a roll-up — `no
+  targets` / `all 4 current` / `2 of 4 behind` — and only targets that are
+  *behind* (`retrying` or `gave_up`) get a row of their own by default. A caret
+  expands the rest. This is a better answer to "can the operator tell at a
+  glance" than any styling of four equal rows: the glance is the summary line,
+  and the roll-up turns amber only when something is behind.
+- **`gave_up` is labelled "not acknowledged"**, never "gave up", and is drawn
+  amber-on-hollow rather than red — distinguishable from `retrying`'s filled
+  amber without claiming to be a failure. The state column is the only column
+  carrying colour, so it is the scan path and nothing competes with it.
+
+The four labels are `current`, `never notified`, `retrying · try 3/5`, and
+`not acknowledged`. They are presentation and the API enum stays as it is above;
+an implementer maps one to the other rather than renaming either.
+
+Layout is a five-column grid — target, state, serial, when, error — sharing
+`AllowTransferBand`'s 152px label gutter so `SOA` (or `TRANSFERS IN`),
+`TRANSFERS OUT` and `NOTIFY OUT` land on one edge. Read is default, edit is
+opt-in behind a pencil, exactly as `allow_transfer` works. Errors are shown
+verbatim and right-aligned, tinted with the state's own colour.
+
+The artboard gates the row on `!builtIn`, which is the same set as
+`AllowTransferBand`'s primary-or-secondary gate given the API creates no other
+type. Mount it on the **positive set** regardless, as that band's call site
+already does: a stub or forwarder row reaching this control is a control that
+fails on click rather than one the screen declined to draw.
+
+The empty state carries most of the weight: a zone with no targets is the
+common case and is *normal*, not unconfigured — it reads `none`, muted, with
+`no targets` beside it. The TSIG keys screen's usage count gains `notify_to`
+references alongside `allow_transfer`'s.
+
+#### 9.10.9 Test posture
+
+- `notifyto_test.go` gets `primaries_test.go`'s table treatment, including the
+  fails-closed case for an unparseable stored value.
+- `serialNewer` gets an RFC 1982 table: ordinary pairs, the wrap at 2^32, and
+  the 2^31-apart pair §3.2 leaves undefined, pinning §9.10.4's policy so a
+  later refactor cannot flip it silently.
+- One test per row of §9.10.2, asserting the rcode *and* the TSIG error code
+  where there is one — including that a store failure is SERVFAIL carrying no
+  TSIG error at all.
+- **The disjoint-column-sets rule, a third time.** D2 shipped a defect from it
+  and D3 wrote a test rather than trusting the rule. D4 has two more surfaces:
+  `updateZoneSQL` must bind `notify_to` and must never bind `zone_notifies`
+  state, and the queue's writer must bind only its own columns. Same test
+  shape, mirrored, rather than a comment saying to be careful.
+- Store tests under `forEachDriver`; sqlite and a real Postgres container both
+  execute. Any concurrency assertion here has to defeat `SetMaxOpenConns(1)`
+  deliberately, or it passes without testing anything.
+- The pass: round start, give-up, reset-on-serial-advance, and reconciliation
+  both adding and removing rows.
+- **The §9.10.1 regression**: a NOTIFY must not reach the pipeline. Assert it
+  is neither query-logged nor forwarded upstream. This one fails on the commit
+  before D4's first, which is what makes it a regression test rather than a
+  restatement.
+- The loopback, extending D3's round trip: a dnsaur primary notifies a dnsaur
+  secondary, signed, the secondary probes and transfers, and the test fails if
+  either half is wrong.
+- Every fix's test shown failing with the fix removed.
+- The roll-up's own arithmetic — `no targets` / `all N current` / `M of N
+  behind`, and which rows survive the default filter — is the one piece of
+  screen logic with a wrong answer rather than a wrong look, so it is unit
+  tested apart from the component.
+- Web tests, and the e2e smoke extended to set `notify_to` and observe a target
+  reach `current`.
+
+#### 9.10.10 Deliberately not in D4
+
+The journal, deltas and real IXFR (D5). The `forwarder` zone type (D6). A
+manual notify button (§9.10.8). SOA probing on the scheduled refresh path
+(§9.10.3) — a real improvement, deliberately not folded into a NOTIFY
+milestone. NOTIFY over TCP: RFC 1996 §3.6 describes the UDP case and permits
+TCP, and nothing in a homelab needs a NOTIFY too large for a datagram, so the
+responder accepts one on either transport but the sender only ever uses UDP.
+And a per-target notify *delay*, BIND's `notify-delay`: the pass ticker already
+bounds how often a target can be told, so a second timer would be two
+mechanisms for one job.
+
+#### 9.10.11 Known follow-ups, carried out of D4
+
+Recorded here rather than in a scratch file so they survive the milestone.
+Each was found by review, judged real, and deliberately not fixed in D4.
+
+- **`Transferrer.fetch` accepts an unsigned AXFR reply**, the same shape as the
+  probe defect D4's final review found and fixed (`probeOne`, transfer.go).
+  `miekg/dns`'s `xfr.go:258` verifies only a TSIG that is present, exactly as
+  `client.go:267` does. It was scoped out because an AXFR runs over TCP on an
+  established connection rather than the probe's single spoofable UDP
+  exchange, and it predates D4 — but it is the identical defect one function
+  away, and "harder to reach" is not "closed".
+- **`BumpSerial` cannot wrap.** `soa_serial = soa_serial + 1` on a zone at
+  4294967295 writes 4294967296, and every later `scanZone` into `uint32` fails
+  with a range error, taking the zone out of service. Pre-existing since
+  Milestone A. It undercuts D4's own wrap story: `SerialNewer` is careful
+  across the wrap and the import path wraps correctly, while the commonest
+  serial-advancing path in the product cannot reach 0 at all.
+- **`NotifyServer`'s work goroutine is detached from `App.wg`.** A NOTIFY
+  admitted near shutdown can probe or transfer against a closed store.
+  Bounded to a confusing log line — the transaction rolls back atomically and
+  nothing panics or hangs — but the lifetime is genuinely unmanaged.
+- **`notifyStateOf` ignores `pending_serial`, so the API and the pass disagree
+  about "gave up".** `maybeSend` scopes give-up to the *round* and resets
+  `attempts` when the serial advances; the API scopes it to the *target* and
+  does not. A target that exhausted its budget at serial 100 and then sees 101
+  reads `gave_up` on screen for up to the remaining back-off while the
+  notifier considers it a fresh round. Not a lie — the target genuinely has
+  not acknowledged — but the two components mean different things by one word.
+- **`isTransferQuery` does not check the opcode**, so a message with
+  `Opcode == NOTIFY, Qtype == AXFR` routes to `Transfers` rather than
+  `Notifies`. The ACL still applies, so it is not a hole; it is now two
+  branches deep in `serve` and the next person adding a third will not
+  re-derive it.
+- **`Reconcile` opens a transaction per enabled zone per pass**, including the
+  common case of a zone with no targets at all. With the RFC 6303 built-ins
+  seeded, that is roughly twenty read-only transactions every five seconds on
+  an install using no NOTIFY at all.

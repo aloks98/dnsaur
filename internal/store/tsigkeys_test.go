@@ -134,3 +134,83 @@ func TestDeleteAllowsAKeyOnlyResembledByAnACLEntry(t *testing.T) {
 		}
 	})
 }
+
+// D3 extended the delete guard from tsig_key_id to key: references in
+// allow_transfer. notify_to is a third reference, and without it deleting a
+// key silently downgrades a signed NOTIFY to an unsigned one that the peer
+// then refuses — a failure that surfaces nowhere near the delete that caused
+// it.
+func TestDeleteTSIGKeyRefusedWhileNotifyToNamesIt(t *testing.T) {
+	forEachDriver(t, func(t *testing.T, s Store) {
+		ctx := context.Background()
+		// Unique per run, for the same reason seedNotifyZone's name is (see
+		// its comment): tsig_keys.name is UNIQUE and postgres is one
+		// database shared across the whole package's test run.
+		name := testGroupName("ns2-xfer") + "."
+		keyID, err := s.TSIGKeys().Create(ctx, TSIGKey{
+			Name: name, Algorithm: "hmac-sha256.", Secret: "c2VjcmV0",
+		})
+		if err != nil {
+			t.Fatalf("Add: %v", err)
+		}
+		zoneID := seedNotifyZone(t, s, "example.com")
+		z, _ := s.Zones().Zone(ctx, zoneID)
+		z.NotifyTo = "10.0.0.2:53 key:" + name
+		if err := s.Zones().UpdateZone(ctx, z); err != nil {
+			t.Fatalf("UpdateZone: %v", err)
+		}
+
+		if err := s.TSIGKeys().Delete(ctx, keyID); !errors.Is(err, ErrInUse) {
+			t.Fatalf("Delete = %v, want ErrInUse", err)
+		}
+
+		// And it is released once the reference goes, rather than being
+		// permanently undeletable.
+		z.NotifyTo = ""
+		if err := s.Zones().UpdateZone(ctx, z); err != nil {
+			t.Fatalf("clearing UpdateZone: %v", err)
+		}
+		if err := s.TSIGKeys().Delete(ctx, keyID); err != nil {
+			t.Fatalf("Delete after clearing = %v, want nil", err)
+		}
+	})
+}
+
+// The guard matches whole names between delimiters, so a key whose name is a
+// substring of another's is not held hostage by it. The same rule aclKeyRef
+// already documents, applied to the second column.
+func TestDeleteTSIGKeyNotifyToMatchesWholeNamesOnly(t *testing.T) {
+	forEachDriver(t, func(t *testing.T, s Store) {
+		ctx := context.Background()
+		// base is shared between the short and long names below, the same
+		// way "ns2."/"ns2-xfer." shared "ns2" in the design — see
+		// TestDeleteTSIGKeyRefusedWhileNotifyToNamesIt for why the name
+		// itself is made unique per run.
+		base := testGroupName("ns2")
+		shortName := base + "."
+		longName := base + "-xfer."
+		shortID, err := s.TSIGKeys().Create(ctx, TSIGKey{
+			Name: shortName, Algorithm: "hmac-sha256.", Secret: "c2VjcmV0",
+		})
+		if err != nil {
+			t.Fatalf("Add: %v", err)
+		}
+		if _, err := s.TSIGKeys().Create(ctx, TSIGKey{
+			Name: longName, Algorithm: "hmac-sha256.", Secret: "c2VjcmV0",
+		}); err != nil {
+			t.Fatalf("Add long: %v", err)
+		}
+		zoneID := seedNotifyZone(t, s, "example.com")
+		z, _ := s.Zones().Zone(ctx, zoneID)
+		z.NotifyTo = "10.0.0.2:53 key:" + longName
+		if err := s.Zones().UpdateZone(ctx, z); err != nil {
+			t.Fatalf("UpdateZone: %v", err)
+		}
+
+		// Only ns2-xfer. is referenced. ns2. is a prefix of it and must
+		// still be deletable.
+		if err := s.TSIGKeys().Delete(ctx, shortID); err != nil {
+			t.Fatalf("Delete(ns2.) = %v, want nil", err)
+		}
+	})
+}

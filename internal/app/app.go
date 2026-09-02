@@ -92,7 +92,14 @@ type App struct {
 	// listener in Start via dnssrv.WithTransfers, the same way the key store
 	// is: live, not a snapshot, so a zone's allow_transfer edited through the
 	// API governs the next transfer rather than the next restart.
-	xfrOut    *zones.TransferServer
+	xfrOut *zones.TransferServer
+	// notifier is the outbound half of NOTIFY (D4): who to tell when a zone
+	// this server owns has changed. notifyIn is the inbound half: the gate
+	// that decides whether an arriving NOTIFY is acted on, sharing
+	// zoneRefresh so a notify-triggered transfer takes the same per-zone
+	// lock a scheduled one does. Both attached to every listener in Start.
+	notifier  *zones.Notifier
+	notifyIn  *zones.NotifyServer
 	logger    *qlog.Logger
 	fwd       *swappable
 	servers   []*dnssrv.Server
@@ -134,19 +141,38 @@ func New(ctx context.Context, cfg *config.Config, version string) (*App, error) 
 		ready:    make(chan struct{}),
 	}
 	a.refresher = filter.NewRefresher(st.Filters(), st.Clients(), a.engine, cfg.DataDir)
+	// Built before the Transferrer, which takes its Wake for the cascade.
+	a.notifier = zones.NewNotifier(st.Zones(), st.Notifies(), st.TSIGKeys())
 	// The transfer republishes the served snapshot itself: a zone installed
 	// into the store that nothing reloaded is answering from the copy it just
 	// replaced. The key store is passed live, not a snapshot, for the same
 	// reason the DNS servers get it that way — a key edited through the API
 	// signs the next transfer, not the next restart.
 	a.zoneRefresh = zones.NewRefresher(st.Zones(),
-		zones.NewTransferrer(st.Zones(), st.TSIGKeys(), zones.WithReload(a.resolver.Reload)))
+		zones.NewTransferrer(st.Zones(), st.TSIGKeys(),
+			zones.WithReload(a.resolver.Reload),
+			// The cascade: a secondary that just installed a zone may have
+			// downstream secondaries of its own. Nothing cascade-specific
+			// happens here — the pass compares serials, and the install has
+			// just written the primary's serial verbatim.
+			zones.WithNotifyWake(a.notifier.Wake)))
 	// The other direction: what a.zoneRefresh's Transferrer pulls from
 	// someone else's TransferServer, this one serves to a peer pulling from
 	// us. It reads a.resolver's live snapshot, so a zone this server
 	// authors is transferred as of its last reload, the same data an
 	// ordinary query would get.
 	a.xfrOut = zones.NewTransferServer(a.resolver, st.Zones())
+	// The inbound half. It shares the Refresher the scheduler drives, so a
+	// notify-triggered transfer takes the same per-zone lock a scheduled one
+	// does rather than racing it.
+	//
+	// **WithNotifyProbes is not optional here even though the option is.**
+	// Without it a NOTIFY skips the SOA probe and transfers on every
+	// admitted message — the pre-Task-7 behaviour, silently, with a log
+	// line as the only signal. A primary editing ten records would cause
+	// ten full zone transfers.
+	a.notifyIn = zones.NewNotifyServer(a.resolver, st.Zones(), a.zoneRefresh,
+		zones.WithNotifyProbes(a.zoneRefresh.Transferrer()))
 	return a, nil
 }
 
@@ -298,12 +324,13 @@ func (a *App) Start(ctx context.Context) error {
 	for _, addr := range a.cfg.DNSListen {
 		// The key store, not a snapshot of it: a key created through the API
 		// is live on the next signed message rather than the next restart.
-		// a.xfrOut is the same TransferServer on every listener, so a
-		// transfer answers identically regardless of which address a peer
-		// dials.
+		// a.xfrOut and a.notifyIn are each the same instance on every
+		// listener, so a transfer or a notify answers identically regardless
+		// of which address a peer dials.
 		s := dnssrv.NewServer(addr, handler,
 			dnssrv.WithTSIGKeys(a.st.TSIGKeys()),
-			dnssrv.WithTransfers(a.xfrOut))
+			dnssrv.WithTransfers(a.xfrOut),
+			dnssrv.WithNotifies(a.notifyIn))
 		if err := s.Start(); err != nil {
 			return err
 		}
@@ -354,6 +381,11 @@ func (a *App) Start(ctx context.Context) error {
 		// is already due before its first tick, so a restart does not leave a
 		// zone that expired overnight answering nothing for another interval.
 		a.zoneRefresh.Run,
+		// Outbound NOTIFY. It passes once before its first tick, which finds
+		// nothing on a healthy restart — every row already records delivery
+		// at the current serial — and catches up anything that changed while
+		// the process was down.
+		a.notifier.Run,
 		func(c context.Context) { a.refresher.Run(c, refreshEvery) },
 		func(c context.Context) {
 			for {
@@ -403,6 +435,7 @@ func (a *App) HTTPAddr() string { return a.apiAddr }
 func (a *App) ReloadClients(ctx context.Context) error  { return a.registry.Reload(ctx) }
 func (a *App) ReloadZones(ctx context.Context) error    { return a.resolver.Reload(ctx) }
 func (a *App) RefreshFilters(ctx context.Context) error { return a.refresher.RefreshAll(ctx) }
+func (a *App) NotifyZones()                             { a.notifier.Wake() }
 
 func (a *App) Shutdown(ctx context.Context) error {
 	if a.apiCancel != nil {

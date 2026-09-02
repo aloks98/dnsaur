@@ -27,6 +27,10 @@ type Reloader interface {
 	ReloadClients(ctx context.Context) error
 	ReloadZones(ctx context.Context) error
 	RefreshFilters(ctx context.Context) error
+	// NotifyZones wakes the outbound NOTIFY pass. See zones.Notifier.Wake:
+	// it is promptness, never correctness, so a handler that forgets this
+	// call only delays delivery by one tick rather than losing it.
+	NotifyZones()
 }
 
 // ZoneRefresher transfers one secondary zone on demand — the manual path
@@ -131,6 +135,7 @@ func (s *Server) registerRoutes() {
 	s.zoneRecordsRoutes()
 	s.zoneFileRoutes()
 	s.tsigKeysRoutes()
+	s.notifiesRoutes()
 	// Later tasks append their routes here.
 	//
 	// This catch-all is registered through route() like everything else —

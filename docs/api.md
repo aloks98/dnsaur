@@ -148,10 +148,13 @@ Full parameter/response detail lives in `internal/api/openapi.yaml`
   type; it's an ordinary `primary` zone whose `name` ends in
   `in-addr.arpa` or `ip6.arpa` (e.g. `168.192.in-addr.arpa`).
 - **Secondary zones** — a `secondary` is a copy of a zone held elsewhere,
-  pulled over AXFR and kept fresh on the schedule its own SOA publishes.
-  Creating one requires `primaries` — comma-separated `host[:port]`, port
-  53 by default, stored as written and resolved at transfer time — and
-  takes an optional `tsig_key_id` naming the key to sign transfers with.
+  pulled over AXFR and kept fresh on the schedule its own SOA publishes, or
+  sooner if one of its `primaries` sends it a DNS NOTIFY — see
+  [`docs/architecture.md`](architecture.md) for the accept/refuse rules and
+  what each rcode means. Creating one requires `primaries` —
+  comma-separated `host[:port]`, port 53 by default, stored as written and
+  resolved at transfer time — and takes an optional `tsig_key_id` naming
+  the key to sign transfers with.
   Both fields are refused with `400` on any other type. **Its records are
   read-only**: `POST`/`PUT`/`DELETE` under `/zones/{id}/records`, and
   `POST /zones/{id}/file`, all answer `409`, because the next transfer
@@ -210,6 +213,65 @@ Full parameter/response detail lives in `internal/api/openapi.yaml`
   how fast a peer that *did* complete a TCP handshake can make the server
   write it. See [`docs/architecture.md`](architecture.md) for what each
   rcode a refused transfer carries actually means.
+- **Zone NOTIFY (outbound)** — `notify_to` on `POST /zones` and
+  `PATCH /zones/{id}` is who this zone tells when it changes (DNS NOTIFY,
+  RFC 1996): a comma-separated list where each entry is `host[:port]` (port
+  defaulting to 53), optionally suffixed `key:<tsig-name>` to sign that
+  target's NOTIFY — e.g. `"10.0.0.2, 10.0.0.3:5353 key:secondary-ns2."`.
+  **Empty is the default and means notify nobody.** Applies to both
+  `primary` and `secondary` zones — a secondary re-serving what it pulled
+  has its own downstream secondaries to tell — unlike `primaries` and
+  `tsig_key_id`, which are secondary-only. A `key:` entry must name a TSIG
+  key that exists at write time, `400`s otherwise, checked the same way
+  `allow_transfer`'s is. **What's stored is the canonical spelling, not
+  what was typed**: the value is re-parsed and re-formatted on write (the
+  port always explicit, lowercase fully-qualified key names,
+  `", "`-separated) — the same rule `allow_transfer` follows above, for the
+  same reason.
+
+  Delivery itself is a background process
+  ([`docs/architecture.md`](architecture.md)'s outbound NOTIFY queue) driven
+  off the zone's `soa_serial`, not synchronous with the write that set
+  `notify_to` — there is no endpoint that sends a NOTIFY on demand.
+
+  `GET /zones/{id}/notifies` reports one row per `host[:port]` in the
+  zone's own `notify_to`, whatever the zone's own type, with eight fields:
+  `target` (the address, without its key — re-keying a target keeps its
+  history, since the key is looked up by name at send time rather than
+  stored on the row), `state` (below), `notified_serial` (the last serial
+  this target acknowledged; meaningless until `notified_at` is non-zero),
+  `notified_at` (unix ms of the last round that landed, `0` = never
+  delivered), `attempts` (how many times the *current* round has been
+  tried), `max_attempts` (the round budget, currently `5`, sent alongside
+  `attempts` so a client never hardcodes the denominator), `last_error`
+  (the most recent failure in the sender's own words, `""` when the last
+  attempt landed or none has been tried), and `created_at` (unix ms the
+  target was first seen — never moves, so it dates a target whose state is
+  still `never`). A zone with no `notify_to` returns `[]`, never `null`.
+
+  `state` is derived server-side — never left to a client to infer from the
+  other columns, so two clients can never disagree about it — and is one of
+  four values:
+  - **`never`** — no round has ever been tried (`attempts` is `0` and
+    nothing has landed). Nothing for the operator to do; the target simply
+    hasn't had its turn yet.
+  - **`current`** — the target has acknowledged the zone's present
+    `soa_serial` (an RFC 1982 comparison, so a wrapped serial is never
+    mistaken for current). Nothing to do.
+  - **`retrying`** — behind the current serial, and `attempts` is still
+    under `max_attempts`. Mid-round; nothing to do yet.
+  - **`gave_up`** — behind the current serial, and `attempts` has reached
+    `max_attempts`. **This is not a failure the operator needs to act on**:
+    the round simply rests, and it starts over from `attempts: 0` on the
+    next serial bump — the zone's own next edit — with no action required.
+    (This is also what a target that has *never* been delivered *and* has
+    exhausted its attempts reports — `never` means "not yet tried", not
+    "tried and failed", so that combination is `gave_up`, not `never`.)
+
+  None of the four states requires operator action for correctness: a
+  NOTIFY only ever changes *when* a secondary refreshes, never *whether* it
+  does — the target's own SOA `refresh` timer is the backstop regardless of
+  how a round ends.
 - **Zone records** — `GET /zones/{id}/records`, `POST /zones/{id}/records`,
   `PUT /zones/{id}/records/{rid}`, `DELETE /zones/{id}/records/{rid}` —
   records within a zone, named relative to its apex (`@`, `bifrost`, `*`,

@@ -134,6 +134,147 @@ it.
 See `docs/superpowers/specs/2026-08-08-zones-design.md` §9.5.5 for the
 full gate, in order, with every row's reasoning.
 
+## Zone NOTIFY (RFC 1996)
+
+Like AXFR/IXFR above, NOTIFY does not go through the middleware pipeline.
+`Server.serve` branches on it — `dns.OpcodeNotify` is an *opcode*, not a
+qtype, so the transfer branch's qtype check does not catch it and this is a
+second, independent branch ahead of the pipeline — and hands the raw
+`dns.ResponseWriter` to a `Notifies` handler (`internal/zones.NotifyServer`,
+wired in via `dnssrv.WithNotifies`). Unlike a transfer, a NOTIFY reply
+*could* fit through `Handler`'s one-`*Response` shape mechanically, so the
+justification here is not the same shape mismatch as AXFR's. It still must
+not reach the chain, and getting this wrong had a concrete, shipped
+consequence rather than a theoretical one: **before this branch existed, a
+NOTIFY arriving at dnsaur was handled as an ordinary SOA query** —
+query-logged, filtered, and, for an apex the server does not hold,
+cacheable and forwarded upstream to the configured resolver, so dnsaur
+asked its own upstream an SOA question on behalf of a peer that was trying
+to notify *it*. `internal/dnssrv/notifies.go`'s `Notifies` doc comment
+records this as the reason the interface exists, not as a nice-to-have.
+
+**Inbound: who may notify this server, and what it says back.**
+`NotifyServer.ServeNotify` runs the cheap, purely local checks first —
+question shape, apex, zone type, enabled — and only *then* resolves the
+zone's `primaries` to check the sender against them. That ordering is
+load-bearing, not tidiness: `ParsePrimaries` may do a live, uncached DNS
+lookup for a hostname primary, and doing that before the local checks would
+let one unauthenticated, trivially spoofable UDP packet drive an outbound
+recursive lookup for a NOTIFY that was going to be refused anyway. The gate,
+in order:
+
+| Rcode | TSIG error | Means |
+|---|---|---|
+| `FORMERR` | — | not a single SOA question |
+| `NOTAUTH` | — | no zone at that apex, the zone isn't type `secondary`, or it's disabled |
+| `REFUSED` | — | the peer's address isn't one of the zone's configured `primaries` |
+| `REFUSED` | `BADKEY` | the TSIG names an unknown key or algorithm |
+| `REFUSED` | `BADSIG` | the TSIG signature didn't verify |
+| `REFUSED` | `BADTIME` | the TSIG timestamp is outside the fudge window |
+| `REFUSED` | — | the zone requires TSIG (`tsig_key_id` set) and the message carries none |
+| `SERVFAIL` | — | this server's own TSIG check couldn't run — no key store attached, or a key lookup itself failed |
+
+Two things in that table are deliberate, not incidental:
+
+- **The peer-not-a-primary row answering `REFUSED` is a deliberate
+  divergence from RFC 1996 §3.10**, which says to *ignore* such a request.
+  dnsaur answers instead — recorded as a conformance exception in
+  `docs/superpowers/specs/2026-08-08-zones-design.md` §9.9. Silence is
+  indistinguishable from a firewall drop, the usual cause of this row is a
+  `primaries` list with one address wrong, and a NOTIFY and its refusal are
+  both ~50 bytes, so answering costs nothing an attacker could turn into
+  amplification.
+- **The three TSIG rows (`BADKEY`/`BADSIG`/`BADTIME`) fire whether or not
+  the zone names a key at all** — they are *not* gated on `tsig_key_id`
+  being set. RFC 8945 §5.2.1/§5.2.2 make them mandatory regardless of local
+  policy: gating them would let a NOTIFY carrying a broken MAC to a keyless
+  zone be *accepted* unsigned, which the sender then has to discard and
+  retransmit forever under RFC 1996 §3.6. The zone's own key requirement
+  decides only the *unsigned*-message row — a keyless zone accepts a NOTIFY
+  carrying no TSIG at all; a keyed one refuses it.
+
+The `SERVFAIL` row is its own deliberate choice, not a leftover default:
+`dnssrv.ErrTSIGUnavailable` (no key store attached to this server at all)
+answers `SERVFAIL`, not `REFUSED` — this server has nothing that could have
+verified the message, so none of this is the peer's fault, and answering
+`REFUSED` would send an operator debugging an otherwise-correct peer to the
+wrong end of the connection. This mirrors `TransferServer.decide`'s
+identical treatment of the same error value (D3, above). A `BADKEY`/`BADSIG`
+TSIG error record goes back **unsigned** and `BADTIME`'s goes back
+**signed** — the identical rule the AXFR/IXFR table above uses, reused from
+the same code (`errorTSIG`, `signIfVerified`) rather than reimplemented.
+
+**Inbound sequence, once a NOTIFY is accepted:** reply, throttle, probe,
+compare, transfer.
+
+1. **Reply first, before any work** — an authoritative `NOERROR`, signed if
+   the request verified. RFC 1996 §4.7 has the responder enter its refresh
+   state on receipt and §3.6 has the sender retransmitting until it gets
+   *any* response, so a responder that waited for the transfer to finish
+   before replying would earn itself a second NOTIFY for the transfer
+   already in flight.
+2. **Throttle** (5s per zone): a primary editing ten records sends ten
+   NOTIFYs; each gets its own immediate reply, and they collapse to one
+   probe. Without this, "NOTIFY is cheap" becomes a probe amplifier pointed
+   at dnsaur's own configured primary.
+3. **Probe**: an SOA query against the zone's primaries checks whether they
+   are actually ahead, skipped only when no probe is wired in or for a zone
+   that has never transferred (see below, where a serial comparison would
+   be meaningless).
+4. **Compare**: a serial comparison (RFC 1982). Not newer means the NOTIFY
+   was true and the zone was already current — RFC 1996 calls a NOTIFY a
+   hint, and this is that hint being correctly declined; nothing
+   transfers.
+5. **Transfer**: only once the probe shows the primary genuinely ahead does
+   the zone actually get pulled.
+
+A zone that has never transferred skips the probe and compare steps and
+transfers unconditionally on the first accepted NOTIFY. A freshly created
+secondary starts at `soa_serial 1`; if its primary also happens to start at
+`1`, a serial comparison would say "not newer" and leave the secondary
+permanently empty while reporting nothing wrong — the very first transfer
+has no honest baseline to be gated against.
+
+**Outbound: the queue, and why the trigger is serial detection, never call
+sites.** `internal/zones.Notifier` runs on its own tick (5s) plus an
+explicit `Wake()`, and reconciles a durable queue (`zone_notifies`, the
+0012 migration) against every enabled zone's `notify_to`. That queue carries
+no "pending" column at all. Whether a target needs telling is *derived*,
+every pass, by comparing the zone's current `soa_serial` against what that
+target last acknowledged — never stored as a flag some code path has to
+remember to set.
+
+This is the design decision most likely to look "simplifiable" into an
+enqueue call at each place a zone changes, and it is not simplifiable that
+way on purpose. An enqueue-at-the-call-site design has exactly as many
+chances to be *wrong* as there are places that can bump a serial — the
+ordinary API write, a zone-file import, auto-PTR, a transfer installing a
+new copy of a secondary's zone, and any path nobody has written yet — and
+missing one produces a target that silently stops hearing about changes
+made through it. Deriving pending-ness from the serial comparison instead
+means every one of those paths is covered with no call to forget, because
+none of them has to know the `Notifier` exists at all.
+`docs/superpowers/specs/2026-08-08-zones-design.md` §9.4 names exactly this
+shape — an automatic path skipping a rule the human path enforces — as this
+project's most repeated defect, and the serial-derived queue is the
+deliberate answer to it here.
+
+`Notifier.Wake()` (`internal/app.App.NotifyZones`, called from several
+`internal/api` write paths — zone create/patch/delete, record
+create/update/delete, auto-PTR, zone-file import — after each one's own
+write lands) only ever affects *promptness*, never correctness: it asks for
+a pass before the next tick, so any one of those call sites forgetting to
+call it only changes how many seconds early a NOTIFY goes out for that
+write — nothing can be lost, because the next tick (at most 5s later)
+re-derives the same pending set from the serial regardless, with no call
+site involved at all. A round is
+retried up to 5 times, backing off 5s/10s/20s/40s/80s (about two and a half
+minutes total) and then rests; that budget is deliberately small because it
+is not load-bearing for correctness either — the target's own SOA `refresh`
+timer picks the zone up regardless of how a round ends, which is what keeps
+NOTIFY a delivery optimisation rather than something dnsaur has to get
+right to stay correct.
+
 ## Package map
 
 | Package | Responsibility |
@@ -141,10 +282,10 @@ full gate, in order, with every row's reasoning.
 | `cmd/dnsaur` | Entry point: flag/config parsing, wiring, graceful shutdown |
 | `internal/app` | Top-level app object: builds the pipeline, owns settings hot-reload and background jobs |
 | `internal/config` | Bootstrap YAML + env config loading and validation |
-| `internal/dnssrv` | DNS listeners, the `Handler`/`Middleware` pipeline abstraction, panic recovery, and TSIG (RFC 8945): a `dns.TsigProvider` that verifies signed messages against the stored keys on every message, plus `RequireTSIG` for the paths that must refuse an unsigned one; also the AXFR/IXFR intercept that routes a transfer's raw `ResponseWriter` to a `Transfers` handler ahead of the pipeline (see Zone transfers above) |
+| `internal/dnssrv` | DNS listeners, the `Handler`/`Middleware` pipeline abstraction, panic recovery, and TSIG (RFC 8945): a `dns.TsigProvider` that verifies signed messages against the stored keys on every message, plus `RequireTSIG` for the paths that must refuse an unsigned one; also the AXFR/IXFR intercept that routes a transfer's raw `ResponseWriter` to a `Transfers` handler ahead of the pipeline, and the NOTIFY opcode intercept that routes to a `Notifies` handler the same way (see Zone transfers and Zone NOTIFY above) |
 | `internal/clients` | Client registry: IP/CIDR matching to client + group |
 | `internal/filter` | Blocklist/allowlist engine, list parsing, per-client-group rules, background refresh |
-| `internal/zones` | Authoritative zones: zone cut and deepest-match lookup, apex-relative names, RR construction from stored presentation-format rdata, and the NODATA/NXDOMAIN/wildcard/CNAME/referral answering rules; also `TransferServer`, which answers AXFR/IXFR requests the `allow_transfer` ACL permits |
+| `internal/zones` | Authoritative zones: zone cut and deepest-match lookup, apex-relative names, RR construction from stored presentation-format rdata, and the NODATA/NXDOMAIN/wildcard/CNAME/referral answering rules; also `TransferServer`, which answers AXFR/IXFR requests the `allow_transfer` ACL permits; `NotifyServer`, which answers inbound NOTIFY and probes/transfers on it; and `Notifier`, which drives the outbound NOTIFY queue (see Zone NOTIFY above) |
 | `internal/cache` | In-memory DNS response cache (TTL clamps, negative caching, serve-stale) |
 | `internal/upstream` | Upstream forwarders and selection strategy |
 | `internal/qlog` | Async query logging and retention pruning |

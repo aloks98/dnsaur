@@ -107,8 +107,15 @@ function parseKeyEntry(field: string): EntryResult {
  * refused too — this format's own delimiters — even though a `,` can never
  * actually reach here (`parseACL` already split on it): failing closed
  * rather than open if that splitting ever changes.
+ *
+ * Exported for `lib/notify.ts`, whose own key check reuses this rather than
+ * a second copy — `validNotifyKeyName` in notifyto.go is a byte-for-byte
+ * duplicate of `validACLKeyName` in acl.go (its own comment says so), so the
+ * TS side mirrors that by sharing one function instead of two that could
+ * drift apart from each other even while each stays faithful to its Go
+ * original.
  */
-function isValidACLKeyName(name: string): boolean {
+export function isValidACLKeyName(name: string): boolean {
   if (name === "" || name.length > MAX_DOMAIN_NAME_LENGTH) return false;
   if (/[ \t\r\n/\\,:]/.test(name)) return false;
   const trimmed = name.endsWith(".") ? name.slice(0, -1) : name;
@@ -119,8 +126,11 @@ function isValidACLKeyName(name: string): boolean {
 /** Lowercase, trailing dot — `dns.CanonicalName`'s spelling, the same
  * normalisation `lib/tsig.ts`'s `canonicalKeyName` already gives a typed
  * TSIG key name (see `normalizeTSIGName`, internal/api/tsigkeys_handlers.go).
- * `name` is already validated non-empty by the caller. */
-function canonicalDomainName(name: string): string {
+ * `name` is already validated non-empty by the caller.
+ *
+ * Exported for `lib/notify.ts`'s own key names — `dns.CanonicalName` is the
+ * one normalisation, reused rather than reimplemented a third time. */
+export function canonicalDomainName(name: string): string {
   const lower = name.toLowerCase();
   return lower.endsWith(".") ? lower : `${lower}.`;
 }
@@ -160,7 +170,13 @@ function parseCIDREntry(field: string): EntryResult {
   return { ok: true, entry: { kind: "prefix", value: formatCIDR(cidr) } };
 }
 
-function parseAddress(s: string): AddressResult | null {
+/**
+ * Exported for `lib/notify.ts`'s own host check — `validPrimaryHost`
+ * (primaries.go, reused by notifyto.go) tries `netip.ParseAddr` first on
+ * exactly the same terms ACL's bare-address branch does, so this is that
+ * one `ParseAddr` port shared rather than written twice.
+ */
+export function parseAddress(s: string): AddressResult | null {
   const v4 = parseIPv4(s);
   if (v4) return { family: "v4", bytes: v4 };
   const groups = parseIPv6Groups(s);

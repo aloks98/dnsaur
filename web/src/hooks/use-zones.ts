@@ -26,6 +26,13 @@ export const zoneRecordKeys = {
   list: (zoneId: number) => ["zoneRecords", zoneId] as const,
 };
 
+// Also not nested under zoneKeys, and for the same reason: editing
+// notify_to (a zone-row mutation) has to invalidate this tree explicitly
+// too — see useUpdateZone's onSuccess.
+export const zoneNotifyKeys = {
+  list: (zoneId: number) => ["zoneNotifies", zoneId] as const,
+};
+
 /**
  * How often a screen keeps a secondary's transfer state honest, and the one
  * cadence in this file — see `watchesTransfers` for when it applies at all.
@@ -97,6 +104,15 @@ interface ZoneCreateInput {
    * secondary zones — a secondary re-serves what it pulled.
    */
   allow_transfer?: string;
+  /**
+   * Who this zone tells when it changes (DNS NOTIFY, RFC 1996): a
+   * comma-separated list of host[:port] with an optional key:<tsig name>
+   * suffix — see lib/notify.ts for the format. Optional; omitted or ""
+   * means notify nobody, which is the default. Like allow_transfer, this
+   * applies to both primary and secondary zones — a secondary that
+   * re-serves what it pulled has its own downstream secondaries to tell.
+   */
+  notify_to?: string;
   soa_ns?: string;
   soa_mbox?: string;
   soa_refresh?: number;
@@ -167,6 +183,14 @@ export function useUpdateZone() {
     onSuccess: (_data, { id }) => {
       void qc.invalidateQueries({ queryKey: zoneKeys.all });
       void qc.invalidateQueries({ queryKey: zoneKeys.detail(id) });
+      // Every PATCH, not just one that touched notify_to — the same reason
+      // invalidateZoneAndRecords below refetches the whole records tree for
+      // any record write rather than asking which field changed. A PATCH
+      // that *did* edit notify_to changes the target set /notifies reports
+      // (the notifier reconciles zone_notifies to match on its next pass,
+      // woken by this same PATCH — see Notifier.Wake); one that didn't is a
+      // cheap refetch of something that comes back unchanged.
+      void qc.invalidateQueries({ queryKey: zoneNotifyKeys.list(id) });
     },
   });
 }
@@ -201,6 +225,64 @@ export function useZoneRecords(zoneId: number) {
   return useQuery({
     queryKey: zoneRecordKeys.list(zoneId),
     queryFn: () => api.get<ZoneRecord[]>(`/zones/${zoneId}/records`),
+  });
+}
+
+/**
+ * One `notify_to` target's outbound NOTIFY delivery state (Go: notifyRow,
+ * internal/api/notifies_handlers.go) — GET /zones/{id}/notifies's own row,
+ * Task 11's read side of D4.
+ *
+ * `state` is derived server-side from `notified_at`, `notified_serial` and
+ * `attempts` against the zone's current `soa_serial`, deliberately never
+ * left for the client to infer from those columns — see notifyStateOf's own
+ * comment: two clients could compute it differently, and a status that can
+ * disagree with itself is not a status.
+ */
+export interface ZoneNotify {
+  /** host:port, as written in the zone's notify_to (port always explicit).
+   * Carries no key; it is the row identity. */
+  target: string;
+  state: "never" | "current" | "retrying" | "gave_up";
+  /** The last serial this target acknowledged; meaningless (0) until
+   * notified_at is non-zero. */
+  notified_serial: number;
+  /** Unix ms of the last round that landed; 0 = never delivered. */
+  notified_at: number;
+  /** How many times the current round has been tried. Reset to 0 by a
+   * delivery that lands. */
+  attempts: number;
+  /** The round budget attempts is compared against — sent alongside
+   * attempts so "try 3/5" never hardcodes the denominator. */
+  max_attempts: number;
+  /** The most recent failure, in the sender's own words; "" when the last
+   * attempt delivered or none has been tried. */
+  last_error: string;
+  /** Unix ms this target was first seen. Never moves after; it is what
+   * dates a target whose state is still `never`. */
+  created_at: number;
+}
+
+/**
+ * A zone's outbound NOTIFY delivery state, one row per `notify_to` target —
+ * the NOTIFY OUT row's own data (Task 12).
+ *
+ * Polled on the same cadence as a secondary's transfer state
+ * (`TRANSFER_POLL_MS`, the scheduler's own tick) while there is at least one
+ * target to watch, and left alone otherwise: the notifier's own pass runs
+ * every 5s (`notifyTick`, internal/zones/notifier.go), so this page cannot
+ * promise anything fresher than the zone-refresh cadence already imported
+ * here, and 30s is cheap for a row that stays on screen. A zone with no
+ * targets never polls — an empty array cannot change into anything but
+ * another empty array without an edit `useUpdateZone` already invalidates
+ * this on.
+ */
+export function useZoneNotifies(zoneId: number) {
+  return useQuery({
+    queryKey: zoneNotifyKeys.list(zoneId),
+    queryFn: () => api.get<ZoneNotify[]>(`/zones/${zoneId}/notifies`),
+    refetchInterval: (query) => ((query.state.data?.length ?? 0) > 0 ? TRANSFER_POLL_MS : false),
+    refetchOnWindowFocus: (query) => (query.state.data?.length ?? 0) > 0,
   });
 }
 

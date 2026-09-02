@@ -31,6 +31,12 @@ func (s *Server) reloadZones(r *http.Request) {
 	}
 }
 
+// notifyZones wakes the outbound NOTIFY pass after a zone mutation that may
+// have moved a serial. See Notifier.Wake.
+func (s *Server) notifyZones() {
+	s.deps.Reloader.NotifyZones()
+}
+
 // apexNSTTL is the TTL given to the apex NS record every new zone is seeded
 // with (RFC 2181 §10.1, see handleZoneCreate). It matches the TTL convention
 // used elsewhere for generated/example zone_records rows.
@@ -67,7 +73,7 @@ const (
 // alike — a rule enforced on POST and not on PATCH is a rule with a way
 // around it. It returns the status code and message to answer with, or 0
 // when the configuration is sound.
-func (s *Server) checkZoneTransferConfig(ctx context.Context, zoneType, primaries string, tsigKeyID int64, allowTransfer string) (int, string) {
+func (s *Server) checkZoneTransferConfig(ctx context.Context, zoneType, primaries string, tsigKeyID int64, allowTransfer, notifyTo string) (int, string) {
 	if zoneType == zoneTypeSecondary {
 		// Syntax only, deliberately: zones.ValidatePrimaries does not
 		// resolve, so a primary named by hostname is stored as written and
@@ -114,6 +120,30 @@ func (s *Server) checkZoneTransferConfig(ctx context.Context, zoneType, primarie
 			}
 		}
 	}
+	if notifyTo != "" {
+		// Both transfer types may notify; nothing else may. internal is the
+		// RFC 6303 built-ins, which are not transferable, and stub/forwarder
+		// answer nothing of their own — a notify list on any of them is
+		// configuration nothing would ever read, shown by the UI as though
+		// it meant something.
+		if zoneType != zoneTypePrimary && zoneType != zoneTypeSecondary {
+			return http.StatusBadRequest, "notify_to applies to primary and secondary zones only"
+		}
+		if err := zones.ValidateNotifyTo(notifyTo); err != nil {
+			return http.StatusBadRequest, err.Error()
+		}
+		// A key: name that names nothing would make every NOTIFY to that
+		// target unsigned, and a peer requiring a signature refuses it with
+		// no indication why. Caught here, exactly as allow_transfer's keys
+		// are, and guarded from the other end by tsigKeyStore.Delete.
+		for _, name := range zones.NotifyToKeys(notifyTo) {
+			if _, found, err := s.deps.Store.TSIGKeys().ByName(ctx, name); err != nil {
+				return http.StatusServiceUnavailable, "storage unavailable"
+			} else if !found {
+				return http.StatusBadRequest, "notify_to names TSIG key " + name + ", which does not exist"
+			}
+		}
+	}
 	return 0, ""
 }
 
@@ -135,6 +165,26 @@ func canonicalAllowTransfer(input string) (string, error) {
 		return "", err
 	}
 	return zones.FormatACL(parsed), nil
+}
+
+// canonicalNotifyTo parses input and returns it in zones.FormatNotifyTo's
+// canonical spelling — the form tsigKeyStore.Delete matches ` key:<name>`
+// against in SQL. input == "" returns "" without parsing.
+//
+// Called after checkZoneTransferConfig has already validated the same string,
+// so the error here is unreachable in practice; it is checked rather than
+// discarded for the reason canonicalAllowTransfer's comment gives — errcheck
+// cannot know that, and a re-parse that swallowed a failure would be one call
+// away from storing whatever ParseNotifyTo gave up on.
+func canonicalNotifyTo(input string) (string, error) {
+	if input == "" {
+		return "", nil
+	}
+	ts, err := zones.ParseNotifyTo(input)
+	if err != nil {
+		return "", err
+	}
+	return zones.FormatNotifyTo(ts), nil
 }
 
 // normalizeZoneName lowercases name, strips a trailing dot, and validates
@@ -205,6 +255,10 @@ type zoneCreate struct {
 	// default. Unlike Primaries, this applies to both primary and secondary
 	// zones — a secondary re-serves what it pulled (§9.5.3).
 	AllowTransfer string `json:"allow_transfer"`
+	// NotifyTo is who this zone tells when it changes. Like AllowTransfer and
+	// unlike Primaries/TSIGKeyID, it applies to both transfer types: a
+	// secondary that re-serves what it pulled has its own secondaries.
+	NotifyTo string `json:"notify_to"`
 	// Enabled is a pointer so "not sent" differs from "false".
 	Enabled *bool `json:"enabled"`
 	// SOA fields, all optional: omitted means the generated default, so a
@@ -236,11 +290,16 @@ func (s *Server) handleZoneCreate(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusBadRequest, "only primary and secondary zones are supported")
 		return
 	}
-	if code, msg := s.checkZoneTransferConfig(r.Context(), zoneType, body.Primaries, body.TSIGKeyID, body.AllowTransfer); code != 0 {
+	if code, msg := s.checkZoneTransferConfig(r.Context(), zoneType, body.Primaries, body.TSIGKeyID, body.AllowTransfer, body.NotifyTo); code != 0 {
 		errJSON(w, code, msg)
 		return
 	}
 	allowTransfer, err := canonicalAllowTransfer(body.AllowTransfer)
+	if err != nil {
+		errJSON(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	notifyTo, err := canonicalNotifyTo(body.NotifyTo)
 	if err != nil {
 		errJSON(w, http.StatusBadRequest, err.Error())
 		return
@@ -296,8 +355,10 @@ func (s *Server) handleZoneCreate(w http.ResponseWriter, r *http.Request) {
 		// The canonical spelling, not body.AllowTransfer — see
 		// canonicalAllowTransfer.
 		AllowTransfer: allowTransfer,
-		CreatedAt:     now,
-		ModifiedAt:    now,
+		// The canonical spelling, not body.NotifyTo — see canonicalNotifyTo.
+		NotifyTo:   notifyTo,
+		CreatedAt:  now,
+		ModifiedAt: now,
 	})
 	if err != nil {
 		storeErrDup(w, err, "a zone with that name already exists")
@@ -330,6 +391,7 @@ func (s *Server) handleZoneCreate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.reloadZones(r)
+	s.notifyZones()
 	writeJSON(w, http.StatusCreated, map[string]int64{"id": id})
 }
 
@@ -358,6 +420,10 @@ type zonePatch struct {
 	// AllowTransfer, unlike Primaries and TSIGKeyID, applies to both
 	// primary and secondary zones — see zoneCreate.AllowTransfer.
 	AllowTransfer *string `json:"allow_transfer"`
+	// NotifyTo, like AllowTransfer, applies to both primary and secondary
+	// zones — see zoneCreate.NotifyTo. A pointer so absent (leave alone) and
+	// "" (clear it) are different.
+	NotifyTo *string `json:"notify_to"`
 }
 
 func (s *Server) handleZonePatch(w http.ResponseWriter, r *http.Request) {
@@ -429,11 +495,14 @@ func (s *Server) handleZonePatch(w http.ResponseWriter, r *http.Request) {
 	if body.AllowTransfer != nil {
 		z.AllowTransfer = *body.AllowTransfer
 	}
+	if body.NotifyTo != nil {
+		z.NotifyTo = *body.NotifyTo
+	}
 	// Checked on the merged zone rather than on the body: a patch that sets
 	// type without primaries, or clears primaries without changing type,
 	// leaves a secondary with nowhere to pull from either way, and only the
 	// result says which.
-	if code, msg := s.checkZoneTransferConfig(r.Context(), z.Type, z.Primaries, z.TSIGKeyID, z.AllowTransfer); code != 0 {
+	if code, msg := s.checkZoneTransferConfig(r.Context(), z.Type, z.Primaries, z.TSIGKeyID, z.AllowTransfer, z.NotifyTo); code != 0 {
 		errJSON(w, code, msg)
 		return
 	}
@@ -447,6 +516,13 @@ func (s *Server) handleZonePatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	z.AllowTransfer = allowTransfer
+	// Same reasoning for NotifyTo — see canonicalNotifyTo.
+	notifyTo, err := canonicalNotifyTo(z.NotifyTo)
+	if err != nil {
+		errJSON(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	z.NotifyTo = notifyTo
 	z.ModifiedAt = time.Now().UnixMilli()
 
 	if err := s.deps.Store.Zones().UpdateZone(r.Context(), z); err != nil {
@@ -454,6 +530,7 @@ func (s *Server) handleZonePatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.reloadZones(r)
+	s.notifyZones()
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -497,6 +574,7 @@ func (s *Server) handleZoneDelete(w http.ResponseWriter, r *http.Request) {
 	// serves both halves — see handleZoneRecordCreate.
 	s.retireZonePTRs(r.Context(), recs, z.Name)
 	s.reloadZones(r)
+	s.notifyZones()
 	w.WriteHeader(http.StatusNoContent)
 }
 

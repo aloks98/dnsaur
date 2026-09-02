@@ -247,6 +247,25 @@ components:
             Why the most recent outbound transfer request was refused, in
             the server's own words, or "" when it was served. The outbound
             twin of last_error. Read-only.
+        notify_to:
+          type: string
+          description: >
+            Who this zone tells when it changes (DNS NOTIFY, RFC 1996): a
+            comma-separated list where each entry is host[:port] (port
+            defaulting to 53) with an optional key:<tsig-name> suffix to
+            sign that target's NOTIFY — e.g. "10.0.0.2, 10.0.0.3:5353
+            key:secondary-ns2.". Empty means notify nobody, which is the
+            default. Applies to both primary and secondary zones — a
+            secondary that re-serves what it pulled has its own downstream
+            secondaries — unlike primaries and tsig_key_id, which are
+            secondary-only.
+
+
+            Stored and read back in its canonical spelling (the port always
+            explicit, lowercase key names, fully qualified, ", "-separated),
+            which may differ from what was written even though it means
+            the same thing. A key:<name> entry must name a TSIG key that
+            exists.
         created_at: { type: integer, format: int64 }
         modified_at: { type: integer, format: int64 }
     ZoneRecord:
@@ -368,6 +387,79 @@ components:
             Hiding it after creation would make the feature unusable without
             direct database access.
         created_at: { type: integer, format: int64, description: unix ms }
+    ZoneNotify:
+      type: object
+      description: >
+        One notify_to target's outbound NOTIFY (RFC 1996) delivery state —
+        also its queue entry, since pending-ness is derived from the serial
+        rather than stored separately.
+      properties:
+        target:
+          type: string
+          description: >
+            host:port, as written in the zone's notify_to (port always
+            explicit). Carries no key; it is the row identity.
+        state:
+          type: string
+          enum: [never, current, retrying, gave_up]
+          description: >
+            Derived server-side from notified_at, notified_serial and
+            attempts against the zone's current soa_serial — never left to
+            the client to infer from those columns, so two clients can
+            never compute it differently.
+
+
+            never — no round has ever landed and none has ever been tried
+            (attempts is 0). The only state where notified_at is 0 and
+            attempts has not exhausted the budget.
+
+            current — the target has acknowledged the zone's present
+            soa_serial (RFC 1982 comparison, so a wrapped serial is never
+            mistaken for current).
+
+            retrying — behind the zone's current serial, and attempts
+            within max_attempts.
+
+            gave_up — behind the zone's current serial, and attempts has
+            reached max_attempts. This includes a target that has never
+            been delivered at all: never delivered and exhausted is
+            gave_up, not never — reading notified_at alone would show a
+            target that has failed max_attempts times as though nothing
+            had been tried.
+        notified_serial:
+          type: integer
+          format: int64
+          description: >
+            The last serial this target acknowledged; meaningless (0) until
+            notified_at is non-zero.
+        notified_at:
+          type: integer
+          format: int64
+          description: unix ms of the last round that landed; 0 = never delivered.
+        attempts:
+          type: integer
+          description: >
+            How many times the current round has been tried. Reset to 0 by
+            a delivery that lands; see max_attempts for the budget it is
+            compared against.
+        max_attempts:
+          type: integer
+          description: >
+            The round budget (a server constant, currently 5) attempts is
+            compared against — sent alongside attempts so the dashboard's
+            "try 3/5" never hardcodes the denominator.
+        last_error:
+          type: string
+          description: >
+            The most recent failure, in the sender's own words; "" when the
+            last attempt delivered or none has been tried.
+        created_at:
+          type: integer
+          format: int64
+          description: >
+            unix ms this target was first seen (added to notify_to and
+            reconciled into the queue). Never moves after; it is what dates
+            a target whose state is still never.
   responses:
     ReadOnlyToken:
       description: read-only token used for a write operation
@@ -1595,6 +1687,13 @@ paths:
                     request. Applies to both primary and secondary — see
                     the Zone schema's allow_transfer field for the format;
                     a key:<name> entry must name an existing TSIG key.
+                notify_to:
+                  type: string
+                  description: >
+                    optional; empty (the default) means notify nobody.
+                    Applies to both primary and secondary — see the Zone
+                    schema's notify_to field for the format; a key:<name>
+                    entry must name an existing TSIG key.
                 soa_ns: { type: string, description: 'defaults to "ns.<name>"' }
                 soa_mbox: { type: string, description: 'defaults to "hostadmin.<name>"' }
                 soa_refresh: { type: integer, format: int64, description: seconds; defaults to 900 }
@@ -1617,8 +1716,10 @@ paths:
             and secondary zones are supported"); a secondary's primaries
             is missing or malformed; primaries or tsig_key_id is set on a
             zone that is not a secondary; tsig_key_id names no existing
-            key; allow_transfer is malformed; or allow_transfer names a
-            TSIG key that does not exist
+            key; allow_transfer is malformed; allow_transfer names a
+            TSIG key that does not exist; notify_to is set on a type
+            other than primary or secondary; notify_to is malformed; or
+            notify_to names a TSIG key that does not exist
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -1715,6 +1816,11 @@ paths:
                 primaries: { type: string, description: 'see the Zone schema''s primaries field' }
                 tsig_key_id: { type: integer, format: int64 }
                 allow_transfer: { type: string, description: 'see the Zone schema''s allow_transfer field' }
+                notify_to:
+                  type: string
+                  description: >
+                    see the Zone schema's notify_to field. Absent leaves it
+                    unchanged; "" clears it (notify nobody).
       responses:
         "204":
           description: No Content
@@ -1726,8 +1832,10 @@ paths:
             be left a secondary without valid primaries, primaries or
             tsig_key_id is set on a zone that is not a secondary,
             tsig_key_id names no existing key, allow_transfer is
-            malformed, or allow_transfer names a TSIG key that does not
-            exist
+            malformed, allow_transfer names a TSIG key that does not
+            exist, notify_to is set on a type other than primary or
+            secondary, notify_to is malformed, or notify_to names a TSIG
+            key that does not exist
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -2356,6 +2464,53 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ZoneFileImportResult" }
+        "503":
+          description: storage unavailable
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /zones/{id}/notifies:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: integer, format: int64, description: zone id }
+    get:
+      tags: [Zones]
+      summary: Outbound NOTIFY delivery state, one row per target
+      description: >
+        One row per host[:port] in the zone's notify_to, reporting whether
+        each has acknowledged the zone's current SOA serial. state is
+        derived server-side rather than left for the dashboard to infer
+        from the other columns — see the ZoneNotify schema's state field —
+        so two clients can never disagree about it.
+
+
+        A zone with no notify_to returns an empty array, never null.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/ZoneNotify" }
+        "400":
+          description: bad id
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401":
+          description: authentication required
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "404":
+          description: zone not found
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
         "503":
           description: storage unavailable
           content:

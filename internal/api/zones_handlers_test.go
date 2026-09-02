@@ -335,6 +335,9 @@ func TestZonePatch(t *testing.T) {
 	if clients, records, _ := srv.rl.counts(); clients != 0 || records == 0 {
 		t.Errorf("mutations did not trigger ReloadZones: clients=%d records=%d", clients, records)
 	}
+	if n := srv.rl.notifyCount(); n == 0 {
+		t.Error("mutations did not trigger NotifyZones")
+	}
 }
 
 // The PATCH twin of TestZoneCreateRejectsAnUnservableType. Renamed from
@@ -583,6 +586,114 @@ func TestAllowTransferIsAcceptedOnBothServingTypes(t *testing.T) {
 		if rec := srv.do(t, "POST", "/api/v1/zones", body); rec.Code != http.StatusCreated {
 			t.Fatalf("POST %s = %d, body %s", body, rec.Code, rec.Body)
 		}
+	}
+}
+
+// notify_to joins allow_transfer as applying to both primary and secondary —
+// unlike primaries and tsig_key_id, which are secondary-only — because a
+// secondary that re-serves what it pulled has its own downstream secondaries.
+func TestZoneCreateAcceptsNotifyToOnBothTransferTypes(t *testing.T) {
+	for _, zoneType := range []string{"primary", "secondary"} {
+		t.Run(zoneType, func(t *testing.T) {
+			srv := newTestServer(t)
+			body := fmt.Sprintf(`{"name":"example.com","type":%q,"notify_to":"10.0.0.2, 10.0.0.3:5353"`, zoneType)
+			if zoneType == "secondary" {
+				body += `,"primaries":"10.0.0.1"`
+			}
+			body += "}"
+			rec := srv.do(t, "POST", "/api/v1/zones", body)
+			if rec.Code != http.StatusCreated {
+				t.Fatalf("status %d, body %s", rec.Code, rec.Body)
+			}
+			id := createdID(t, rec)
+			// Stored canonical, not as typed — the delete guard matches
+			// key:<name> inside this column in SQL and can only do that
+			// because the spelling is known.
+			if got := srv.zone(t, id).NotifyTo; got != "10.0.0.2:53, 10.0.0.3:5353" {
+				t.Errorf("notify_to = %q, want the canonical spelling", got)
+			}
+		})
+	}
+}
+
+// The built-ins are the only reachable `internal` zones, and stub/forwarder
+// cannot be created at all — see the type gate at the top of
+// handleZoneCreate — so the create path with a type the API refuses outright
+// is where this rule is observable; a notify list on any of them is
+// configuration nothing reads.
+func TestZoneNotifyToRefusedOnNonTransferTypes(t *testing.T) {
+	srv := newTestServer(t)
+	rec := srv.do(t, "POST", "/api/v1/zones", `{"name":"example.com","type":"internal","notify_to":"10.0.0.2"}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status %d, body %s", rec.Code, rec.Body)
+	}
+}
+
+func TestZoneNotifyToRejectsMalformedAndUnknownKeys(t *testing.T) {
+	tests := []struct {
+		name     string
+		notifyTo string
+		contains string
+	}{
+		{"malformed entry", "10.0.0.2:0", "port"},
+		{"unknown key", "10.0.0.2 key:nope", "which does not exist"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := newTestServer(t)
+			body := fmt.Sprintf(`{"name":"example.com","type":"primary","notify_to":%q}`, tc.notifyTo)
+			rec := srv.do(t, "POST", "/api/v1/zones", body)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status %d, body %s", rec.Code, rec.Body)
+			}
+			if !strings.Contains(rec.Body.String(), tc.contains) {
+				t.Errorf("body %s does not mention %q", rec.Body, tc.contains)
+			}
+		})
+	}
+}
+
+// A rule enforced on POST and not on PATCH is a rule with a way around it —
+// checkZoneTransferConfig's own doc comment, and the reason it validates the
+// zone as it would be *stored* rather than the request body.
+func TestZonePatchValidatesNotifyTo(t *testing.T) {
+	srv := newTestServer(t)
+	rec := srv.do(t, "POST", "/api/v1/zones", `{"name":"example.com","type":"primary"}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create failed: %s", rec.Body)
+	}
+	id := createdID(t, rec)
+	path := fmt.Sprintf("/api/v1/zones/%d", id)
+
+	if bad := srv.do(t, "PATCH", path, `{"notify_to":"10.0.0.2:0"}`); bad.Code != http.StatusBadRequest {
+		t.Fatalf("PATCH with a bad port: status %d, body %s", bad.Code, bad.Body)
+	}
+	// A malformed value is also caught by canonicalNotifyTo's own re-parse,
+	// so the case above alone doesn't pin checkZoneTransferConfig's presence
+	// on the patch path — an unknown key is checked nowhere else, so this
+	// one does: skipping checkZoneTransferConfig on PATCH (verified by hand)
+	// lets this 204 through with a notify_to naming a key that does not
+	// exist, which is exactly the "rule with a way around it" the create
+	// path already refuses (TestZoneNotifyToRejectsMalformedAndUnknownKeys).
+	if badKey := srv.do(t, "PATCH", path, `{"notify_to":"10.0.0.2 key:nope"}`); badKey.Code != http.StatusBadRequest {
+		t.Fatalf("PATCH with an unknown key: status %d, body %s", badKey.Code, badKey.Body)
+	}
+
+	if ok := srv.do(t, "PATCH", path, `{"notify_to":"  10.0.0.2  "}`); ok.Code != http.StatusNoContent {
+		t.Fatalf("PATCH: status %d, body %s", ok.Code, ok.Body)
+	}
+	if got := srv.zone(t, id).NotifyTo; got != "10.0.0.2:53" {
+		t.Errorf("notify_to = %q, want the canonical spelling", got)
+	}
+
+	// Clearing it back to empty must work — a zone that stops notifying is
+	// an ordinary edit, and an empty string must not be read as "unset, keep
+	// what was there".
+	if cleared := srv.do(t, "PATCH", path, `{"notify_to":""}`); cleared.Code != http.StatusNoContent {
+		t.Fatalf("clearing PATCH: status %d, body %s", cleared.Code, cleared.Body)
+	}
+	if got := srv.zone(t, id).NotifyTo; got != "" {
+		t.Errorf("notify_to = %q after clearing, want empty", got)
 	}
 }
 
