@@ -117,6 +117,20 @@
   --invert: oklch(0.24 0.035 158);
   --invert-foreground: oklch(0.9705 0.0214 158.6);
 
+  /* The tooltip surface, and the one token in this file that does NOT flip
+     with the mode. Every other surface here follows the theme: --popover is
+     white in light and near-black in dark, --invert and --foreground swap
+     ends. A tooltip is a transient overlay rather than a piece of the page,
+     and the decision is that it reads as the same object in both modes —
+     dark, with light text, always.
+
+     Light is --foreground's own value: an inverted chip, which is what the
+     component would have given anyway. Dark is --popover's, a surface lifted
+     off the page rather than an inverted one, because at #e6e8e4 the default
+     put a near-white slab on a near-black page. */
+  --tooltip: #07140c;
+  --tooltip-foreground: #f7faf8;
+
   /* rnui spends --focus-foreground on BOTH the solid `bg-focus` badge and
      the `focus-light`/`focus-outline` tints, so one of the two is doomed
      unless --focus itself is tint-shaped: light in light mode (dark text
@@ -213,6 +227,10 @@
 
   --invert: oklch(0.9 0.008 150);
   --invert-foreground: oklch(0.1575 0.0027 145.45);
+
+  /* Deliberately not the mirror of the light value: see the light block. */
+  --tooltip: #111312;
+  --tooltip-foreground: #e6e8e4;
 
   /* Dark-mode half of the tint-shaped --focus described in the light block:
      a deep emerald chip carrying bright mint text, which reads on the solid

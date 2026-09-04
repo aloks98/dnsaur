@@ -144,6 +144,67 @@ func TestRefreshNowTransfersAZoneCreatedThroughTheAPI(t *testing.T) {
 	}
 }
 
+// The same button on a stub, which reaches the other worker entirely: two
+// ordinary queries to a master rather than an AXFR to a primary.
+//
+// Worth its own end-to-end pass because three layers have to agree about
+// which types have a master at all — the handler's gate, the scheduler's, and
+// the fetcher's own — and each of them says so in its own words. The zone is
+// created through the API and never touched directly, so a disagreement shows
+// up as a 400 or a 502 rather than as a compile error.
+func TestRefreshNowFetchesAStubCreatedThroughTheAPI(t *testing.T) {
+	resolver, h := newAPIAndResolverWithRefresher(t)
+	master := startStubMaster(t, transferApex, stubMasterConfig{
+		serial: primarySerial,
+		ns:     []string{stubNSLine("ns1." + transferApex)},
+		glue:   []string{fmt.Sprintf("ns1.%s. 3600 IN A 10.9.0.1", transferApex)},
+	})
+
+	zoneID := apiCreate(t, h, "/api/v1/zones", fmt.Sprintf(
+		`{"name":%q,"type":"stub","primaries":%q}`, transferApex, master.addr))
+
+	rec := apiDo(t, h, http.MethodPost, fmt.Sprintf("/api/v1/zones/%d/refresh", zoneID), "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("refresh: status = %d body = %s, want 200", rec.Code, rec.Body)
+	}
+	var got struct {
+		Primary     string `json:"primary"`
+		Serial      uint32 `json:"serial"`
+		Records     int    `json:"records"`
+		RefreshedAt int64  `json:"refreshed_at"`
+		ExpiresAt   int64  `json:"expires_at"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal %s: %v", rec.Body, err)
+	}
+	if got.Primary != master.addr {
+		t.Errorf("primary = %q, want the master that answered (%q)", got.Primary, master.addr)
+	}
+	if got.Serial != primarySerial {
+		t.Errorf("serial = %d, want the master's %d", got.Serial, primarySerial)
+	}
+	if got.Records != 2 {
+		t.Errorf("records = %d, want 2 (the NS record and its glue)", got.Records)
+	}
+	if got.RefreshedAt == 0 {
+		t.Errorf("refreshed_at = 0 after a fetch that worked")
+	}
+	// Not an oversight and not "unknown": a stub is never given an expiry.
+	if got.ExpiresAt != 0 {
+		t.Errorf("expires_at = %d, want 0 — a stub does not expire", got.ExpiresAt)
+	}
+
+	// And the delegation is routable from what the server is serving, with no
+	// reload of this test's own: the fetch published it.
+	z := resolver.Snapshot().Apex(transferApex)
+	if z == nil {
+		t.Fatalf("the stub is not in the served snapshot")
+	}
+	if u := zones.StubUpstreams(*z); len(u) != 1 || u[0] != "10.9.0.1:53" {
+		t.Errorf("StubUpstreams = %v, want [10.9.0.1:53]", u)
+	}
+}
+
 // ── the harness ─────────────────────────────────────────────────────────────
 
 // apiReloader is the hook the API calls after a write. Wiring it to the
@@ -207,8 +268,15 @@ func buildAPIAndResolver(t *testing.T, withRefresher bool) (store.Store, *zones.
 		Version:  "test",
 	}
 	if withRefresher {
+		// Both workers, as App.New wires them: a secondary is pulled by the
+		// Transferrer and a stub by the StubFetcher, which is a separate
+		// object with a reload of its own. The reload here is the resolver's
+		// because this harness has no forwarder to route with — production
+		// passes App.ReloadZones, and internal/app is where that is pinned.
 		deps.ZoneRefresher = zones.NewRefresher(st.Zones(),
-			zones.NewTransferrer(st.Zones(), st.TSIGKeys(), zones.WithReload(resolver.Reload)))
+			zones.NewTransferrer(st.Zones(), st.TSIGKeys(), zones.WithReload(resolver.Reload)),
+			zones.WithStubFetcher(zones.NewStubFetcher(st.Zones(), st.TSIGKeys(),
+				zones.WithStubReload(resolver.Reload))))
 	}
 	h := authedHandler{h: api.New(deps).Handler(), token: token}
 	return st, resolver, h, token

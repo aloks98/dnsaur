@@ -23,12 +23,20 @@ document is the contract a UI can be built against.
 SPA, so `GET /settings` returns `index.html`, not JSON.
 
 **Error envelope** — every error is `{"error": "<string>"}` with
-`Content-Type: application/json; charset=utf-8`
-(`internal/api/server.go:126,131-133`). The strings quoted in this document are
-verbatim; they are what a user will see.
+`Content-Type: application/json; charset=utf-8` (`errJSON` over `writeJSON`,
+`internal/api/server.go`). The strings quoted in this document are verbatim;
+they are what a user will see — **the string only**, with no RFC citation or
+other commentary appended, which §2.6's record conflicts are the place that
+most often gets written down wrong.
+
+*Citations in this section name functions, not line numbers* — four of them
+pointed about a hundred lines off by D6, because a line number is a fact
+about a file's history rather than about its behaviour. The rest of the
+document still carries line-number citations, unverified since they were
+written; see §10 item 16.
 
 **Auth** — a `dnsaur_session` cookie or `Authorization: Bearer <token>`. Bearer
-wins if both are sent (`internal/api/server.go:168-171`).
+wins if both are sent (`Server.requireAuth`, `internal/api/server.go`).
 
 | Cookie attribute | Value |
 |---|---|
@@ -37,25 +45,32 @@ wins if both are sent (`internal/api/server.go:168-171`).
 | `Max-Age` | `2592000` (30 days); `-1` on logout |
 | `HttpOnly` | yes |
 | `SameSite` | `Strict` |
-| `Secure` | **only when Go itself terminated TLS** (`r.TLS != nil`, `internal/api/auth_handlers.go:105`). Behind a TLS-terminating reverse proxy the cookie ships without `Secure`. |
+| `Secure` | **only when Go itself terminated TLS** (`r.TLS != nil` in `sessionCookie`, `internal/api/auth_handlers.go`). Behind a TLS-terminating reverse proxy the cookie ships without `Secure`. |
 
 Sessions slide: past the halfway mark the expiry is pushed out another 30 days
-(`internal/auth/service.go:128-130`).
+(`Service.Authenticate`, `internal/auth/service.go`).
 
 **Scopes** — a `read` token is rejected on any method other than GET/HEAD with
-**403** `read-only token` (`internal/api/server.go:182-184`). Enforcement is
+**403** `read-only token` (`Server.requireAuth`, same function). Enforcement is
 purely method-based. Session cookies are always minted `write`, so a browser
 session is never 403'd — the SPA has no 403 handling and doesn't need any.
 
 **Request bodies** — decoded with `DisallowUnknownFields` and a 1 MiB cap
-(`internal/api/server.go:146-154`). An unknown key, malformed JSON, an empty
+(`decode[T]`, `internal/api/server.go`). An unknown key, malformed JSON, an empty
 body and a wrong-typed field are indistinguishable to the handler, so they all
 produce that endpoint's single decode-failure string — which is often *not*
 `invalid json`. See each endpoint.
 
 **Status codes** — `201` for creates (no `Location` header, ever), `204` for
 updates/deletes (empty body — refetch to observe state), `202` for exactly one
-endpoint (`POST /filters/refresh`).
+endpoint (`POST /filters/refresh`). Four more appear on the zone routes and
+nowhere else in this document until now: **`200` on a `POST`** (both
+`/zones/{id}/refresh` and `/zones/{id}/file` answer with a body rather than
+`201`/`204`, because the caller asked in order to read the result), **`413`**
+(`/zones/{id}/file` over the 1 MiB cap), **`422`** (a zone file that parses
+but is rejected, carrying an `errors` list beside the flat `error`), and
+**`502`** (`/zones/{id}/refresh`, when the master refused or was unreachable —
+a failure of a server this one depends on, not of this one).
 
 **No 405.** `/api/` is a registered catch-all, so a method mismatch on a real
 path returns **404** `not found`, not 405, and no `Allow` header. `HEAD` works
@@ -324,6 +339,19 @@ forwarded**, which is the entire point of the change (see
 | `PUT /zones/{id}/records/{rid}` | 204 (full replace) |
 | `DELETE /zones/{id}/records/{rid}` | 204 |
 
+> **Known gap — this table and this section are incomplete.** Four zone
+> routes that exist and are used by the dashboard are missing from it:
+> `GET /zones/{id}/file` (200, a BIND master file as an attachment),
+> `POST /zones/{id}/file` (200, the import — `dry_run` required, 413/422 of
+> its own), `POST /zones/{id}/refresh` (200, or 502 carrying the master's
+> own error), and `GET /zones/{id}/notifies` (200 array). Their full
+> contracts — the import's diff shape and `errors` list, the refresh
+> result's fields, the notify row's eight fields and four states — are
+> **not documented here at all**. [`docs/api.md`](api.md) covers all four in
+> prose and `openapi.yaml` is authoritative for the shapes; this section
+> will not be trustworthy for a client generator until they are written up
+> here, and that is its own piece of work rather than a correction.
+
 Real capture, `POST /zones {"name":"home.lan"}` then `GET /zones`:
 
 ```json
@@ -334,21 +362,46 @@ Real capture, `POST /zones {"name":"home.lan"}` then `GET /zones`:
   "refreshed_at":0,"created_at":1786219213980,"modified_at":1786219213980}]
 ```
 
-`type` omitted on create defaults to `primary`. **`primary` and `secondary`
-are the two types the API will create or patch** — Milestone D2 added the
-second. `POST /zones` with `"type":"internal"` 400s `only primary and
-secondary zones are supported`, and so do `stub` and `forwarder`; the check
-(`internal/api/zones_handlers.go`) is an equality test against those two
-values, not an allowlist that happens to include them, so `internal` isn't a
-quiet exception. A `secondary` additionally requires a non-empty
-`primaries`, and `primaries`/`tsig_key_id` are rejected on any other type.
-`stub` and `forwarder` exist in the schema and are rendered by the zone
-list/detail badges (§3.6, §8) for zones however they come to exist —
-API-created zones just can't be one.
+**That capture predates D3, D4 and D6.** The row a current build returns
+also carries `last_error`, `last_attempt`, `allow_transfer`, `last_xfr_at`,
+`last_xfr_peer`, `last_xfr_error`, `notify_to` and `forward_to` — every one
+of them empty or `0` on a fresh `primary`. §3.6 is the field list to read;
+this block is kept for the shape, not the column set.
 
-Creating a zone also inserts its apex NS record (`name: "@"`, pointed at
-`soa_ns`) — RFC 2181 §10.1 requires apex NS on every authoritative zone.
-That insert is best-effort against an already-committed zone: a failure is
+`type` omitted on create defaults to `primary`. **`primary`, `secondary`,
+`forwarder` and `stub` are the four types the API will create or patch** —
+D2 added the second, D6 the last two. `POST /zones` with `"type":"internal"`
+400s `only primary, secondary, forwarder and stub zones are supported`; the
+check (`internal/api/zones_handlers.go`) is an equality test against those
+four values, not an allowlist that happens to include them, so `internal`
+isn't a quiet exception.
+
+Which of the other fields each type may set, all of them 400 elsewhere
+(`checkZoneTransferConfig`, one function for create and patch alike):
+
+| Field | Types that may set it |
+|---|---|
+| `primaries` (**required non-empty**), `tsig_key_id` | `secondary`, `stub` |
+| `forward_to` | `forwarder` |
+| `allow_transfer`, `notify_to` | `primary`, `secondary` |
+
+`forward_to` is the only one of the four whose empty value is meaningful
+rather than merely absent: a forwarder that names no upstreams claims its
+suffix and SERVFAILs (§3.8). See [`docs/api.md`](api.md)'s Forwarder zones
+entry for the format, which is `notify_to`'s grammar minus the `key:`
+suffix.
+
+Creating a **`primary`** also inserts its apex NS record (`name: "@"`,
+pointed at `soa_ns`) — RFC 2181 §10.1 requires apex NS on every
+authoritative zone. **Only a `primary`** (`zones_handlers.go`'s
+`zoneType == zoneTypePrimary` gate): the other three creatable types hold
+contents dnsaur does not author — a secondary's and a stub's arrive with the
+first pull and would be replaced by it, and a forwarder answers from no
+records at all — so seeding one would be this server authoring data in a
+zone it does not own. Do not expect a record back from
+`GET /zones/{id}/records` on a freshly created `secondary`, `stub` or
+`forwarder`; the correct answer there is `[]`. Where it does happen the
+insert is best-effort against an already-committed zone: a failure is
 logged, not surfaced, so `GET /zones/{id}/records` is how to confirm it
 landed. `soa_ttl` is fixed at `900` — there is no request field to set it,
 on create or patch.
@@ -360,7 +413,7 @@ Zone create/patch errors:
 | 400 | `invalid json` |
 | 400 | `bad id` |
 | 400 | `name must be a valid domain name` |
-| 400 | `only primary and secondary zones are supported` |
+| 400 | `only primary, secondary, forwarder and stub zones are supported` |
 | 404 | `not found` |
 | 409 | `a zone with that name already exists` |
 | 503 | `storage unavailable` |
@@ -406,9 +459,15 @@ Three write conflicts, checked in this order and each real-captured:
 
 | Order | Status | Error string | RFC |
 |---|---|---|---|
-| 1 | 409 | `CNAME is not allowed at the zone apex (RFC 1912 §2.4)` | 1912 §2.4 |
-| 2 | 409 | `CNAME cannot coexist with another record at the same name (RFC 1034 §3.6.2)` | 1034 §3.6.2 |
-| 3 | 409 | `records in the same RRSet must share one TTL (RFC 2181 §5.2)` | 2181 §5.2 |
+| 1 | 409 | `CNAME is not allowed at the zone apex` | 1912 §2.4 |
+| 2 | 409 | `CNAME cannot coexist with another record at the same name` | 1034 §3.6.2 |
+| 3 | 409 | `records in the same RRSet must share one TTL` | 2181 §5.2 |
+
+**The RFC citation is this table's, not the server's.** `RecordProblem.Error()`
+returns `Msg` bare (`internal/zones/record.go`), so an exact-match client
+looking for a trailing `(RFC 1912 §2.4)` finds nothing. The RFC column is
+where the reference belongs; it used to be in the quoted string too, which
+broke §1's promise that these are verbatim.
 
 Rule 2 fires in either write order — a CNAME landing beside an existing
 record, or a record landing beside an existing CNAME. Rule 1 only applies
@@ -423,9 +482,19 @@ Other errors:
 |---|---|---|
 | 400 | `bad id` | zone or record id fails to parse as a positive int64 |
 | 400 | `invalid json` | |
-| 400 | `ttl must not exceed 2147483647 (RFC 2181 §8)` | |
+| 400 | `ttl must not exceed 2147483647` | RFC 2181 §8; the citation is not part of the string |
 | 404 | `not found` | unknown zone id, on `/zones/{id}` **or any `/zones/{id}/records*` route**, or `rid` doesn't belong to the zone named by `id` — real-captured; `openapi.yaml`'s per-route "zone not found" / "rid is not a record of this zone" wording is a description of the situation, not the actual response body, which is always the flat `{"error":"not found"}` |
+| 409 | `built-in zones cannot be changed` | any write to an `internal` zone or its records, `POST /zones/{id}/file` included |
+| 409 | `a secondary zone's records come from its primary; change them there` | any record write, or a file import, into a `secondary` |
+| 409 | `a stub zone's records are the NS set it fetches from its master; change them there` | the same, into a `stub` — "fetches", not "transfers", because it does not transfer |
 | 503 | `storage unavailable` | |
+
+The three 409s above are one rule with one implementation
+(`recordWriteRefusal`, `internal/api/zonerecords_handlers.go`): a zone whose
+contents are authored elsewhere refuses the write that would be destroyed.
+**A `forwarder` is deliberately not among them** — nothing overwrites its
+records, so a write into one is inert rather than lost, which is a different
+complaint and not a 409's to make.
 
 There is **no uniqueness constraint** on records beyond the three conflicts
 above — two `TXT` records at the same name, for instance, are both stored
@@ -601,7 +670,7 @@ another user's token *and* any underlying storage failure.
 | `POST /tsig-keys` | 201 `{"id"}` | |
 | `GET /tsig-keys/{id}` | 200 object | |
 | `PUT /tsig-keys/{id}` | 204 | full replace — all three fields required, same as create |
-| `DELETE /tsig-keys/{id}` | 204 | succeeds even for an id that never existed |
+| `DELETE /tsig-keys/{id}` | 204 | **404** for an id that never existed, **409** when a zone names the key — see below |
 
 ```json
 [{"id":1,"name":"xfer.e412.in.","algorithm":"hmac-sha256.",
@@ -628,15 +697,30 @@ Three things about this shape are easy to get wrong:
 
 Errors: 400 `name must be a valid domain name`, 400 `algorithm must be one of
 hmac-sha1., hmac-sha224., hmac-sha256., hmac-sha384., hmac-sha512.`, 400
-`secret must be base64-encoded`, 400 `invalid json` / `bad id`, 404 `not found`
-(get only), 409 `a TSIG key with that name already exists` (create and
-update).
+`secret must be base64-encoded`, 400 `invalid json` / `bad id`, 404
+`not found` (**get, update *and* delete** — `Update` goes through `execOne`
+and `Delete` re-reads on 0 rows precisely so it can tell "never existed"
+from "spoken for"), 409 `a TSIG key with that name already exists` (create
+and update), 409 `resource in use` (delete, when a zone names the key — see
+below). This document said delete "succeeds even for an id that never
+existed" and scoped the 404 to `GET` until D6's docs pass; both were false
+and both contradicted the shipped `openapi.yaml`, which documents 404 on all
+three.
 
-> **Nothing references a key.** `zones.tsig_key_id` exists in the schema and
-> is serialized on every zone (§3.6), but no zone endpoint accepts it, no
-> transfer runs against a key, and `DELETE /tsig-keys/{id}` succeeds silently
-> whatever points at it. The screen therefore has no "used by" column and no
-> in-use delete guard — both arrive with zone transfers.
+> **Zones reference keys, and deleting one that is referenced is refused.**
+> This paragraph said the opposite until D6's docs pass; it had been false
+> since D2/D3, when the things it was waiting for arrived. `tsig_key_id` is
+> accepted on `POST`/`PATCH /zones` for a `secondary` or a `stub` (§2.6) and
+> validated to name an existing key; `allow_transfer` and `notify_to` both
+> take `key:<name>` entries, validated the same way; and transfers, NOTIFYs
+> and a stub's SOA/NS fetch all run signed under them.
+> `DELETE /tsig-keys/{id}` answers **409 `resource in use`** when any zone
+> names the key — by `tsig_key_id`, or by `key:` in either list — enforced
+> in the `DELETE` statement itself (`tsigKeyStore.Delete`) because
+> `zones.tsig_key_id` carries no foreign key. The screen has a **USED BY**
+> column to match, counting the zones that name the key; it is computed
+> client-side from `GET /zones` rather than served as a field, so if that
+> request fails every row reads `—` and the 409 is what reports the truth.
 
 ---
 
@@ -788,8 +872,9 @@ plain IPv4 client. No match → `group_id 1`, hardcoded
 
 > **IPv6 zone ids are accepted but can never match.** `fe80::1%eth0` passes
 > validation and stores fine (verified: 201), but the request-side address is
-> built with `netip.AddrFromSlice`, which never carries a zone
-> (`internal/dnssrv/server.go:91-93`). A zoned matcher is therefore dead
+> built with `netip.AddrFromSlice`, which never carries a zone (the UDP and
+> TCP arms of `Server.serve`'s `RemoteAddr` switch,
+> `internal/dnssrv/server.go`). A zoned matcher is therefore dead
 > config. A zoned *CIDR* is correctly rejected at 400.
 
 ### 3.5 Group
@@ -810,14 +895,17 @@ unmatched clients fall back to it.
 |---|---|---|
 | `id` | int64 | |
 | `name` | string | apex, lowercase, no trailing dot |
-| `type` | string | `primary` \| `secondary` \| `stub` \| `forwarder` \| `internal`; only `primary` and `secondary` are creatable/patchable (§2.6) |
+| `type` | string | `primary` \| `secondary` \| `stub` \| `forwarder` \| `internal`; all but `internal` are creatable/patchable (§2.6). `forwarder` and `stub` hold no data of their own — they claim the suffix and route it (§3.8) |
 | `enabled` | bool | a disabled zone is skipped by lookup entirely — it neither answers nor claims the name, so queries under it fall through to a shallower enabled zone or upstream, exactly as if the zone didn't exist (`internal/zones/zone.go`'s `Index.Find`) |
 | `soa_ns`, `soa_mbox` | string | default to `ns.<name>` / `hostadmin.<name>` on create |
 | `soa_serial` | uint32 | starts at `1`; bumped by one on every record create/update/delete in the zone — **and on a reverse zone whose PTR auto-PTR just wrote, moved or retired**, so one write addressed to a forward zone can move two zones' serials, and a reverse zone's serial can move with no request ever naming it (`BumpSerial`, best-effort — logged, not surfaced, on failure) |
 | `soa_refresh`, `soa_retry`, `soa_expire` | uint32 (seconds) | default 900 / 300 / 604800 |
 | `soa_minimum` | uint32 (seconds) | negative-cache TTL advertised for this zone's NXDOMAINs (RFC 2308), not a floor on positive answers; default 900 |
 | `soa_ttl` | uint32 (seconds) | the SOA record's own header TTL, independent of `soa_minimum` — RFC 2308 §5 needs both to express `min(minimum, ttl)`. Fixed at `900`; **no request field sets it**, on create or patch |
-| `primaries`, `tsig_key_id`, `expires_at`, `refreshed_at` | string / int64 | secondary/stub/forwarder only (Milestone D); always empty/`0` for `primary`/`internal` |
+| `primaries`, `tsig_key_id` | string / int64 | where this zone pulls from and the key it signs with — `secondary` and `stub` only, rejected on every other type. `primaries` is required non-empty on both |
+| `refreshed_at`, `last_attempt`, `last_error` | int64 / int64 / string | the last pull that **succeeded**, the last one **tried**, and why that one failed (`""` on success). Written for a `secondary` and a `stub`; `0`/`""` on a type that never pulls. See [`docs/api.md`](api.md)'s Secondary zones entry |
+| `expires_at` | int64 (unix ms) | **`secondary` only.** A stub is never given one — its NS set is routing information rather than data it vouches for, so it does not expire (`Zone.Serving`, and [`docs/architecture.md`](architecture.md)). `0` on every other type, **except** a row retyped from `secondary` to `stub`: `handleZonePatch` never clears the column, so that row keeps its old non-zero stamp forever. Nothing reads it — but do not read it either (§9.20) |
+| `forward_to` | string | where a `forwarder` sends the queries it claims — `forwarder` only, rejected on every other type. See [`docs/api.md`](api.md)'s Forwarder zones entry for the format, and for why what is stored can differ from what was sent. **Empty is legal and means the zone claims its suffix and SERVFAILs it** (§3.8) |
 | `allow_transfer`, `last_xfr_at`, `last_xfr_peer`, `last_xfr_error` | string / int64 | the outbound AXFR ACL and the last inbound transfer *request*'s outcome — `primary` and `secondary` only. See [`docs/api.md`](api.md)'s `allow_transfer` entry for the format and what each read-only field means (and why `last_xfr_peer` is not proof of who asked) |
 | `notify_to` | string | who this zone tells when it changes (DNS NOTIFY, RFC 1996) — `primary` and `secondary` only, the same reach as `allow_transfer`. See [`docs/api.md`](api.md)'s `notify_to` entry for the format. Per-target delivery status is a separate read, `GET /zones/{id}/notifies`, not a field on the zone itself — see §9's Notify-out item |
 | `created_at`, `modified_at` | int64 (unix ms) | |
@@ -860,9 +948,13 @@ found first (deepest enabled zone whose apex suffixes the query name wins;
 7. Nothing matched: NXDOMAIN, SOA in AUTHORITY.
 
 Every negative answer's AUTHORITY-section SOA carries
-`ttl = min(soa_minimum, soa_ttl)` (RFC 2308 §5). `forwarder`/`stub` zone
-types don't hold data and never reach this logic (Milestone D); the resolver
-treats them as if the name weren't covered at all and falls through.
+`ttl = min(soa_minimum, soa_ttl)` (RFC 2308 §5). `forwarder` and `stub`
+zones hold no data and never reach this logic: `Zone.Answer` returns
+`handled=false` and the query falls through to the next middleware. **That
+is not the same as the name being uncovered** — the fall-through lands in
+the cache and then in the upstream forwarder, which holds a routing table
+keyed on exactly these zones' apexes and sends the query to that zone's own
+upstreams, never to the default ones (§3.8).
 
 ### 3.8 Upstream
 
@@ -888,9 +980,51 @@ all are down, all are tried anyway; failures are negatively cached **30s** per
 (qname,qtype) per RFC 9520; per-exchange timeout is **2s and not configurable**;
 0x20 case randomisation with strict echo checking is always on.
 
-**Conditional / split-horizon forwarding is TODO** — `upstream.Config.Conditional`
-exists and `New` implements it, but nothing ever populates it: no setting, no
-table, no API.
+**Conditional / split-horizon forwarding shipped in Milestone D6.**
+`upstream.Config.Conditional` is populated from **zone rows** — every enabled
+`forwarder` and `stub` zone's apex, mapped to that zone's upstreams — and
+from nothing else. There is still no setting and no separate table, by
+design: the zone row is the one place a suffix is claimed.
+`Forwarder.SetConditional` swaps the table behind an `atomic.Pointer` on
+every zone reload, reusing each address's `*up` so the swap preserves latency
+EWMA and health backoff.
+
+A forwarder's addresses come from `forward_to` (§3.6) and are dialled as
+written — a hostname there is resolved by Go's dialer per exchange, never by
+dnsaur. A stub's are derived from the NS records it fetched: an **in-zone**
+nameserver's address must arrive as glue in the master's ADDITIONAL section
+and is never looked up (looking it up would route back into this same zone),
+an **out-of-zone** one is looked up normally, and either way the address is
+stored beside the NS record so `zones.StubUpstreams` can rebuild the table on
+reload without querying. Those upstreams are **always port 53**: neither glue
+rdata nor an address lookup carries one, so `StubUpstreams` joins 53
+unconditionally.
+
+Matching is longest-suffix (one shared `filter.DomainSet`), and **a matched
+suffix never falls back to the defaults**: with every upstream in that
+suffix's list failing, or the list empty, the query gets SERVFAIL and is
+negatively cached 30s like any other upstream failure — *unless the cache
+still holds an answer that suffix's own upstreams produced earlier*, in which
+case serve-stale answers it NOERROR at TTL 30, exactly as for any other
+forwarded name. That is not a fall-through and not an exception to the rule
+above: the reply is the zone's own data going stale, never the defaults'.
+"Never falls back to the defaults" is about the *route*, and it is absolute;
+"SERVFAILs" is about the *outcome*, and it holds when there is nothing
+cached beneath the suffix. That is the point of
+the feature rather than a gap — see
+[`docs/architecture.md`](architecture.md#a-claimed-suffix-servfails-it-never-falls-through).
+A disabled zone contributes nothing, so disabling one releases its suffix
+back to `upstreams`.
+
+Installing that table also **purges the cache** of every suffix whose route
+set changed — added, removed or altered (`Cache.Purge`, from
+`App.installConditional`). The cache sits above the forwarder and its entries
+record no route, so without it a name cached from `upstreams` before a zone
+claimed its suffix would go on being served from that entry, and would be
+served *stale* for `cache.serve_stale_for` once the claimed upstreams failed.
+Nothing in the UI surfaces the purge; it matters here because it is why a
+zone edit takes effect on the next query rather than on the next TTL
+expiry.
 
 ### 3.9 Settings keys
 
@@ -1068,7 +1202,7 @@ no `onMutate` and no `setQueryData` in the whole client.
 | Groups | Delete | `DELETE /groups/{id}` | `Can't delete ${group.name} — it's still in use` (on 409) |
 | Groups | Apply/remove a list | `PUT /groups/{id}/lists` | `Couldn't update lists for ${group.name}` |
 | Clients | Edit / Add | `PUT|POST /clients` | server message, else `Couldn't ${update\|add} the client` |
-| Clients | Delete | `DELETE /clients/{id}` | `Couldn't delete ${target.name}` |
+| Clients | Delete | `DELETE /clients/{id}` | `Couldn't delete ${target.matcher}` — the **matcher**, not a name; a client has no name field |
 | Zones | Add | `POST /zones` | server message, else `Couldn't add the zone` |
 | Zones | Delete | `DELETE /zones/{id}` | `Couldn't delete ${target.name}` |
 | Zone detail | Enable / disable | `PATCH /zones/{id}` | `Couldn't ${enabled ? "disable" : "enable"} ${target.name}` |
@@ -1082,7 +1216,17 @@ no `onMutate` and no `setQueryData` in the whole client.
 | Shell | Pause blocking | `POST /blocking/pause` | `Couldn't pause blocking — try again` |
 | Shell | Resume blocking | `DELETE /blocking/pause` | `Couldn't resume blocking — try again` |
 | Shell | Log out | `POST /auth/logout` | `Couldn't sign out — try again` — **suppressed on 401**, which counts as logged out |
-| Settings | Save changes (bulk) | one `PUT /settings` per changed key | partial: `Saved ${n}, but couldn't save ${keys} — try again` |
+| Settings | Save changes (bulk) | one `PUT /settings` per changed key | three branches, not one: all saved → **success** toast `${n} setting(s) updated`; some saved → `Saved ${n}, but couldn't save ${keys} — try again`; none saved → the first rejection's server message, else `Couldn't save settings — try again` |
+
+> **Known gap — this table is missing eleven row actions.** The whole **TSIG
+> keys** screen is absent (Add, Save, Delete — the last being
+> `Couldn't delete ${target.name}`, and the only Delete here that can come
+> back **409 `resource in use`**), and so are Zone detail's **Refresh now**,
+> **Export**, **Import**, **Save master/upstreams**, **Save allow_transfer**
+> and **Save notify_to**, and the Zones list's inline **create-row** save.
+> Absent means undocumented, not absent from the UI. Adding them is its own
+> piece of work; until then read this table as covering the screens it
+> lists rather than as covering the app.
 
 **Disabled states that actually occur:** dashboard quick actions while
 `groups.isPending || groups.isError`; query-log Block/Allow while
@@ -1117,9 +1261,10 @@ The client distinguishes two error cases, and the distinction is load-bearing:
 | Groups | 3 skeletons | `No groups yet` | `Couldn't load groups` | stale banner |
 | Clients | 4 skeletons | `No clients yet` | `Couldn't load clients` | stale banner |
 | Zones | 4 skeletons | `No zones yet` | `Couldn't load zones` | stale banner |
-| Zone detail | 4 skeletons (zone), then 4 more (records) | `No records yet. Add one above and dnsaur will answer for this zone directly.` (unfiltered) / `No records match this filter.` (filtered) | `Couldn't load this zone` (zone) / `Couldn't load records` (records) | stale banner on **records only** — a background zone refetch failing has no banner of its own |
+| Zone detail | 4 skeletons (zone), then 4 more (records) | filtered: `No records match this filter.` Unfiltered, a four-way switch on type (`detail.tsx`): **secondary** → `Nothing transferred yet. The records will arrive with the first transfer from the primary.`; **stub with a recorded failure** → `No NS set yet.`; **stub without one** → `Fetching the NS set from ${primaries}`; **otherwise** → `No records yet. Add one above and dnsaur will answer for this zone directly.` A **forwarder** has no empty state at all — it renders no records grid | `Couldn't load this zone` (zone) / `Couldn't load records` (records) | stale banner on **records only** — a background zone refetch failing has no banner of its own |
 | Settings | layout-shaped skeleton | n/a (fixed 11 fields) | `Couldn't load settings` | stale banner, "Any edits below are untouched." |
-| Account | 2-card skeleton | `No API tokens yet` | `Couldn't load your account` | stale banner |
+| TSIG keys | 3 skeletons | `No TSIG keys yet.` with a **New key** action — suppressed entirely while the create row is open, since the row is already the answer | `Couldn't load TSIG keys` | stale banner |
+| Account | 2-card skeleton | `No API tokens yet` | **two**: `Couldn't load your account` (the account card, first load failed) and `Couldn't load API tokens` (the token card, independently) | stale banner |
 
 **Live-tail mode has no loading state at all** — it renders the empty state
 until the first SSE row arrives.
@@ -1139,12 +1284,31 @@ A **mid-session 401** from any query revalidates `me` once (re-entrancy
 guarded); if it now fails, all non-auth cached data is dropped and the gate
 falls back to Login.
 
-**Polling** — three things poll, all at 30s: the four dashboard stats queries
-(overview, timeline, top blocked, top clients),
-`GET /health` (the top bar's row-1 `DNS OK` readout, every screen), and `GET /blocking` (pause
-control, every screen plus one per group row). Everything else is
-fetch-on-mount with a 10s stale time and no window-focus refetch; `me` is the
-exception, refetching on focus only once it has succeeded.
+**Polling** — two kinds, and the second is conditional, which is what this
+paragraph got wrong until D6's docs pass.
+
+*Unconditional, always 30s:* the four dashboard stats queries (overview,
+timeline, top blocked, top clients), `GET /health` (the top bar's row-1
+`DNS OK` readout, every screen), and `GET /blocking` (pause control, every
+screen plus one per group row).
+
+*Conditional, 30s, and only while there is something that can change on its
+own* (`web/src/hooks/use-zones.ts`): `useZones` and `useZone` set both
+`refetchInterval` **and** `refetchOnWindowFocus` from `watchesTransfers` —
+true when a zone in view is a `secondary` or a `stub`, the server's own
+`pullsFromAMaster` set. `useZoneNotifies` does the same, gated on the notify
+list being non-empty. A zones screen showing only primaries and forwarders
+polls at nothing and refetches on focus at nothing, because nothing on it
+moves without an operator.
+
+*One-off, not a poll:* `useRefreshFilters` (`web/src/hooks/use-filters.ts`)
+re-reads the list table on a **1s / 4s / 12s** ladder after a manual refresh,
+because `POST /filters/refresh` is a 202 that resolves long before any row
+changes.
+
+Everything else is fetch-on-mount with a 10s stale time and no window-focus
+refetch; `me` is a further exception, refetching on focus only once it has
+succeeded.
 
 **SSE client behaviour** — backoff doubles 1s → 30s; after **6** consecutive
 failures with no successful open it gives up and shows `Live tail disconnected`
@@ -1194,7 +1358,7 @@ typing in an input.
 | **404 / unknown route** | renders a dedicated not-found screen inside the shell, no group marked in row 2 (`pages/not-found.tsx`) — this table is stale on this point in older captures; `path="*"` no longer redirects |
 | **DHCP** | nothing exists (§3.11) |
 | **Encrypted DNS (DoH/DoT)** | no code |
-| **Zone transfers (stub/forwarder), DNSSEC** | `secondary` is done: Milestone D2 ships the transfer client (dnsaur pulls a zone from a primary, TSIG and all), D3 the server (dnsaur serves AXFR to its own secondaries, gated by `allow_transfer`), and D4 DNS NOTIFY in both directions (dnsaur tells its own secondaries a zone changed, and reacts promptly when told by its own primary — §9.18), all three with UI. `stub` and `forwarder` are still schema and badges only — create/patch reject them with `400` — and there is no DNSSEC signing. **Reverse zones are no longer on this list**: `PTR` is a normal record type, a reverse zone is an ordinary `primary` zone ending in `.arpa`, the RFC 6303 §4 built-ins (`internal/store/builtins.go`'s `BuiltinZones`) are seeded as `type: internal` (read-only, `409` on any write), and an A/AAAA write maintains the matching PTR server-side in the same request |
+| **DNSSEC** | no signing, no validation, no UI. Every other zone type on this row has now shipped and left it: `secondary` in D2–D4 (D2 the transfer client, D3 the AXFR server gated by `allow_transfer`, D4 NOTIFY in both directions — §9.18), and `forwarder` and `stub` in D6 (create/patch, the conditional routing table, the stub's SOA/NS fetch, and both page shapes — §3.8, §2.6). **Reverse zones were never on this list either**: `PTR` is a normal record type, a reverse zone is an ordinary `primary` zone ending in `.arpa`, the RFC 6303 §4 built-ins (`internal/store/builtins.go`'s `BuiltinZones`) are seeded as `type: internal` (read-only, `409` on any write), and an A/AAAA write maintains the matching PTR server-side in the same request |
 | **HA / cluster UI** | no code; the spec anticipated a health-strip stub, which does not exist |
 
 The nav contains exactly the nine implemented leaf routes, in four groups
@@ -1293,7 +1457,9 @@ Collected because each one has already caused, or would cause, a wrong UI.
 17. **The allow-transfer band shows four states**, not one. Shown on
     `/zones/{id}` for `primary` and `secondary` zones only —
     `internal`/`stub`/`forwarder` refuse every transfer outright and get no
-    editable ACL. A blank `allow_transfer` renders an explicit **"No peer
+    editable ACL — and the server backs that up rather than leaving it to
+    the UI: `allow_transfer` on a `stub` or a `forwarder` is a `400`, and
+    any write to an `internal` zone is a `409`. A blank `allow_transfer` renders an explicit **"No peer
     may transfer this zone."** line rather than leaving the field looking
     merely unset; independent of that, the *last inbound transfer
     request* — whatever the ACL says now — is one of **"Never asked
@@ -1336,6 +1502,45 @@ Collected because each one has already caused, or would cause, a wrong UI.
       with no operator action, on the zone's next edit. Drawn amber-on-hollow
       (a ring, no fill) rather than `retrying`'s filled dot, so it reads as
       "resting" rather than as a failure.
+19. **A `forwarder` or `stub` zone whose upstreams are unreachable makes its
+    whole suffix stop resolving.** It does not fall back to the `upstreams`
+    setting: `Forwarder.pick` returns the matched suffix's list and never
+    `f.def`, so an empty or entirely-failing list ends in SERVFAIL — with one
+    caveat that matters when a screen is deciding what to promise. The purge
+    that installing the routing table performs (§3.8) covers entries the
+    *defaults* produced, so a claimed suffix can never be answered by the
+    public internet. It says nothing about the suffix's own earlier answers:
+    an **entirely-failing** list still serves those stale, NOERROR at TTL 30,
+    for as long as `cache.serve_stale_for` allows. An **empty** list has
+    never produced any, so that one really is SERVFAIL outright. This is
+    the single most surprising behaviour of the two types and the reason the
+    forwarder page carries a line about it (`ForwarderConsequence`,
+    `web/src/pages/zones/detail.tsx`) — the screen states the fact,
+    [`docs/architecture.md`](architecture.md) carries the why. The empty
+    `forward_to` is not a validation gap: it is accepted deliberately, and
+    only *disabling* the zone releases the suffix.
+20. **A stub does not expire — but do not detect one by `expires_at === 0`.**
+    A stub is never *given* an expiry (`StubFetcher.install` never writes the
+    column, and `Zone.Serving`'s check is `secondary`-only), yet a row
+    **retyped from `secondary` to `stub` keeps its old non-zero stamp**:
+    `handleZonePatch` does not clear the column, so the field is a stale
+    leftover on that row rather than an expiry anything honours. Branch on
+    `type`, never on the stamp. Do not render a stub's staleness the way a
+    secondary's is rendered either: a secondary
+    past `expires_at` stops answering, while a stub goes on routing to the
+    last NS set it fetched however old that is (`Zone.Serving` is
+    `secondary`-only, and `StubFetcher.install` never writes the column).
+    `transferState` is likewise not applied to a stub — its row reads
+    `refreshed_at` and `last_error` alone (`web/src/lib/zones.ts`). The zone
+    list's Status cell says only **Enabled**/**Disabled** for both new types;
+    a stub's fetch state lives on the zone page.
+21. **A stub's records are read-only for a stronger reason than a
+    secondary's.** A hand-written record in a secondary is served
+    authoritatively until the next transfer deletes it. A stub answers from
+    none of its records — but `StubUpstreams` reads them back to rebuild the
+    routing table on every zone reload, so a hand-written apex NS record
+    redirects the whole claimed suffix until the next fetch undoes it. Both
+    are `409` at the API (see §2.6); the UI hides the controls as well.
 
 ---
 
@@ -1377,16 +1582,31 @@ Go source. **The code is the source of truth.**
    `components/schemas/List` and is `$ref`'d from both `GET /filters/lists`
    and `GET /groups/{id}/lists`, which previously carried separate inline
    copies that had already drifted apart.
-6. `openapi.yaml` omits **503 `storage unavailable`** on most operations that
-   can return it, and omits it entirely from `POST /setup`. It still omits
-   **409** on the duplicate responses other than `POST /filters/lists`, which
-   is now documented.
+6. **Mostly fixed; the residue is named rather than estimated.** The 503
+   `storage unavailable` response is documented on 45 of `openapi.yaml`'s 59
+   operations, `GET`/`POST /setup` included — this entry previously said it
+   was omitted from `POST /setup` and from "most operations", and both were
+   wrong. Twelve operations that touch storage still omit it:
+   `POST /auth/logout`, `GET /auth/me`, the three `POST /auth/totp/*`,
+   `GET /blocking`, `POST`/`DELETE /blocking/pause`, `POST /filters/refresh`,
+   `GET /queries/tail`, `POST /tokens`, `DELETE /tokens/{id}`. (`GET /health`
+   and `GET /openapi.yaml` also omit it and correctly: neither reads
+   storage.) The **409-on-duplicate** half of this entry is fully resolved —
+   every one of the nine `storeErrDup` endpoints documents it — and is
+   withdrawn rather than narrowed.
 7. `openapi.yaml` marks `group_id` **required** on `DELETE /blocking/pause`;
    the code makes it optional, defaulting to 0 (the global pause).
 8. `openapi.yaml` marks `group_id` required on `POST /blocking/pause`; only
    `minutes` is actually validated.
-9. `openapi.yaml` documents neither `DisallowUnknownFields` nor the 1 MiB body
-   cap, and does not mention that method mismatches yield 404 rather than 405.
+9. **Partly fixed.** The 1 MiB cap is documented on
+   `POST /zones/{id}/file`, where it carries its own **413** — but as that
+   endpoint's rule rather than as the global one it is (`decode`'s
+   `io.LimitReader(r.Body, 1<<20)` bounds *every* JSON body; only the import
+   turns exceeding it into a 413 instead of a decode failure).
+   `openapi.yaml` still documents neither `DisallowUnknownFields` — so a
+   client sending an unknown key gets that endpoint's decode-failure string
+   with nothing in the spec to explain why — nor that a method mismatch
+   yields 404 rather than 405.
 10. `openapi.yaml` describes the SSE stream without noting the absent
     `event:`/`id:` fields, the absent heartbeat, or the 64-entry
     drop-on-slow-consumer behaviour.
@@ -1395,16 +1615,32 @@ Go source. **The code is the source of truth.**
     implemented** — no such string exists in the client.
 13. The spec's "keeps retrying" behaviour for the API-unreachable banner is
     **not implemented**: recovery requires the manual Retry button.
-14. **Was backwards until Milestone D3's review.** `openapi.yaml` is the
-    correct one here: its `POST /zones` and `PATCH /zones/{id}` request
-    bodies give `type` an `enum: [primary, secondary]` and say `stub`,
-    `forwarder` and `internal` are rejected with 400, which is what the code
-    does. The five-value list it also carries belongs to the *Zone schema*'s
-    `type` — the set a stored zone may have, not the set an API caller may
-    send. This document's §2.6 and §3.6 claimed `primary` alone was
-    creatable, and quoted an error string (`only primary zones are
-    supported`) the code stopped emitting in D2; both are corrected.
+14. **Was backwards until Milestone D3's review, and widened twice since.**
+    `openapi.yaml` is the correct one here: its `POST /zones` and
+    `PATCH /zones/{id}` request bodies now give `type` an
+    `enum: [primary, secondary, forwarder, stub]` and say `internal` alone
+    is rejected with 400, which is what the code does. The five-value list
+    it also carries belongs to the *Zone schema*'s `type` — the set a stored
+    zone may have, not the set an API caller may send. This document's §2.6
+    and §3.6 claimed `primary` alone was creatable, then `primary` and
+    `secondary` alone, and quoted error strings (`only primary zones are
+    supported`, `only primary and secondary zones are supported`) the code
+    stopped emitting in D2 and D6 respectively; all of it is corrected.
 15. `openapi.yaml`'s 404 responses on the `/zones/{id}/records*` routes
     describe the situation ("zone not found", "rid is not a record of this
     zone") rather than the response body, which is always the flat
     `{"error":"not found"}` used everywhere else 404 is returned. See §2.6.
+16. **This document's own line-number citations rot, and eleven are
+    unverified.** §1's and §3.4's pointed about a hundred lines off by D6 and
+    are now function names instead; the remaining `file.go:N` citations —
+    §1's store/search/token notes, §2.2's TOTP cite, §2.3, §2.5, §2.9,
+    §3.1, §3.4's registry note, §2.7's two `qlog.go` cites — were not
+    re-checked in that pass and should be converted the same way when each
+    section is next touched. A line number is a claim about a file's history; a function name
+    is a claim about its behaviour, which is what this document is for.
+17. `openapi.yaml`'s `DELETE /tsig-keys/{id}` describes the 409 as "while any
+    zone's `tsig_key_id` names this key". The `DELETE` statement also refuses
+    when a zone's `allow_transfer` or `notify_to` carries a matching `key:`
+    entry (`aclKeyRef`/`notifyKeyRef`, `internal/store/tsigkeys.go`), so the
+    spec's reason is narrower than the behaviour. §2.10 above states the full
+    rule.

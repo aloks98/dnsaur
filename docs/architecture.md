@@ -55,13 +55,25 @@ terminal upstream forwarder. Each stage can answer the query outright
    seeded at migration so those names never reach an upstream; every
    write to one of them is refused with `409` at the API layer instead.
    Future DHCP-registered hostnames register into a zone at this stage.
+   Two zone types are the exception that proves the rule — a `forwarder`
+   and a `stub` claim a suffix without holding any data for it, so
+   `Zone.Answer` returns `handled=false` and the query goes on to the next
+   stage deliberately and permanently. It is still never forwarded to the
+   *default* upstreams: the forwarder stage below routes it to that zone's
+   own, and passing through the cache on the way is the whole reason the
+   routing lives there rather than here. See Conditional routing below.
    See [`dashboard.md`](dashboard.md#zones) for the user-facing rules.
 6. **cache** — in-memory cache keyed on (qname, qtype), respecting upstream
    TTLs with configurable min/max clamps, negative caching, and
-   serve-stale-on-failure with background refresh.
+   serve-stale-on-failure with background refresh. An entry records no
+   route, so a change to the conditional routing table below purges the
+   suffixes it changed — see Conditional routing below.
 7. **upstream forwarder** — the terminal handler; sends unresolved queries
-   to configured upstreams with a selectable strategy (race today; failover
-   and fastest planned).
+   to configured upstreams with a selectable strategy (`race`, `failover`
+   or `fastest` — see [`configuration.md`](configuration.md)). It also holds
+   the conditional routing table: a query under a suffix a `forwarder` or
+   `stub` zone claims goes to that zone's upstreams instead of the default
+   ones, and never falls back to them. See Conditional routing below.
 
 Stages implement a small `Handler`/`Middleware` Go interface
 (`internal/dnssrv`), so each one is unit-testable in isolation and new
@@ -166,7 +178,7 @@ in order:
 | Rcode | TSIG error | Means |
 |---|---|---|
 | `FORMERR` | — | not a single SOA question |
-| `NOTAUTH` | — | no zone at that apex, the zone isn't type `secondary`, or it's disabled |
+| `NOTAUTH` | — | no zone at that apex, the zone is a type with no master to re-ask (`primary`, `forwarder`, `internal` — a `secondary` and a `stub` both pull from one), or it's disabled |
 | `REFUSED` | — | the peer's address isn't one of the zone's configured `primaries` |
 | `REFUSED` | `BADKEY` | the TSIG names an unknown key or algorithm |
 | `REFUSED` | `BADSIG` | the TSIG signature didn't verify |
@@ -275,6 +287,260 @@ timer picks the zone up regardless of how a round ends, which is what keeps
 NOTIFY a delivery optimisation rather than something dnsaur has to get
 right to stay correct.
 
+## Conditional routing (`forwarder` and `stub` zones)
+
+Two zone types claim a suffix without holding any data for it. A
+**forwarder** sends every query beneath its apex to addresses the operator
+typed into `forward_to`; a **stub** sends them to nameservers it *fetched*
+from a master. One routing mechanism with two sources for the same list of
+addresses — a stub is a forwarder whose upstreams are derived rather than
+typed. `zones.ParseForwardTo` and `zones.StubUpstreams` are the two
+producers; `internal/app`'s `conditionalRoutes` is the one consumer.
+
+### Why the routing lives in the forwarder, not the zones stage
+
+The obvious shape is for the zones stage to dispatch: it has already found
+the zone, and the zone declares where its queries go. **That loses caching
+entirely.** The pipeline order is `zones → cache → upstream forwarder`, and
+a stage that answers short-circuits every stage after it — so a zones stage
+that resolved a forwarder zone's query itself would never be seen by the
+cache, and every repeat query to an internal suffix would go back out to the
+corporate resolver. Instead `Zone.Answer` (`internal/zones/answer.go`)
+returns `handled=false` for both types, the query falls through to the cache
+and then to the terminal forwarder, and the forwarder is where the suffix is
+matched. That fall-through is deliberate and permanent, not a stage waiting
+to be written. It also means such a query is logged `forwarded`, with the
+conditional upstream's address, rather than `authoritative` — no zone
+answered it.
+
+The other candidate shape — rebuilding the whole `upstream.Forwarder`
+whenever a zone changes — is the smallest diff and the worst behaviour.
+Every record edit calls `reloadZones`, and a rebuild discards each
+upstream's latency EWMA, its 15-second backoff after three consecutive
+failures, and the RFC 9520 failure cache. Editing a record would degrade
+resolution.
+
+So the table is swapped rather than rebuilt around.
+`Forwarder.SetConditional` (`internal/upstream/forwarder.go`) builds a
+fresh, immutable `condTable` and stores it behind an `atomic.Pointer`:
+`pick` loads that pointer and takes no lock, so a query never waits on a
+swap and the table it is reading can never be mutated underneath it — the
+shape `zones.Resolver`'s snapshot uses, for the same reason. Writers *do*
+take a lock, because a swap is a read-modify-write: the outgoing table is
+read so that **an address already in it keeps its `*up`**, and with it its
+latency history and its health backoff. Without that reuse a swap would
+preserve health state for the default upstreams and discard it for exactly
+the conditional routes a zone edit is about. One shared `filter.DomainSet`
+across every suffix makes matching deterministic longest-suffix routing, so
+`internal.corp.example` beats `corp.example` when both are claimed.
+
+`App.ReloadZones` rebuilds the table from the served snapshot after every
+zone reload, in that order: the table is derived from the snapshot, so
+pushing it first would publish the previous reload's routes. It walks the
+snapshot rather than the store because a stub's upstreams are derived from
+its NS records and their glue, which only the snapshot carries. A settings
+change that rebuilds the forwarder installs the table onto the new one
+*before* it goes live, for the same reason — a window in which every claimed
+suffix resolves through the default upstreams is a window in which a
+split-horizon name is answered by the public internet.
+
+**Only enabled zones contribute.** Disabling a forwarder or a stub releases
+its suffix back to the default upstreams, which is what "disabled" means on
+every other path: dnsaur gives up the name, so the internet's answer applies.
+
+### A claimed suffix SERVFAILs; it never falls through
+
+**A misconfigured forwarder or stub makes its whole suffix stop resolving,
+deliberately.** A zone that claims a suffix keeps its claim when its
+upstreams are down or absent: `pick` returns that suffix's list and never
+falls back to the defaults, so when every address in it fails — or there are
+none — the handler returns an error, the query is answered `SERVFAIL`, and
+that failure is negatively cached for 30 seconds per (qname, qtype) per RFC
+9520.
+
+This is the rule an expired secondary already follows (`Zone.Serving`),
+applied to a configuration failure instead of a data one. A server that
+cannot answer for a name it has claimed must not let the public internet
+answer instead: for a split-horizon zone, falling through would resolve an
+internal name to whatever the outside world says it is, which is the leak
+zones exist to close.
+
+**`pick` is necessary and is not sufficient, because the cache is above
+it.** A cache entry is keyed on (qname, qtype) and records nothing about
+which route produced it, so a hit is served without `pick` being reached at
+all — and the name you are claiming is, by the nature of the type, one that
+resolves publicly right now, so the public answer is in the cache at the
+moment you claim it. Left alone, that entry keeps being served; and when the
+claimed suffix's own upstreams then fail, the cache serves it **stale** —
+`NOERROR`, TTL 30, for `cache.serve_stale_for` past its own TTL — where this
+section requires `SERVFAIL`.
+
+So installing the routing table also purges it. `App.installConditional`
+calls `Cache.Purge` for every suffix whose route set changed — added,
+removed or altered — *after* the install, never before, since purging first
+would leave a window in which a miss re-fills the cache from the defaults.
+The purge also bumps an epoch, which does two jobs a sweep of the map alone
+cannot. `put` compares against it, so a lookup that reached the upstreams
+before the claim existed cannot store its pre-claim answer after the sweep
+has passed; and it is part of the singleflight key, so a query arriving
+*after* the purge is not collapsed onto a leader that went out before it and
+handed that leader's answer from the old route. It is scoped to what changed:
+every record edit reinstalls this table, and purging on each would throw away
+exactly the answers conditional routing exists to cache.
+
+`Purge` is a linear scan of the cache once per changed suffix, and it holds
+the cache's single mutex throughout — so it stalls the query path for that
+long, not just the purging goroutine. Measured against a full 10,000-entry
+cache: ~0.6 ms for one changed suffix, ~7 ms for a hundred, ~18 ms for five
+hundred. At the documented scale (a homelab's single-digit zone count) that
+is nothing, and it only runs when routing actually changed. An index from
+suffix to keys would be the answer if hundreds of forwarder zones ever met a
+large cache.
+
+Two things that follow, and are worth having stated:
+
+- **The mirror case is closed by the same code.** Disabling or deleting a
+  forwarder releases its suffix, and the internal answers cached under it go
+  with it — so a name that should now resolve publicly does, rather than
+  answering from behind the corporate resolver until the entry ages out.
+- **Serve-stale still applies to the zone's own answers, and that is not a
+  fall-through.** Once a claimed suffix has answers of its own in the cache,
+  an upstream failure serves those stale exactly as it would for any other
+  forwarded name. What can never happen is the outside world's answer being
+  served for a claimed name.
+- **The residual window is one upstream round trip, not one cache lookup.**
+  What survives is a query that was already somewhere in the pipeline when
+  the routing changed: one that had read the cache and *hit* (answered from
+  what it read — that one really is a lookup wide); one that had read it and
+  *missed* and is out at the old route, answered a round trip later; and one
+  landing between `SetConditional` and `Purge`, which sees the new table and
+  the old entries. All three are bounded by the forwarder's 2s timeout, and
+  none of them can *store* anything — `put` refuses an entry whose epoch has
+  moved on, and the singleflight key carries the epoch so a query arriving
+  after the purge cannot join a lookup dispatched before it. What leaks is one
+  in-flight answer to one client, once; the stored state is clean the instant
+  the purge returns. Closing even that would mean serialising the cache read
+  against the routing swap, which is a lock on the query path.
+
+There are three ways into that state and they are all the same state:
+
+- a `forwarder` whose `forward_to` is empty, which the API accepts on
+  purpose rather than refusing;
+- a `forwarder` whose stored `forward_to` will not parse — a hand-edited
+  row, since the API validates on write — which fails closed to no upstreams
+  rather than open to an unintended destination;
+- a `stub` that has not fetched yet, or whose every nameserver turned out to
+  be unusable.
+
+The dashboard states this consequence on the zone page (see
+[`dashboard.md`](dashboard.md#forwarder-zones)) without explaining it; the
+explanation is here.
+
+### The stub's two queries, and the glue rule
+
+A stub is a secondary that keeps only the apex. `zones.StubFetcher.Fetch`
+(`internal/zones/stub.go`) asks its master two ordinary questions —
+`<apex> SOA` for the serial and the schedule, `<apex> NS` for the delegation
+with glue in ADDITIONAL — and installs what comes back through the same
+`DiffRecords`/`ReplaceRecords` a transfer installs a zone with. **Not an
+AXFR, and that is the point rather than an optimisation**: a stub needs no
+`allow_transfer` permission on the far end, so it works against a master
+that will not transfer its zone to anybody. Both queries are signed when the
+zone names a TSIG key, since a master that requires TSIG on ordinary queries
+would otherwise refuse the fetch, and both re-ask over TCP on a truncated
+answer — a delegation with several nameservers and glue for each is exactly
+the shape that overflows a 512-byte UDP answer, and a client that believed
+`TC=1` would lose every address silently.
+
+**An in-zone nameserver is never resolved.** `ns1.corp.example` ends with
+the apex of zone `corp.example`, so resolving it would match that stub's own
+suffix, route into the stub, and need the address being resolved — a hang,
+not a slow failure. DNS's own answer is glue, and it is the right one here:
+the address comes from the master's ADDITIONAL section or the nameserver is
+unusable. An out-of-zone nameserver cannot re-enter the zone, so it is
+resolved normally, through the same `net.Resolver` a hostname in `primaries`
+is looked up through, and its addresses are stored beside it exactly as glue
+is.
+
+**This is why dnsaur emits glue for its own apex NS set.** A master that
+answers an apex `NS` query with names and no addresses leaves a stub with
+nothing it is allowed to use: it may not resolve an in-zone nameserver, so it
+skips every one and ends up claiming a suffix it cannot route. That is what
+`ns1.google.com` avoids by returning A and AAAA for all four of `google.com`'s
+nameservers, and it is RFC 1035 §3.3.11's additional-section processing.
+dnsaur did it for referrals — where glue is load-bearing because the child is
+the only one who could answer — and not for its own apex, which made it
+unusable as a stub's master until `Zone.attachNSGlue` closed the gap.
+
+Only in-zone addresses go in, and `a.iana-servers.net` shows both halves of
+that rule in a single response: asked for `iana-servers.net NS` it answers with
+four nameservers and attaches A and AAAA for `a.`, `b.` and `c.iana-servers.net`
+— and nothing at all for `ns.icann.org`. It is authoritative for the zone and
+ICANN runs that host, and it still declines to vouch for an address outside
+the zone. (Its empty additional section for `example.com` looks like the same
+rule but does not prove it: a server with `minimal-responses` set would answer
+identically.)
+
+A nameserver with no usable address is skipped rather than failing the whole
+fetch — routing to the ones that worked beats SERVFAILing a suffix because
+one glue record was malformed — and if every one is skipped, the zone claims
+its suffix and SERVFAILs by the rule above. What gets stored is what
+`zones.StubUpstreams` reads back to rebuild the routing table on every zone
+reload; it takes no context and no resolver, so it *cannot* query, which is
+what makes a reload free.
+
+Two consequences are worth stating because they stay invisible until they
+surprise someone:
+
+- **A stub's upstreams are always port 53.** Neither glue rdata nor an
+  address lookup carries a port, so `StubUpstreams` joins 53
+  unconditionally. `primaries` still accepts `host:port` — that port is for
+  the *fetch*, and a master on 5353 is fine — but a stub cannot route to a
+  nameserver on a non-standard port.
+- **A stub's records are read-only through the API** (`409` on every write),
+  and the reason is stronger than a secondary's rather than milder. A
+  secondary's hand write is served authoritatively until the next transfer
+  deletes it; a stub answers from none of its records, but `StubUpstreams`
+  reads them back, so a hand-written apex NS record would silently redirect
+  the whole claimed suffix until the next fetch undid it.
+
+### A stub does not expire
+
+A secondary past its SOA expire stops answering (RFC 1034 §4.3.5): it holds
+its primary's data on loan, past the expire it can no longer confirm what it
+holds, and serving it anyway is worse than serving nothing. **A stub does
+not expire, and the divergence is deliberate.** `Zone.Serving`'s expiry
+check is `secondary`-only, and `StubFetcher.install` never writes an
+`expires_at` in the first place.
+
+A stub serves no data at all. Its NS set is *routing information* — where to
+ask — so an old-but-working nameserver beats a self-inflicted SERVFAIL, and
+if those nameservers really are gone the query SERVFAILs anyway through the
+path above. The outcome is the same when it should be, and better when it
+should not. "Both pull from a master, so both expire" is a sentence that
+writes itself and does not follow; `Zone.Serving` carries the warning at the
+line somebody widening it would edit.
+
+### Refresh is `secondary || stub`, never a forwarder
+
+One scheduler drives both types that pull (`zones.Refresher`,
+`internal/zones/refresh.go`): a secondary by AXFR, a stub by the two queries
+above, each on the `refresh`/`retry` interval its own SOA publishes, floored
+at 60 seconds so a peer that publishes a zero cannot turn the schedule into
+a busy loop against itself. `refreshed_at`, `last_attempt` and `last_error`
+are written the same way for both, which is what makes a stub's state
+readable after a restart. Only the third SOA timer, `expire`, is
+type-specific — see above.
+
+A forwarder is not in that set and cannot be: it has no master and nothing
+to fetch, so refreshing it would be a button that does nothing.
+`POST /zones/{id}/refresh` refuses it with `400`. One predicate answers both
+questions the API asks — which types may set `primaries`/`tsig_key_id`, and
+which may be refreshed — because they are the same question, asked of the
+zone's master; it is spelled `pullsFromAMaster` in `internal/api` and again
+in `internal/zones`, deliberately not shared, since one answers about a type
+an HTTP client just typed and the other about a stored row.
+
 ## Package map
 
 | Package | Responsibility |
@@ -285,9 +551,9 @@ right to stay correct.
 | `internal/dnssrv` | DNS listeners, the `Handler`/`Middleware` pipeline abstraction, panic recovery, and TSIG (RFC 8945): a `dns.TsigProvider` that verifies signed messages against the stored keys on every message, plus `RequireTSIG` for the paths that must refuse an unsigned one; also the AXFR/IXFR intercept that routes a transfer's raw `ResponseWriter` to a `Transfers` handler ahead of the pipeline, and the NOTIFY opcode intercept that routes to a `Notifies` handler the same way (see Zone transfers and Zone NOTIFY above) |
 | `internal/clients` | Client registry: IP/CIDR matching to client + group |
 | `internal/filter` | Blocklist/allowlist engine, list parsing, per-client-group rules, background refresh |
-| `internal/zones` | Authoritative zones: zone cut and deepest-match lookup, apex-relative names, RR construction from stored presentation-format rdata, and the NODATA/NXDOMAIN/wildcard/CNAME/referral answering rules; also `TransferServer`, which answers AXFR/IXFR requests the `allow_transfer` ACL permits; `NotifyServer`, which answers inbound NOTIFY and probes/transfers on it; and `Notifier`, which drives the outbound NOTIFY queue (see Zone NOTIFY above) |
+| `internal/zones` | Authoritative zones: zone cut and deepest-match lookup, apex-relative names, RR construction from stored presentation-format rdata, and the NODATA/NXDOMAIN/wildcard/CNAME/referral answering rules; also `TransferServer`, which answers AXFR/IXFR requests the `allow_transfer` ACL permits; `NotifyServer`, which answers inbound NOTIFY and probes/transfers on it; and `Notifier`, which drives the outbound NOTIFY queue (see Zone NOTIFY above); and, for the two zone types that route rather than answer, `ParseForwardTo`/`StubUpstreams` (the addresses a claimed suffix goes to) and `StubFetcher` (the SOA/NS fetch and the glue rule) — see Conditional routing above |
 | `internal/cache` | In-memory DNS response cache (TTL clamps, negative caching, serve-stale) |
-| `internal/upstream` | Upstream forwarders and selection strategy |
+| `internal/upstream` | Upstream forwarders and selection strategy; also the conditional routing table (`SetConditional`) that sends a suffix a `forwarder` or `stub` zone claims to that zone's own upstreams — see Conditional routing above |
 | `internal/qlog` | Async query logging and retention pruning |
 | `internal/stats` | Hourly stats rollups from the query log |
 | `internal/store` | Storage interfaces plus SQLite/Postgres implementations, migrations, settings |

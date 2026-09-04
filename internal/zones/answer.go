@@ -17,12 +17,14 @@ const maxCNAMEChase = 8
 // whether the zone answered at all.
 //
 // handled is false only for zone types that name somewhere else to ask
-// rather than holding data (forwarder, stub — Milestone D); for those, m is
-// left untouched for the rest of the pipeline. Every other type answers,
-// and that is the whole difference between a zone and the override list it
-// replaced: inside a zone we hold, a query never leaves. A name we do not
-// have is an authoritative NXDOMAIN carrying our SOA, not a lookup upstream
-// that leaks an internal name and lets a public record shadow it.
+// rather than holding data (forwarder, stub); for those, m is left
+// untouched for the rest of the pipeline, which routes the query to that
+// zone's own upstreams through the conditional table — see
+// Resolver.Middleware. Every other type answers, and that is the whole
+// difference between a zone and the override list it replaced: inside a
+// zone we hold, a query never leaves. A name we do not have is an
+// authoritative NXDOMAIN carrying our SOA, not a lookup upstream that leaks
+// an internal name and lets a public record shadow it.
 //
 // The order below is RFC 1034 §4.3.2:
 //
@@ -68,6 +70,23 @@ func (z *Zone) Answer(m *dns.Msg, qname string, qtype uint16, nowMs int64) (hand
 //     ExpiresAt is 0 until a transfer records a deadline, which is why the
 //     comparison is guarded rather than being nowMs >= ExpiresAt outright.
 //
+// **A stub must never be added to that type check, and this is the line
+// somebody widening it would edit.** It looks like it belongs: a stub pulls
+// from a master, on the same SOA schedule, through the same scheduler, and
+// "both pull from a master, so both expire" is a sentence that writes itself.
+// It does not follow. A secondary serves its master's *data* and past the
+// expire cannot vouch for what it holds; a stub serves no data at all — its NS
+// set is routing information, so an old-but-working nameserver beats a
+// self-inflicted SERVFAIL, and if those nameservers really are gone the query
+// fails anyway through the forwarder's own path. Same outcome when it should
+// be, better when it should not (§9.11.8, and see StubFetcher.install for the
+// other end of it: a stub is never given an expires_at in the first place).
+//
+// Nothing nearby will remind you of that. Answer returns handled=false for a
+// stub *before* it consults Serving, so this function read in isolation has no
+// visible connection to the type at all. TestAStubDoesNotExpire is what fails
+// if the check is widened.
+//
 // What such a zone must not do is answer NXDOMAIN + SOA. That is an
 // authoritative claim that the name does not exist — RFC 8020 makes it a
 // claim about everything beneath it too — so an empty secondary would
@@ -90,6 +109,8 @@ func (z *Zone) Answer(m *dns.Msg, qname string, qtype uint16, nowMs int64) (hand
 // to know is that disabling a split-horizon zone exposes its names to public
 // answers rather than making them fail.
 func (z *Zone) Serving(nowMs int64) bool {
+	// Secondary only. See above for the type that looks like it belongs here
+	// and must not be added: a stub does not expire (§9.11.8).
 	if !strings.EqualFold(z.Type, "secondary") {
 		return true
 	}
@@ -194,7 +215,57 @@ func (z *Zone) fill(m *dns.Msg, fqdn string, recs []store.ZoneRecord, qtype uint
 		m.Answer = append(m.Answer, rr)
 		n++
 	}
+	// The qtype test is a shortcut, not a gate: attachNSGlue only reacts to
+	// NS records in ANSWER, and no other qtype puts one there. It saves a
+	// scan of ANSWER on every successful query, so removing it changes
+	// nothing observable — do not read it as load-bearing.
+	if n > 0 && qtype == dns.TypeNS {
+		z.attachNSGlue(m)
+	}
 	return n > 0
+}
+
+// attachNSGlue does RFC 1035 §3.3.11's additional-section processing for the
+// NS records just written into m.Answer: a client handed a nameserver's name
+// and no address has to go and find one.
+//
+// referral covers the delegation case, where glue is load-bearing because the
+// child is the only one who could answer and we have just told the client to
+// ask it. This covers NS records that reach the ANSWER section instead — the
+// zone's own apex set, and (pre-existing, see fill) a wildcard NS synthesised
+// for a name that does not exist. Neither is a cut, so neither reaches
+// referral's walk. Every real master does this: ns1.google.com returns A and
+// AAAA for all four of google.com's nameservers.
+//
+// It is what makes a stub zone workable. A stub takes an in-zone nameserver's
+// address from glue and never resolves it, because resolving ns1.corp.example
+// for zone corp.example would route back into the zone being reached (§9.11.7)
+// — so a master that omits glue leaves the stub with no usable nameserver at
+// all. Omitting it here is what made dnsaur unusable as a stub's master.
+//
+// Only in-zone addresses go in, the same rule referral obeys. a.iana-servers.net
+// shows both halves in a single response: asked for iana-servers.net NS it
+// returns A and AAAA for a., b. and c.iana-servers.net and nothing at all for
+// ns.icann.org, which it is not authoritative for. An address for a name
+// outside this zone is not ours to vouch for, even when we hold one.
+func (z *Zone) attachNSGlue(m *dns.Msg) {
+	seen := make(map[string]bool, len(m.Answer))
+	for _, rr := range m.Answer {
+		ns, ok := rr.(*dns.NS)
+		if !ok {
+			continue
+		}
+		// Canonicalised because rdata is stored verbatim and DNS compares
+		// names case-insensitively: two apex NS rows naming one host in
+		// different case both pass the RRSet checks on write, and a raw-string
+		// key would emit that host's address twice under two spellings.
+		key := dns.CanonicalName(ns.Ns)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		m.Extra = append(m.Extra, z.glue(ns.Ns)...)
+	}
 }
 
 // chase appends the CNAME and, when its target is inside this zone,

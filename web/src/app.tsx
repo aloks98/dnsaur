@@ -1,10 +1,11 @@
 import { Navigate, Route, Routes } from "react-router";
-import { Spinner, Toaster } from "@e412/rnui-react";
+import { Spinner, Toaster, TooltipProvider } from "@e412/rnui-react";
 import { AppShell } from "./components/app-shell";
 import { ApiUnreachableBanner } from "./components/api-unreachable-banner";
 import { ErrorBoundary } from "./components/error-boundary";
 import { useMe, useSetupState } from "./hooks/use-auth";
 import { useTheme } from "./lib/theme";
+import { TOOLTIP_DELAY_MS } from "./lib/tooltip";
 import { Account } from "./pages/account";
 import { Dashboard } from "./pages/dashboard";
 import { FilteringLayout } from "./pages/filtering";
@@ -59,7 +60,12 @@ export function App() {
   const { theme } = useTheme();
 
   return (
-    <>
+    // Wraps the tree rather than sitting beside the Toaster below, which is
+    // the one thing about this provider that is not a formality: it hands
+    // its delay down through context, so one mounted as a sibling of the
+    // routes would be inert and every tooltip in the app would quietly keep
+    // Base UI's own default.
+    <TooltipProvider delay={TOOLTIP_DELAY_MS}>
       {/* The outer net. AppShell has its own per-route boundary (so one
           broken page keeps the chrome usable), but that one covers only the
           Outlet: the always-mounted top nav and command palette, and the
@@ -107,6 +113,6 @@ export function App() {
       {/* One Toaster for the whole app — mounted here (not per-shell) so
           unauthenticated screens (Setup, Login) can toast too. */}
       <Toaster theme={theme} />
-    </>
+    </TooltipProvider>
   );
 }

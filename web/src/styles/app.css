@@ -46,6 +46,11 @@
   /* The design's own name for the "stale" tone. rnui calls it --warning;
      this alias means components can spell it the way the design spec does
      without a second source of truth. */
+  /* The tooltip surface. Registered here for the same reason as the rest of
+     this block — rnui maps no such token, because rnui has no such idea: its
+     tooltip is `bg-foreground`, which flips. See dnsaur-theme.css. */
+  --color-tooltip: var(--tooltip);
+  --color-tooltip-foreground: var(--tooltip-foreground);
   --color-warn: var(--warning);
   --color-warning-solid-foreground: var(--warning-solid-foreground);
 }

@@ -35,6 +35,7 @@ function zone(overrides: Partial<Zone> = {}): Zone {
     last_xfr_peer: "",
     last_xfr_error: "",
     notify_to: "",
+    forward_to: "",
     created_at: Date.now() - 86_400_000,
     modified_at: Date.now() - 60_000,
     ...overrides,
@@ -2155,4 +2156,444 @@ test("shows the row for a secondary too", async () => {
 
   expect(screen.getByText("10.0.0.9")).toBeInTheDocument();
   expect(await screen.findByText("all 1 current")).toBeInTheDocument();
+});
+
+// ── A forwarder zone ──────────────────────────────────────────────────────
+// A forwarder answers nothing of its own: it claims a suffix and sends every
+// query beneath it to the addresses typed into `forward_to`. So its page is
+// short by design — header, one row, zone actions — and every band that
+// assumes authored data is gone. The tests below are mostly *absences*,
+// because that is where the gating actually lives: a test that only asserted
+// the FORWARD TO row is present would pass just as happily with the SOA form
+// still under it.
+
+/** A forwarder with two upstreams, in the canonical spelling the server
+ * reads `forward_to` back in (port always explicit). */
+function forwarder(overrides: Partial<Zone> = {}): Zone {
+  return zone({
+    id: 1,
+    name: "corp.example",
+    type: "forwarder",
+    forward_to: "10.0.0.1:53, 10.0.0.2:5353",
+    ...overrides,
+  });
+}
+
+test("a forwarder shows its upstreams in the FORWARD TO row, counted", async () => {
+  renderZoneDetail({ zone: forwarder() });
+  await screen.findByText("Forward to");
+
+  expect(screen.getByText("Forward to")).toBeInTheDocument();
+  expect(screen.getByText("10.0.0.1:53, 10.0.0.2:5353")).toBeInTheDocument();
+  expect(screen.getByText("2 upstreams")).toBeInTheDocument();
+});
+
+// The line that stops a three-element page reading as one that failed to
+// load. It is also the single most surprising thing about the type: a
+// claimed suffix does *not* fall back to the default resolvers, so a
+// forwarder whose upstreams are all down takes its whole suffix down with
+// it. §9.11.5, and the reason the sentence is on screen rather than in docs/.
+test("a forwarder states the SERVFAIL consequence of claiming its suffix", async () => {
+  renderZoneDetail({ zone: forwarder() });
+  await screen.findByText("Forward to");
+
+  expect(
+    screen.getByText(/queries for it get SERVFAIL — they do not fall through/i),
+  ).toBeInTheDocument();
+});
+
+// Every band on this page assumes a zone that holds records. A forwarder
+// holds none, so all of them go — including the records grid itself, which
+// is the one a stub keeps.
+test("a forwarder has no SOA band, no records grid and no record controls", async () => {
+  renderZoneDetail({ zone: forwarder(), records: [record({ id: 1, name: "bifrost" })] });
+  await screen.findByText("Forward to");
+
+  // The SOA band is the specific regression: the old
+  // `isSecondary ? <TransferBand/> : <SoaBand/>` put a forwarder in the else
+  // branch, offering an editable SOA form for a zone whose SOA nobody reads.
+  expect(screen.queryByRole("button", { name: /^soa$/i })).not.toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: /^save soa$/i })).not.toBeInTheDocument();
+  // No grid at all — not an empty one. Even a record that somehow exists on
+  // the row is not listed, because a forwarder serves nothing from records.
+  expect(screen.queryByTestId("zone-record-list")).not.toBeInTheDocument();
+  expect(screen.queryByText("bifrost")).not.toBeInTheDocument();
+  expect(screen.queryByLabelText(/filter by name/i)).not.toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: /add record/i })).not.toBeInTheDocument();
+  expect(screen.queryByTestId("record-form-row")).not.toBeInTheDocument();
+  // §9.5.3 refuses a transfer of a forwarder with NOTAUTH regardless of its
+  // ACL, and checkZoneTransferConfig 400s both fields on one outright.
+  expect(screen.queryByRole("button", { name: /^edit allow transfer$/i })).not.toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: /^edit notify targets$/i })).not.toBeInTheDocument();
+});
+
+// Refresh is `secondary || stub`, never a forwarder: a forwarder has no
+// master and nothing to fetch, and POST /zones/{id}/refresh answers it 400
+// ("only secondary and stub zones pull from a master"). Export goes for a
+// different reason — there is nothing under the apex to render into a file.
+test("a forwarder offers neither Refresh now nor Export, but keeps the zone actions", async () => {
+  renderZoneDetail({ zone: forwarder() });
+  await screen.findByText("Forward to");
+
+  expect(screen.queryByRole("button", { name: /refresh now/i })).not.toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: /^export$/i })).not.toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: /^import$/i })).not.toBeInTheDocument();
+  expect(screen.getByRole("button", { name: /disable zone/i })).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: /delete zone/i })).toBeInTheDocument();
+});
+
+test("editing the FORWARD TO row PATCHes forward_to and returns to read mode", async () => {
+  const user = userEvent.setup();
+  let body: unknown;
+  renderZoneDetail({ zone: forwarder() });
+  server.use(
+    http.patch("/api/v1/zones/1", async ({ request }) => {
+      body = await request.json();
+      return new HttpResponse(null, { status: 204 });
+    }),
+  );
+  await screen.findByText("Forward to");
+
+  await user.click(screen.getByRole("button", { name: /^edit upstreams$/i }));
+  const field = screen.getByLabelText(/^forward to$/i);
+  // Seeded with the saved value, so an edit is an edit rather than a retype.
+  expect(field).toHaveValue("10.0.0.1:53, 10.0.0.2:5353");
+  await user.clear(field);
+  await user.type(field, "10.0.0.3");
+  await user.click(screen.getByRole("button", { name: /^save$/i }));
+
+  await waitFor(() => expect(body).toEqual({ forward_to: "10.0.0.3" }));
+  await waitFor(() => expect(screen.queryByLabelText(/^forward to$/i)).not.toBeInTheDocument());
+});
+
+// "" is a configuration, not a gap — the zone still claims the suffix and
+// SERVFAILs it — so the server accepts it and this row must not invent a
+// client-side rule the server does not have.
+test("a forwarder with no upstreams says so and can still be saved empty", async () => {
+  const user = userEvent.setup();
+  let body: unknown;
+  renderZoneDetail({ zone: forwarder({ forward_to: "" }) });
+  server.use(
+    http.patch("/api/v1/zones/1", async ({ request }) => {
+      body = await request.json();
+      return new HttpResponse(null, { status: 204 });
+    }),
+  );
+  await screen.findByText("Forward to");
+
+  expect(screen.getByText("none")).toBeInTheDocument();
+  expect(screen.queryByText(/upstreams$/)).not.toBeInTheDocument();
+
+  await user.click(screen.getByRole("button", { name: /^edit upstreams$/i }));
+  await user.click(screen.getByRole("button", { name: /^save$/i }));
+  await waitFor(() => expect(body).toEqual({ forward_to: "" }));
+});
+
+test("one upstream is counted in the singular", async () => {
+  renderZoneDetail({ zone: forwarder({ forward_to: "10.0.0.1:53" }) });
+  await screen.findByText("Forward to");
+
+  expect(screen.getByText("1 upstream")).toBeInTheDocument();
+});
+
+// ── A stub zone ───────────────────────────────────────────────────────────
+// A stub claims a suffix and routes it too, but fetches the addresses rather
+// than being told them: an SOA and an NS query with glue against its master,
+// not an AXFR. So it keeps the records grid — a fetched NS set is worth
+// seeing — read-only, and its MASTER row carries the state of the fetch.
+// Every one of its states carries its own date: an error with no date is a
+// claim about the present made by an unknown past.
+
+/** A stub whose last fetch landed 26 minutes ago. */
+function stub(overrides: Partial<Zone> = {}): Zone {
+  return zone({
+    id: 1,
+    name: "ad.corp.example",
+    type: "stub",
+    primaries: "10.0.0.9:53",
+    soa_refresh: 25200,
+    soa_retry: 3600,
+    refreshed_at: Date.now() - 26 * 60_000,
+    ...overrides,
+  });
+}
+
+const NS_SET = [
+  record({ id: 1, name: "@", type: "NS", ttl: 86400, rdata: "dc01.ad.corp.example." }),
+  record({ id: 2, name: "@", type: "NS", ttl: 86400, rdata: "dc02.ad.corp.example." }),
+];
+
+test("a stub shows its master and dates the NS set it fetched", async () => {
+  renderZoneDetail({ zone: stub(), records: NS_SET });
+  await screen.findByText("ad.corp.example");
+
+  expect(screen.getByText("Master")).toBeInTheDocument();
+  expect(screen.getByText("10.0.0.9:53")).toBeInTheDocument();
+  expect(screen.getByText("NS set fetched 26m ago")).toBeInTheDocument();
+});
+
+// The NS set is the whole point of the type, so it is listed — but it came
+// off the wire, and the next fetch replaces it wholesale (DiffRecords in
+// StubFetcher.Fetch), so nothing here may be edited.
+test("a stub lists its NS set, read-only", async () => {
+  renderZoneDetail({ zone: stub(), records: NS_SET });
+  await screen.findByText("ad.corp.example");
+
+  const rows = recordRows();
+  expect(rows).toHaveLength(2);
+  expect(within(rows[0]).getByText("dc01.ad.corp.example.")).toBeInTheDocument();
+  expect(within(rows[0]).queryByRole("button", { name: /^edit/i })).not.toBeInTheDocument();
+  expect(within(rows[0]).queryByRole("button", { name: /^delete/i })).not.toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: /add record/i })).not.toBeInTheDocument();
+  expect(screen.queryByTestId("record-form-row")).not.toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: /^import$/i })).not.toBeInTheDocument();
+  expect(screen.getByText(/fetched · read-only/i)).toBeInTheDocument();
+});
+
+test("a stub has no SOA band, no record filter, no allow-transfer row and no notify row", async () => {
+  renderZoneDetail({ zone: stub(), records: NS_SET });
+  await screen.findByText("ad.corp.example");
+
+  // Same regression as the forwarder's: the else branch would have offered
+  // an editable SOA form for an SOA the master owns and the next fetch
+  // overwrites (StubFetcher.Fetch writes all seven fields).
+  expect(screen.queryByRole("button", { name: /^soa$/i })).not.toBeInTheDocument();
+  // The filter row is dropped for *both* routing types, and asserting it on
+  // the forwarder alone left half the gate deletable with the suite green —
+  // a forwarder has no grid to filter, so `!isForwarder` there would look
+  // right and silently give a stub a filter over three rows that are all
+  // named "@" and all of type NS.
+  expect(screen.queryByLabelText(/filter by name/i)).not.toBeInTheDocument();
+  expect(screen.queryByLabelText(/filter by record type/i)).not.toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: /^edit allow transfer$/i })).not.toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: /^edit notify targets$/i })).not.toBeInTheDocument();
+});
+
+// Refresh is `secondary || stub` — a stub has a master and something to
+// fetch from it, which is exactly the condition the API's own gate uses.
+// Export stays: a fetched delegation is worth reading out.
+test("a stub can be refreshed and exported", async () => {
+  renderZoneDetail({ zone: stub(), records: NS_SET });
+  await screen.findByText("ad.corp.example");
+
+  expect(screen.getByRole("button", { name: /refresh now/i })).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: /^export$/i })).toBeInTheDocument();
+});
+
+test("Refresh now on a stub fetches, and reports it as a fetch rather than a transfer", async () => {
+  const user = userEvent.setup();
+  const success = vi.spyOn(toast, "success").mockImplementation(() => "");
+  renderZoneDetail({ zone: stub(), records: NS_SET });
+  server.use(
+    http.post("/api/v1/zones/1/refresh", () =>
+      HttpResponse.json({
+        primary: "10.0.0.9:53",
+        serial: 7,
+        records: 5,
+        refreshed_at: Date.now(),
+        expires_at: 0,
+      }),
+    ),
+  );
+  await screen.findByText("ad.corp.example");
+
+  await user.click(screen.getByRole("button", { name: /refresh now/i }));
+
+  await waitFor(() => expect(success).toHaveBeenCalledWith("Fetched 5 records from 10.0.0.9:53"));
+});
+
+// State two of three. The first fetch has not landed, so there is no set to
+// date — and the grid says which master is being asked, which is the only
+// other fact there is.
+test("a stub with no NS set yet says so and names the master", async () => {
+  renderZoneDetail({ zone: stub({ refreshed_at: 0 }), records: [] });
+  await screen.findByText("ad.corp.example");
+
+  expect(screen.getByText("no NS set yet")).toBeInTheDocument();
+  expect(screen.getByText("Fetching the NS set from 10.0.0.9:53")).toBeInTheDocument();
+});
+
+// State three. The error verbatim, the date of the attempt that produced it,
+// and the age of the set still being routed to — three facts, none of which
+// means anything without the other two.
+test("a failed stub fetch shows the error verbatim, dated, beside what is still being served", async () => {
+  renderZoneDetail({
+    zone: stub({
+      refreshed_at: Date.now() - 3 * 86_400_000,
+      last_error: "i/o timeout",
+      last_attempt: Date.now() - 12 * 60_000,
+    }),
+    records: NS_SET,
+  });
+  await screen.findByText("ad.corp.example");
+
+  expect(screen.getByText("Last fetch · 12m ago")).toBeInTheDocument();
+  expect(screen.getByTestId("stub-fetch-error")).toHaveTextContent("i/o timeout");
+  expect(screen.getByText("serving the NS set from 3d ago")).toBeInTheDocument();
+  // The note beside the value goes with it: the set is old, and saying only
+  // "NS set fetched 3d ago" would read as a healthy schedule.
+  expect(screen.getByText("NS set from 3d ago")).toBeInTheDocument();
+});
+
+// The one case where "still serving" would be a lie: nothing has ever been
+// fetched, so the zone claims its suffix with no addresses behind it and
+// SERVFAILs every name under it (see Refresher.firstAttempt).
+test("a stub that has never fetched does not claim to be serving an NS set", async () => {
+  renderZoneDetail({
+    zone: stub({
+      refreshed_at: 0,
+      last_error: "dial udp 10.0.0.9:53: connect: connection refused",
+      last_attempt: Date.now() - 90_000,
+    }),
+    records: [],
+  });
+  await screen.findByText("ad.corp.example");
+
+  expect(screen.getByText("Last fetch · 1m ago")).toBeInTheDocument();
+  expect(screen.getByTestId("stub-fetch-error")).toHaveTextContent(
+    "dial udp 10.0.0.9:53: connect: connection refused",
+  );
+  expect(screen.getByText("Answering nothing until the first fetch succeeds.")).toBeInTheDocument();
+  expect(screen.queryByText(/serving the NS set/i)).not.toBeInTheDocument();
+  // …and the empty grid does not claim to be fetching either. "Fetching the
+  // NS set from …" is present tense, and this stub is not fetching — its last
+  // attempt failed, which the MASTER row above states with its date. The
+  // artboard draws the present-tense line unconditionally; this is the one
+  // place this page departs from it, and without this assertion the departure
+  // could be undone with the whole suite green.
+  expect(screen.getByText("No NS set yet.")).toBeInTheDocument();
+  expect(screen.queryByText(/fetching the NS set from/i)).not.toBeInTheDocument();
+});
+
+// A stub is never *given* an expires_at (§9.11.8) — but a row retyped from
+// secondary to stub keeps the column, and internal/zones/refresh.go makes
+// this exact carve-out for exactly that reason. Reading it here would put a
+// zone that is routing perfectly well on screen as expired and not
+// answering, and send an operator hunting an outage that is not happening.
+test("a stale expires_at left on a stub is never rendered as an expiry", async () => {
+  renderZoneDetail({
+    zone: stub({
+      expires_at: Date.now() - 17 * 86_400_000,
+      refreshed_at: Date.now() - 26 * 60_000,
+    }),
+    records: NS_SET,
+  });
+  await screen.findByText("ad.corp.example");
+
+  expect(screen.getByText("Enabled")).toBeInTheDocument();
+  expect(screen.queryByText("Not answering")).not.toBeInTheDocument();
+  expect(screen.queryByText(/expired/i)).not.toBeInTheDocument();
+  expect(screen.getByText("NS set fetched 26m ago")).toBeInTheDocument();
+});
+
+test("editing the MASTER row PATCHes primaries and returns to read mode", async () => {
+  const user = userEvent.setup();
+  let body: unknown;
+  renderZoneDetail({ zone: stub(), records: NS_SET });
+  server.use(
+    http.patch("/api/v1/zones/1", async ({ request }) => {
+      body = await request.json();
+      return new HttpResponse(null, { status: 204 });
+    }),
+  );
+  await screen.findByText("ad.corp.example");
+
+  await user.click(screen.getByRole("button", { name: /^edit master$/i }));
+  const field = screen.getByLabelText(/^master$/i);
+  expect(field).toHaveValue("10.0.0.9:53");
+  await user.clear(field);
+  await user.type(field, "10.0.0.10");
+  await user.click(screen.getByRole("button", { name: /^save$/i }));
+
+  await waitFor(() => expect(body).toEqual({ primaries: "10.0.0.10" }));
+  await waitFor(() => expect(screen.queryByLabelText(/^master$/i)).not.toBeInTheDocument());
+});
+
+// The server 400s a stub with no primaries — it would never fetch, so it
+// would claim its suffix and SERVFAIL it forever. Caught here only to save
+// the round trip, which is the same reason the create row catches it.
+test("a stub's master cannot be cleared, and the empty value is never sent", async () => {
+  const user = userEvent.setup();
+  let patched = false;
+  renderZoneDetail({ zone: stub(), records: NS_SET });
+  server.use(
+    http.patch("/api/v1/zones/1", () => {
+      patched = true;
+      return new HttpResponse(null, { status: 204 });
+    }),
+  );
+  await screen.findByText("ad.corp.example");
+
+  await user.click(screen.getByRole("button", { name: /^edit master$/i }));
+  await user.clear(screen.getByLabelText(/^master$/i));
+  await user.click(screen.getByRole("button", { name: /^save$/i }));
+
+  expect(await screen.findByText(/where to fetch from/i)).toBeInTheDocument();
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  expect(patched).toBe(false);
+});
+
+// The server's own words, on the field's own row — the same treatment
+// allow_transfer and notify_to already get. The client checks nothing about
+// the grammar here (zones.ValidateForwardTo is the real check), so the
+// server's message is the only account of what was wrong.
+test("a server rejection of the upstreams is surfaced verbatim", async () => {
+  const user = userEvent.setup();
+  const error = vi.spyOn(toast, "error").mockImplementation(() => "");
+  renderZoneDetail({ zone: forwarder() });
+  server.use(
+    http.patch("/api/v1/zones/1", () =>
+      HttpResponse.json({ error: 'forward target "10.0.0.1:99999": bad port' }, { status: 400 }),
+    ),
+  );
+  await screen.findByText("Forward to");
+
+  await user.click(screen.getByRole("button", { name: /^edit upstreams$/i }));
+  await user.clear(screen.getByLabelText(/^forward to$/i));
+  await user.type(screen.getByLabelText(/^forward to$/i), "10.0.0.1:99999");
+  await user.click(screen.getByRole("button", { name: /^save$/i }));
+
+  await waitFor(() =>
+    expect(error).toHaveBeenCalledWith('forward target "10.0.0.1:99999": bad port'),
+  );
+});
+
+// The other half of the poll's bargain, on the type that most looks like it
+// should be watched and must not be. A forwarder's upstreams are typed in by
+// hand and nothing in the background ever writes to its row — no scheduler
+// wakes for it (pullsFromAMaster covers `secondary || stub` only) — so a poll
+// here would ask a question whose answer cannot change.
+test("a forwarder's page is read once and never again", async () => {
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  const paths = trackFetchedPaths();
+  renderZoneDetail({ zone: forwarder() });
+  await screen.findByText("Forward to");
+
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(5 * 60_000);
+  });
+
+  expect(paths.filter((p) => p === "/api/v1/zones/1")).toHaveLength(1);
+  // Read once and never rendered: the grid is dropped for a forwarder, so
+  // this is one request whose answer is always [] and always unused. Kept
+  // rather than gated because the gate would have to wait for the zone query
+  // to say what type it is, which is a second round trip's worth of
+  // sequencing to save one request that costs nothing.
+  expect(paths.filter((p) => p === "/api/v1/zones/1/records")).toHaveLength(1);
+});
+
+// The stub half of the same rule, and the reason it is not a forwarder's:
+// the scheduler fetches a stub's NS set on the SOA's own schedule, so its row
+// does change with nobody touching the page.
+test("a stub's page keeps asking, because its NS set arrives on a schedule", async () => {
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  const paths = trackFetchedPaths();
+  renderZoneDetail({ zone: stub({ refreshed_at: 0 }), records: [] });
+  await screen.findByText("Master");
+
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(5 * 60_000);
+  });
+
+  expect(paths.filter((p) => p === "/api/v1/zones/1").length).toBeGreaterThan(1);
 });

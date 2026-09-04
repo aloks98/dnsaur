@@ -529,3 +529,147 @@ func TestSecondaryZoneRecordsStayReadable(t *testing.T) {
 		}
 	}
 }
+
+// A stub zone's records are the NS set it fetched, and the next fetch
+// replaces the whole set through the same DiffRecords a transfer uses
+// (StubFetcher.Fetch) — so a hand write into one is deleted on the SOA's own
+// schedule, exactly as it is in a secondary, and with nothing to say so.
+//
+// It is worse here than in a secondary in one way. A stub's records are not
+// answered from at all; they are read back by StubUpstreams to rebuild the
+// conditional routing table on every zone reload. So a hand-written apex NS
+// record does not merely get served and then vanish — until the next fetch
+// it *changes where the whole suffix is routed*, which is the one effect an
+// operator writing a record here would least expect to have.
+//
+// This became reachable with Task 7: before the fetcher existed, a record
+// written into a stub simply stayed there.
+func TestRecordWritesIntoAStubAreRefused(t *testing.T) {
+	srv := newTestServer(t)
+	now := time.Now().UnixMilli()
+	zid, err := srv.store.Zones().AddZone(t.Context(), store.Zone{
+		Name: "ad.corp.example", Type: "stub", Enabled: true,
+		SOANS: "dc01.ad.corp.example", SOAMbox: "hostadmin.ad.corp.example",
+		SOASerial: 7, SOARefresh: 900, SOARetry: 300, SOAExpire: 604800,
+		SOAMinimum: 900, SOATTL: 900,
+		Primaries: "10.0.0.9", CreatedAt: now, ModifiedAt: now,
+	})
+	if err != nil {
+		t.Fatalf("seed stub: %v", err)
+	}
+	// A row the fetch would have installed, seeded through the store so there
+	// is something for PUT and DELETE to aim at.
+	rid, err := srv.store.Zones().AddRecord(t.Context(), store.ZoneRecord{
+		ZoneID: zid, Name: "@", Type: "NS", TTL: 86400, RData: "dc01.ad.corp.example.", Enabled: true,
+	})
+	if err != nil {
+		t.Fatalf("seed record: %v", err)
+	}
+
+	base := fmt.Sprintf("/api/v1/zones/%d", zid)
+	// All four entry points, the file import included: gating only the
+	// record routes would leave an import able to replace the whole set
+	// silently, which is the larger of the two writes.
+	for _, c := range []struct{ method, path, body string }{
+		{"POST", base + "/records", `{"name":"@","type":"NS","ttl":86400,"rdata":"dc99.ad.corp.example."}`},
+		{"PUT", fmt.Sprintf("%s/records/%d", base, rid), `{"name":"@","type":"NS","ttl":60,"rdata":"dc99.ad.corp.example."}`},
+		{"DELETE", fmt.Sprintf("%s/records/%d", base, rid), ""},
+		{"POST", base + "/file", `{"content":"@ 900 IN SOA dc01.ad.corp.example. h.ad.corp.example. 1 900 300 604800 900\n","dry_run":false}`},
+	} {
+		rec := srv.do(t, c.method, c.path, c.body)
+		if rec.Code != http.StatusConflict {
+			t.Errorf("%s %s: status = %d body = %s, want 409", c.method, c.path, rec.Code, rec.Body)
+		}
+		// Where they come from, in the words that are true of a stub. A stub
+		// does not transfer — it asks its master two ordinary questions,
+		// which is the whole reason the type exists apart from a secondary —
+		// so a message naming a transfer would point an operator at a
+		// mechanism that never runs here. Two strings this milestone has
+		// already had to fix for that exact reason.
+		if body := rec.Body.String(); !strings.Contains(body, "master") {
+			t.Errorf("%s %s: %s does not say where the records come from", c.method, c.path, body)
+		}
+		if body := rec.Body.String(); strings.Contains(body, "transfer") {
+			t.Errorf("%s %s: %s calls a stub's fetch a transfer", c.method, c.path, body)
+		}
+	}
+
+	// Nothing got through, including the delete.
+	if recs := srv.records(t, zid); len(recs) != 1 || recs[0].RData != "dc01.ad.corp.example." {
+		t.Errorf("records = %+v, want the one seeded row unchanged", recs)
+	}
+}
+
+// Reads are untouched, on the same terms as a secondary's: a stub's fetched
+// NS set is what the zone detail screen lists, read-only, and its zone file
+// is exportable.
+func TestStubZoneRecordsStayReadable(t *testing.T) {
+	srv := newTestServer(t)
+	now := time.Now().UnixMilli()
+	zid, err := srv.store.Zones().AddZone(t.Context(), store.Zone{
+		Name: "ad.corp.example", Type: "stub", Enabled: true,
+		SOANS: "dc01.ad.corp.example", SOAMbox: "hostadmin.ad.corp.example",
+		SOASerial: 7, SOARefresh: 900, SOARetry: 300, SOAExpire: 604800,
+		SOAMinimum: 900, SOATTL: 900,
+		Primaries: "10.0.0.9", CreatedAt: now, ModifiedAt: now,
+	})
+	if err != nil {
+		t.Fatalf("seed stub: %v", err)
+	}
+	base := fmt.Sprintf("/api/v1/zones/%d", zid)
+	for _, path := range []string{base + "/records", base + "/file"} {
+		if rec := srv.do(t, "GET", path, ""); rec.Code != http.StatusOK {
+			t.Errorf("GET %s: status = %d, want 200", path, rec.Code)
+		}
+	}
+}
+
+// The other half of the refusal, and the half that tells "refuses a stub"
+// apart from "refuses everything that is not a primary".
+//
+// A forwarder is deliberately **not** refused. Nothing overwrites its
+// records: it answers from none of them (Zone.Answer returns handled=false
+// for the type) and its routing comes from forward_to rather than from an NS
+// set, so no scheduled job ever replaces what is written here. The rule this
+// function encodes is "these records are authored somewhere else and this
+// write will be destroyed", and neither half of that is true of a forwarder.
+// A write into one is inert, not lost — a different complaint, and not a
+// 409's to make.
+//
+// Without this case the test above passes just as happily against a
+// `default: return "..."` that refuses every non-primary type, which is a
+// stricter rule than the one intended and would need its own decision.
+func TestRecordWritesIntoAForwarderAreStillAccepted(t *testing.T) {
+	srv := newTestServer(t)
+	now := time.Now().UnixMilli()
+	zid, err := srv.store.Zones().AddZone(t.Context(), store.Zone{
+		Name: "corp.example", Type: "forwarder", Enabled: true,
+		SOANS: "ns.corp.example", SOAMbox: "hostadmin.corp.example",
+		SOASerial: 7, SOARefresh: 900, SOARetry: 300, SOAExpire: 604800,
+		SOAMinimum: 900, SOATTL: 900,
+		ForwardTo: "10.0.0.1:53", CreatedAt: now, ModifiedAt: now,
+	})
+	if err != nil {
+		t.Fatalf("seed forwarder: %v", err)
+	}
+	base := fmt.Sprintf("/api/v1/zones/%d", zid)
+	rec := srv.do(t, "POST", base+"/records", `{"name":"nas","type":"A","ttl":300,"rdata":"10.9.0.20"}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("POST records: status = %d body = %s, want 201", rec.Code, rec.Body)
+	}
+	if recs := srv.records(t, zid); len(recs) != 1 {
+		t.Errorf("records = %+v, want the written row", recs)
+	}
+}
+
+// And a primary, which is the type the whole route exists for — the same
+// discrimination from the other side, so a refusal that spread to everything
+// could not hide behind the forwarder case alone.
+func TestRecordWritesIntoAPrimaryAreStillAccepted(t *testing.T) {
+	srv, zid := newTestServerWithZone(t, "e412.in")
+	rec := srv.do(t, "POST", fmt.Sprintf("/api/v1/zones/%d/records", zid),
+		`{"name":"nas","type":"A","ttl":300,"rdata":"10.9.0.20"}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("POST records: status = %d body = %s, want 201", rec.Code, rec.Body)
+	}
+}

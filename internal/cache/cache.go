@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/aloks98/dnsaur/internal/dnssrv"
@@ -40,6 +41,11 @@ type Cache struct {
 	lru     *list.List // front = most recent; values are ckey
 	o       Options
 	sf      singleflight.Group
+	// epoch counts purges. A lookup reads it before going to the upstreams
+	// and put refuses an entry whose epoch has moved on since — see Purge.
+	// Bumped and compared under mu; the read at the top of Middleware is a
+	// bare atomic load, so the query path takes no extra lock for it.
+	epoch atomic.Uint64
 }
 
 func New(o Options) *Cache {
@@ -65,6 +71,72 @@ func (c *Cache) Len() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return len(c.entries)
+}
+
+// Purge drops every entry for a name at or under one of suffixes, and
+// reports how many it dropped.
+//
+// This is how a routing change reaches the cache. An entry is keyed on
+// (qname, qtype) and records nothing about which upstream produced it, so an
+// answer cached from the default resolvers before a zone claimed that suffix
+// keeps being served afterwards — the routing table is below the cache and is
+// never consulted on a hit. The mirror case is the same defect pointing the
+// other way: releasing a suffix leaves internal answers cached for names that
+// should now resolve publicly. Both are closed by dropping the suffix's
+// entries when its routing changes, which is what app.installConditional
+// calls this for.
+//
+// A name matches a suffix when it *is* that suffix or sits beneath it on a
+// label boundary. Entries are keyed by dnssrv.Request.QName — lower-cased and
+// with the root dot trimmed — so suffixes are normalised the same way here
+// rather than at every call site.
+//
+// It also invalidates the lookups already in flight, which is the half a
+// sweep of the map alone would miss: a query that reached the upstreams
+// *before* the claim existed is still going to come back with a pre-claim
+// answer and put it into the cache, and it would land after the sweep had
+// already passed. Every in-flight put carries the epoch it started under and
+// is dropped if a purge has happened since. The comparison is made under mu,
+// which Purge also holds while bumping, so there is no window between the
+// check and the store; the cost is that a purge for one suffix also drops
+// whatever unrelated lookups were in flight at that instant, which is one
+// extra upstream query each and no wrong answers.
+func (c *Cache) Purge(suffixes ...string) int {
+	norm := make([]string, 0, len(suffixes))
+	for _, s := range suffixes {
+		if s = strings.ToLower(strings.TrimSuffix(s, ".")); s != "" {
+			norm = append(norm, s)
+		}
+	}
+	if len(norm) == 0 {
+		return 0
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.epoch.Add(1)
+	n := 0
+	for k := range c.entries {
+		if nameUnder(k.name, norm) {
+			c.removeLocked(k)
+			n++
+		}
+	}
+	return n
+}
+
+// nameUnder reports whether name is one of suffixes or sits beneath one of
+// them. The label-boundary check is what keeps notcorp.example out of
+// corp.example.
+func nameUnder(name string, suffixes []string) bool {
+	for _, s := range suffixes {
+		if name == s {
+			return true
+		}
+		if len(name) > len(s)+1 && name[len(name)-len(s)-1] == '.' && strings.HasSuffix(name, s) {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *Cache) get(k ckey) (fresh *entry, stale *entry) {
@@ -93,9 +165,14 @@ func (c *Cache) removeLocked(k ckey) {
 	}
 }
 
-func (c *Cache) put(k ckey, msg *dns.Msg, ttl time.Duration) {
+// put stores msg under k, unless a Purge has happened since epoch — see
+// Purge's last paragraph.
+func (c *Cache) put(k ckey, msg *dns.Msg, ttl time.Duration, epoch uint64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.epoch.Load() != epoch {
+		return
+	}
 	c.removeLocked(k)
 	e := &entry{msg: msg.Copy(), storedAt: c.o.Now(), ttl: ttl}
 	e.elem = c.lru.PushFront(k)
@@ -179,6 +256,9 @@ func (c *Cache) Middleware() dnssrv.Middleware {
 			if len(req.Msg.Question) != 1 || req.Msg.Question[0].Qclass != dns.ClassINET {
 				return next.ServeDNS(ctx, req)
 			}
+			// Read before the lookup, not after: it is the epoch this query's
+			// answer will have been produced under.
+			epoch := c.epoch.Load()
 			k := ckey{name: req.QName(), qtype: req.QType()}
 			if fresh, _ := c.get(k); fresh != nil {
 				age := uint32(c.o.Now().Sub(fresh.storedAt) / time.Second)
@@ -192,11 +272,24 @@ func (c *Cache) Middleware() dnssrv.Middleware {
 				rewriteQuestion(m, req)
 				return &dnssrv.Response{Msg: m, Decision: dnssrv.DecisionCached}, nil
 			}
-			v, err, _ := c.sf.Do(fmt.Sprintf("%s|%d", k.name, k.qtype), func() (any, error) {
+			// **The epoch is part of the key, not decoration.** Without
+			// it the group is route-blind: a query arriving entirely
+			// *after* a claim is installed and the purge has run misses
+			// the now-empty cache and is collapsed onto a leader that was
+			// dispatched to the default upstreams before the claim
+			// existed — and is handed that leader's public answer for a
+			// name a split-horizon zone now claims. Nothing is stored (the
+			// put below is refused for the same reason), so it is
+			// transient; but transient is not the same as harmless, and
+			// the window is one upstream round trip rather than one cache
+			// lookup. Keying on the epoch makes a purge end the in-flight
+			// group as well as the stored entries: a query that arrives
+			// after it cannot join a lookup sent before it.
+			v, err, _ := c.sf.Do(fmt.Sprintf("%d|%s|%d", epoch, k.name, k.qtype), func() (any, error) {
 				resp, err := next.ServeDNS(ctx, req)
 				if err == nil && resp != nil && resp.Msg != nil && resp.Decision == dnssrv.DecisionForwarded {
 					if ttl, ok := respTTL(c.o, resp.Msg); ok {
-						c.put(k, resp.Msg, ttl)
+						c.put(k, resp.Msg, ttl, epoch)
 					}
 				}
 				return resp, err

@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"net"
 	"net/http"
 	"net/http/cookiejar"
 	"net/http/httptest"
@@ -17,20 +16,14 @@ import (
 	"github.com/miekg/dns"
 )
 
+// mockUpstream is the fixture the pre-D6 tests in this package were written
+// against: a counting DNS server answering 9.9.9.9 to everything. It is
+// mockDNSCounting (app_test.go) with that answer bound, rather than a second
+// copy of the same server, so the package has one mock DNS server and not
+// two near-identical ones.
 func mockUpstream(t *testing.T, counter *atomic.Int64) string {
 	t.Helper()
-	pc, _ := net.ListenPacket("udp", "127.0.0.1:0")
-	srv := &dns.Server{PacketConn: pc, Handler: dns.HandlerFunc(func(w dns.ResponseWriter, m *dns.Msg) {
-		counter.Add(1)
-		r := new(dns.Msg)
-		r.SetReply(m)
-		rr, _ := dns.NewRR(m.Question[0].Name + " 300 IN A 9.9.9.9")
-		r.Answer = []dns.RR{rr}
-		_ = w.WriteMsg(r)
-	})}
-	go func() { _ = srv.ActivateAndServe() }()
-	t.Cleanup(func() { _ = srv.Shutdown() })
-	return pc.LocalAddr().String()
+	return mockDNSCounting(t, counter, answerA("9.9.9.9"))
 }
 
 func TestEndToEnd(t *testing.T) {

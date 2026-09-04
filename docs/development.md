@@ -10,9 +10,15 @@ See also: [`README.md`](../README.md) · [`docs/architecture.md`](architecture.m
   past end-of-life, so prefer 22+ locally. See
   [`web/README.md`](../web/README.md) for the dashboard's own dev
   workflow, scripts, and Playwright smoke test.
-- **Docker**, only if you want to run the Postgres-backed store tests —
-  they use `testcontainers-go` to spin up a real Postgres and are skipped
-  automatically when Docker isn't available.
+- **Docker**, only if you want to run the Postgres-backed tests.
+  `internal/store`, `internal/zones` and `internal/app` each use
+  `testcontainers-go` to spin up a real Postgres and skip automatically when
+  Docker isn't available; set `DNSAUR_TEST_POSTGRES_DSN` to point them at one
+  you already run instead. `internal/store` runs its whole suite on both
+  drivers; `internal/zones` and `internal/app` run only the cases where
+  connection or transaction behaviour could differ — the reload, the transfer
+  and stub installs, the concurrent refreshes, and in `internal/app` the
+  routing-table windows and the cache invalidation that hangs off them.
 - **golangci-lint v2.12** for linting (matches the version pinned in CI).
 
 ## Build
@@ -30,7 +36,7 @@ API-only — every dashboard route returns 404 until real assets exist in
 ## Test
 
 ```sh
-go test ./...          # full suite; Postgres store tests skip without Docker
+go test ./...          # full suite; the Postgres halves skip without Docker
 go test -race ./...    # what CI runs
 
 cd web && pnpm test    # dashboard component tests (Vitest)

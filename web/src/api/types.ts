@@ -87,8 +87,16 @@ export interface Zone {
   name: string;
   /**
    * primary | secondary | stub | forwarder | internal; defaults to primary.
-   * Milestone A creates and serves primary zones only — the rest are
-   * accepted and stored but not yet acted on.
+   *
+   * Four are creatable through the API; `internal` is the RFC 6303 set
+   * seeded at migration and is refused on create and patch alike.
+   *
+   * The two added in Milestone D6 both *claim a suffix and route it*
+   * rather than answering from records of their own, and differ only in
+   * where the addresses come from: a `forwarder`'s are typed into
+   * `forward_to` by the operator, a `stub`'s are fetched from its
+   * `primaries` as an SOA and an NS query with glue (not an AXFR) and
+   * derived from the NS set that comes back.
    */
   type: "primary" | "secondary" | "stub" | "forwarder" | "internal";
   enabled: boolean;
@@ -102,19 +110,39 @@ export interface Zone {
   soa_minimum: number;
   /** The SOA record's own header TTL, distinct from soa_minimum. Fixed at 900 in Milestone A — no request field sets it. */
   soa_ttl: number;
-  /** secondary/stub/forwarder only; unused and empty for primary/internal. */
+  /**
+   * Where a secondary transfers this zone from, or a stub fetches its NS
+   * set from: comma-separated `host[:port]`, port 53 by default. Required
+   * and non-empty on both of those, and refused with 400 on every other
+   * type — a forwarder's upstreams are `forward_to`, which is a different
+   * field because it is a different thing (see it below).
+   */
   primaries: string;
+  /** The key a secondary signs its transfer with, or a stub its SOA/NS
+   * queries with; 0 is unsigned. Must be 0 on every other type. */
   tsig_key_id: number;
-  /** Unix ms; secondary only, 0 otherwise. */
+  /**
+   * Unix ms the copy this zone holds stops being servable; **secondary
+   * only, and 0 on every other type — including a stub.**
+   *
+   * A stub is never given one, deliberately (internal/zones/stub.go): its
+   * NS set is routing information rather than data held on loan, and an
+   * old-but-working nameserver beats a self-inflicted SERVFAIL. So a
+   * screen that read this as "expired at" would date every stub to the
+   * epoch. Nothing may render it for a zone that is not a secondary — see
+   * transferState in lib/zones.ts, which is the one place it is read.
+   */
   expires_at: number;
-  /** Unix ms of the last transfer that **succeeded**; secondary only, 0 = never. */
+  /** Unix ms of the last transfer or stub fetch that **succeeded**;
+   * secondary and stub only, 0 = never. */
   refreshed_at: number;
   /**
-   * Why the most recent transfer attempt failed, verbatim — `""` when it
-   * succeeded. The server clears it on success, so a zone that recovered
-   * stops reporting one, and it survives a restart (unlike the scheduler's
-   * own in-memory view of the same thing). See lib/zones.ts, which is the one
-   * place this and the three stamps are read together.
+   * Why the most recent transfer — or, for a stub, NS fetch — failed,
+   * verbatim; `""` when it succeeded. The server clears it on success, so a
+   * zone that recovered stops reporting one, and it survives a restart
+   * (unlike the scheduler's own in-memory view of the same thing). See
+   * lib/zones.ts, which is the one place this and the three stamps are read
+   * together.
    */
   last_error: string;
   /**
@@ -151,6 +179,22 @@ export interface Zone {
    * format, and GET /zones/{id}/notifies for each target's delivery state.
    */
   notify_to: string;
+  /**
+   * Where a forwarder zone sends the queries it claims: comma-separated
+   * `host[:port]`, port always explicit on read. **Forwarder only; ""
+   * on every other type**, which the server enforces on create and patch
+   * alike.
+   *
+   * "" on a forwarder is a configuration, not a gap: the zone still claims
+   * the suffix, and with no upstream to send to every query beneath it is
+   * a SERVFAIL rather than a fall-through to the default resolvers. That
+   * consequence is the one thing a forwarder's page has to say out loud —
+   * see pages/zones/detail.tsx.
+   *
+   * Stored and read back in its canonical spelling (the port always
+   * written, ", "-separated), which may differ from what was sent.
+   */
+  forward_to: string;
   created_at: number;
   modified_at: number;
 }

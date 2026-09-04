@@ -1,6 +1,7 @@
 package zones_test
 
 import (
+	"maps"
 	"testing"
 
 	"github.com/aloks98/dnsaur/internal/store"
@@ -338,6 +339,84 @@ func TestReferralCarriesInZoneGlueOnly(t *testing.T) {
 	out.Answer(om, "host.sub.e412.in", dns.TypeA, testNow)
 	if len(om.Extra) != 0 {
 		t.Errorf("ADDITIONAL = %v, want none for an out-of-zone nameserver", om.Extra)
+	}
+}
+
+// An apex NS answer carries the addresses of its own in-zone nameservers,
+// the way ns1.google.com does for google.com. This is not the referral path
+// — the apex is this zone's authority, not a cut — but the additional
+// section serves the same purpose (RFC 1035 §3.3.11): a client handed a
+// nameserver's name and no address has to go find one, and a stub zone
+// fetching this NS set cannot go find one, because resolving an in-zone
+// nameserver would route straight back into the zone it is trying to reach.
+//
+// The out-of-zone half is the same rule the referral obeys: an address for
+// a nameserver named outside this zone is not ours to vouch for. A real
+// master behaves exactly this way — a.iana-servers.net returns no
+// additional section for example.com, whose nameservers are all out-of-zone.
+func TestApexNSAnswerCarriesInZoneGlueOnly(t *testing.T) {
+	// TWO nameservers, and the second is what makes the loop and the dedup
+	// testable. With one, an implementation that handles only the first
+	// nameserver and drops the dedup entirely passes the whole repository —
+	// and a one-nameserver zone is the case that never occurs in practice.
+	// NS1 in different case is stored verbatim and must not produce a second
+	// copy of ns1's addresses: DNS compares names case-insensitively.
+	z := newZone(t,
+		store.ZoneRecord{Name: "@", Type: "NS", TTL: 3600, RData: "ns1.e412.in.", Enabled: true},
+		store.ZoneRecord{Name: "@", Type: "NS", TTL: 3600, RData: "ns2.e412.in.", Enabled: true},
+		store.ZoneRecord{Name: "@", Type: "NS", TTL: 3600, RData: "NS1.e412.in.", Enabled: true},
+		store.ZoneRecord{Name: "ns1", Type: "A", TTL: 3600, RData: "10.0.0.53", Enabled: true},
+		store.ZoneRecord{Name: "ns1", Type: "AAAA", TTL: 3600, RData: "fd00::53", Enabled: true},
+		store.ZoneRecord{Name: "ns2", Type: "A", TTL: 3600, RData: "10.0.0.54", Enabled: true},
+	)
+	m := reply("e412.in.", dns.TypeNS)
+	z.Answer(m, "e412.in", dns.TypeNS, testNow)
+	if len(m.Answer) != 3 {
+		t.Fatalf("ANSWER = %v, want all three apex NS records", m.Answer)
+	}
+	if !m.Authoritative {
+		t.Error("aa = false, want an authoritative answer: the apex is not a cut")
+	}
+	if len(m.Ns) != 0 {
+		t.Errorf("AUTHORITY = %v, want none: this is an answer, not a referral", m.Ns)
+	}
+	got := make(map[string]int)
+	for _, rr := range m.Extra {
+		switch rr := rr.(type) {
+		case *dns.A:
+			got[rr.Hdr.Name+" A "+rr.A.String()]++
+		case *dns.AAAA:
+			got[rr.Hdr.Name+" AAAA "+rr.AAAA.String()]++
+		}
+	}
+	want := map[string]int{
+		"ns1.e412.in. A 10.0.0.53":   1,
+		"ns1.e412.in. AAAA fd00::53": 1,
+		"ns2.e412.in. A 10.0.0.54":   1,
+	}
+	if !maps.Equal(got, want) {
+		t.Errorf("ADDITIONAL = %v, want exactly one A/AAAA per in-zone nameserver", m.Extra)
+	}
+
+	// Out-of-zone nameserver, and the fixture is deliberately hostile: this
+	// zone holds a record *named* "ns1.other.test", which is the name
+	// ns1.other.test.e412.in. — a different name that relativises to the
+	// same string the out-of-zone target does, because RelName leaves a name
+	// it cannot strip the apex from unchanged.
+	//
+	// Without glue's ownership check that record's address is attached as
+	// glue for ns1.other.test., asserting an address for a name this zone
+	// does not own. A plain out-of-zone fixture cannot catch that: the
+	// relative lookup finds nothing either way, so the assertion passes
+	// whether the check is there or not.
+	out := newZone(t,
+		store.ZoneRecord{Name: "@", Type: "NS", TTL: 3600, RData: "ns1.other.test.", Enabled: true},
+		store.ZoneRecord{Name: "ns1.other.test", Type: "A", TTL: 3600, RData: "10.0.0.66", Enabled: true},
+	)
+	om := reply("e412.in.", dns.TypeNS)
+	out.Answer(om, "e412.in", dns.TypeNS, testNow)
+	if len(om.Extra) != 0 {
+		t.Errorf("ADDITIONAL = %v, want none: ns1.other.test. is not this zone's to address", om.Extra)
 	}
 }
 

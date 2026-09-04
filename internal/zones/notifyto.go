@@ -1,7 +1,6 @@
 package zones
 
 import (
-	"errors"
 	"fmt"
 	"net"
 	"strconv"
@@ -124,32 +123,9 @@ func parseNotifyTarget(field string) (NotifyTarget, error) {
 		return NotifyTarget{}, fmt.Errorf("notify target %q: needs a host before the key", field)
 	}
 
-	host, portStr, err := net.SplitHostPort(hostPart)
+	host, port, err := parseHostPort("notify target", field, hostPart)
 	if err != nil {
-		// Same two legal shapes parsePrimary documents: "missing port in
-		// address" for a bare host, "too many colons in address" for a bare
-		// IPv6 literal. Both are the no-port form.
-		var addrErr *net.AddrError
-		if !errors.As(err, &addrErr) {
-			return NotifyTarget{}, fmt.Errorf("notify target %q: %w", field, err)
-		}
-		host, portStr = hostPart, ""
-	}
-
-	port := uint16(DefaultPrimaryPort)
-	if portStr != "" {
-		n, err := strconv.ParseUint(portStr, 10, 16)
-		if err != nil || n == 0 {
-			return NotifyTarget{}, fmt.Errorf("notify target %q: port must be between 1 and 65535", field)
-		}
-		port = uint16(n)
-	}
-	// validPrimaryHost is reused rather than copied: the question is
-	// identical (an IP literal or a domain name, with dns.IsDomainName's
-	// extreme liberality guarded), and two spellings of one rule is how they
-	// come to disagree.
-	if !validPrimaryHost(host) {
-		return NotifyTarget{}, fmt.Errorf("notify target %q: host must be an IP address or a domain name", field)
+		return NotifyTarget{}, err
 	}
 	return NotifyTarget{Host: host, Port: port, Key: key}, nil
 }

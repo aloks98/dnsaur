@@ -2,6 +2,8 @@ package zones_test
 
 import (
 	"context"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -226,4 +228,205 @@ func TestResolverDefaultClockIsWallTime(t *testing.T) {
 	if got := rcodeFor(t, stale, "bifrost.e412.in."); got != dns.RcodeServerFailure {
 		t.Errorf("a zone that expired an hour ago: rcode = %d, want SERVFAIL", got)
 	}
+}
+
+// parkingZoneStore holds the *first* Reload between its two store reads,
+// which is the window Resolver.Reload's lost update lives in. Every later
+// read runs straight through, so a second Reload is free to overtake the
+// parked one — that overtaking is the whole experiment.
+type parkingZoneStore struct {
+	*fakeZoneStore
+
+	mu    sync.Mutex
+	zones []store.Zone
+
+	reads   atomic.Int64
+	parked  chan struct{} // closed once the first reload has read the list
+	release chan struct{} // closed to let it continue
+}
+
+func (p *parkingZoneStore) Zones(ctx context.Context) ([]store.Zone, error) {
+	p.mu.Lock()
+	out := append([]store.Zone(nil), p.zones...)
+	p.mu.Unlock()
+	if p.reads.Add(1) == 1 {
+		close(p.parked)
+		<-p.release
+	}
+	return out, nil
+}
+
+func (p *parkingZoneStore) add(z store.Zone) {
+	p.mu.Lock()
+	p.zones = append(p.zones, z)
+	p.mu.Unlock()
+}
+
+// Two concurrent Reloads must not lose the later one's zones.
+//
+// Reload derives its whole Index from the store and swaps it in atomically,
+// which is what makes it safe against *tearing*: no reader ever sees half an
+// Index. It is not safe against *ordering*. Let two reloads overlap and the
+// one that read the store first can Store its Index last, so every zone that
+// appeared between the two reads is gone from what the server serves — and
+// gone permanently, since nothing revisits it until something else reloads.
+//
+// The consequence is not a stale answer. Index.Find stops claiming the zone
+// altogether, so a name inside it falls through to the forwarder and the
+// public internet answers for a name this server holds. That is the §9.11.5
+// leak reached by another route, and it costs a *primary* zone its own names,
+// not just a forwarder zone its routing.
+//
+// None of this is hypothetical or specific to how App calls it.
+// Refresher.RefreshDue starts a goroutine per due secondary and every install
+// reloads, so concurrent whole-store reloads are what that path does by
+// design. sqlite's single connection does not prevent it either:
+// SetMaxOpenConns(1) serialises individual queries, while Reload's two reads
+// are separate QueryContext calls with the connection released between them
+// and no transaction around either, and it governs nothing about snap.Store.
+//
+// The store parks the first reload rather than leaving the interleaving to
+// chance, so this fails on every run rather than one run in ten.
+func TestConcurrentReloadsDoNotLoseAZone(t *testing.T) {
+	ctx := context.Background()
+	ps := &parkingZoneStore{
+		fakeZoneStore: &fakeZoneStore{records: map[int64][]store.ZoneRecord{}},
+		zones: []store.Zone{{
+			ID: 1, Name: testApex, Type: "primary", Enabled: true,
+			SOANS: "ns1." + testApex, SOAMbox: "hostadmin." + testApex, SOASerial: 1,
+		}},
+		parked:  make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	r := zones.NewResolver(ps)
+
+	// A: reads the zone list, then parks before it can build or store.
+	var first sync.WaitGroup
+	first.Add(1)
+	go func() {
+		defer first.Done()
+		if err := r.Reload(ctx); err != nil {
+			t.Errorf("first Reload: %v", err)
+		}
+	}()
+	<-ps.parked
+
+	// B: a zone appears and is reloaded while A is still parked. This is an
+	// API zone create, or a secondary finishing its transfer.
+	const added = "added.test"
+	ps.add(store.Zone{ID: 2, Name: added, Type: "primary", Enabled: true, SOASerial: 1})
+	done := make(chan struct{})
+	var second sync.WaitGroup
+	second.Add(1)
+	go func() {
+		defer second.Done()
+		defer close(done)
+		if err := r.Reload(ctx); err != nil {
+			t.Errorf("second Reload: %v", err)
+		}
+	}()
+
+	// Give B room to overtake. Serialised it cannot, and being unable to is
+	// the fix — so this waits rather than requiring the overtake to happen.
+	select {
+	case <-done:
+	case <-time.After(250 * time.Millisecond):
+	}
+
+	close(ps.release)
+	first.Wait()
+	second.Wait()
+
+	if r.Snapshot().Apex(added) == nil {
+		t.Errorf("%s is gone from the served snapshot: the reload that read the store first stored its Index last, and every name in that zone now falls through to the forwarder", added)
+	}
+}
+
+// The same property as TestConcurrentReloadsDoNotLoseAZone, against a real
+// store on both drivers.
+//
+// That test parks a *fake* store, which is what makes it deterministic — and
+// also what makes it say nothing about either driver. The lost update it
+// pins is an ordering bug, so the store underneath is irrelevant to whether
+// it reproduces; what is not irrelevant is the claim Reload's comment makes
+// about why the window is open at all. It says sqlite's SetMaxOpenConns(1)
+// (internal/store/store.go) does *not* serialise the two reads, because they
+// are separate QueryContext calls with the connection released in between.
+// Only a real sqlite store can show that, and only a real postgres one can
+// show the other half: postgres sets no such limit, so its two reads are on
+// two connections and genuinely overlap.
+//
+// So: a real store, parked at the same seam (gatedZoneStore.holdList, just
+// after the whole-zone list read returns), so this fails on every run rather
+// than one run in ten — on both drivers. If the sqlite connection *did*
+// serialise the reads, the second reload here could never overtake the first
+// and this test would deadlock on its own gate rather than pass.
+//
+// Parked rather than left to chance deliberately, and that was measured, not
+// assumed: an unparked version of this — two reloads simply started together
+// with a zone appearing between them, repeated — was written and thrown away
+// because it could not be made to fail for the right reason. With rmu
+// removed it still passed at 40 rounds, and only failed on two runs in three
+// at 600, by which point it cost ~10s. An assertion that misses the bug a
+// third of the time is not coverage, so it is not here.
+func TestConcurrentReloadsAgainstARealStoreDoNotLoseAZone(t *testing.T) {
+	forEachDriver(t, func(t *testing.T, driver string) {
+		ctx := context.Background()
+		st := openTestStoreOn(t, driver)
+
+		// Held after the first reload has read the zone list and before it
+		// can build or store its Index. Every later read runs straight
+		// through, so the second reload is free to overtake.
+		hold := newOneShotHold()
+		defer hold.free()
+		zs := &gatedZoneStore{ZoneStore: st.Zones(), hold: func() {}, holdList: hold.hold}
+		r := zones.NewResolver(zs)
+
+		var first sync.WaitGroup
+		first.Add(1)
+		go func() {
+			defer first.Done()
+			if err := r.Reload(ctx); err != nil {
+				t.Errorf("first Reload: %v", err)
+			}
+		}()
+		hold.wait(t, "the first reload's zone list read")
+
+		// A zone appears and is reloaded while the first is still parked:
+		// an API zone create, or a secondary finishing its transfer.
+		const added = "added.test"
+		if _, err := st.Zones().AddZone(ctx, store.Zone{
+			ID: 0, Name: added, Type: "primary", Enabled: true,
+			SOANS: "ns1." + added, SOAMbox: "hostadmin." + added,
+			SOASerial: 1, SOARefresh: 900, SOARetry: 300, SOAExpire: 604800,
+			SOAMinimum: 900, SOATTL: 900,
+		}); err != nil {
+			t.Fatalf("AddZone: %v", err)
+		}
+		done := make(chan struct{})
+		var second sync.WaitGroup
+		second.Add(1)
+		go func() {
+			defer second.Done()
+			defer close(done)
+			if err := r.Reload(ctx); err != nil {
+				t.Errorf("second Reload: %v", err)
+			}
+		}()
+
+		// Room to overtake. Serialised it cannot, and being unable to is the
+		// fix — so this waits rather than requiring the overtake to happen.
+		select {
+		case <-done:
+		case <-time.After(250 * time.Millisecond):
+		}
+
+		hold.free()
+		first.Wait()
+		second.Wait()
+
+		if r.Snapshot().Apex(added) == nil {
+			t.Errorf("%s is gone from the served snapshot: the reload that read the store first stored its Index last, and every name in that zone now falls through to the forwarder", added)
+		}
+	})
 }

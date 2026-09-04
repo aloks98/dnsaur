@@ -65,13 +65,27 @@ type failKey struct {
 	qtype uint16
 }
 
+// condTable is the conditional routing table: immutable once built, replaced
+// wholesale by SetConditional. A reader on the query path loads the pointer
+// and never takes a lock, so the table it is reading can never be mutated
+// underneath it -- the shape zones.Resolver uses for its snapshot, for the
+// same reason.
+type condTable struct {
+	set    *filter.DomainSet
+	routes map[string][]*up
+}
+
 type Forwarder struct {
-	def        []*up
-	condSet    *filter.DomainSet
-	condRoutes map[string][]*up
-	strategy   string
-	timeout    time.Duration
-	now        func() time.Time
+	def      []*up
+	cond     atomic.Pointer[condTable]
+	strategy string
+	timeout  time.Duration
+	now      func() time.Time
+
+	// cmu serialises writers of cond against each other. Readers never take
+	// it — pick does a bare cond.Load() — so the query path stays lock-free;
+	// see SetConditional for why the writers cannot do the same.
+	cmu sync.Mutex
 
 	fmu       sync.Mutex
 	failCache map[failKey]time.Time
@@ -100,21 +114,11 @@ func New(cfg Config) (*Forwarder, error) {
 	for _, a := range cfg.Upstreams {
 		f.def = append(f.def, newUp(a, cfg.Timeout))
 	}
-	if len(cfg.Conditional) > 0 {
-		// One shared DomainSet across all conditional suffixes so Match's
-		// most-specific-wins semantics give deterministic longest-suffix
-		// routing, instead of iterating per-suffix sets in (randomized)
-		// map order.
-		f.condSet = filter.NewDomainSet()
-		f.condRoutes = make(map[string][]*up, len(cfg.Conditional))
-		for suffix, addrs := range cfg.Conditional {
-			f.condSet.Add(suffix)
-			var ups []*up
-			for _, a := range addrs {
-				ups = append(ups, newUp(a, cfg.Timeout))
-			}
-			f.condRoutes[strings.ToLower(strings.TrimSuffix(suffix, "."))] = ups
-		}
+	// The conditional table is built through the same path a runtime swap
+	// takes, so there is one construction path and the existing
+	// conditional-routing tests are the proof construction did not change.
+	if err := f.SetConditional(cfg.Conditional); err != nil {
+		return nil, err
 	}
 	return f, nil
 }
@@ -162,13 +166,95 @@ func (f *Forwarder) exchange(ctx context.Context, m *dns.Msg, u *up) (*dns.Msg, 
 }
 
 func (f *Forwarder) pick(qname string) []*up {
-	if f.condSet != nil {
-		if matched, ok := f.condSet.Match(qname); ok {
-			return f.condRoutes[matched]
+	if t := f.cond.Load(); t != nil {
+		if matched, ok := t.set.Match(qname); ok {
+			return t.routes[matched]
 		}
 	}
 	return f.def
 }
+
+// SetConditional replaces the suffix routing table.
+//
+// The default upstreams, their health state and the failure cache are all
+// untouched: this exists precisely so a zone reload -- which happens on every
+// record edit -- does not discard them by rebuilding the whole Forwarder.
+//
+// Upstreams are reused across swaps by address, so a conditional upstream
+// that survives a reload keeps its latency history and its down-marking too.
+// Rebuilding them would fix the problem for the defaults and leave it for the
+// conditional routes, which are the ones a zone edit is about.
+//
+// A nil or empty map releases every suffix back to the defaults.
+//
+// Writers serialise on cmu, held across the whole load-build-store below.
+// This is a read-modify-write on live state -- the outgoing table is read to
+// adopt its upstreams -- so two overlapping calls would both adopt from the
+// same outgoing table and the first to store would have its newly minted
+// upstreams discarded by the second, taking their EWMA, failure count and
+// backoff window with them. That is a lost update rather than a data race, so
+// it is invisible to -race and cannot be left to the caller: a zone reload
+// arrives here from api.Server.reloadZones on every zone write with nothing
+// on the path serialising it.
+//
+// Readers are deliberately not part of this. pick loads the atomic pointer
+// and takes no lock, so a query never waits on a swap; the lock is between
+// writers only, and writers are as frequent as zone edits.
+func (f *Forwarder) SetConditional(routes map[string][]string) error {
+	f.cmu.Lock()
+	defer f.cmu.Unlock()
+
+	if len(routes) == 0 {
+		f.cond.Store(nil)
+		return nil
+	}
+
+	// Every *up this table will use, keyed by address. Seeded from the
+	// outgoing table so a swap adopts rather than rebuilds, and added to as
+	// new ones are minted so one address named under two suffixes shares a
+	// single *up -- and with it a single failure count and backoff window.
+	byAddr := map[string]*up{}
+	if old := f.cond.Load(); old != nil {
+		for _, ups := range old.routes {
+			for _, u := range ups {
+				byAddr[u.addr] = u
+			}
+		}
+	}
+
+	t := &condTable{
+		// One shared DomainSet across all suffixes so Match's
+		// most-specific-wins gives deterministic longest-suffix routing,
+		// instead of iterating per-suffix sets in randomized map order.
+		set:    filter.NewDomainSet(),
+		routes: make(map[string][]*up, len(routes)),
+	}
+	for suffix, addrs := range routes {
+		if len(addrs) == 0 {
+			// A suffix with no upstreams still claims the name: pick returns
+			// an empty slice, every attempt fails, and the handler answers
+			// SERVFAIL rather than falling through to the defaults.
+			t.set.Add(suffix)
+			t.routes[strings.ToLower(strings.TrimSuffix(suffix, "."))] = nil
+			continue
+		}
+		t.set.Add(suffix)
+		var ups []*up
+		for _, a := range addrs {
+			u, ok := byAddr[a]
+			if !ok {
+				u = newUp(a, f.timeout)
+				byAddr[a] = u
+			}
+			ups = append(ups, u)
+		}
+		t.routes[strings.ToLower(strings.TrimSuffix(suffix, "."))] = ups
+	}
+	f.cond.Store(t)
+	return nil
+}
+
+func (f *Forwarder) condTableLoad() *condTable { return f.cond.Load() }
 
 func (f *Forwarder) Handler() dnssrv.Handler {
 	return dnssrv.HandlerFunc(func(ctx context.Context, req *dnssrv.Request) (*dnssrv.Response, error) {

@@ -1,14 +1,15 @@
 import { http, HttpResponse } from "msw";
 import { toast } from "sonner";
 import { afterEach, expect, test, vi } from "vitest";
-import { act, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { useEffect } from "react";
 import { useForm } from "react-hook-form";
 import { Form } from "@e412/rnui-react";
 import { server } from "../../test/msw-server";
 import { renderWithProviders } from "../../test/render";
 import type { Zone, ZoneRecord } from "../../api/types";
-import { CreateRowHint, PrimariesField, TSIGKeyField, ZonesList, type AddZoneValues } from "./list";
+import { CreateRowHint, TSIGKeyField, UpstreamField, ZonesList, type AddZoneValues } from "./list";
 
 function zone(overrides: Partial<Zone> = {}): Zone {
   return {
@@ -35,6 +36,7 @@ function zone(overrides: Partial<Zone> = {}): Zone {
     last_xfr_peer: "",
     last_xfr_error: "",
     notify_to: "",
+    forward_to: "",
     created_at: Date.now() - 86_400_000,
     modified_at: Date.now() - 60_000,
     ...overrides,
@@ -66,6 +68,39 @@ function zoneRows(): HTMLElement[] {
   return Array.from(document.querySelectorAll<HTMLElement>('[data-testid="zone-row"]'));
 }
 
+/**
+ * Hovers a row's status cell and returns the tooltip it opens.
+ *
+ * The popup is portalled to the end of the body, so it is looked up on
+ * `screen` rather than `within(row)` — which is also what makes "the label is
+ * nowhere in the row" a real assertion rather than one the tooltip's own copy
+ * would satisfy from inside it.
+ */
+async function statusTip(
+  user: ReturnType<typeof userEvent.setup>,
+  row: HTMLElement,
+): Promise<HTMLElement> {
+  await user.hover(within(row).getByTestId("zone-status"));
+  return await screen.findByTestId("zone-status-tip");
+}
+
+/**
+ * Opens a row's actions menu and returns the popup.
+ *
+ * `fireEvent` rather than `userEvent`, the same way groups-clients.test.tsx
+ * drives its dropdown: base-ui's menu opens off a pointerdown sequence that
+ * jsdom cannot complete.
+ *
+ * The popup is portalled to the end of the body, so it is looked up on
+ * `screen` and asserted on `within(menu)` rather than inside the row — which
+ * is what keeps "the row says nothing about transfers" a real assertion
+ * rather than one an open menu would satisfy from inside it.
+ */
+async function rowMenu(row: HTMLElement, zoneName: string): Promise<HTMLElement> {
+  fireEvent.click(within(row).getByRole("button", { name: `Actions for ${zoneName}` }));
+  return await screen.findByRole("menu");
+}
+
 async function openCreateRow(user: ReturnType<typeof userEvent.setup>) {
   // findAllBy* rather than findBy*: an empty list shows "New zone" twice
   // (header + empty-state body), and this only needs one of them clicked.
@@ -75,26 +110,45 @@ async function openCreateRow(user: ReturnType<typeof userEvent.setup>) {
 
 /**
  * Renders the three type-dependent create-row cells directly, with `type` set
- * by the caller rather than driven through the real select. The select can
- * now produce both values a user can pick, but it cannot produce `stub`,
- * `forwarder` or `internal` — and those are exactly the cases worth pinning,
- * since the artboard asks for `stub`/`forwarder` to behave like `secondary`
- * here and they deliberately do not (see PrimariesField in list.tsx).
+ * by the caller rather than driven through the real select.
+ *
+ * The select now offers all four creatable types, so most of this is
+ * reachable through the real row too — but `internal` is not, and never will
+ * be (the API refuses it), and driving four types through a select for a
+ * question about one cell is four times the setup for the same assertion.
  */
-function TypeAwareFieldsHarness({ type }: { type: Zone["type"] }) {
+function TypeAwareFieldsHarness({
+  type,
+  fieldError,
+}: {
+  type: Zone["type"];
+  /**
+   * A validation error to seed onto one of the two upstream fields, so the
+   * hint's error branch is reachable without a schema rule to trip. The
+   * `forward_to` half has no rule today — a forwarder's upstreams may
+   * legitimately be empty and nothing else here parses them — and that is
+   * exactly why it is worth pinning: the wiring has to already carry an
+   * error the day someone adds one.
+   *
+   * Seeded onto the *form*, never handed to CreateRowHint as a prop. The cell
+   * reads its own errors off the control, so passing one in would have tested
+   * the harness rather than the wiring — which is exactly how the first
+   * version of this test passed against a cell that could only ever render
+   * `primaries`.
+   */
+  fieldError?: { name: "primaries" | "forward_to"; message: string };
+}) {
   const form = useForm<AddZoneValues>({
-    defaultValues: { name: "", type: "primary", primaries: "", tsig_key_id: "" },
+    defaultValues: { name: "", type: "primary", primaries: "", forward_to: "", tsig_key_id: "" },
   });
+  useEffect(() => {
+    if (fieldError) form.setError(fieldError.name, { message: fieldError.message });
+  }, [fieldError, form]);
   return (
     <Form {...form}>
-      <PrimariesField type={type} control={form.control} />
+      <UpstreamField type={type} control={form.control} />
       <TSIGKeyField type={type} control={form.control} />
-      <CreateRowHint
-        type={type}
-        control={form.control}
-        nameError={undefined}
-        primariesError={undefined}
-      />
+      <CreateRowHint type={type} control={form.control} />
     </Form>
   );
 }
@@ -137,8 +191,11 @@ test("internal zones cannot be deleted", async () => {
   const rows = await screen.findAllByTestId("zone-row");
 
   expect(rows).toHaveLength(2);
-  expect(within(rows[0]).getByRole("button", { name: /delete/i })).toBeInTheDocument();
-  expect(within(rows[1]).queryByRole("button", { name: /delete/i })).not.toBeInTheDocument();
+  // The user's own zone has an actions menu, and Delete zone inside it.
+  const menu = await rowMenu(rows[0], "e412.in");
+  expect(within(menu).getByRole("menuitem", { name: "Delete zone" })).toBeInTheDocument();
+  // The built-in has no menu for one to be in.
+  expect(within(rows[1]).queryByRole("button", { name: /^actions for/i })).not.toBeInTheDocument();
 });
 
 // The artboard's stronger claim: an internal zone's Actions cell doesn't
@@ -199,7 +256,7 @@ test("the built-ins disclosure is collapsed by default and its rows are not rend
   expect(screen.queryByText("localhost")).not.toBeInTheDocument();
 });
 
-test("expanding the disclosure reveals built-in rows with a BUILT-IN cell and no edit or delete buttons", async () => {
+test("expanding the disclosure reveals built-in rows with a BUILT-IN cell and no actions menu", async () => {
   const user = userEvent.setup();
   mockZones([
     zone({ id: 1, name: "e412.in" }),
@@ -216,8 +273,12 @@ test("expanding the disclosure reveals built-in rows with a BUILT-IN cell and no
   const builtinRow = rows[1];
   expect(within(builtinRow).getByText("localhost")).toBeInTheDocument();
   expect(within(builtinRow).getByText(/built-in/i)).toBeInTheDocument();
-  expect(within(builtinRow).queryByRole("button", { name: /edit/i })).not.toBeInTheDocument();
-  expect(within(builtinRow).queryByRole("button", { name: /delete/i })).not.toBeInTheDocument();
+  // Asserted against the editable row beside it, so this is a difference
+  // between the two rather than a query that would match nothing anywhere.
+  expect(within(rows[0]).getByRole("button", { name: "Actions for e412.in" })).toBeInTheDocument();
+  expect(
+    within(builtinRow).queryByRole("button", { name: /^actions for/i }),
+  ).not.toBeInTheDocument();
 });
 
 test("the built-ins disclosure label pluralises the count", async () => {
@@ -326,7 +387,8 @@ test("deleting a zone asks for confirmation, then DELETEs it", async () => {
   renderWithProviders(<ZonesList />);
   await waitFor(() => expect(zoneRows()).toHaveLength(1));
 
-  await user.click(screen.getByRole("button", { name: /delete old.example.com/i }));
+  const menu = await rowMenu(zoneRows()[0], "old.example.com");
+  fireEvent.click(within(menu).getByRole("menuitem", { name: "Delete zone" }));
   const confirm = await screen.findByRole("alertdialog");
   await user.click(within(confirm).getByRole("button", { name: /^delete$/i }));
 
@@ -344,7 +406,8 @@ test("a failed delete shows a toast and leaves the zone in the list", async () =
   renderWithProviders(<ZonesList />);
   await waitFor(() => expect(zoneRows()).toHaveLength(1));
 
-  await user.click(screen.getByRole("button", { name: /delete old.example.com/i }));
+  const menu = await rowMenu(zoneRows()[0], "old.example.com");
+  fireEvent.click(within(menu).getByRole("menuitem", { name: "Delete zone" }));
   const confirm = await screen.findByRole("alertdialog");
   await user.click(within(confirm).getByRole("button", { name: /^delete$/i }));
 
@@ -422,7 +485,11 @@ test("the records count groups with thousands separators", async () => {
 // `forwarder` is Milestone D6 and `stub` is in no milestone at all. An option
 // that always fails is worse than an absent one, so this pins the list rather
 // than leaving it to drift back to the artboard's.
-test("the type select offers primary and secondary, and nothing the API would refuse", async () => {
+// Exactly the four the API creates or patches into (handleZoneCreate). The
+// fifth, `internal`, is the RFC 6303 set seeded at migration and is refused
+// with 400 — a select offering it would promise a zone type and hand back a
+// server error.
+test("the type select offers all four creatable types, and nothing the API would refuse", async () => {
   const user = userEvent.setup();
   mockZones([]);
   renderWithProviders(<ZonesList />);
@@ -432,6 +499,8 @@ test("the type select offers primary and secondary, and nothing the API would re
   expect(Array.from(select.querySelectorAll("option")).map((option) => option.value)).toEqual([
     "primary",
     "secondary",
+    "stub",
+    "forwarder",
   ]);
 });
 
@@ -557,37 +626,184 @@ test("a secondary with no primaries is rejected client-side and never posted", a
   expect(posted).toBe(false);
 });
 
-// The type cell above is static "primary" (previous test), so nothing
-// a real user can click ever drives PrimariesField/CreateRowHint's `type`
-// prop away from "primary" — this harness (see its own comment) is
-// currently the only thing that does, ahead of #72 widening the select
-// back out to the four types this still knows how to render.
-// The artboard's `needsPrimaries` covers secondary, stub AND forwarder. Only
-// secondary is right: neither of the other two is creatable at all (the API
-// 400s them), and a forwarder does not have primaries in the first place — it
-// has upstreams to ask, which is a different field for a different milestone.
-// Building the artboard as drawn would have put a "Primary servers" input in
-// front of a zone type that has none.
-test("the transfer fields and their hints appear for secondary alone, never for stub or forwarder", () => {
+// One cell, four behaviours. A secondary and a stub both pull from a master,
+// so both get "Primary servers" — the API validates `primaries` identically
+// for the two (checkZoneTransferConfig's pullsAZone). A forwarder does not
+// have primaries at all: it has upstreams it sends queries to, which is a
+// different column (`forward_to`) the server 400s on any other type. The
+// artboard's own `needsPrimaries` covers all three with one field, and
+// building it as drawn would have posted `primaries` for a forwarder and
+// been refused.
+test("the extra field's label and placeholder follow the type, and only the master-pulling types get TSIG", () => {
   // A fresh render per type rather than rerender(): rerender replaces the
   // whole tree, wrapper included, and TSIGKeyField reads a query client.
-  const secondary = renderWithProviders(<TypeAwareFieldsHarness type="secondary" />);
-  expect(screen.getByLabelText(/primary servers/i)).toBeInTheDocument();
-  expect(screen.getByLabelText(/tsig key/i)).toBeInTheDocument();
-  expect(screen.getByText("Primary servers, comma separated.")).toBeInTheDocument();
-  expect(screen.getByText("Optional.")).toBeInTheDocument();
-  expect(screen.queryByText("SOA defaults are filled in.")).not.toBeInTheDocument();
-  secondary.unmount();
-
-  for (const type of ["primary", "stub", "forwarder", "internal"] as const) {
-    const other = renderWithProviders(<TypeAwareFieldsHarness type={type} />);
-    expect(screen.queryByLabelText(/primary servers/i)).not.toBeInTheDocument();
-    expect(screen.queryByLabelText(/tsig key/i)).not.toBeInTheDocument();
-    other.unmount();
+  for (const type of ["secondary", "stub"] as const) {
+    const view = renderWithProviders(<TypeAwareFieldsHarness type={type} />);
+    expect(screen.getByLabelText(/^primary servers$/i)).toHaveAttribute(
+      "placeholder",
+      "192.168.150.1:53",
+    );
+    expect(screen.getByLabelText(/tsig key/i)).toBeInTheDocument();
+    expect(screen.getByText("Primary servers, comma separated.")).toBeInTheDocument();
+    expect(screen.getByText("Optional.")).toBeInTheDocument();
+    expect(screen.queryByText("SOA defaults are filled in.")).not.toBeInTheDocument();
+    view.unmount();
   }
 
+  const forwarder = renderWithProviders(<TypeAwareFieldsHarness type="forwarder" />);
+  expect(screen.getByLabelText(/^forward to$/i)).toHaveAttribute(
+    "placeholder",
+    "10.0.0.1, 10.0.0.2:5353",
+  );
+  expect(screen.queryByLabelText(/^primary servers$/i)).not.toBeInTheDocument();
+  // A forwarder signs nothing — it sends ordinary queries, not transfers —
+  // and tsig_key_id is 400ed on it (checkZoneTransferConfig).
+  expect(screen.queryByLabelText(/tsig key/i)).not.toBeInTheDocument();
+  expect(screen.getByText("Upstream servers, comma separated.")).toBeInTheDocument();
+  // Column 1's hint is a *primary's* alone, and a forwarder is the case that
+  // proves it: gating it on "does not pull from a master" would read as right
+  // and put "SOA defaults are filled in." under a zone type that answers from
+  // no records for an SOA to head. (A secondary and a stub are covered by the
+  // loop above; without this line and the internal one below, the gate could
+  // be widened back with the suite green.)
+  expect(screen.queryByText("SOA defaults are filled in.")).not.toBeInTheDocument();
+  forwarder.unmount();
+
+  const internal = renderWithProviders(<TypeAwareFieldsHarness type="internal" />);
+  expect(screen.queryByLabelText(/^primary servers$/i)).not.toBeInTheDocument();
+  expect(screen.queryByLabelText(/^forward to$/i)).not.toBeInTheDocument();
+  expect(screen.queryByLabelText(/tsig key/i)).not.toBeInTheDocument();
+  expect(screen.queryByText("SOA defaults are filled in.")).not.toBeInTheDocument();
+  internal.unmount();
+
   renderWithProviders(<TypeAwareFieldsHarness type="primary" />);
+  expect(screen.queryByLabelText(/^primary servers$/i)).not.toBeInTheDocument();
+  expect(screen.queryByLabelText(/^forward to$/i)).not.toBeInTheDocument();
+  expect(screen.queryByLabelText(/tsig key/i)).not.toBeInTheDocument();
   expect(screen.getByText("SOA defaults are filled in.")).toBeInTheDocument();
+});
+
+// A stub is configured exactly as a secondary is — same two fields, same
+// server-side check — so the only thing that distinguishes the two on the
+// wire is `type`.
+test("creating a stub posts primaries and the TSIG key's id, like a secondary", async () => {
+  const user = userEvent.setup();
+  let body: unknown;
+  mockZones([]);
+  server.use(
+    http.get("/api/v1/tsig-keys", () =>
+      HttpResponse.json([
+        {
+          id: 4,
+          name: "xfer.e412.in.",
+          algorithm: "hmac-sha256.",
+          secret: "Sh5ZuulpjcmcJuN6VwMQCVEhTJyUmlPTSHexvePtaWo=",
+          created_at: Date.now(),
+        },
+      ]),
+    ),
+    http.post("*/api/v1/zones", async ({ request }) => {
+      body = await request.json();
+      return HttpResponse.json({ id: 1 }, { status: 201 });
+    }),
+  );
+  renderWithProviders(<ZonesList />);
+  await openCreateRow(user);
+
+  await user.selectOptions(screen.getByLabelText("Zone type"), "stub");
+  await user.type(screen.getByLabelText(/zone name/i), "ad.corp.example");
+  await user.type(screen.getByLabelText(/primary servers/i), "10.0.0.9");
+  await user.selectOptions(await screen.findByLabelText(/tsig key/i), "4");
+  await user.click(screen.getByRole("button", { name: "Add" }));
+
+  await waitFor(() =>
+    expect(body).toEqual({
+      name: "ad.corp.example",
+      type: "stub",
+      primaries: "10.0.0.9",
+      tsig_key_id: 4,
+    }),
+  );
+});
+
+// The same rule the secondary already has, and for the same reason: a stub
+// with nowhere to fetch from claims its suffix and SERVFAILs it forever.
+// checkZoneTransferConfig runs ValidatePrimaries for both types identically.
+test("a stub with no primaries is rejected client-side and never posted", async () => {
+  const user = userEvent.setup();
+  let posted = false;
+  mockZones([]);
+  server.use(
+    http.post("*/api/v1/zones", () => {
+      posted = true;
+      return HttpResponse.json({ id: 1 }, { status: 201 });
+    }),
+  );
+  renderWithProviders(<ZonesList />);
+  await openCreateRow(user);
+
+  await user.selectOptions(screen.getByLabelText("Zone type"), "stub");
+  await user.type(screen.getByLabelText(/zone name/i), "ad.corp.example");
+  await user.click(screen.getByRole("button", { name: "Add" }));
+
+  expect(await screen.findByText(/where to pull from/i)).toBeInTheDocument();
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  expect(posted).toBe(false);
+});
+
+// `forward_to`, not `primaries` — the server 400s "primaries applies to
+// secondary and stub zones only" for a forwarder, so posting the field the
+// artboard's shared `needsPrimaries` implies would fail every time.
+test("creating a forwarder posts forward_to and never primaries", async () => {
+  const user = userEvent.setup();
+  let body: unknown;
+  mockZones([]);
+  server.use(
+    http.post("*/api/v1/zones", async ({ request }) => {
+      body = await request.json();
+      return HttpResponse.json({ id: 1 }, { status: 201 });
+    }),
+  );
+  renderWithProviders(<ZonesList />);
+  await openCreateRow(user);
+
+  await user.selectOptions(screen.getByLabelText("Zone type"), "forwarder");
+  await user.type(screen.getByLabelText(/zone name/i), "corp.example");
+  await user.type(screen.getByLabelText(/^forward to$/i), "10.0.0.1, 10.0.0.2:5353");
+  await user.click(screen.getByRole("button", { name: "Add" }));
+
+  await waitFor(() =>
+    expect(body).toEqual({
+      name: "corp.example",
+      type: "forwarder",
+      forward_to: "10.0.0.1, 10.0.0.2:5353",
+    }),
+  );
+});
+
+// "" is a configuration and not a gap: the zone claims the suffix and
+// SERVFAILs everything beneath it rather than falling through. The server
+// accepts it, so this row must not invent a rule the server does not have —
+// and the field is omitted rather than sent empty, the same way `primaries`
+// and `tsig_key_id` already are.
+test("a forwarder with no upstreams is accepted and posts no forward_to at all", async () => {
+  const user = userEvent.setup();
+  let body: unknown;
+  mockZones([]);
+  server.use(
+    http.post("*/api/v1/zones", async ({ request }) => {
+      body = await request.json();
+      return HttpResponse.json({ id: 1 }, { status: 201 });
+    }),
+  );
+  renderWithProviders(<ZonesList />);
+  await openCreateRow(user);
+
+  await user.selectOptions(screen.getByLabelText("Zone type"), "forwarder");
+  await user.type(screen.getByLabelText(/zone name/i), "corp.example");
+  await user.click(screen.getByRole("button", { name: "Add" }));
+
+  await waitFor(() => expect(body).toEqual({ name: "corp.example", type: "forwarder" }));
 });
 
 test("the create row shows an em dash for serial, records and modified", async () => {
@@ -603,7 +819,8 @@ test("the create row shows an em dash for serial, records and modified", async (
 // The state a plain "disabled" switch can't express: still `enabled`, but
 // nothing behind it can answer for it — the artboard makes this its own
 // destructive status rather than a shade of disabled.
-test("an expired secondary shows the EXPIRED warning row with a Retry transfer button", async () => {
+test("an expired secondary shows the EXPIRED sub-line and a Retry transfer item", async () => {
+  const user = userEvent.setup();
   const seventeenDaysAgo = Date.now() - 17 * 86_400_000;
   mockZones([
     zone({
@@ -613,6 +830,7 @@ test("an expired secondary shows the EXPIRED warning row with a Retry transfer b
       enabled: true,
       primaries: "203.0.113.9",
       refreshed_at: seventeenDaysAgo,
+      last_attempt: Date.now() - 2 * 3600_000,
       expires_at: Date.now() - 1000,
     }),
   ]);
@@ -620,19 +838,28 @@ test("an expired secondary shows the EXPIRED warning row with a Retry transfer b
   const rows = await screen.findAllByTestId("zone-row");
 
   expect(within(rows[0]).getByText("Not answering")).toBeInTheDocument();
-  expect(within(rows[0]).getByText("Expired")).toBeInTheDocument();
-  expect(
-    within(rows[0]).getByText(
-      "Transfer from 203.0.113.9 last succeeded 17 days ago, past the SOA expiry.",
-    ),
-  ).toBeInTheDocument();
-  const retry = within(rows[0]).getByRole("button", { name: /retry transfer/i });
+  // When the last attempt was, in the row; what it means, on hover.
+  expect(within(rows[0]).getByTestId("zone-pull-attempt").textContent).toBe("2h ago");
+  const tip = await statusTip(user, rows[0]);
+  expect(tip).toHaveTextContent("Expired");
+  // Computed, never the artboard's literal "17d": the age of the copy this
+  // zone is no longer allowed to answer from.
+  expect(tip).toHaveTextContent(
+    "Tried 2h ago. No transfer for 17 days, past the SOA expiry. Answering nothing.",
+  );
+  // The way to try again, now in the row's own actions menu rather than in a
+  // band beneath the row.
+  const menu = await rowMenu(rows[0], "branch.example.com");
+  const retry = within(menu).getByRole("menuitem", { name: "Retry transfer" });
   expect(retry).toBeInTheDocument();
-  // Deliberately inert in this milestone — see the component's own comment.
+  // Deliberately nothing that submits, and portalled clear of every form on
+  // the page: a submit control here would be one keystroke from posting the
+  // create row.
   expect(retry).not.toHaveAttribute("type", "submit");
+  expect(retry.closest("form")).toBeNull();
 });
 
-test("a healthy secondary shows no warning row at all, and reads when it last refreshed", async () => {
+test("a healthy secondary shows no sub-line at all, and reads when it last refreshed", async () => {
   mockZones([
     zone({
       id: 8,
@@ -650,8 +877,28 @@ test("a healthy secondary shows no warning row at all, and reads when it last re
   // Not "Enabled": for a copy, when it was last confirmed current is the
   // thing worth knowing, and a plain "Enabled" hides it.
   expect(within(rows[0]).getByText("Refreshed 2h ago")).toBeInTheDocument();
+  expect(within(rows[0]).queryByTestId("zone-pull-warning")).not.toBeInTheDocument();
   expect(screen.queryByText("Expired")).not.toBeInTheDocument();
-  expect(screen.queryByRole("button", { name: /retry transfer/i })).not.toBeInTheDocument();
+  // The retry item IS offered, even though nothing is wrong. "Go and get the
+  // current version now" is a reasonable thing to ask of a healthy copy, the
+  // API allows it on any secondary or stub, and the detail page's "Refresh
+  // now" has always offered it — so withholding it here would mean the same
+  // zone offering the action on one screen and refusing it on the other.
+  //
+  // An earlier draft tied this item to the warning, because that was the
+  // condition the band it replaced appeared under. That was an artifact of
+  // the band, and this assertion is what changed when it went.
+  const menu = await rowMenu(rows[0], "ok-secondary.example.com");
+  expect(within(menu).getByRole("menuitem", { name: "Disable" })).toBeInTheDocument();
+  expect(within(menu).getByRole("menuitem", { name: "Delete zone" })).toBeInTheDocument();
+  expect(within(menu).getByRole("menuitem", { name: "Retry transfer" })).toBeInTheDocument();
+
+  // The pulled marker survives being healthy. Elsewhere this is pinned only
+  // against being drawn too widely (a forwarder must not get one); without
+  // this, narrowing it to "only when something is wrong" passes the whole
+  // suite, and a healthy secondary would silently stop being marked as
+  // holding someone else's records.
+  expect(within(rows[0]).getByLabelText("Pulled from another server")).toBeInTheDocument();
 });
 
 // The state a fresh secondary is in for its first minute, and the one an
@@ -659,6 +906,7 @@ test("a healthy secondary shows no warning row at all, and reads when it last re
 // and answering SERVFAIL for its whole suffix, because it holds nothing it
 // may speak for (Zone.Serving, internal/zones/answer.go).
 test("a secondary that has never transferred says so, rather than reading as enabled", async () => {
+  const user = userEvent.setup();
   mockZones([
     zone({
       id: 9,
@@ -672,11 +920,16 @@ test("a secondary that has never transferred says so, rather than reading as ena
   const rows = await screen.findAllByTestId("zone-row");
 
   // "Not answering" in the status column — the same words an expired zone
-  // gets, because it is the same fact — and the warning row below is what
-  // says which of the two this is.
+  // gets, because it is the same fact — and the tooltip is what says which of
+  // the two this is.
   expect(within(rows[0]).getByText("Not answering")).toBeInTheDocument();
-  expect(within(rows[0]).getByText("Never transferred")).toBeInTheDocument();
   expect(within(rows[0]).queryByText("Enabled")).not.toBeInTheDocument();
+  // Nothing has been tried, and the row says that rather than dating a
+  // failure that never happened.
+  expect(within(rows[0]).getByTestId("zone-pull-attempt").textContent).toBe("never attempted");
+  const tip = await statusTip(user, rows[0]);
+  expect(tip).toHaveTextContent("Never transferred");
+  expect(tip).toHaveTextContent("Answering nothing under new-secondary.example.com.");
 });
 
 // The whole point of persisting last_error: this zone is failing for a
@@ -685,6 +938,7 @@ test("a secondary that has never transferred says so, rather than reading as ena
 // whole sentence on the element, because rewriting a resolver error into
 // "couldn't transfer" throws away everything actionable about it.
 test("a failing secondary leads with the failure and keeps the whole message", async () => {
+  const user = userEvent.setup();
   mockZones([
     zone({
       id: 10,
@@ -701,17 +955,25 @@ test("a failing secondary leads with the failure and keeps the whole message", a
   renderWithProviders(<ZonesList />);
   const rows = await screen.findAllByTestId("zone-row");
 
-  // Not "Serving, transfer failing": the note below says what is being
-  // served, and how old it is, which the status column cannot.
+  // Not "Serving, transfer failing": the sentence on hover says what is being
+  // served and how old it is, which the status column cannot.
   expect(within(rows[0]).getByText("Transfer failing")).toBeInTheDocument();
-  const cause = within(rows[0]).getByTestId("zone-transfer-error");
-  // Just the failure — this page's own sentence about the consequence is a
-  // separate element beside it, not concatenated onto the end of it.
+  expect(within(rows[0]).getByTestId("zone-pull-attempt").textContent).toBe("1m ago");
+  const cause = within(rows[0]).getByTestId("zone-pull-error");
+  // Just the failure — every word this page wrote itself is somewhere else,
+  // not concatenated onto the end of the server's.
   expect(cause.textContent).toBe("connection refused");
-  expect(cause).toHaveAttribute("title", "203.0.113.9:53: dial tcp: connect: connection refused");
-  expect(within(rows[0]).getByTestId("zone-transfer-note").textContent).toBe(
-    "Still serving the copy from 1d ago.",
-  );
+  // The whole message moved into the Tooltip when the native title went: two
+  // hover surfaces inside one cell fired at different moments in different
+  // styles saying different things.
+  expect(cause).not.toHaveAttribute("title");
+  await user.hover(within(rows[0]).getByTestId("zone-status"));
+  expect(
+    within(await screen.findByTestId("zone-status-tip")).getByTestId("zone-status-tip-cause"),
+  ).toHaveTextContent("203.0.113.9:53: dial tcp: connect: connection refused");
+  const tip = await statusTip(user, rows[0]);
+  expect(tip).toHaveTextContent("Last transfer");
+  expect(tip).toHaveTextContent("Tried 1m ago. Still serving the copy from 1d ago.");
 });
 
 // The defect this row had: the transfer's error and this page's own sentence
@@ -719,6 +981,7 @@ test("a failing secondary leads with the failure and keeps the whole message", a
 // into the note with nothing between them and pushed it out of the row.
 // Whatever the server said, the note is a separate element and stays whole.
 test("a long transfer error does not run into the note or crowd it out", async () => {
+  const user = userEvent.setup();
   const longError = `zone "failing.example.com": every primary failed: ${"203.0.113.9:53: dial tcp 203.0.113.9:53: no route to host: ".repeat(8)}connection refused`;
   mockZones([
     zone({
@@ -736,18 +999,26 @@ test("a long transfer error does not run into the note or crowd it out", async (
   renderWithProviders(<ZonesList />);
   const rows = await screen.findAllByTestId("zone-row");
 
-  // The one thing the row has to keep: what the zone is doing about it, in
-  // its own element rather than glued to the end of 500 characters of error.
-  const note = within(rows[0]).getByTestId("zone-transfer-note");
-  expect(note.textContent).toBe("Still serving the copy from 1d ago.");
+  // The two things that stay whole whatever the server said: the date of the
+  // attempt, which never shrinks inside the cell, and the way to try again,
+  // which is out of the cell entirely and so cannot be crowded at all.
+  expect(within(rows[0]).getByTestId("zone-pull-attempt").textContent).toBe("1m ago");
 
   // And what is drawn of the error is short whatever its length — the part
   // that says what went wrong, not the leading context an ellipsis would
-  // have left behind — with nothing of this page's own sentence run into it.
-  const cause = within(rows[0]).getByTestId("zone-transfer-error");
+  // have left behind.
+  const cause = within(rows[0]).getByTestId("zone-pull-error");
   expect(cause.textContent).toBe("connection refused");
   // Nothing is lost by drawing less of it.
-  expect(cause).toHaveAttribute("title", longError);
+  expect(cause).not.toHaveAttribute("title");
+  await user.hover(within(rows[0]).getByTestId("zone-status"));
+  expect(
+    within(await screen.findByTestId("zone-status-tip")).getByTestId("zone-status-tip-cause"),
+  ).toHaveTextContent(longError);
+  expect(cause).toHaveClass("truncate");
+
+  const menu = await rowMenu(rows[0], "failing.example.com");
+  expect(within(menu).getByRole("menuitem", { name: "Retry transfer" })).toBeInTheDocument();
 });
 
 // An error left over from before the last success is not this zone's current
@@ -775,10 +1046,78 @@ test("an error older than the last success is not shown", async () => {
   expect(within(rows[0]).getByText(/^Refreshed /)).toBeInTheDocument();
 });
 
-// The button was inert through Milestone A — there was no transfer endpoint
-// to call. It has one now.
-test("Retry transfer asks the server for a transfer now", async () => {
+// The action was inert through Milestone A — there was no transfer endpoint
+// to call. It has one now, and it lives in the row's menu.
+// One hover surface, not two. The untruncated error used to live in a native
+// `title` on the sub-line's cause — inside the very cell the Tooltip wraps —
+// so hovering fired both, in two styles, saying two different things. The
+// Tooltip is the only thing that speaks on hover now, and it carries the
+// message in full while the row keeps the truncated lead.
+test("the status tooltip carries the whole error, and no native title competes with it", async () => {
   const user = userEvent.setup();
+  const full =
+    'zone "corp2.lan": every primary failed: 127.0.0.1:5399: dial tcp 127.0.0.1:5399: connect: connection refused';
+  mockZones([
+    zone({
+      id: 41,
+      name: "corp2.lan",
+      type: "secondary",
+      enabled: true,
+      refreshed_at: Date.now() - 7 * 3_600_000,
+      expires_at: Date.now() + 86_400_000,
+      last_error: full,
+      last_attempt: Date.now() - 30_000,
+    }),
+  ]);
+  renderWithProviders(<ZonesList />);
+  const rows = await screen.findAllByTestId("zone-row");
+
+  // The row truncates, and says so by not carrying the whole message.
+  const inline = within(rows[0]).getByTestId("zone-pull-error");
+  expect(inline).not.toHaveAttribute("title");
+  expect(inline.textContent).not.toBe(full);
+
+  await user.hover(within(rows[0]).getByTestId("zone-status"));
+  const tip = await screen.findByTestId("zone-status-tip");
+  expect(within(tip).getByTestId("zone-status-tip-cause")).toHaveTextContent(full);
+  // Title-case in the DOM, uppercased by CSS — assert what is actually there,
+  // not what the screen shows, or the test passes on a string that never
+  // existed.
+  expect(within(tip).getByText("Last transfer")).toBeInTheDocument();
+});
+
+// The tooltip surface does not follow the theme, and that is the one place in
+// this app where that is true. rnui styles the popup `bg-foreground`, which
+// flips: near-black on a light page, near-white on a dark one — a pale slab
+// over a dark table. bg-tooltip is a token that stays dark in both modes.
+//
+// Asserting the absence of bg-foreground is the half that matters: the class
+// arrives through the component's own cn() merge, so a token rename or a
+// changed merge order would leave both classes on the node and the popup
+// would go back to flipping with whichever wins.
+test("the status tooltip keeps its own surface rather than the theme's", async () => {
+  const user = userEvent.setup();
+  mockZones([
+    zone({
+      id: 44,
+      name: "surface.example.com",
+      type: "stub",
+      enabled: true,
+      refreshed_at: 0,
+      last_error: "i/o timeout",
+      last_attempt: Date.now() - 60_000,
+    }),
+  ]);
+  renderWithProviders(<ZonesList />);
+  const rows = await screen.findAllByTestId("zone-row");
+
+  const tip = await statusTip(user, rows[0]);
+  expect(tip).toHaveClass("bg-tooltip");
+  expect(tip).toHaveClass("text-tooltip-foreground");
+  expect(tip).not.toHaveClass("bg-foreground");
+});
+
+test("Retry transfer asks the server for a transfer now", async () => {
   let refreshed = 0;
   mockZones([
     zone({
@@ -805,7 +1144,8 @@ test("Retry transfer asks the server for a transfer now", async () => {
   renderWithProviders(<ZonesList />);
   await screen.findAllByTestId("zone-row");
 
-  await user.click(screen.getByRole("button", { name: /retry transfer/i }));
+  const menu = await rowMenu(zoneRows()[0], "branch.example.com");
+  fireEvent.click(within(menu).getByRole("menuitem", { name: "Retry transfer" }));
   await waitFor(() => expect(refreshed).toBe(1));
 });
 
@@ -829,6 +1169,7 @@ test("a long .arpa apex does not break the zones-list grid", async () => {
 // it. Without this state the row would read "Refreshed 5h ago" in the calm
 // green of a zone that is up to date.
 test("a secondary past its refresh deadline with nothing recorded reads overdue", async () => {
+  const user = userEvent.setup();
   mockZones([
     zone({
       id: 13,
@@ -845,10 +1186,9 @@ test("a secondary past its refresh deadline with nothing recorded reads overdue"
   const rows = await screen.findAllByTestId("zone-row");
 
   expect(within(rows[0]).getByText("Serving, transfer overdue")).toBeInTheDocument();
-  expect(within(rows[0]).getByText("Overdue")).toBeInTheDocument();
-  expect(
-    within(rows[0]).getByText(/nothing has transferred from 203\.0\.113\.9 since 5h ago/i),
-  ).toBeInTheDocument();
+  const tip = await statusTip(user, rows[0]);
+  expect(tip).toHaveTextContent("Overdue");
+  expect(tip).toHaveTextContent(/nothing has transferred from 203\.0\.113\.9 since 5h ago/i);
 });
 
 // A disabled zone is skipped by the scheduler entirely, so its transfer state
@@ -872,10 +1212,462 @@ test("a disabled secondary reads Disabled, with no transfer warning of its own",
   const rows = await screen.findAllByTestId("zone-row");
 
   expect(within(rows[0]).getByText("Disabled")).toBeInTheDocument();
-  expect(within(rows[0]).queryByText("Expired")).not.toBeInTheDocument();
+  expect(within(rows[0]).queryByTestId("zone-pull-warning")).not.toBeInTheDocument();
+  // Enable is offered rather than Disable — and so is the retry, even though
+  // the scheduler is not touching this zone. The tempting rule is "nothing is
+  // trying, so do not offer to try", but the detail page's "Refresh now" is
+  // gated on type alone and would offer it, and the API accepts it on any
+  // secondary or stub. Refusing it here would only move the disagreement
+  // between the two screens rather than settle it, and pulling a copy before
+  // switching a zone on is a reasonable thing to want.
+  const menu = await rowMenu(rows[0], "off.example.com");
+  expect(within(menu).getByRole("menuitem", { name: "Enable" })).toBeInTheDocument();
+  expect(within(menu).getByRole("menuitem", { name: "Retry transfer" })).toBeInTheDocument();
+});
+
+// ── a stub claims a suffix too ──────────────────────────────────────────────
+//
+// A stub is the other type whose contents arrive from somewhere else, and the
+// one this list used to call plain "Enabled" in green whatever state it was
+// in. It has no records of its own: it holds an NS set fetched from a master
+// and routes the suffix it claims to those nameservers. With no set, the
+// claim stands and every name beneath it answers SERVFAIL — a suffix-wide
+// outage the row was drawing as health.
+
+test("a stub that has never fetched reads Not answering, never Enabled", async () => {
+  mockZones([
+    zone({
+      id: 20,
+      name: "ad.corp.example.net",
+      type: "stub",
+      enabled: true,
+      primaries: "10.0.0.9",
+    }),
+  ]);
+  renderWithProviders(<ZonesList />);
+  const rows = await screen.findAllByTestId("zone-row");
+
+  expect(within(rows[0]).getByText("Not answering")).toBeInTheDocument();
+  expect(within(rows[0]).queryByText("Enabled")).not.toBeInTheDocument();
+  expect(within(rows[0]).getByTestId("zone-pull-attempt").textContent).toBe("never attempted");
+});
+
+// Five strings in this codebase have already had to be corrected for saying
+// "transfer" about a type that fetches. A stub asks two ordinary questions of
+// its master; it does not transfer and it never expires, so no noun on its
+// row may say otherwise — including the one on the button.
+test("a never-fetched stub's row and tooltip say fetch, and never transfer", async () => {
+  const user = userEvent.setup();
+  mockZones([
+    zone({
+      id: 21,
+      name: "dr.corp.example.net",
+      type: "stub",
+      enabled: true,
+      primaries: "10.0.0.9",
+      last_error: "i/o timeout",
+      last_attempt: Date.now() - 12 * 60_000,
+    }),
+  ]);
+  renderWithProviders(<ZonesList />);
+  const rows = await screen.findAllByTestId("zone-row");
+
+  expect(within(rows[0]).getByTestId("zone-pull-attempt").textContent).toBe("12m ago");
+  expect(within(rows[0]).getByTestId("zone-pull-error").textContent).toBe("i/o timeout");
+  const tip = await statusTip(user, rows[0]);
+  expect(tip).toHaveTextContent("Never fetched");
+  expect(tip).toHaveTextContent("Tried 12m ago. Answering nothing under dr.corp.example.net.");
+
+  expect(rows[0].textContent).not.toMatch(/transfer/i);
+  expect(tip.textContent).not.toMatch(/transfer/i);
+
+  // The menu is portalled out of the row, so the sweep above cannot see it
+  // and it gets one of its own — this is the fifth string on this screen
+  // that has to follow the type, and moving it here must not lose that.
+  const menu = await rowMenu(rows[0], "dr.corp.example.net");
+  expect(within(menu).getByRole("menuitem", { name: "Fetch now" })).toBeInTheDocument();
+  expect(menu.textContent).not.toMatch(/transfer/i);
+});
+
+/**
+ * The subtlest bug this row can have, and the one nothing else catches.
+ *
+ * `handleZonePatch` sets the type on a row read from the store and clears no
+ * stamp, so a zone retyped secondary → stub keeps the `expires_at` its last
+ * transfer wrote. A stub is never given one (§9.11.8), so that number means
+ * nothing — but read it and a stub that is fetching perfectly well reads as
+ * dead, in destructive red, on a row that claims its whole suffix.
+ */
+test("a stub carrying a dead expires_at from a retype is not expired", async () => {
+  mockZones([
+    zone({
+      id: 22,
+      name: "vpn.example.org",
+      type: "stub",
+      enabled: true,
+      primaries: "10.0.0.9",
+      soa_refresh: 7200,
+      refreshed_at: Date.now() - 4 * 3600_000,
+      last_attempt: Date.now() - 4 * 3600_000,
+      // The stamp the transfer left behind, a month past.
+      expires_at: Date.now() - 30 * 86_400_000,
+    }),
+  ]);
+  renderWithProviders(<ZonesList />);
+  const rows = await screen.findAllByTestId("zone-row");
+
+  // Fetched, not Refreshed, and healthy — no warning row, no tooltip, no
+  // destructive treatment of any kind.
+  expect(within(rows[0]).getByText("Fetched 4h ago")).toBeInTheDocument();
+  expect(within(rows[0]).queryByText("Not answering")).not.toBeInTheDocument();
+  expect(within(rows[0]).queryByTestId("zone-pull-warning")).not.toBeInTheDocument();
+  expect(within(rows[0]).queryByTestId("zone-status-tip")).not.toBeInTheDocument();
+});
+
+// A failed fetch does not take the NS set away: the suffix is still routed to
+// the nameservers it already knows, which is the difference between this and
+// the state above and the whole reason it is amber rather than red.
+test("a stub whose last fetch failed is still routing on the set it has", async () => {
+  const user = userEvent.setup();
+  mockZones([
+    zone({
+      id: 23,
+      name: "sql.corp.example.net",
+      type: "stub",
+      enabled: true,
+      primaries: "10.0.0.9",
+      soa_refresh: 7200,
+      refreshed_at: Date.now() - 5 * 86_400_000,
+      last_error: "10.0.0.9:53: dial tcp: connect: connection refused",
+      last_attempt: Date.now() - 40 * 60_000,
+    }),
+  ]);
+  renderWithProviders(<ZonesList />);
+  const rows = await screen.findAllByTestId("zone-row");
+
+  expect(within(rows[0]).getByText("Fetch failing")).toBeInTheDocument();
+  expect(within(rows[0]).getByTestId("zone-pull-error").textContent).toBe("connection refused");
+  const tip = await statusTip(user, rows[0]);
+  expect(tip).toHaveTextContent("Last fetch");
+  expect(tip).toHaveTextContent("Tried 40m ago. Still routing on the NS set from 5d ago.");
+  expect(rows[0].textContent).not.toMatch(/transfer/i);
+});
+
+// The same endpoint a secondary's retry uses — POST /zones/{id}/refresh takes
+// either type (400 "only secondary and stub zones pull from a master" is the
+// server's own gate) — under the name that describes what it does here.
+test("Fetch now asks the server to fetch now", async () => {
+  let fetched = 0;
+  mockZones([zone({ id: 24, name: "ad.corp.example.net", type: "stub", primaries: "10.0.0.9" })]);
+  server.use(
+    http.post("/api/v1/zones/24/refresh", () => {
+      fetched++;
+      return HttpResponse.json({
+        primary: "10.0.0.9:53",
+        serial: 2026080601,
+        records: 2,
+        refreshed_at: Date.now(),
+        // A stub is given no expiry, and the server sends none.
+        expires_at: 0,
+      });
+    }),
+  );
+  renderWithProviders(<ZonesList />);
+  await screen.findAllByTestId("zone-row");
+
+  const success = vi.spyOn(toast, "success");
+  const menu = await rowMenu(zoneRows()[0], "ad.corp.example.net");
+  fireEvent.click(within(menu).getByRole("menuitem", { name: "Fetch now" }));
+  await waitFor(() => expect(fetched).toBe(1));
+  // Fetched, not transferred — the toast is the fifth string on this screen
+  // that has to follow the type.
+  await waitFor(() => expect(success).toHaveBeenCalledWith("ad.corp.example.net fetched"));
+});
+
+// The marker beside the name says the records under this zone were written by
+// someone else — true of a stub exactly as it is of a secondary, and the one
+// signal that stays visible when the type column is scanned past.
+test("a stub is marked as pulled at its name, the same as a secondary", async () => {
+  const user = userEvent.setup();
+  mockZones([
+    zone({ id: 25, name: "vpn.example.org", type: "stub", primaries: "10.0.0.9" }),
+    zone({ id: 26, name: "home.lan", type: "primary" }),
+  ]);
+  renderWithProviders(<ZonesList />);
+  const rows = await screen.findAllByTestId("zone-row");
+
+  const marker = within(rows[0]).getByLabelText("Pulled from another server");
+  expect(within(rows[1]).queryByLabelText("Pulled from another server")).not.toBeInTheDocument();
+
+  // And it says so on hover as well as to a screen reader — the artboard's
+  // own title on this icon, as a real tooltip.
+  await user.hover(marker);
+  expect(await screen.findByText("Pulled from another server")).toBeInTheDocument();
+});
+
+// ── a forwarder has no health to show ───────────────────────────────────────
+
+/**
+ * A forwarder pulls nothing. It claims a suffix and sends the queries beneath
+ * it upstream, live — so whether those upstreams are answering is a fact
+ * about this instant that no column records. The stamps in this fixture are
+ * exactly the ones that would make a stub dead; on a forwarder they are
+ * leftovers, and a row that read them would be inventing a health state out
+ * of a retype.
+ */
+test("a forwarder gets no pull treatment, whatever stamps its row carries", async () => {
+  mockZones([
+    zone({
+      id: 27,
+      name: "corp.example",
+      type: "forwarder",
+      enabled: true,
+      forward_to: "10.0.0.1:53",
+      refreshed_at: 0,
+      last_error: "i/o timeout",
+      last_attempt: Date.now() - 60_000,
+      expires_at: Date.now() - 1000,
+    }),
+  ]);
+  renderWithProviders(<ZonesList />);
+  const rows = await screen.findAllByTestId("zone-row");
+
+  expect(within(rows[0]).getByText("Enabled")).toBeInTheDocument();
+  expect(within(rows[0]).queryByText("Not answering")).not.toBeInTheDocument();
+  expect(within(rows[0]).queryByTestId("zone-pull-warning")).not.toBeInTheDocument();
+  expect(within(rows[0]).queryByLabelText("Pulled from another server")).not.toBeInTheDocument();
+  // And no pull item in its menu — a forwarder has no master to ask, so the
+  // endpoint behind that item answers it 400. The two items every zone gets
+  // are there, so this is the item missing and not the menu.
+  const menu = await rowMenu(rows[0], "corp.example");
+  expect(within(menu).getByRole("menuitem", { name: "Disable" })).toBeInTheDocument();
+  expect(within(menu).getByRole("menuitem", { name: "Delete zone" })).toBeInTheDocument();
   expect(
-    within(rows[0]).queryByRole("button", { name: /retry transfer/i }),
+    within(menu).queryByRole("menuitem", { name: /fetch now|retry transfer/i }),
   ).not.toBeInTheDocument();
+});
+
+// Which leaves one thing to say, and the status cell is where it belongs:
+// green here means enabled, and nothing more than that.
+test("a forwarder's status says outright that upstream health is not tracked", async () => {
+  const user = userEvent.setup();
+  mockZones([zone({ id: 28, name: "corp.example", type: "forwarder", forward_to: "10.0.0.1:53" })]);
+  renderWithProviders(<ZonesList />);
+  const rows = await screen.findAllByTestId("zone-row");
+
+  const tip = await statusTip(user, rows[0]);
+  // U+2019, not an ASCII apostrophe: the escape is deliberate, so that an
+  // editor "correcting" the production string to ' fails this rather than
+  // matching it.
+  // Exact, not a substring: toHaveTextContent matches loosely, so the
+  // trailing period the artboard added would slip in or out unnoticed.
+  // U+2019, not an ASCII apostrophe — the escape is deliberate, so that an
+  // editor "correcting" the production string to ' fails this rather than
+  // matching it.
+  expect(tip.textContent).toBe("Upstream health isn\u2019t tracked.");
+});
+
+// ── where the sub-line sits ────────────────────────────────────────────────
+
+/**
+ * The sub-line belongs to the STATUS column, not to the row.
+ *
+ * It shipped as a full-width band beneath the whole row, which put the
+ * failure under the zone's *name* and made a warned row two bands tall — so
+ * SERIAL, RECORDS and MODIFIED on that row no longer sat on the same line as
+ * their neighbours' and the eye lost the column it was scanning. The artboard
+ * draws it inside the status cell, directly under the status word, which is
+ * the thing it is about.
+ *
+ * Asserted as containment rather than by class names: any re-styling is free,
+ * a move back out to the row is not.
+ */
+test("the warning sub-line is inside the status cell, not a band under the row", async () => {
+  mockZones([
+    zone({
+      id: 45,
+      name: "failing.example.com",
+      type: "secondary",
+      primaries: "203.0.113.9",
+      soa_refresh: 7200,
+      refreshed_at: Date.now() - 31 * 3600_000,
+      expires_at: Date.now() + 999_999_999,
+      last_error: "203.0.113.9:53: dial tcp: connect: connection refused",
+      last_attempt: Date.now() - 60_000,
+    }),
+  ]);
+  renderWithProviders(<ZonesList />);
+  const rows = await screen.findAllByTestId("zone-row");
+
+  const status = within(rows[0]).getByTestId("zone-status");
+  expect(status).toContainElement(within(rows[0]).getByTestId("zone-pull-warning"));
+  expect(status).toContainElement(within(rows[0]).getByTestId("zone-pull-attempt"));
+  expect(status).toContainElement(within(rows[0]).getByTestId("zone-pull-error"));
+  // Which is also what keeps the row one grid: the status word and the
+  // sub-line share a cell, so nothing sits outside the seven columns.
+  expect(within(rows[0]).getByTestId("zone-pull-warning").closest("[data-slot='zone-row']")).toBe(
+    rows[0],
+  );
+  expect(status).toHaveTextContent("Transfer failing");
+});
+
+// ── the row's actions live in one menu ─────────────────────────────────────
+//
+// The row used to carry a pencil and a trash can, and its retry sat in a band
+// across the foot of the row. All three are one kebab now — the artboard's own
+// shape, and what lets three actions of very different weight share a 92px
+// cell. Rename is drawn on the artboard and deliberately not built: no rename
+// exists in this app or its API, and the pencil it would have replaced was a
+// link to the detail page, never a rename.
+
+test("the row's actions are one kebab menu, and the pencil and trash are gone", async () => {
+  mockZones([zone({ id: 40, name: "home.lan", type: "primary" })]);
+  renderWithProviders(<ZonesList />);
+  const rows = await screen.findAllByTestId("zone-row");
+
+  // One control in the cell, named for its own zone rather than "Actions" —
+  // in a list of forty rows the bare word is forty identical buttons.
+  expect(within(rows[0]).queryByRole("button", { name: /^edit /i })).not.toBeInTheDocument();
+  expect(within(rows[0]).queryByRole("button", { name: /^delete /i })).not.toBeInTheDocument();
+
+  const menu = await rowMenu(rows[0], "home.lan");
+  expect(within(menu).getByRole("menuitem", { name: "Disable" })).toBeInTheDocument();
+  expect(within(menu).getByRole("menuitem", { name: "Delete zone" })).toBeInTheDocument();
+  // Not invented: the artboard draws it, nothing in the app implements it.
+  expect(within(menu).queryByRole("menuitem", { name: /rename/i })).not.toBeInTheDocument();
+
+  // And nothing is lost by dropping the pencil: the name is the same link it
+  // pointed at, and it is still the only one on the row.
+  expect(within(rows[0]).getAllByRole("link")).toHaveLength(1);
+  expect(within(rows[0]).getByRole("link", { name: "home.lan" })).toHaveAttribute(
+    "href",
+    "/zones/40",
+  );
+});
+
+// Two rows in one render, so the noun is proved to follow each row's own type
+// rather than a single fixture's. Same endpoint behind both — POST
+// /zones/{id}/refresh takes either type that pulls — and a different word for
+// it, because a stub asks two ordinary questions and does not transfer.
+test("the pull item says Fetch now on a stub and Retry transfer on a secondary", async () => {
+  mockZones([
+    zone({ id: 41, name: "ad.corp.example.net", type: "stub", primaries: "10.0.0.9" }),
+    zone({ id: 42, name: "branch.example.com", type: "secondary", primaries: "203.0.113.9" }),
+  ]);
+  renderWithProviders(<ZonesList />);
+  const rows = await screen.findAllByTestId("zone-row");
+
+  const stubMenu = await rowMenu(rows[0], "ad.corp.example.net");
+  expect(within(stubMenu).getByRole("menuitem", { name: "Fetch now" })).toBeInTheDocument();
+  expect(within(stubMenu).queryByRole("menuitem", { name: /transfer/i })).not.toBeInTheDocument();
+  fireEvent.keyDown(stubMenu, { key: "Escape" });
+
+  const secondaryMenu = await rowMenu(rows[1], "branch.example.com");
+  expect(
+    within(secondaryMenu).getByRole("menuitem", { name: "Retry transfer" }),
+  ).toBeInTheDocument();
+  expect(within(secondaryMenu).queryByRole("menuitem", { name: /fetch/i })).not.toBeInTheDocument();
+});
+
+// Ported from the zone detail page, which is where this lived and nowhere
+// else — so the list could show a zone was off but never switch it. Same
+// PATCH, same two toasts, and the same absence of a confirmation: disabling
+// is one click to undo, and a dialog in front of it would only train people
+// to dismiss the one that guards the delete.
+test("Disable PATCHes enabled:false and Enable PATCHes enabled:true", async () => {
+  let body: unknown;
+  server.use(
+    http.patch("/api/v1/zones/43", async ({ request }) => {
+      body = await request.json();
+      return new HttpResponse(null, { status: 204 });
+    }),
+  );
+  const success = vi.spyOn(toast, "success");
+
+  mockZones([zone({ id: 43, name: "home.lan", enabled: true })]);
+  const on = renderWithProviders(<ZonesList />);
+  await waitFor(() => expect(zoneRows()).toHaveLength(1));
+
+  const offMenu = await rowMenu(zoneRows()[0], "home.lan");
+  // One item, not two: an enabled zone is never also offered Enable.
+  expect(within(offMenu).queryByRole("menuitem", { name: "Enable" })).not.toBeInTheDocument();
+  fireEvent.click(within(offMenu).getByRole("menuitem", { name: "Disable" }));
+  await waitFor(() => expect(body).toEqual({ enabled: false }));
+  await waitFor(() => expect(success).toHaveBeenCalledWith("Zone disabled"));
+  on.unmount();
+
+  // The same zone, off. The item flips its word, and the body it sends with
+  // it — a label that flipped alone would disable an already-disabled zone.
+  body = undefined;
+  mockZones([zone({ id: 43, name: "home.lan", enabled: false })]);
+  renderWithProviders(<ZonesList />);
+  await waitFor(() => expect(zoneRows()).toHaveLength(1));
+
+  const onMenu = await rowMenu(zoneRows()[0], "home.lan");
+  expect(within(onMenu).queryByRole("menuitem", { name: "Disable" })).not.toBeInTheDocument();
+  fireEvent.click(within(onMenu).getByRole("menuitem", { name: "Enable" }));
+  await waitFor(() => expect(body).toEqual({ enabled: true }));
+  await waitFor(() => expect(success).toHaveBeenCalledWith("Zone enabled"));
+});
+
+test("a failed disable names the zone and leaves the row enabled", async () => {
+  mockZones([zone({ id: 44, name: "home.lan", enabled: true })]);
+  server.use(
+    http.patch("/api/v1/zones/44", () => HttpResponse.json({ error: "boom" }, { status: 500 })),
+  );
+  const errorSpy = vi.spyOn(toast, "error");
+
+  renderWithProviders(<ZonesList />);
+  await waitFor(() => expect(zoneRows()).toHaveLength(1));
+
+  const menu = await rowMenu(zoneRows()[0], "home.lan");
+  fireEvent.click(within(menu).getByRole("menuitem", { name: "Disable" }));
+
+  await waitFor(() => expect(errorSpy).toHaveBeenCalledWith("Couldn't disable home.lan"));
+  expect(within(zoneRows()[0]).getByText("Enabled")).toBeInTheDocument();
+});
+
+// ── the tooltip is supplementary, never the only copy ───────────────────────
+
+// The row carries the alarm on its own — weight, colour, dot, edge mark, tint
+// and the sub-line — and the tooltip carries the words that explain it. What
+// must not happen is the label reading twice: it is the tooltip's, and a
+// second copy inline is the artboard's own arrangement undone.
+test("the warn label and its sentence are in the tooltip and nowhere in the row", async () => {
+  const user = userEvent.setup();
+  mockZones([
+    zone({
+      id: 29,
+      name: "ad.corp.example.net",
+      type: "stub",
+      enabled: true,
+      primaries: "10.0.0.9",
+    }),
+  ]);
+  renderWithProviders(<ZonesList />);
+  const rows = await screen.findAllByTestId("zone-row");
+
+  expect(rows[0].textContent).not.toMatch(/never fetched/i);
+  expect(rows[0].textContent).not.toMatch(/answering nothing under/i);
+
+  const tip = await statusTip(user, rows[0]);
+  expect(tip).toHaveTextContent("Never fetched");
+  expect(tip).toHaveTextContent("Answering nothing under ad.corp.example.net.");
+});
+
+// A row with nothing to explain is not a trigger at all: forty rows of
+// tooltips that say nothing is how a tooltip stops being read. Asserted on
+// the cell rather than by hovering and waiting for nothing to happen — a
+// popup that opens 300ms after the assertion would pass that.
+test("a healthy primary's status is not a tooltip trigger", async () => {
+  mockZones([zone({ id: 30, name: "home.lan", type: "primary" })]);
+  renderWithProviders(<ZonesList />);
+  const rows = await screen.findAllByTestId("zone-row");
+
+  const cell = within(rows[0]).getByTestId("zone-status");
+  expect(cell).toHaveTextContent("Enabled");
+  expect(cell).not.toHaveAttribute("data-slot", "tooltip-trigger");
+  expect(cell).not.toHaveClass("cursor-help");
 });
 
 // ── Keeping up with the scheduler ───────────────────────────────────────────
@@ -1020,4 +1812,84 @@ test("a transfer landing re-reads that zone's records, and only that zone's", as
   expect(reads(paths, "/api/v1/zones/6/records")).toBe(2);
   // The primary beside it transferred nothing, because it cannot.
   expect(reads(paths, "/api/v1/zones/1/records")).toBe(1);
+});
+
+// A stub's NS set is fetched on the SOA's own schedule by the same scheduler
+// that transfers a secondary (internal/zones/refresh.go's pullsFromAMaster
+// covers both), so a page showing one is out of date the moment it stops
+// asking — exactly the condition the poll exists for. Without a stub in
+// `watchesTransfers`, a stub sitting at "no NS set yet" stays there until
+// someone reloads, and the first successful fetch never reaches the screen.
+test("a stub is watched the same way a secondary is", async () => {
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  const paths = trackFetchedPaths();
+  // A fixed stamp, not Date.now() per request: refreshed_at moving is the
+  // signal useRecordsFollowTransfers watches, so a handler that minted a new
+  // one on every poll would re-read the records on every poll and the
+  // assertion below would be measuring the fixture rather than the rule.
+  const fetchedAt = Date.now();
+  let fetched = false;
+  server.use(
+    http.get("/api/v1/zones", () =>
+      HttpResponse.json([
+        zone({
+          id: 7,
+          name: "ad.corp.example",
+          type: "stub",
+          primaries: "10.0.0.9:53",
+          soa_refresh: 25_200,
+          refreshed_at: fetched ? fetchedAt : 0,
+        }),
+      ]),
+    ),
+  );
+  mockZoneRecords(7, []);
+
+  renderWithProviders(<ZonesList />);
+  await screen.findAllByTestId("zone-row");
+  const before = reads(paths, "/api/v1/zones");
+
+  // The scheduler's first fetch landed. Nothing told this page so.
+  fetched = true;
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(5 * 60_000);
+  });
+
+  expect(reads(paths, "/api/v1/zones")).toBeGreaterThan(before);
+  // …and the records that arrived with it were re-read exactly once, off
+  // refreshed_at moving — the same rule that follows a transfer.
+  await waitFor(() => expect(reads(paths, "/api/v1/zones/7/records")).toBe(2));
+});
+
+// The hint cell's error branch, on both fields it can carry one for.
+//
+// `upstreamError` was renamed from `primariesError` when this cell grew from
+// serving one type to serving four, and the rename promised coverage the
+// wiring did not have: it was fed `errors.primaries` alone and rendered a
+// `<FormField name="primaries">` unconditionally, so a forwarder's error
+// would have been dropped on the floor at both ends. There is no `forward_to`
+// rule in the schema today — a forwarder's upstreams may legitimately be
+// empty — which is precisely what makes this worth holding: the next person
+// to add one binds it to a prop whose name says it is already handled.
+test("the hint cell shows a validation error for whichever upstream field the type uses", () => {
+  const stub = renderWithProviders(
+    <TypeAwareFieldsHarness
+      type="stub"
+      fieldError={{ name: "primaries", message: "Where to pull from, e.g. 192.168.150.1" }}
+    />,
+  );
+  expect(screen.getByText("Where to pull from, e.g. 192.168.150.1")).toBeInTheDocument();
+  // The error takes its own column over from the hint rather than appearing
+  // beside it.
+  expect(screen.queryByText("Primary servers, comma separated.")).not.toBeInTheDocument();
+  stub.unmount();
+
+  renderWithProviders(
+    <TypeAwareFieldsHarness
+      type="forwarder"
+      fieldError={{ name: "forward_to", message: "bad forward target" }}
+    />,
+  );
+  expect(screen.getByText("bad forward target")).toBeInTheDocument();
+  expect(screen.queryByText("Upstream servers, comma separated.")).not.toBeInTheDocument();
 });

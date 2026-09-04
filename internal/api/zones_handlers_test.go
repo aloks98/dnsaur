@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -167,16 +168,19 @@ func TestZoneCreateRejectsBadName(t *testing.T) {
 	}
 }
 
-// primary and secondary are the two types this API can create. The schema
-// has allowed stub | forwarder | internal since Milestone A, but
-// internal/zones/answer.go treats forwarder and stub as non-answering and
-// nothing populates them, and internal is the RFC 6303 built-ins seeded at
-// migration — a type that cannot be created cannot misbehave, so each is
-// refused rather than stored as a zone the resolver would ignore. Any type
-// outside the two must 400, not just nonsense values.
+// primary, secondary, forwarder and stub are the four types this API can
+// create. internal is the RFC 6303 built-ins seeded at migration and stays
+// refused — a type that cannot be created cannot misbehave. Any type outside
+// the four must 400, not just nonsense values.
+//
+// stub and forwarder were in this list through Milestone D6's Task 4 (see
+// TestZoneCreateAcceptsForwarderAndStub); dropped once each became
+// creatable, the same way secondary was dropped when D2 landed — keeping a
+// type here after it becomes creatable would measure nothing, the failure
+// mode TestZonePatchRejectsAnUnservableType's doc comment already names.
 func TestZoneCreateRejectsAnUnservableType(t *testing.T) {
 	srv := newTestServer(t)
-	for _, zt := range []string{"stub", "forwarder", "internal", "banana"} {
+	for _, zt := range []string{"internal", "banana"} {
 		body := `{"name":"e412.in","type":"` + zt + `"}`
 		if rec := srv.do(t, "POST", "/api/v1/zones", body); rec.Code != http.StatusBadRequest {
 			t.Errorf("POST type=%q status = %d, want 400", zt, rec.Code)
@@ -344,7 +348,9 @@ func TestZonePatch(t *testing.T) {
 // TestZonePatchRejectsNonPrimaryType, which used "secondary" as its rejected
 // type and so measured nothing once secondary became creatable — it would
 // have kept passing on the missing primaries alone, which is
-// TestPatchToSecondaryRequiresPrimaries' job.
+// TestPatchToSecondaryRequiresPrimaries' job. stub and forwarder were
+// dropped from the list the same way, once D6's Task 4 made them creatable
+// too — see TestZoneCreateAcceptsForwarderAndStub.
 func TestZonePatchRejectsAnUnservableType(t *testing.T) {
 	srv := newTestServer(t)
 	rec := srv.do(t, "POST", "/api/v1/zones", `{"name":"e412.in"}`)
@@ -352,7 +358,7 @@ func TestZonePatchRejectsAnUnservableType(t *testing.T) {
 	_ = json.Unmarshal(rec.Body.Bytes(), &got)
 
 	path := fmt.Sprintf("/api/v1/zones/%d", got.ID)
-	for _, zt := range []string{"stub", "forwarder", "internal", "banana"} {
+	for _, zt := range []string{"internal", "banana"} {
 		if rec := srv.do(t, "PATCH", path, `{"type":"`+zt+`"}`); rec.Code != http.StatusBadRequest {
 			t.Errorf("PATCH type=%q status = %d, want 400", zt, rec.Code)
 		}
@@ -806,20 +812,78 @@ func TestZoneRefreshPassesTheTransferErrorThrough(t *testing.T) {
 	}
 }
 
-// A primary has nowhere to pull from. Refused here rather than left to come
-// back as a 502 from Transfer's own type check, which would read as "the
-// other server failed" about a transfer that was never attempted.
-func TestZoneRefreshRefusesANonSecondaryZone(t *testing.T) {
-	fake := &fakeZoneRefresher{}
+// A stub pulls from a master too — two ordinary queries for the apex SOA and
+// NS instead of an AXFR — so the button means something for it, and the
+// scheduler behind it has handled one since stub zones were put on the
+// schedule.
+//
+// expires_at comes back 0 and that is the answer, not a missing value: a stub
+// is never given an expiry (§9.11.8). A client must render it as "does not
+// expire" rather than as an expiry at the epoch.
+func TestZoneRefreshAcceptsAStubZone(t *testing.T) {
+	fake := &fakeZoneRefresher{result: zones.TransferResult{
+		Primary:     netip.MustParseAddrPort("203.0.113.9:53"),
+		Serial:      2026080601,
+		Records:     2,
+		RefreshedAt: 1754000000000,
+	}}
 	srv := newRefreshTestServer(t, fake)
-	id := srv.createZone(t, "e412.in")
-
-	rec := srv.do(t, "POST", fmt.Sprintf("/api/v1/zones/%d/refresh", id), "")
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d body = %s; want 400", rec.Code, rec.Body)
+	rec := srv.do(t, "POST", "/api/v1/zones",
+		`{"name":"ad.corp.example","type":"stub","primaries":"203.0.113.9"}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create stub: status = %d body = %s", rec.Code, rec.Body)
 	}
-	if calls := fake.called(); len(calls) != 0 {
-		t.Errorf("refreshed %v, want no transfer attempted at all", calls)
+	id := createdID(t, rec)
+
+	rec = srv.do(t, "POST", fmt.Sprintf("/api/v1/zones/%d/refresh", id), "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s; want 200", rec.Code, rec.Body)
+	}
+	if calls := fake.called(); len(calls) != 1 || calls[0] != id {
+		t.Fatalf("refreshed %v, want exactly [%d]", calls, id)
+	}
+	var got zoneRefreshResult
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal %s: %v", rec.Body, err)
+	}
+	if got.ExpiresAt != 0 {
+		t.Errorf("expires_at = %d, want 0 — a stub does not expire", got.ExpiresAt)
+	}
+	if got.Serial != 2026080601 || got.Records != 2 {
+		t.Errorf("body = %+v, want the fetch's own serial and rows", got)
+	}
+}
+
+// The other side of the same boundary, which is what stops it from being
+// widened to "any zone at all".
+//
+// A primary is authored here and a forwarder names its upstreams outright in
+// forward_to: neither has a master, so refreshing one is a no-op wearing a
+// button. Refused here rather than left to come back as a 502 from the
+// fetcher's own type check, which would read as "the other server failed"
+// about a fetch that was never attempted.
+func TestZoneRefreshRefusesAZoneWithNoMaster(t *testing.T) {
+	for _, tc := range []struct{ zoneType, body string }{
+		{"primary", `{"name":"e412.in","type":"primary"}`},
+		{"forwarder", `{"name":"corp.example","type":"forwarder","forward_to":"10.0.0.1"}`},
+	} {
+		t.Run(tc.zoneType, func(t *testing.T) {
+			fake := &fakeZoneRefresher{}
+			srv := newRefreshTestServer(t, fake)
+			rec := srv.do(t, "POST", "/api/v1/zones", tc.body)
+			if rec.Code != http.StatusCreated {
+				t.Fatalf("create %s: status = %d body = %s", tc.zoneType, rec.Code, rec.Body)
+			}
+			id := createdID(t, rec)
+
+			rec = srv.do(t, "POST", fmt.Sprintf("/api/v1/zones/%d/refresh", id), "")
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d body = %s; want 400", rec.Code, rec.Body)
+			}
+			if calls := fake.called(); len(calls) != 0 {
+				t.Errorf("refreshed %v, want no attempt at all: a %s has no master to ask", calls, tc.zoneType)
+			}
+		})
 	}
 }
 
@@ -846,5 +910,177 @@ func TestZoneRefreshWithoutASchedulerIsUnavailable(t *testing.T) {
 	rec := srv.do(t, "POST", fmt.Sprintf("/api/v1/zones/%d/refresh", id), "")
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d body = %s; want 503", rec.Code, rec.Body)
+	}
+}
+
+func TestZoneCreateAcceptsForwarderAndStub(t *testing.T) {
+	tests := []struct {
+		name, body string
+		check      func(t *testing.T, z store.Zone)
+	}{
+		{
+			name: "forwarder with upstreams",
+			body: `{"name":"corp.example","type":"forwarder","forward_to":"10.0.0.1, 10.0.0.2:5353"}`,
+			check: func(t *testing.T, z store.Zone) {
+				// Canonical, not as typed.
+				if z.ForwardTo != "10.0.0.1:53, 10.0.0.2:5353" {
+					t.Errorf("forward_to = %q, want the canonical spelling", z.ForwardTo)
+				}
+			},
+		},
+		{
+			name: "stub with a master",
+			body: `{"name":"ad.corp.example","type":"stub","primaries":"10.0.0.9"}`,
+			check: func(t *testing.T, z store.Zone) {
+				if z.Primaries != "10.0.0.9" {
+					t.Errorf("primaries = %q, want it kept", z.Primaries)
+				}
+				if z.ForwardTo != "" {
+					t.Errorf("forward_to = %q on a stub, want empty", z.ForwardTo)
+				}
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ts := newTestServer(t)
+			rec := ts.do(t, "POST", "/api/v1/zones", tc.body)
+			if rec.Code != http.StatusCreated {
+				t.Fatalf("status %d, body %s", rec.Code, rec.Body)
+			}
+			tc.check(t, ts.zone(t, createdID(t, rec)))
+		})
+	}
+}
+
+func TestZoneForwardToRefusedOnOtherTypes(t *testing.T) {
+	for _, zoneType := range []string{"primary", "secondary", "stub"} {
+		t.Run(zoneType, func(t *testing.T) {
+			ts := newTestServer(t)
+			body := `{"name":"x.example","type":"` + zoneType + `","forward_to":"10.0.0.1"`
+			if zoneType == "secondary" || zoneType == "stub" {
+				body += `,"primaries":"10.0.0.9"`
+			}
+			body += `}`
+			rec := ts.do(t, "POST", "/api/v1/zones", body)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status %d, body %s", rec.Code, rec.Body)
+			}
+			if !strings.Contains(rec.Body.String(), "forward_to") {
+				t.Errorf("body %s does not name the offending field", rec.Body)
+			}
+		})
+	}
+}
+
+// A stub may name a TSIG key: its SOA and NS queries are ordinary queries, and
+// a master requiring TSIG on those would refuse the fetch outright.
+func TestZoneStubAcceptsATSIGKey(t *testing.T) {
+	ts := newTestServer(t)
+	keyID, err := ts.store.TSIGKeys().Create(t.Context(), store.TSIGKey{
+		Name: "stub-key.", Algorithm: "hmac-sha256.", Secret: "c2VjcmV0LXNlY3JldC1zZWNyZXQ=",
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	rec := ts.do(t, "POST", "/api/v1/zones",
+		`{"name":"ad.corp.example","type":"stub","primaries":"10.0.0.9","tsig_key_id":`+
+			strconv.FormatInt(keyID, 10)+`}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status %d, body %s", rec.Code, rec.Body)
+	}
+	if z := ts.zone(t, createdID(t, rec)); z.TSIGKeyID != keyID {
+		t.Errorf("tsig_key_id = %d, want %d", z.TSIGKeyID, keyID)
+	}
+}
+
+// Neither new type serves a zone or has secondaries, so both transfer-facing
+// fields stay refused.
+func TestZoneTransferFieldsRefusedOnForwarderAndStub(t *testing.T) {
+	cases := []struct{ zoneType, field, value string }{
+		{"forwarder", "allow_transfer", "10.0.0.0/24"},
+		{"forwarder", "notify_to", "10.0.0.2"},
+		{"stub", "allow_transfer", "10.0.0.0/24"},
+		{"stub", "notify_to", "10.0.0.2"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.zoneType+"/"+tc.field, func(t *testing.T) {
+			ts := newTestServer(t)
+			body := `{"name":"x.example","type":"` + tc.zoneType + `","` + tc.field + `":"` + tc.value + `"`
+			if tc.zoneType == "stub" {
+				body += `,"primaries":"10.0.0.9"`
+			}
+			body += `}`
+			rec := ts.do(t, "POST", "/api/v1/zones", body)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status %d, body %s", rec.Code, rec.Body)
+			}
+		})
+	}
+}
+
+// A rule enforced on POST and not on PATCH is a rule with a way around it.
+func TestZonePatchValidatesForwardTo(t *testing.T) {
+	ts := newTestServer(t)
+	rec := ts.do(t, "POST", "/api/v1/zones", `{"name":"corp.example","type":"forwarder","forward_to":"10.0.0.1"}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create: %s", rec.Body)
+	}
+	id := strconv.FormatInt(createdID(t, rec), 10)
+
+	if bad := ts.do(t, "PATCH", "/api/v1/zones/"+id, `{"forward_to":"10.0.0.1:0"}`); bad.Code != http.StatusBadRequest {
+		t.Fatalf("PATCH with a bad port: status %d, body %s", bad.Code, bad.Body)
+	}
+	if ok := ts.do(t, "PATCH", "/api/v1/zones/"+id, `{"forward_to":"  10.0.0.7  "}`); ok.Code != http.StatusNoContent {
+		t.Fatalf("PATCH: status %d, body %s", ok.Code, ok.Body)
+	}
+	if z := ts.zone(t, createdID(t, rec)); z.ForwardTo != "10.0.0.7:53" {
+		t.Errorf("forward_to = %q, want the canonical spelling", z.ForwardTo)
+	}
+	// Clearing back to empty is an ordinary edit, and must not be read as
+	// "absent, keep what was there".
+	if cleared := ts.do(t, "PATCH", "/api/v1/zones/"+id, `{"forward_to":""}`); cleared.Code != http.StatusNoContent {
+		t.Fatalf("clearing PATCH: status %d, body %s", cleared.Code, cleared.Body)
+	}
+	if z := ts.zone(t, createdID(t, rec)); z.ForwardTo != "" {
+		t.Errorf("forward_to = %q after clearing, want empty", z.ForwardTo)
+	}
+}
+
+// PATCH forward_to onto a zone that is not a forwarder. Only
+// checkZoneTransferConfig refuses this — canonicalForwardTo parses the
+// value happily, because the value itself is well-formed. So this is the
+// case that fails if the type gate is removed or reordered on the patch
+// path, and the malformed-port case above is not.
+func TestZonePatchRefusesForwardToOnAnotherType(t *testing.T) {
+	ts := newTestServer(t)
+	rec := ts.do(t, "POST", "/api/v1/zones", `{"name":"ad.corp.example","type":"stub","primaries":"10.0.0.9"}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create: %s", rec.Body)
+	}
+	id := strconv.FormatInt(createdID(t, rec), 10)
+
+	if bad := ts.do(t, "PATCH", "/api/v1/zones/"+id, `{"forward_to":"10.0.0.1"}`); bad.Code != http.StatusBadRequest {
+		t.Fatalf("PATCH forward_to onto a stub: status %d, body %s", bad.Code, bad.Body)
+	}
+}
+
+// A second shape of the same gap: patching a forwarder's type to stub
+// without touching forward_to in the same request leaves the merged zone —
+// the value checkZoneTransferConfig actually validates — with forward_to
+// still set from before. Refused for the same reason as the case above: the
+// stored value was well-formed when it was written, so only the type gate
+// catches this, not a re-parse.
+func TestZonePatchRefusesTypeChangeThatLeavesForwardToStale(t *testing.T) {
+	ts := newTestServer(t)
+	rec := ts.do(t, "POST", "/api/v1/zones", `{"name":"corp.example","type":"forwarder","forward_to":"10.0.0.1"}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create: %s", rec.Body)
+	}
+	id := strconv.FormatInt(createdID(t, rec), 10)
+
+	if bad := ts.do(t, "PATCH", "/api/v1/zones/"+id, `{"type":"stub","primaries":"10.0.0.9"}`); bad.Code != http.StatusBadRequest {
+		t.Fatalf("PATCH type to stub without clearing forward_to: status %d, body %s", bad.Code, bad.Body)
 	}
 }

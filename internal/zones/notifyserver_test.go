@@ -180,8 +180,34 @@ func TestNotifyGate(t *testing.T) {
 			wantRcode: dns.RcodeFormatError,
 		},
 		{
+			// The types that hold no data of their own and pull from a
+			// master are the ones a master gets to tell. A stub pulls the
+			// same way a secondary does — the same scheduler, the same
+			// per-zone lock, the same recorded attempt (pullsFromAMaster) —
+			// so a master that has just moved its delegation says so the
+			// same way, and this gate is the one place that used to say
+			// otherwise.
+			name:      "a stub zone is told by its master, like the secondary it pulls like",
+			mutate:    func(z *store.Zone) { z.Type = "stub" },
+			qtype:     dns.TypeSOA,
+			peer:      "10.0.0.1",
+			wantRcode: dns.RcodeSuccess, wantRefresh: true,
+		},
+		{
 			name:      "a primary zone is not told by anyone",
 			mutate:    func(z *store.Zone) { z.Type = "primary"; z.Primaries = "" },
+			qtype:     dns.TypeSOA,
+			peer:      "10.0.0.1",
+			wantRcode: dns.RcodeNotAuth,
+		},
+		{
+			// The other half of the widened rule: "pulls from a master" is
+			// the test, not "is not a primary". A forwarder claims a suffix
+			// and names its upstreams outright in forward_to; there is
+			// nobody to pull from, so a NOTIFY for one has no work it could
+			// possibly cause.
+			name:      "a forwarder zone has no master, so nobody tells it",
+			mutate:    func(z *store.Zone) { z.Type = "forwarder"; z.ForwardTo = "10.0.0.1:53" },
 			qtype:     dns.TypeSOA,
 			peer:      "10.0.0.1",
 			wantRcode: dns.RcodeNotAuth,

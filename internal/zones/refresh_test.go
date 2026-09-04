@@ -34,7 +34,9 @@ const (
 	scheduleFloor = 60 * time.Second
 )
 
-// refresher builds a scheduler over the fixture's store and clock.
+// refresher builds a scheduler over the fixture's store and clock, with both
+// workers wired — the Transferrer a secondary is pulled with and the
+// StubFetcher a stub is, which is the shape App.New builds.
 //
 // The jitter is pinned to the far end of the spread rather than left random:
 // a test that only passes because the random delay happened to be small is
@@ -44,6 +46,7 @@ func (f *transferFixture) refresher(opts ...zones.RefreshOption) *zones.Refreshe
 	opts = append([]zones.RefreshOption{
 		zones.WithRefreshNow(func() time.Time { return f.now }),
 		zones.WithJitter(func(d time.Duration) time.Duration { return d }),
+		zones.WithStubFetcher(f.stubFetcher()),
 	}, opts...)
 	return zones.NewRefresher(f.st.Zones(), f.transferrer(), opts...)
 }
@@ -386,46 +389,48 @@ func (g *gatedZoneStore) overlapped() int {
 // The store is wrapped rather than the timing being left to chance: without
 // the per-zone lock this fails every run, not one run in ten.
 func TestConcurrentRefreshesOfOneZoneDoNotDuplicateItsRecords(t *testing.T) {
-	primary := startTestPrimary(t, transferApex, primaryZoneRRs(t))
-	f := newTransferFixture(t, primary.addr, 0)
+	forEachDriver(t, func(t *testing.T, driver string) {
+		primary := startTestPrimary(t, transferApex, primaryZoneRRs(t))
+		f := newTransferFixtureOn(t, driver, primary.addr, 0)
 
-	zs := &gatedZoneStore{ZoneStore: f.st.Zones(), hold: gate(2, 200*time.Millisecond)}
-	tr := zones.NewTransferrer(zs, f.st.TSIGKeys(),
-		zones.WithTransferNow(func() time.Time { return f.now }),
-		zones.WithReload(f.resolver.Reload))
-	ref := zones.NewRefresher(f.st.Zones(), tr,
-		zones.WithRefreshNow(func() time.Time { return f.now }))
+		zs := &gatedZoneStore{ZoneStore: f.st.Zones(), hold: gate(2, 200*time.Millisecond)}
+		tr := zones.NewTransferrer(zs, f.st.TSIGKeys(),
+			zones.WithTransferNow(func() time.Time { return f.now }),
+			zones.WithReload(f.resolver.Reload))
+		ref := zones.NewRefresher(f.st.Zones(), tr,
+			zones.WithRefreshNow(func() time.Time { return f.now }))
 
-	var wg sync.WaitGroup
-	errs := make([]error, 2)
-	for i := range errs {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			_, errs[i] = ref.Refresh(context.Background(), f.zoneID)
-		}()
-	}
-	wg.Wait()
-	for i, err := range errs {
-		if err != nil {
-			t.Fatalf("refresh %d: %v", i, err)
+		var wg sync.WaitGroup
+		errs := make([]error, 2)
+		for i := range errs {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				_, errs[i] = ref.Refresh(context.Background(), f.zoneID)
+			}()
 		}
-	}
+		wg.Wait()
+		for i, err := range errs {
+			if err != nil {
+				t.Fatalf("refresh %d: %v", i, err)
+			}
+		}
 
-	// Both transfers ran — the second waited for the first rather than being
-	// dropped — and the zone holds one copy of itself.
-	if got := primary.requests(); got != 2 {
-		t.Errorf("the primary was asked %d times, want 2: a manual refresh waits, it does not skip", got)
-	}
-	if got := zs.overlapped(); got != 1 {
-		t.Errorf("%d transfers of one zone were inside the read-then-write window at once, want 1", got)
-	}
-	if got := len(f.records(t)); got != 5 {
-		t.Fatalf("the zone holds %d records after two concurrent transfers, want 5", got)
-	}
-	if m := f.ask(t, "bifrost."+transferApex, dns.TypeA); len(m.Answer) != 2 {
-		t.Errorf("bifrost answered with %d records, want 2", len(m.Answer))
-	}
+		// Both transfers ran — the second waited for the first rather than being
+		// dropped — and the zone holds one copy of itself.
+		if got := primary.requests(); got != 2 {
+			t.Errorf("the primary was asked %d times, want 2: a manual refresh waits, it does not skip", got)
+		}
+		if got := zs.overlapped(); got != 1 {
+			t.Errorf("%d transfers of one zone were inside the read-then-write window at once, want 1", got)
+		}
+		if got := len(f.records(t)); got != 5 {
+			t.Fatalf("the zone holds %d records after two concurrent transfers, want 5", got)
+		}
+		if m := f.ask(t, "bifrost."+transferApex, dns.TypeA); len(m.Answer) != 2 {
+			t.Errorf("bifrost answered with %d records, want 2", len(m.Answer))
+		}
+	})
 }
 
 // oneShotHold blocks the first caller until the test releases it and lets
@@ -468,48 +473,50 @@ func (h *oneShotHold) wait(t *testing.T, what string) {
 // repoints it, while one is in flight must not have that edit undone by the
 // transfer landing on top of it.
 func TestAnEditMadeDuringATransferSurvivesTheInstall(t *testing.T) {
-	primary := startTestPrimary(t, transferApex, primaryZoneRRs(t))
-	f := newTransferFixture(t, primary.addr, 0)
+	forEachDriver(t, func(t *testing.T, driver string) {
+		primary := startTestPrimary(t, transferApex, primaryZoneRRs(t))
+		f := newTransferFixtureOn(t, driver, primary.addr, 0)
 
-	// Held after the transfer has read the zone's records and before it has
-	// written anything — the middle of the install.
-	hold := newOneShotHold()
-	defer hold.free()
-	zs := &gatedZoneStore{ZoneStore: f.st.Zones(), hold: hold.hold}
-	tr := zones.NewTransferrer(zs, f.st.TSIGKeys(),
-		zones.WithTransferNow(func() time.Time { return f.now }),
-		zones.WithReload(f.resolver.Reload))
-	ref := zones.NewRefresher(f.st.Zones(), tr,
-		zones.WithRefreshNow(func() time.Time { return f.now }))
+		// Held after the transfer has read the zone's records and before it has
+		// written anything — the middle of the install.
+		hold := newOneShotHold()
+		defer hold.free()
+		zs := &gatedZoneStore{ZoneStore: f.st.Zones(), hold: hold.hold}
+		tr := zones.NewTransferrer(zs, f.st.TSIGKeys(),
+			zones.WithTransferNow(func() time.Time { return f.now }),
+			zones.WithReload(f.resolver.Reload))
+		ref := zones.NewRefresher(f.st.Zones(), tr,
+			zones.WithRefreshNow(func() time.Time { return f.now }))
 
-	done := make(chan struct{})
-	go func() { defer close(done); _ = ref.RefreshDue(context.Background()) }()
+		done := make(chan struct{})
+		go func() { defer close(done); _ = ref.RefreshDue(context.Background()) }()
 
-	hold.wait(t, "the install")
-	const repointed = "192.0.2.9:53"
-	f.updateZone(t, func(z *store.Zone) { z.Enabled, z.Primaries = false, repointed })
-	hold.free()
+		hold.wait(t, "the install")
+		const repointed = "192.0.2.9:53"
+		f.updateZone(t, func(z *store.Zone) { z.Enabled, z.Primaries = false, repointed })
+		hold.free()
 
-	select {
-	case <-done:
-	case <-time.After(30 * time.Second):
-		t.Fatal("the pass did not finish")
-	}
+		select {
+		case <-done:
+		case <-time.After(30 * time.Second):
+			t.Fatal("the pass did not finish")
+		}
 
-	z := f.zone(t)
-	if z.Enabled {
-		t.Errorf("a transfer in flight re-enabled a zone the operator disabled")
-	}
-	if z.Primaries != repointed {
-		t.Errorf("primaries = %q, want %q — the transfer reverted them", z.Primaries, repointed)
-	}
-	// And it is the *edit* that survived, not the transfer that was lost.
-	if z.RefreshedAt == 0 || z.SOASerial != primarySerial {
-		t.Errorf("refreshed_at = %d serial = %d, want the transfer to have landed", z.RefreshedAt, z.SOASerial)
-	}
-	if got := len(f.records(t)); got != 5 {
-		t.Errorf("the zone holds %d records, want 5", got)
-	}
+		z := f.zone(t)
+		if z.Enabled {
+			t.Errorf("a transfer in flight re-enabled a zone the operator disabled")
+		}
+		if z.Primaries != repointed {
+			t.Errorf("primaries = %q, want %q — the transfer reverted them", z.Primaries, repointed)
+		}
+		// And it is the *edit* that survived, not the transfer that was lost.
+		if z.RefreshedAt == 0 || z.SOASerial != primarySerial {
+			t.Errorf("refreshed_at = %d serial = %d, want the transfer to have landed", z.RefreshedAt, z.SOASerial)
+		}
+		if got := len(f.records(t)); got != 5 {
+			t.Errorf("the zone holds %d records, want 5", got)
+		}
+	})
 }
 
 // The destructive corner of the same window. Transfer refuses to install into
@@ -517,45 +524,47 @@ func TestAnEditMadeDuringATransferSurvivesTheInstall(t *testing.T) {
 // a zone made a primary while the transfer was in flight would be overwritten
 // by data this server is now supposed to be the author of.
 func TestAZoneRetypedDuringATransferIsNotOverwritten(t *testing.T) {
-	primary := startTestPrimary(t, transferApex, primaryZoneRRs(t))
-	f := newTransferFixture(t, primary.addr, 0)
+	forEachDriver(t, func(t *testing.T, driver string) {
+		primary := startTestPrimary(t, transferApex, primaryZoneRRs(t))
+		f := newTransferFixtureOn(t, driver, primary.addr, 0)
 
-	hold := newOneShotHold()
-	defer hold.free()
-	zs := &gatedZoneStore{ZoneStore: f.st.Zones(), hold: hold.hold}
-	tr := zones.NewTransferrer(zs, f.st.TSIGKeys(),
-		zones.WithTransferNow(func() time.Time { return f.now }),
-		zones.WithReload(f.resolver.Reload))
-	ref := zones.NewRefresher(f.st.Zones(), tr,
-		zones.WithRefreshNow(func() time.Time { return f.now }))
+		hold := newOneShotHold()
+		defer hold.free()
+		zs := &gatedZoneStore{ZoneStore: f.st.Zones(), hold: hold.hold}
+		tr := zones.NewTransferrer(zs, f.st.TSIGKeys(),
+			zones.WithTransferNow(func() time.Time { return f.now }),
+			zones.WithReload(f.resolver.Reload))
+		ref := zones.NewRefresher(f.st.Zones(), tr,
+			zones.WithRefreshNow(func() time.Time { return f.now }))
 
-	done := make(chan struct{})
-	go func() { defer close(done); _ = ref.RefreshDue(context.Background()) }()
+		done := make(chan struct{})
+		go func() { defer close(done); _ = ref.RefreshDue(context.Background()) }()
 
-	hold.wait(t, "the install")
-	f.updateZone(t, func(z *store.Zone) { z.Type = "primary" })
-	hold.free()
+		hold.wait(t, "the install")
+		f.updateZone(t, func(z *store.Zone) { z.Type = "primary" })
+		hold.free()
 
-	select {
-	case <-done:
-	case <-time.After(30 * time.Second):
-		t.Fatal("the pass did not finish")
-	}
+		select {
+		case <-done:
+		case <-time.After(30 * time.Second):
+			t.Fatal("the pass did not finish")
+		}
 
-	z := f.zone(t)
-	if z.Type != "primary" {
-		t.Errorf("type = %q, want primary — the transfer wrote back its own idea of the zone", z.Type)
-	}
-	if z.RefreshedAt != 0 {
-		t.Errorf("refreshed_at = %d, want 0 — nothing may be installed into a zone that is no longer a secondary", z.RefreshedAt)
-	}
-	if got := len(f.records(t)); got != 0 {
-		t.Errorf("the zone holds %d records, want 0", got)
-	}
-	// And it is recorded as what it was: an attempt that failed.
-	if st, _ := ref.Status(f.zoneID); st.Failures != 1 {
-		t.Errorf("failures = %d, want 1", st.Failures)
-	}
+		z := f.zone(t)
+		if z.Type != "primary" {
+			t.Errorf("type = %q, want primary — the transfer wrote back its own idea of the zone", z.Type)
+		}
+		if z.RefreshedAt != 0 {
+			t.Errorf("refreshed_at = %d, want 0 — nothing may be installed into a zone that is no longer a secondary", z.RefreshedAt)
+		}
+		if got := len(f.records(t)); got != 0 {
+			t.Errorf("the zone holds %d records, want 0", got)
+		}
+		// And it is recorded as what it was: an attempt that failed.
+		if st, _ := ref.Status(f.zoneID); st.Failures != 1 {
+			t.Errorf("failures = %d, want 1", st.Failures)
+		}
+	})
 }
 
 // The same hazard one step earlier: what a transfer *does* — which primary it
@@ -656,41 +665,43 @@ func zoneRRsFor(t *testing.T, apex string) []dns.RR {
 // whichever one is currently waiting out a dead primary's dial timeout. Two
 // zones with nothing in common must transfer at the same time.
 func TestTwoZonesTransferConcurrently(t *testing.T) {
-	const otherApex = "other.e412.in"
-	first := startTestPrimary(t, transferApex, primaryZoneRRs(t))
-	second := startTestPrimary(t, otherApex, zoneRRsFor(t, otherApex))
-	f := newTransferFixture(t, first.addr, 0)
-	if _, err := f.st.Zones().AddZone(context.Background(), store.Zone{
-		Name: otherApex, Type: "secondary", Enabled: true,
-		SOANS: "ns1." + otherApex, SOAMbox: "hostadmin." + otherApex,
-		SOASerial: 1, SOARefresh: primaryRefresh, SOARetry: primaryRetry,
-		SOAExpire: primaryExpire, SOAMinimum: 900, SOATTL: 900,
-		Primaries: second.addr,
-	}); err != nil {
-		t.Fatalf("AddZone: %v", err)
-	}
+	forEachDriver(t, func(t *testing.T, driver string) {
+		const otherApex = "other.e412.in"
+		first := startTestPrimary(t, transferApex, primaryZoneRRs(t))
+		second := startTestPrimary(t, otherApex, zoneRRsFor(t, otherApex))
+		f := newTransferFixtureOn(t, driver, first.addr, 0)
+		if _, err := f.st.Zones().AddZone(context.Background(), store.Zone{
+			Name: otherApex, Type: "secondary", Enabled: true,
+			SOANS: "ns1." + otherApex, SOAMbox: "hostadmin." + otherApex,
+			SOASerial: 1, SOARefresh: primaryRefresh, SOARetry: primaryRetry,
+			SOAExpire: primaryExpire, SOAMinimum: 900, SOATTL: 900,
+			Primaries: second.addr,
+		}); err != nil {
+			t.Fatalf("AddZone: %v", err)
+		}
 
-	// Each zone's transfer is held after reading its records until the other
-	// one gets there too. Serialised, neither ever sees the other and the
-	// gate can only time out.
-	zs := &gatedZoneStore{ZoneStore: f.st.Zones(), hold: gate(2, 5*time.Second)}
-	tr := zones.NewTransferrer(zs, f.st.TSIGKeys(),
-		zones.WithTransferNow(func() time.Time { return f.now }),
-		zones.WithReload(f.resolver.Reload))
-	ref := zones.NewRefresher(f.st.Zones(), tr,
-		zones.WithRefreshNow(func() time.Time { return f.now }))
+		// Each zone's transfer is held after reading its records until the other
+		// one gets there too. Serialised, neither ever sees the other and the
+		// gate can only time out.
+		zs := &gatedZoneStore{ZoneStore: f.st.Zones(), hold: gate(2, 5*time.Second)}
+		tr := zones.NewTransferrer(zs, f.st.TSIGKeys(),
+			zones.WithTransferNow(func() time.Time { return f.now }),
+			zones.WithReload(f.resolver.Reload))
+		ref := zones.NewRefresher(f.st.Zones(), tr,
+			zones.WithRefreshNow(func() time.Time { return f.now }))
 
-	f.refreshDue(t, ref)
+		f.refreshDue(t, ref)
 
-	if got := zs.overlapped(); got != 2 {
-		t.Errorf("%d zones were transferring at once, want 2 — one zone must not wait for another", got)
-	}
-	if got := first.requests(); got != 1 {
-		t.Errorf("the first zone's primary was asked %d times, want 1", got)
-	}
-	if got := second.requests(); got != 1 {
-		t.Errorf("the second zone's primary was asked %d times, want 1", got)
-	}
+		if got := zs.overlapped(); got != 2 {
+			t.Errorf("%d zones were transferring at once, want 2 — one zone must not wait for another", got)
+		}
+		if got := first.requests(); got != 1 {
+			t.Errorf("the first zone's primary was asked %d times, want 1", got)
+		}
+		if got := second.requests(); got != 1 {
+			t.Errorf("the second zone's primary was asked %d times, want 1", got)
+		}
+	})
 }
 
 // Startup, the polite half: a zone that fell due while this process was down
@@ -1022,39 +1033,333 @@ func TestASuccessfulTransferClearsTheRecordedError(t *testing.T) {
 // proved is that this statement, whatever happened just before it, cannot
 // carry a stale copy of any other column with it.
 func TestRecordingAFailureDoesNotRevertAnEditMadeBeforeIt(t *testing.T) {
-	f := newTransferFixture(t, deadPort(t), 0)
-	hold := newOneShotHold()
-	defer hold.free()
-	r := zones.NewRefresher(&gatedNoteStore{ZoneStore: f.st.Zones(), hold: hold.hold}, f.transferrer(),
+	forEachDriver(t, func(t *testing.T, driver string) {
+		f := newTransferFixtureOn(t, driver, deadPort(t), 0)
+		hold := newOneShotHold()
+		defer hold.free()
+		r := zones.NewRefresher(&gatedNoteStore{ZoneStore: f.st.Zones(), hold: hold.hold}, f.transferrer(),
+			zones.WithRefreshNow(func() time.Time { return f.now }))
+
+		done := make(chan struct{})
+		go func() { defer close(done); _ = r.RefreshDue(context.Background()) }()
+
+		hold.wait(t, "the failure being recorded")
+		const repointed = "192.0.2.9:5353"
+		f.updateZone(t, func(z *store.Zone) {
+			z.Primaries = repointed
+			z.SOAMbox = "someone-else." + transferApex
+		})
+		hold.free()
+
+		select {
+		case <-done:
+		case <-time.After(30 * time.Second):
+			t.Fatal("the pass did not finish")
+		}
+
+		z := f.zone(t)
+		if z.Primaries != repointed {
+			t.Errorf("primaries = %q, want %q — recording a failure reverted the operator's edit", z.Primaries, repointed)
+		}
+		if z.SOAMbox != "someone-else."+transferApex {
+			t.Errorf("soa_mbox = %q — recording a failure reverted an unrelated column too", z.SOAMbox)
+		}
+		// And the failure was still recorded: the edit surviving must not be the
+		// write having been lost.
+		if z.LastError == "" {
+			t.Errorf("last_error is empty; the edit survived because nothing was written")
+		}
+	})
+}
+
+// stubDelegation is the master a stub's tests fetch from: one nameserver
+// inside the zone, with glue, which is the shape every deployment of the type
+// has.
+func stubDelegation(t *testing.T) *stubMaster {
+	t.Helper()
+	return startStubMaster(t, transferApex, stubMasterConfig{
+		serial: primarySerial,
+		ns:     []string{stubNSLine("ns1." + transferApex)},
+		glue:   []string{fmt.Sprintf("ns1.%s. 3600 IN A 10.9.0.1", transferApex)},
+	})
+}
+
+// stubUpstream is the dial address stubDelegation's glue implies.
+const stubUpstream = "10.9.0.1:53"
+
+// A stub pulls from a master too — two ordinary queries instead of an AXFR —
+// and it is this same loop that decides when. One scheduler for both, because
+// both are "ask a master on the SOA's schedule and record how it went", and
+// two loops would drift.
+//
+// Until this landed a stub was never scheduled at all: it fetched only when
+// an operator asked, so a stub left alone claimed its suffix and answered
+// SERVFAIL forever.
+func TestRefreshDueFetchesAStubZone(t *testing.T) {
+	forEachDriver(t, func(t *testing.T, driver string) {
+		master := stubDelegation(t)
+		f := newTransferFixtureOn(t, driver, master.addr, 0, asZoneType("stub"))
+		ref := f.refresher()
+
+		// Nothing fetched yet: the zone claims its suffix with no addresses
+		// behind it, which is SERVFAIL for everything under it.
+		if u := upstreamsFromSnapshot(t, f); len(u) != 0 {
+			t.Fatalf("precondition: the unfetched stub already names %v", u)
+		}
+
+		f.refreshDue(t, ref)
+
+		// SOA then NS. A scheduler that handed a stub to the Transferrer would
+		// have contacted nobody at all — Transfer refuses a non-secondary before
+		// it dials — and one that held the zone in the startup spread (the
+		// fixture pins the jitter to the far end of it) would have too.
+		if got := master.queries.Load(); got != 2 {
+			t.Fatalf("the master was asked %d times, want 2 (SOA then NS)", got)
+		}
+		if u := upstreamsFromSnapshot(t, f); len(u) != 1 || u[0] != stubUpstream {
+			t.Fatalf("StubUpstreams from the snapshot = %v, want [%s]", u, stubUpstream)
+		}
+
+		z := f.zone(t)
+		if z.RefreshedAt != f.now.UnixMilli() {
+			t.Errorf("refreshed_at = %d, want %d", z.RefreshedAt, f.now.UnixMilli())
+		}
+		if z.SOASerial != primarySerial || z.SOARefresh != primaryRefresh {
+			t.Errorf("zone row: serial=%d refresh=%d, want the master's %d/%d",
+				z.SOASerial, z.SOARefresh, primarySerial, primaryRefresh)
+		}
+		// The schedule is adopted; the expiry is not written at all. See
+		// TestAStubDoesNotExpire.
+		if z.ExpiresAt != 0 {
+			t.Errorf("expires_at = %d, want 0 — a stub is given no expiry", z.ExpiresAt)
+		}
+		st, ok := ref.Status(f.zoneID)
+		if !ok {
+			t.Fatalf("the scheduler kept no state for the stub it fetched")
+		}
+		if st.Failures != 0 || !st.NotBefore.IsZero() {
+			t.Errorf("status = %+v, want no failures and no back-off after a success", st)
+		}
+
+		// And the interval between fetches is the master's own SOA refresh, to
+		// the second, exactly as a secondary's is.
+		f.advance(primaryRefresh*time.Second - time.Second)
+		f.refreshDue(t, ref)
+		if got := master.queries.Load(); got != 2 {
+			t.Fatalf("one second before the refresh elapsed the master was asked %d times, want 2", got)
+		}
+
+		f.advance(time.Second)
+		f.refreshDue(t, ref)
+		if got := master.queries.Load(); got != 4 {
+			t.Fatalf("once the refresh elapsed the master was asked %d times, want 4", got)
+		}
+		if z := f.zone(t); z.RefreshedAt != f.now.UnixMilli() {
+			t.Errorf("refreshed_at = %d after the second fetch, want %d", z.RefreshedAt, f.now.UnixMilli())
+		}
+	})
+}
+
+// §9.11.8, and the divergence that must not be inherited away.
+//
+// A secondary past its SOA expire stops answering (Zone.Serving): it holds
+// its primary's *data* on loan and can no longer confirm that what it holds
+// is current. A stub holds no data. Its NS set is routing information, and an
+// old-but-working nameserver beats a self-inflicted SERVFAIL — if those
+// nameservers really are gone the query fails anyway, through the forwarder's
+// own path, so the outcome is the same when it should be and better when it
+// should not.
+//
+// This test is the only thing standing between that decision and a later
+// change that widens Serving to cover stub "for consistency", which is
+// exactly the reasoning "both pull from a master" invites.
+func TestAStubDoesNotExpire(t *testing.T) {
+	master := stubDelegation(t)
+	f := newTransferFixture(t, master.addr, 0, asZoneType("stub"))
+	ref := f.refresher()
+
+	f.refreshDue(t, ref)
+	if u := upstreamsFromSnapshot(t, f); len(u) != 1 {
+		t.Fatalf("setup: the fetch installed %v, want one upstream", u)
+	}
+
+	// Long past any expiry the master's SOA implies, with the column set as
+	// though something had written one — a stub's own install never does, so
+	// this is the row a zone retyped from secondary to stub carries.
+	f.advance(primaryExpire*time.Second + time.Hour)
+	f.updateZone(t, func(z *store.Zone) { z.ExpiresAt = f.now.Add(-time.Hour).UnixMilli() })
+
+	z := f.resolver.Snapshot().Apex(transferApex)
+	if z == nil {
+		t.Fatalf("the zone is not in the served snapshot")
+	}
+	if !z.Serving(f.now.UnixMilli()) {
+		t.Errorf("a stub an hour past its expires_at stopped serving: its NS set is routing information, " +
+			"not data held on loan, so it keeps forwarding (§9.11.8)")
+	}
+	if u := zones.StubUpstreams(*z); len(u) != 1 || u[0] != stubUpstream {
+		t.Errorf("StubUpstreams = %v, want [%s] — an expired stub stopped contributing to the routing table", u, stubUpstream)
+	}
+
+	// The contrast that makes this a divergence rather than a tautology: the
+	// very same row, as a secondary, has stopped answering. A copy, because
+	// the snapshot's zone is shared with every reader of it.
+	asSecondary := *z
+	asSecondary.Type = "secondary"
+	if asSecondary.Serving(f.now.UnixMilli()) {
+		t.Errorf("the same row as a secondary is still serving; the two types are not being told apart at all")
+	}
+
+	// The other half: a failed attempt is the only event that can carry a
+	// zone across its expiry, and it is where a secondary announces that it
+	// has stopped answering. A stub has not stopped, so it must not say so —
+	// an operator reading that line would go looking for an outage that is
+	// not happening.
+	logs := captureLogs(t)
+	f.updateZone(t, func(z *store.Zone) { z.Primaries = deadPort(t) })
+	f.refreshDue(t, ref)
+	if f.zone(t).LastError == "" {
+		t.Fatalf("the attempt that was meant to fail did not, so there is no sample to assert on")
+	}
+	for _, r := range logs() {
+		if r.Level >= slog.LevelError {
+			t.Errorf("a stub past its expires_at logged %q at %s; a stub does not expire and has not stopped answering", r.Message, r.Level)
+		}
+	}
+}
+
+// A failed fetch is recorded on the zone exactly as a failed transfer is —
+// same columns, same back-off, same retry timer — and changes nothing else.
+// The zone keeps the NS set it already had and goes on routing to it: a stub
+// that dropped its delegation because a master was briefly unreachable would
+// SERVFAIL its whole suffix over an outage somewhere else.
+func TestStubFetchFailureKeepsThePreviousNSSet(t *testing.T) {
+	master := stubDelegation(t)
+	f := newTransferFixture(t, master.addr, 0, asZoneType("stub"))
+	ref := f.refresher()
+
+	f.refreshDue(t, ref)
+	fetchedAt := f.zone(t).RefreshedAt
+	if fetchedAt == 0 {
+		t.Fatalf("setup: the first fetch did not land")
+	}
+
+	// A master that is up and unwilling, so the failure is immediate and the
+	// attempts are countable.
+	refuser := startStubMaster(t, transferApex, stubMasterConfig{rcode: dns.RcodeRefused})
+	f.updateZone(t, func(z *store.Zone) { z.Primaries = refuser.addr })
+	f.advance(primaryRefresh * time.Second)
+	f.refreshDue(t, ref)
+
+	if got := refuser.queries.Load(); got != 1 {
+		t.Fatalf("the refusing master was asked %d times, want 1", got)
+	}
+	z := f.zone(t)
+	if z.LastError == "" {
+		t.Errorf("last_error is empty after a failed fetch; the failure left no trace at all")
+	}
+	if z.LastAttempt != f.now.UnixMilli() {
+		t.Errorf("last_attempt = %d, want %d", z.LastAttempt, f.now.UnixMilli())
+	}
+	if z.RefreshedAt != fetchedAt {
+		t.Errorf("refreshed_at = %d, want %d — a failed fetch must not read as a success", z.RefreshedAt, fetchedAt)
+	}
+	if u := upstreamsFromSnapshot(t, f); len(u) != 1 || u[0] != stubUpstream {
+		t.Errorf("StubUpstreams = %v after a failed fetch, want [%s] — the zone dropped a delegation it still had", u, stubUpstream)
+	}
+	st, ok := ref.Status(f.zoneID)
+	if !ok {
+		t.Fatalf("the scheduler kept no state for the stub it tried")
+	}
+	if st.Failures != 1 || st.LastError == "" {
+		t.Errorf("status = %+v, want one recorded failure with its message", st)
+	}
+	if want := f.now.Add(primaryRetry * time.Second); st.NotBefore.Before(want) {
+		t.Errorf("next attempt = %s, want no earlier than %s", st.NotBefore, want)
+	}
+
+	// And the retry lands on the SOA's retry rather than its refresh — the
+	// shorter of the two timers, through the same back-off a secondary gets.
+	f.advance(primaryRetry*time.Second - time.Second)
+	f.refreshDue(t, ref)
+	if got := refuser.queries.Load(); got != 1 {
+		t.Fatalf("one second before the retry elapsed the master was asked %d times, want 1", got)
+	}
+
+	f.advance(time.Second)
+	f.refreshDue(t, ref)
+	if got := refuser.queries.Load(); got != 2 {
+		t.Fatalf("once the retry elapsed the master was asked %d times, want 2 — a stub's back-off is the SOA's retry", got)
+	}
+}
+
+// The manual path — an operator pressing refresh, and the one a NOTIFY takes
+// — reports a stub's fetch in the same shape it reports a transfer, so a
+// caller does not have to know which kind of zone it asked about.
+//
+// ExpiresAt is the one field that differs, and it is zero rather than
+// unwritten: a stub is never given an expiry (§9.11.8), so there is nothing
+// for a caller to display or compare against.
+func TestRefreshingAStubOnDemandReportsWhatItFetched(t *testing.T) {
+	master := stubDelegation(t)
+	f := newTransferFixture(t, master.addr, 0, asZoneType("stub"))
+
+	res, err := f.refresher().Refresh(context.Background(), f.zoneID)
+	if err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+	if got := master.queries.Load(); got != 2 {
+		t.Fatalf("the master was asked %d times, want 2 (SOA then NS)", got)
+	}
+	if res.Primary.String() != master.addr {
+		t.Errorf("Primary = %s, want the master that answered, %s", res.Primary, master.addr)
+	}
+	if res.Serial != primarySerial {
+		t.Errorf("Serial = %d, want the master's %d", res.Serial, primarySerial)
+	}
+	// The delegation and the glue beside it: what the zone holds after the
+	// install, the same thing the number means for a transfer.
+	if res.Records != 2 {
+		t.Errorf("Records = %d, want 2 (the NS record and its glue)", res.Records)
+	}
+	if res.RefreshedAt != f.now.UnixMilli() {
+		t.Errorf("RefreshedAt = %d, want %d — the stamp the install actually wrote", res.RefreshedAt, f.now.UnixMilli())
+	}
+	if res.ExpiresAt != 0 {
+		t.Errorf("ExpiresAt = %d, want 0 — a stub is given no expiry", res.ExpiresAt)
+	}
+	if z := f.zone(t); z.RefreshedAt != res.RefreshedAt || z.ExpiresAt != 0 {
+		t.Errorf("the zone row says refreshed_at=%d expires_at=%d, want %d and 0",
+			z.RefreshedAt, z.ExpiresAt, res.RefreshedAt)
+	}
+}
+
+// A scheduler built with no stub fetcher is a misconfiguration, and there are
+// two wrong ways to meet one. Handing the zone to a nil fetcher panics on a
+// worker goroutine, which takes the process down; skipping it quietly leaves
+// the stub claiming its suffix and answering SERVFAIL with nothing anywhere
+// saying why. It is recorded as the failed attempt it is, in the column an
+// operator asking "why is this zone not routing" already reads.
+func TestAStubWithNoFetcherConfiguredIsRecordedNotSkipped(t *testing.T) {
+	master := stubDelegation(t)
+	f := newTransferFixture(t, master.addr, 0, asZoneType("stub"))
+	ref := zones.NewRefresher(f.st.Zones(), f.transferrer(),
 		zones.WithRefreshNow(func() time.Time { return f.now }))
 
-	done := make(chan struct{})
-	go func() { defer close(done); _ = r.RefreshDue(context.Background()) }()
+	f.refreshDue(t, ref)
 
-	hold.wait(t, "the failure being recorded")
-	const repointed = "192.0.2.9:5353"
-	f.updateZone(t, func(z *store.Zone) {
-		z.Primaries = repointed
-		z.SOAMbox = "someone-else." + transferApex
-	})
-	hold.free()
-
-	select {
-	case <-done:
-	case <-time.After(30 * time.Second):
-		t.Fatal("the pass did not finish")
+	if got := master.queries.Load(); got != 0 {
+		t.Errorf("the master was asked %d times, want 0 — there is nothing to ask it with", got)
 	}
-
 	z := f.zone(t)
-	if z.Primaries != repointed {
-		t.Errorf("primaries = %q, want %q — recording a failure reverted the operator's edit", z.Primaries, repointed)
-	}
-	if z.SOAMbox != "someone-else."+transferApex {
-		t.Errorf("soa_mbox = %q — recording a failure reverted an unrelated column too", z.SOAMbox)
-	}
-	// And the failure was still recorded: the edit surviving must not be the
-	// write having been lost.
 	if z.LastError == "" {
-		t.Errorf("last_error is empty; the edit survived because nothing was written")
+		t.Errorf("last_error is empty: a stub this server cannot fetch left no trace at all")
+	}
+	if z.RefreshedAt != 0 {
+		t.Errorf("refreshed_at = %d, want 0 — nothing was fetched", z.RefreshedAt)
+	}
+	st, ok := ref.Status(f.zoneID)
+	if !ok || st.Failures != 1 {
+		t.Errorf("status = %+v (tracked = %v), want one recorded failure", st, ok)
 	}
 }

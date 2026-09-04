@@ -166,3 +166,13 @@ func (idx *Index) Find(qname string) *Zone {
 	}
 	return nil
 }
+
+// Zones returns every zone in this snapshot, disabled ones included — the
+// caller decides what "disabled" means for what it is building, the same way
+// Apex leaves that decision to a transfer and Find makes it for a query.
+//
+// The slice is the Index's own and must not be mutated: an Index is
+// immutable once built and shared by every reader of the snapshot. Reload
+// replaces the whole Index rather than editing one in place, which is what
+// makes handing the slice out safe.
+func (idx *Index) Zones() []Zone { return idx.zones }

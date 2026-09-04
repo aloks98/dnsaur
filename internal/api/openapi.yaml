@@ -128,16 +128,36 @@ components:
             /zones/{id}/records — is rejected with 409.
 
 
-            primary and secondary are the only two this API creates or
-            patches into; stub, forwarder and internal are rejected with
-            400. A secondary is filled by transfer from its primaries and
-            is created empty — no apex NS record is seeded for it, unlike
+            primary, secondary, forwarder and stub are the four this API
+            creates or patches into; internal is rejected with 400. A
+            secondary is filled by transfer from its primaries and is
+            created empty — no apex NS record is seeded for it, unlike
             a primary. Its records are read-only through this API: every
             write under /zones/{id}/records, and a zone file import, is
             rejected with 409, because a transfer replaces the whole zone
             and would delete the write at the next refresh. The zone
             itself stays editable — PATCH and DELETE work, and that is how
             its primaries and TSIG key are changed.
+
+
+            A stub fetches its NS set from primaries by ordinary query
+            rather than transfer, and — like a secondary — may sign that
+            query with tsig_key_id. Its records are read-only through this
+            API on the same terms and for the same reason: the fetch
+            replaces the whole set, so every write under /zones/{id}/records
+            and a zone file import are rejected with 409. A forwarder
+            answers nothing of its own:
+            it claims the suffix and sends every query beneath it to
+            forward_to, so a name it has no answer for is a SERVFAIL, not a
+            fall-through past dnsaur. Creating, patching, deleting or
+            disabling either type also drops whatever the cache held for the
+            suffix whose routing changed, so a claimed suffix is never
+            answered from an entry the default upstreams produced before the
+            claim existed, and a released one stops answering from the
+            entries its own upstreams produced.
+            Neither stub nor forwarder serves a
+            zone or has secondaries, so allow_transfer and notify_to stay
+            refused on both, and neither gets an apex NS record seeded.
 
 
             Until its first transfer lands (refreshed_at is 0), and again
@@ -168,51 +188,72 @@ components:
         primaries:
           type: string
           description: >
-            Where a secondary pulls the zone from: a comma-separated list
+            Where a secondary transfers the zone from, or a stub fetches
+            its NS set from by ordinary query: a comma-separated list
             of host[:port], port defaulting to 53, where host is an IP
             address or a domain name — "192.168.150.5",
             "192.168.150.5:5353, ns1.upstream.example", "[2001:db8::1]:5353".
 
 
-            Stored exactly as written and resolved at transfer time, not
-            at write: a primary named by hostname has to survive its
+            Stored exactly as written and resolved at transfer/query time,
+            not at write: a primary named by hostname has to survive its
             address changing, and a primary that is unreachable right now
             must not block the zone from being configured. Required and
-            non-empty for a secondary; must be empty on every other type.
+            non-empty for a secondary or stub; must be empty on every
+            other type.
         tsig_key_id:
           type: integer
           format: int64
           description: >
-            The TSIG key a secondary signs its transfer requests with; 0
-            means unsigned. Optional, but when set it must name a key
-            that exists, and while a zone names it that key cannot be
-            deleted (DELETE /tsig-keys/{id} answers 409). Must be 0 on
-            every type other than secondary.
-        expires_at: { type: integer, format: int64, description: unix ms; secondary only, 0 otherwise }
+            The TSIG key a secondary signs its transfer requests with, or
+            a stub signs its SOA/NS queries with; 0 means unsigned.
+            Optional, but when set it must name a key that exists, and
+            while a zone names it that key cannot be deleted (DELETE
+            /tsig-keys/{id} answers 409). Must be 0 on every type other
+            than secondary and stub.
+        expires_at:
+          type: integer
+          format: int64
+          description: >
+            unix ms the copy this zone holds stops being servable; secondary
+            only, 0 on every other type. A stub is never given one, and that
+            is deliberate rather than an omission: its NS set is routing
+            information, not data held on loan, and an old-but-working
+            nameserver beats a self-inflicted SERVFAIL. Only a transfer
+            writes this, so unlike refreshed_at below it does not widen to
+            the stub — and a row retyped from secondary to stub still carries
+            whatever value it had, which is why a client must not read it for
+            any type but secondary.
         refreshed_at:
           type: integer
           format: int64
           description: >
-            unix ms of the last transfer that succeeded; secondary only,
-            0 = never. Distinct from last_attempt, which dates the last
-            transfer that was tried.
+            unix ms of the last pull from a master that succeeded — a
+            secondary's transfer or a stub's NS fetch; 0 = never. Written
+            by both, unlike expires_at, which only a transfer writes.
+            Distinct from last_attempt, which dates the last pull that was
+            tried. Written for a secondary and a stub; 0 on a type that has
+            never pulled. Like expires_at, a retyped row keeps whatever it
+            already had, so read it only for the types that write it.
         last_error:
           type: string
           description: >
-            Why the most recent transfer attempt failed, in the
-            transfer's own words, or "" when it succeeded. Cleared on
-            success, so a zone that recovered stops reporting one, and
-            written together with last_attempt in a single statement so
-            the two can never disagree. Read-only: no request body sets
-            it. Secondary only.
+            Why the most recent pull failed, in the transfer's or fetch's
+            own words, or "" when it succeeded. Cleared on success, so a
+            zone that recovered stops reporting one, and written together
+            with last_attempt in a single statement so the two can never
+            disagree. Read-only: no request body sets it. Written for a
+            secondary and a stub; like expires_at, a retyped row keeps
+            whatever it already had, so read it only for those types.
         last_attempt:
           type: integer
           format: int64
           description: >
-            unix ms of the last transfer attempt, successful or not;
+            unix ms of the last pull attempted, successful or not;
             0 = never attempted. Only meaningful read beside last_error,
             which without a date is a claim about the present made by an
-            unknown past. Read-only. Secondary only.
+            unknown past. Read-only. Written for a secondary and a stub;
+            like expires_at, a retyped row keeps whatever it already had.
         allow_transfer:
           type: string
           description: >
@@ -222,7 +263,8 @@ components:
             "10.0.0.0/24, 192.168.1.5, key:secondary-ns2.". Empty means
             deny every transfer, which is the default. Applies to both
             primary and secondary zones — a secondary re-serves what it
-            pulled — unlike primaries, which is secondary-only.
+            pulled — unlike primaries, which is secondary-only. Must be
+            empty on a stub or forwarder: neither serves a zone.
 
 
             Stored and read back in its canonical spelling (lowercase key
@@ -258,7 +300,8 @@ components:
             default. Applies to both primary and secondary zones — a
             secondary that re-serves what it pulled has its own downstream
             secondaries — unlike primaries and tsig_key_id, which are
-            secondary-only.
+            secondary-only. Must be empty on a stub or forwarder: neither
+            serves a zone.
 
 
             Stored and read back in its canonical spelling (the port always
@@ -266,6 +309,23 @@ components:
             which may differ from what was written even though it means
             the same thing. A key:<name> entry must name a TSIG key that
             exists.
+        forward_to:
+          type: string
+          description: >
+            Where a forwarder zone sends the queries it claims: a
+            comma-separated list of host[:port], port defaulting to 53 —
+            e.g. "10.0.0.1, 10.0.0.2:5353". Empty means the zone names no
+            upstreams, which makes every query beneath it a SERVFAIL
+            rather than a fall-through past dnsaur — the zone still claims
+            the suffix. Changing this list drops whatever the cache held
+            beneath the zone's apex, so the addresses you just removed stop
+            answering for it. Applies to forwarder only; must be empty on every
+            other type.
+
+
+            Stored and read back in its canonical spelling (the port
+            always explicit, ", "-separated), which may differ from what
+            was written even though it means the same thing.
         created_at: { type: integer, format: int64 }
         modified_at: { type: integer, format: int64 }
     ZoneRecord:
@@ -1651,7 +1711,10 @@ paths:
         A secondary is created empty and gets no apex NS: its contents are
         its primary's, arriving whole on the first transfer. It requires a
         non-empty primaries, and tsig_key_id when set must name an
-        existing TSIG key.
+        existing TSIG key. A stub likewise requires primaries (and may set
+        tsig_key_id) but fetches by ordinary query rather than transfer,
+        and also gets no apex NS. A forwarder gets no apex NS either and
+        answers nothing of its own — it may set forward_to instead.
       requestBody:
         required: true
         content:
@@ -1663,37 +1726,44 @@ paths:
                 name: { type: string, description: apex domain name, e.g. example.com }
                 type:
                   type: string
-                  enum: [primary, secondary]
+                  enum: [primary, secondary, forwarder, stub]
                   description: >
-                    defaults to primary. stub, forwarder and internal are
-                    rejected with 400 — see the Zone schema's type field.
+                    defaults to primary. internal is rejected with 400 —
+                    see the Zone schema's type field.
                 enabled: { type: boolean, default: true }
                 primaries:
                   type: string
                   description: >
-                    required and non-empty for a secondary, rejected on
-                    any other type; see the Zone schema's primaries field
-                    for the format
+                    required and non-empty for a secondary or stub,
+                    rejected on any other type; see the Zone schema's
+                    primaries field for the format
                 tsig_key_id:
                   type: integer
                   format: int64
                   description: >
-                    secondary only; optional, and when set must name an
-                    existing TSIG key
+                    secondary or stub only; optional, and when set must
+                    name an existing TSIG key
                 allow_transfer:
                   type: string
                   description: >
                     optional; empty (the default) means deny every AXFR
-                    request. Applies to both primary and secondary — see
-                    the Zone schema's allow_transfer field for the format;
-                    a key:<name> entry must name an existing TSIG key.
+                    request. Applies to both primary and secondary, and
+                    is rejected on forwarder and stub — see the Zone
+                    schema's allow_transfer field for the format; a
+                    key:<name> entry must name an existing TSIG key.
                 notify_to:
                   type: string
                   description: >
                     optional; empty (the default) means notify nobody.
-                    Applies to both primary and secondary — see the Zone
+                    Applies to both primary and secondary, and is
+                    rejected on forwarder and stub — see the Zone
                     schema's notify_to field for the format; a key:<name>
                     entry must name an existing TSIG key.
+                forward_to:
+                  type: string
+                  description: >
+                    forwarder only; rejected on every other type — see
+                    the Zone schema's forward_to field for the format.
                 soa_ns: { type: string, description: 'defaults to "ns.<name>"' }
                 soa_mbox: { type: string, description: 'defaults to "hostadmin.<name>"' }
                 soa_refresh: { type: integer, format: int64, description: seconds; defaults to 900 }
@@ -1712,14 +1782,16 @@ paths:
         "400":
           description: >
             invalid json; name must be a valid domain name; type is set
-            to something other than primary or secondary ("only primary
-            and secondary zones are supported"); a secondary's primaries
-            is missing or malformed; primaries or tsig_key_id is set on a
-            zone that is not a secondary; tsig_key_id names no existing
-            key; allow_transfer is malformed; allow_transfer names a
-            TSIG key that does not exist; notify_to is set on a type
-            other than primary or secondary; notify_to is malformed; or
-            notify_to names a TSIG key that does not exist
+            to something other than primary, secondary, forwarder or stub
+            ("only primary, secondary, forwarder and stub zones are
+            supported"); a secondary's or stub's primaries is missing or
+            malformed; primaries or tsig_key_id is set on a zone that is
+            not a secondary or stub; tsig_key_id names no existing key;
+            allow_transfer is set on a forwarder or stub, is malformed, or
+            names a TSIG key that does not exist; notify_to is set on a
+            type other than primary or secondary, is malformed, or names
+            a TSIG key that does not exist; or forward_to is set on a
+            type other than forwarder, or is malformed
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -1783,8 +1855,8 @@ paths:
         Every property is optional; only fields present are changed. Same
         name validation as create applies when name is sent. soa_ttl is
         not editable here — see the Zone schema. type, if sent, must be
-        primary or secondary, or the request is rejected with 400
-        regardless of the zone's current type.
+        primary, secondary, forwarder or stub, or the request is rejected
+        with 400 regardless of the zone's current type.
 
 
         A zone of type internal — the RFC 6303 built-ins seeded at
@@ -1793,10 +1865,10 @@ paths:
         and before any field is applied.
 
 
-        primaries and tsig_key_id are validated against the zone as it
-        will be, not against the request: patching a zone to secondary
-        without giving it primaries is rejected, and so is clearing the
-        primaries of a zone that is already one.
+        primaries, tsig_key_id and forward_to are validated against the
+        zone as it will be, not against the request: patching a zone to
+        secondary without giving it primaries is rejected, and so is
+        clearing the primaries of a zone that is already one.
       requestBody:
         required: true
         content:
@@ -1805,7 +1877,7 @@ paths:
               type: object
               properties:
                 name: { type: string, description: apex domain name, e.g. example.com }
-                type: { type: string, enum: [primary, secondary] }
+                type: { type: string, enum: [primary, secondary, forwarder, stub] }
                 enabled: { type: boolean }
                 soa_ns: { type: string }
                 soa_mbox: { type: string }
@@ -1821,21 +1893,28 @@ paths:
                   description: >
                     see the Zone schema's notify_to field. Absent leaves it
                     unchanged; "" clears it (notify nobody).
+                forward_to:
+                  type: string
+                  description: >
+                    see the Zone schema's forward_to field. Absent leaves
+                    it unchanged; "" clears it (names no upstreams).
       responses:
         "204":
           description: No Content
         "400":
           description: >
             bad id, invalid json, name must be a valid domain name, type
-            is set to something other than primary or secondary ("only
-            primary and secondary zones are supported"), the zone would
-            be left a secondary without valid primaries, primaries or
-            tsig_key_id is set on a zone that is not a secondary,
-            tsig_key_id names no existing key, allow_transfer is
-            malformed, allow_transfer names a TSIG key that does not
-            exist, notify_to is set on a type other than primary or
-            secondary, notify_to is malformed, or notify_to names a TSIG
-            key that does not exist
+            is set to something other than primary, secondary, forwarder
+            or stub ("only primary, secondary, forwarder and stub zones
+            are supported"), the zone would be left a secondary or stub
+            without valid primaries, primaries or tsig_key_id is set on a
+            zone that is not a secondary or stub, tsig_key_id names no
+            existing key, allow_transfer is set on a forwarder or stub /
+            is malformed / names a TSIG key that does not exist,
+            notify_to is set on a type other than primary or secondary /
+            is malformed / names a TSIG key that does not exist, or
+            forward_to is set on a type other than forwarder / is
+            malformed
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -1915,24 +1994,27 @@ paths:
         schema: { type: integer, format: int64 }
     post:
       tags: [Zones]
-      summary: Transfer a secondary zone from its primaries now
+      summary: Pull a secondary or stub zone from its master now
       description: >
-        Runs one AXFR immediately, whatever the SOA schedule says, and
+        Runs one pull immediately, whatever the SOA schedule says, and
         answers only once it has finished — so the response is the
-        outcome, not an acknowledgement. Secondary zones only: any other
-        type has nowhere to pull from and is refused with 400.
+        outcome, not an acknowledgement. A secondary transfers the whole
+        zone by AXFR; a stub fetches only its apex SOA and NS by ordinary
+        query. Those two types only: a primary is authored here and a
+        forwarder names its upstreams outright, so neither has a master to
+        ask, and both are refused with 400.
 
 
-        A transfer that fails changes nothing at all: the zone keeps the
+        A pull that fails changes nothing at all: the zone keeps the
         records, the serial and the refreshed_at it already had. So a 502
         always means "still serving whatever it had", never a
         half-applied zone.
 
 
-        The scheduler runs the same transfer on the zone's own SOA
+        The scheduler runs the same pull on the zone's own SOA
         refresh/retry timers without anyone asking; this endpoint exists
         for the case where waiting for the next tick is not the answer. A
-        transfer already in flight for this zone is waited for rather than
+        pull already in flight for this zone is waited for rather than
         skipped, so a request may take as long as that one has left.
 
 
@@ -1944,7 +2026,7 @@ paths:
         account of a failure the API ever gives.
       responses:
         "200":
-          description: the transfer completed and the zone was replaced with what arrived
+          description: the pull completed — a secondary's records replaced, a stub's delegation installed
           content:
             application/json:
               schema:
@@ -1953,15 +2035,22 @@ paths:
                   primary:
                     type: string
                     description: >
-                      the primary that answered, as host:port — one of the
+                      the master that answered, as host:port — one of the
                       zone's primaries, not the whole list
                     example: 203.0.113.9:53
-                  serial: { type: integer, format: int64, description: the primary's serial, adopted verbatim }
-                  records: { type: integer, description: rows the zone holds after the install }
+                  serial: { type: integer, format: int64, description: the master's serial, adopted verbatim }
+                  records: { type: integer, description: rows the zone holds after the install — for a stub, its NS set and the addresses stored beside it }
                   refreshed_at: { type: integer, format: int64, description: unix ms }
-                  expires_at: { type: integer, format: int64, description: unix ms }
+                  expires_at:
+                    type: integer
+                    format: int64
+                    description: >
+                      unix ms, and always 0 for a stub — a stub is never
+                      given an expiry, because its NS set is routing
+                      information rather than data held on loan. Render it
+                      as "does not expire", never as an expiry at the epoch.
         "400":
-          description: bad id, or the zone is not a secondary ("only secondary zones are transferred")
+          description: bad id, or the zone has no master ("only secondary and stub zones pull from a master")
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -2035,10 +2124,13 @@ paths:
       description: >
         Rejected with 409 before the body is even read if the zone's
         records are authored somewhere other than here: type internal —
-        the RFC 6303 built-ins seeded at migration — or type secondary,
-        whose records arrive whole from its primary on every transfer and
-        would replace anything written by hand at the next refresh. See
-        the Zone schema's type field.
+        the RFC 6303 built-ins seeded at migration; type secondary, whose
+        records arrive whole from its primary on every transfer; or type
+        stub, whose records are the NS set it fetches from its master.
+        The last two would both replace anything written by hand at the
+        next refresh. A forwarder is not among them — nothing overwrites
+        its records, because it has no master and answers from none of
+        them. See the Zone schema's type field.
 
 
         rdata is DNS presentation format — the rdata portion only, e.g.
@@ -2148,12 +2240,14 @@ paths:
         "409":
           description: >
             the zone is type internal ("built-in zones cannot be
-            changed") or type secondary ("a secondary zone's records come
-            from its primary; change them there"), checked before the
-            body is parsed; or, once the body is valid: CNAME at the zone
-            apex (RFC 1912 §2.4); CNAME beside another record at the same
-            name in either write order (RFC 1034 §3.6.2); or a TTL that
-            doesn't match the rest of the RRSet at this name and type
+            changed"), type secondary ("a secondary zone's records come
+            from its primary; change them there") or type stub ("a stub
+            zone's records are the NS set it fetches from its master;
+            change them there"), checked before the body is parsed; or,
+            once the body is valid: CNAME at the zone apex (RFC 1912
+            §2.4); CNAME beside another record at the same name in either
+            write order (RFC 1034 §3.6.2); or a TTL that doesn't match the
+            rest of the RRSet at this name and type
             (RFC 2181 §5.2) — checked in that order
           content:
             application/json:
@@ -2238,12 +2332,14 @@ paths:
         "409":
           description: >
             the zone is type internal ("built-in zones cannot be
-            changed") or type secondary ("a secondary zone's records come
-            from its primary; change them there"), checked before the
-            body is parsed; or, once the body is valid: CNAME at the zone
-            apex (RFC 1912 §2.4); CNAME beside another record at the same
-            name in either write order (RFC 1034 §3.6.2); or a TTL that
-            doesn't match the rest of the RRSet at this name and type
+            changed"), type secondary ("a secondary zone's records come
+            from its primary; change them there") or type stub ("a stub
+            zone's records are the NS set it fetches from its master;
+            change them there"), checked before the body is parsed; or,
+            once the body is valid: CNAME at the zone apex (RFC 1912
+            §2.4); CNAME beside another record at the same name in either
+            write order (RFC 1034 §3.6.2); or a TTL that doesn't match the
+            rest of the RRSet at this name and type
             (RFC 2181 §5.2) — checked in that order
           content:
             application/json:
@@ -2258,9 +2354,9 @@ paths:
       summary: Delete a record from a zone
       description: >
         rid must belong to the zone named by id, or the request 404s the
-        same as an unknown record. Rejected with 409 if the zone is type
-        internal — the RFC 6303 built-ins seeded at migration, see the
-        Zone schema's type field.
+        same as an unknown record. Rejected with 409 if the zone's records
+        are authored somewhere other than here — type internal, secondary
+        or stub, see the Zone schema's type field and the 409 below.
 
 
         If the deleted record was type A or AAAA, this also removes its
@@ -2293,8 +2389,10 @@ paths:
         "409":
           description: >
             the zone is type internal ("built-in zones cannot be
-            changed") or type secondary ("a secondary zone's records come
-            from its primary; change them there")
+            changed"), type secondary ("a secondary zone's records come
+            from its primary; change them there") or type stub ("a stub
+            zone's records are the NS set it fetches from its master;
+            change them there")
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -2386,9 +2484,12 @@ paths:
 
         A zone whose records are authored somewhere other than here
         rejects import with 409, like every other write: type internal —
-        the RFC 6303 built-ins seeded at migration — and type secondary,
-        whose contents arrive whole from its primary on every transfer.
-        Export (GET) is allowed for both.
+        the RFC 6303 built-ins seeded at migration — type secondary, whose
+        contents arrive whole from its primary on every transfer, and type
+        stub, whose contents are the NS set it fetches from its master.
+        Export (GET) is allowed for all three. Import is the write that
+        matters most for the latter two, because it replaces the whole
+        zone and the next refresh replaces it right back.
 
 
         The request body is limited to 1 MiB — roughly 35,000 records. A
@@ -2444,8 +2545,10 @@ paths:
         "409":
           description: >
             the zone is type internal ("built-in zones cannot be
-            changed") or type secondary ("a secondary zone's records come
-            from its primary; change them there")
+            changed"), type secondary ("a secondary zone's records come
+            from its primary; change them there") or type stub ("a stub
+            zone's records are the NS set it fetches from its master;
+            change them there")
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }

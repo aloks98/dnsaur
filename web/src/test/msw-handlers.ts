@@ -95,6 +95,7 @@ function defaultZones(): Zone[] {
       last_xfr_peer: "",
       last_xfr_error: "",
       notify_to: "",
+      forward_to: "",
       created_at: Date.now() - 30 * 24 * 60 * 60 * 1000,
       modified_at: Date.now() - 15 * 60 * 1000,
     },

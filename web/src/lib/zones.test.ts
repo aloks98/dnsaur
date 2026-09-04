@@ -5,6 +5,8 @@ import {
   lastTransferError,
   MIN_REFRESH_INTERVAL_MS,
   nextRefreshAt,
+  pullsFromAMaster,
+  pullState,
   refreshIntervalMs,
   retryIntervalMs,
   transferErrorLead,
@@ -54,6 +56,7 @@ function secondary(): Zone {
     last_xfr_peer: "",
     last_xfr_error: "",
     notify_to: "",
+    forward_to: "",
     created_at: NOW - 30 * DAY,
     modified_at: NOW - 30 * DAY,
   } satisfies Zone;
@@ -262,4 +265,103 @@ test("only a secondary can be not-serving, and only when it holds nothing it may
 // as expired at every moment since 1970.
 test("a zone that transferred but carries no expiry deadline is serving", () => {
   expect(isServing(zoneWith({ refreshed_at: NOW - HOUR, expires_at: 0 }), NOW)).toBe(true);
+});
+
+// ── what a pulled zone's state is, per type ─────────────────────────────────
+//
+// `transferState` above is a secondary's alone. These pin the other half: the
+// two types that pull are asked the same question and only one of them may be
+// asked it through an expiry.
+
+// The gate every type-dependent noun and every health treatment on both zone
+// screens is derived from. A forwarder is deliberately outside it: it pulls
+// nothing, stores no attempt, and has no state to read.
+test("exactly the two types that pull from a master are pulled types", () => {
+  const types = ["primary", "secondary", "stub", "forwarder", "internal"] as const;
+  expect(types.map(pullsFromAMaster)).toEqual([false, true, true, false, false]);
+});
+
+/**
+ * The one that matters, and the reason this function exists rather than the
+ * pages calling `transferState` for both types.
+ *
+ * `expires_at` is written by a transfer and by nothing else. A row retyped
+ * from secondary to stub keeps every stamp the transfer left on it —
+ * handleZonePatch sets the type on a row read from the store and clears
+ * neither `expires_at` nor `refreshed_at` — so an ordinary stub can carry a
+ * long-past expiry that stopped meaning anything the moment it stopped being
+ * a secondary. Read it and a stub that is routing perfectly well reads as
+ * answering nothing.
+ */
+test("a stub's state never reads expires_at, so a retyped row's dead expiry is not one", () => {
+  const retyped = zoneWith({
+    type: "stub",
+    refreshed_at: NOW - 5 * HOUR,
+    last_attempt: NOW - 5 * HOUR,
+    // The stamp the transfer left behind, months past.
+    expires_at: NOW - 30 * DAY,
+  });
+  expect(pullState(retyped, NOW)).toBe("fresh");
+  // The very call this must not make, on the very row it must not make it on.
+  expect(transferState(retyped, NOW)).toBe("expired");
+});
+
+test("a stub that has never fetched is never, whether or not one was tried", () => {
+  expect(pullState(zoneWith({ type: "stub", refreshed_at: 0, expires_at: 0 }), NOW)).toBe("never");
+  // Tried and failed is still `never`: nothing has ever landed, so there is no
+  // NS set to route on and the suffix answers nothing either way. The failure
+  // is the cause beside the state, not a state of its own.
+  expect(
+    pullState(
+      zoneWith({
+        type: "stub",
+        refreshed_at: 0,
+        expires_at: 0,
+        last_error: "i/o timeout",
+        last_attempt: NOW - 12 * 60_000,
+      }),
+      NOW,
+    ),
+  ).toBe("never");
+});
+
+test("a stub whose last fetch failed is failing — it still has an NS set to route on", () => {
+  const zone = zoneWith({
+    type: "stub",
+    refreshed_at: NOW - 5 * DAY,
+    last_error: "connection refused",
+    last_attempt: NOW - 40 * 60_000,
+  });
+  expect(pullState(zone, NOW)).toBe("failing");
+});
+
+/**
+ * A stub has three states and a secondary five, which is not an omission.
+ *
+ * `expired` it cannot have: it is never given an expiry (§9.11.8), because an
+ * old-but-working nameserver beats a self-inflicted SERVFAIL. `overdue` it is
+ * not given: that state exists to say a copy is of unknown age while the
+ * screen calls it current, and a stub's row already dates its NS set outright
+ * ("Fetched 5d ago") rather than calling it fresh.
+ */
+test("a stub past its refresh deadline with nothing recorded is not overdue", () => {
+  const zone = zoneWith({
+    type: "stub",
+    soa_refresh: 7200,
+    refreshed_at: NOW - 3 * HOUR,
+    last_attempt: NOW - 3 * HOUR,
+  });
+  expect(transferState(zone, NOW)).toBe("overdue");
+  expect(pullState(zone, NOW)).toBe("fresh");
+});
+
+test("a secondary's pull state is its transfer state, expiry and all", () => {
+  const cases: [TransferState, Zone][] = [
+    ["never", zoneWith({ refreshed_at: 0, expires_at: 0 })],
+    ["expired", zoneWith({ expires_at: NOW - 1 })],
+    ["failing", zoneWith({ last_error: "connection refused", last_attempt: NOW - 60_000 })],
+    ["overdue", zoneWith({ refreshed_at: NOW - 3 * HOUR, last_attempt: NOW - 3 * HOUR })],
+    ["fresh", secondary()],
+  ];
+  expect(cases.map(([, zone]) => pullState(zone, NOW))).toEqual(cases.map(([want]) => want));
 });

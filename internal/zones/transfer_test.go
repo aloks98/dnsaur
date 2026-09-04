@@ -56,6 +56,9 @@ type primaryConfig struct {
 	// answered. A test uses it to keep two transfers of one zone genuinely
 	// overlapping rather than hoping they do.
 	hold func()
+	// unsignedReplies makes the primary verify a signed request and then
+	// answer *without* signing — RFC 8945 §5.4's requirement, violated.
+	unsignedReplies bool
 }
 
 func withTSIG(keys dnssrv.TSIGKeys) primaryOption {
@@ -71,6 +74,24 @@ func withRcode(rcode int) primaryOption {
 // is the only way to watch a retry schedule do its job.
 func withRcodeFn(fn func() int) primaryOption {
 	return func(c *primaryConfig) { c.rcodeFn = fn }
+}
+
+// withUnsignedReplies makes the primary accept and verify a correctly signed
+// AXFR request and then answer it unsigned.
+//
+// It exists to pin a property this code depends on and does not own. A
+// signed request's response must be signed (RFC 8945 §5.4), and for the AXFR
+// path that rule is enforced inside miekg rather than by us: Transfer.ReadMsg
+// calls TsigVerifyWithProvider *unconditionally* whenever a provider is set
+// (xfr.go), unlike dns.Client.ReadMsg, which only verifies a TSIG that is
+// already present (client.go). An unsigned reply therefore reaches
+// stripTsig, which returns ErrNoSig on Arcount == 0.
+//
+// That asymmetry between two functions in one library is exactly the kind of
+// thing a dependency bump can change silently, so it is pinned here rather
+// than assumed.
+func withUnsignedReplies() primaryOption {
+	return func(c *primaryConfig) { c.unsignedReplies = true }
 }
 
 // withHold runs fn at the start of every request, before anything is
@@ -133,13 +154,30 @@ func startTestPrimary(t *testing.T, zone string, rrs []dns.RR, opts ...primaryOp
 			return
 		}
 
+		// Transfer.Out signs each envelope only when the request it is given
+		// carries a TSIG (xfr.go). Handing it a copy with the TSIG stripped
+		// is therefore how a primary answers unsigned without reimplementing
+		// the envelope loop.
+		out := r
+		if cfg.unsignedReplies {
+			stripped := r.Copy()
+			var extra []dns.RR
+			for _, rr := range stripped.Extra {
+				if _, isTSIG := rr.(*dns.TSIG); !isTSIG {
+					extra = append(extra, rr)
+				}
+			}
+			stripped.Extra = extra
+			out = stripped
+		}
+
 		ch := make(chan *dns.Envelope)
 		tr := new(dns.Transfer)
 		var wg sync.WaitGroup
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_ = tr.Out(w, r, ch)
+			_ = tr.Out(w, out, ch)
 		}()
 		// One envelope carrying the whole zone, SOA first and last (RFC 5936
 		// §2.2). Splitting it across envelopes is the primary's choice and
@@ -217,8 +255,10 @@ func primaryZoneRRs(t *testing.T) []dns.RR {
 	}
 }
 
-// transferFixture is a real sqlite store holding one secondary zone, plus the
-// resolver that answers from it.
+// transferFixture is a real store holding one secondary zone, plus the
+// resolver that answers from it. Which store depends on how it was built:
+// sqlite by default, or whichever driver forEachDriver named for the cases
+// that run on both (main_test.go).
 type transferFixture struct {
 	st       store.Store
 	resolver *zones.Resolver
@@ -226,26 +266,48 @@ type transferFixture struct {
 	now      time.Time
 }
 
-func newTransferFixture(t *testing.T, primaries string, tsigKeyID int64) *transferFixture {
+// fixtureOption adjusts the zone newTransferFixture creates before it is
+// written. It exists so the stub fetcher's tests (stub_test.go) can have the
+// same store, resolver and clock around a zone of type "stub" rather than a
+// second fixture that would drift from this one.
+type fixtureOption func(*store.Zone)
+
+// asZoneType makes the fixture's zone typ instead of "secondary".
+func asZoneType(typ string) fixtureOption {
+	return func(z *store.Zone) { z.Type = typ }
+}
+
+// newTransferFixture builds the fixture on sqlite, which is what the cases
+// that turn on pure logic rather than on connection behaviour want.
+func newTransferFixture(t *testing.T, primaries string, tsigKeyID int64, opts ...fixtureOption) *transferFixture {
+	t.Helper()
+	return newTransferFixtureOn(t, "sqlite", primaries, tsigKeyID, opts...)
+}
+
+// newTransferFixtureOn is newTransferFixture with the driver named, for the
+// cases forEachDriver runs on both. Everything below this line is identical
+// between the two, so a postgres half exercises the same fixture as its
+// sqlite twin and not a second one that could drift.
+func newTransferFixtureOn(t *testing.T, driver, primaries string, tsigKeyID int64, opts ...fixtureOption) *transferFixture {
 	t.Helper()
 	ctx := context.Background()
 
-	st, err := store.Open(ctx, "sqlite", t.TempDir()+"/t.db")
-	if err != nil {
-		t.Fatalf("store.Open: %v", err)
-	}
-	t.Cleanup(func() { _ = st.Close() })
+	st := openTestStoreOn(t, driver)
 
 	// A secondary as Task 1's API creates one: enabled, no records, and no
 	// transfer behind it — refreshed_at and expires_at both zero, which is
 	// what Zone.Serving reads as "must not answer yet".
-	id, err := st.Zones().AddZone(ctx, store.Zone{
+	z := store.Zone{
 		Name: transferApex, Type: "secondary", Enabled: true,
 		SOANS: "ns1." + transferApex, SOAMbox: "hostadmin." + transferApex,
 		SOASerial: 1, SOARefresh: 900, SOARetry: 300, SOAExpire: 604800,
 		SOAMinimum: 900, SOATTL: 900,
 		Primaries: primaries, TSIGKeyID: tsigKeyID,
-	})
+	}
+	for _, o := range opts {
+		o(&z)
+	}
+	id, err := st.Zones().AddZone(ctx, z)
 	if err != nil {
 		t.Fatalf("AddZone: %v", err)
 	}
@@ -299,78 +361,80 @@ func askResolver(t *testing.T, r *zones.Resolver, qname string, qtype uint16) *d
 }
 
 func TestTransferInstallsTheZone(t *testing.T) {
-	primary := startTestPrimary(t, transferApex, primaryZoneRRs(t))
-	f := newTransferFixture(t, primary.addr, 0)
+	forEachDriver(t, func(t *testing.T, driver string) {
+		primary := startTestPrimary(t, transferApex, primaryZoneRRs(t))
+		f := newTransferFixtureOn(t, driver, primary.addr, 0)
 
-	// Before the transfer the zone holds nothing and must say so by saying
-	// nothing (Zone.Serving) — the state Task 1 established.
-	if got := f.ask(t, "bifrost."+transferApex, dns.TypeA).Rcode; got != dns.RcodeServerFailure {
-		t.Fatalf("before the transfer: rcode = %s, want SERVFAIL", dns.RcodeToString[got])
-	}
-
-	res, err := f.transferrer().Transfer(context.Background(), f.zone(t))
-	if err != nil {
-		t.Fatalf("transfer: %v", err)
-	}
-
-	if res.Primary.String() != primary.addr {
-		t.Errorf("answered by %s, want %s", res.Primary, primary.addr)
-	}
-	if res.Serial != primarySerial {
-		t.Errorf("serial = %d, want the primary's %d", res.Serial, primarySerial)
-	}
-	if res.Records != 5 {
-		t.Errorf("installed %d records, want 5 (the zone's RRs, less its SOA)", res.Records)
-	}
-
-	// A transfer adopts the primary's SOA whole, serial included. A secondary
-	// that invented its own serial would advertise a zone version nobody
-	// else has, and its own next comparison against the primary would be
-	// against a number of its own making.
-	z := f.zone(t)
-	if z.SOASerial != primarySerial {
-		t.Errorf("stored serial = %d, want %d — a transfer must not bump", z.SOASerial, primarySerial)
-	}
-	if z.SOARefresh != primaryRefresh || z.SOAExpire != primaryExpire {
-		t.Errorf("stored SOA timers = refresh %d expire %d, want %d/%d",
-			z.SOARefresh, z.SOAExpire, primaryRefresh, primaryExpire)
-	}
-	if z.SOANS != "ns1."+transferApex {
-		t.Errorf("stored soa_ns = %q, want %q", z.SOANS, "ns1."+transferApex)
-	}
-
-	// The two columns that decide whether the zone may answer at all.
-	wantRefreshed := f.now.UnixMilli()
-	wantExpires := f.now.Add(primaryExpire * time.Second).UnixMilli()
-	if z.RefreshedAt != wantRefreshed {
-		t.Errorf("refreshed_at = %d, want %d", z.RefreshedAt, wantRefreshed)
-	}
-	if z.ExpiresAt != wantExpires {
-		t.Errorf("expires_at = %d, want %d", z.ExpiresAt, wantExpires)
-	}
-
-	// And the whole point: the zone answers now.
-	m := f.ask(t, "bifrost."+transferApex, dns.TypeA)
-	if m.Rcode != dns.RcodeSuccess || !m.Authoritative {
-		t.Fatalf("after the transfer: rcode = %s aa = %v, want NOERROR aa=true", dns.RcodeToString[m.Rcode], m.Authoritative)
-	}
-	got := map[string]bool{}
-	for _, rr := range m.Answer {
-		a, ok := rr.(*dns.A)
-		if !ok {
-			t.Fatalf("answer carried a %T, want only A records", rr)
+		// Before the transfer the zone holds nothing and must say so by saying
+		// nothing (Zone.Serving) — the state Task 1 established.
+		if got := f.ask(t, "bifrost."+transferApex, dns.TypeA).Rcode; got != dns.RcodeServerFailure {
+			t.Fatalf("before the transfer: rcode = %s, want SERVFAIL", dns.RcodeToString[got])
 		}
-		got[a.A.String()] = true
-	}
-	if !got["10.9.0.10"] || !got["10.9.0.11"] || len(got) != 2 {
-		t.Errorf("bifrost A = %v, want both 10.9.0.10 and 10.9.0.11", got)
-	}
 
-	// A record whose owner arrived fully qualified is stored relative, or it
-	// would be served at name.zone.zone.
-	if m := f.ask(t, "www."+transferApex, dns.TypeCNAME); len(m.Answer) != 1 {
-		t.Errorf("www CNAME: %d answers, want 1 — %v", len(m.Answer), m.Answer)
-	}
+		res, err := f.transferrer().Transfer(context.Background(), f.zone(t))
+		if err != nil {
+			t.Fatalf("transfer: %v", err)
+		}
+
+		if res.Primary.String() != primary.addr {
+			t.Errorf("answered by %s, want %s", res.Primary, primary.addr)
+		}
+		if res.Serial != primarySerial {
+			t.Errorf("serial = %d, want the primary's %d", res.Serial, primarySerial)
+		}
+		if res.Records != 5 {
+			t.Errorf("installed %d records, want 5 (the zone's RRs, less its SOA)", res.Records)
+		}
+
+		// A transfer adopts the primary's SOA whole, serial included. A secondary
+		// that invented its own serial would advertise a zone version nobody
+		// else has, and its own next comparison against the primary would be
+		// against a number of its own making.
+		z := f.zone(t)
+		if z.SOASerial != primarySerial {
+			t.Errorf("stored serial = %d, want %d — a transfer must not bump", z.SOASerial, primarySerial)
+		}
+		if z.SOARefresh != primaryRefresh || z.SOAExpire != primaryExpire {
+			t.Errorf("stored SOA timers = refresh %d expire %d, want %d/%d",
+				z.SOARefresh, z.SOAExpire, primaryRefresh, primaryExpire)
+		}
+		if z.SOANS != "ns1."+transferApex {
+			t.Errorf("stored soa_ns = %q, want %q", z.SOANS, "ns1."+transferApex)
+		}
+
+		// The two columns that decide whether the zone may answer at all.
+		wantRefreshed := f.now.UnixMilli()
+		wantExpires := f.now.Add(primaryExpire * time.Second).UnixMilli()
+		if z.RefreshedAt != wantRefreshed {
+			t.Errorf("refreshed_at = %d, want %d", z.RefreshedAt, wantRefreshed)
+		}
+		if z.ExpiresAt != wantExpires {
+			t.Errorf("expires_at = %d, want %d", z.ExpiresAt, wantExpires)
+		}
+
+		// And the whole point: the zone answers now.
+		m := f.ask(t, "bifrost."+transferApex, dns.TypeA)
+		if m.Rcode != dns.RcodeSuccess || !m.Authoritative {
+			t.Fatalf("after the transfer: rcode = %s aa = %v, want NOERROR aa=true", dns.RcodeToString[m.Rcode], m.Authoritative)
+		}
+		got := map[string]bool{}
+		for _, rr := range m.Answer {
+			a, ok := rr.(*dns.A)
+			if !ok {
+				t.Fatalf("answer carried a %T, want only A records", rr)
+			}
+			got[a.A.String()] = true
+		}
+		if !got["10.9.0.10"] || !got["10.9.0.11"] || len(got) != 2 {
+			t.Errorf("bifrost A = %v, want both 10.9.0.10 and 10.9.0.11", got)
+		}
+
+		// A record whose owner arrived fully qualified is stored relative, or it
+		// would be served at name.zone.zone.
+		if m := f.ask(t, "www."+transferApex, dns.TypeCNAME); len(m.Answer) != 1 {
+			t.Errorf("www CNAME: %d answers, want 1 — %v", len(m.Answer), m.Answer)
+		}
+	})
 }
 
 // The primary's SOA must not become a zone_records row: the zone's SOA lives
@@ -564,6 +628,58 @@ func TestTransferSignsWithTSIGWhenTheZoneNamesAKey(t *testing.T) {
 	}
 }
 
+// A primary that verifies our signature and then answers unsigned must be
+// refused. RFC 8945 §5.4: a signed request's response has to be signed too.
+//
+// Without this, TSIG would authenticate the *request* and contribute nothing
+// to the *reply* — an attacker who can answer before the real primary hands
+// us a whole zone we then install. That is the identical shape as the defect
+// found in the SOA probe and the NOTIFY sender during D4, both of which use
+// dns.Client, whose ReadMsg verifies only a TSIG that is already present.
+//
+// The AXFR path is safe for a reason we do not control: Transfer.ReadMsg
+// verifies unconditionally once a provider is set, so an unsigned envelope
+// fails in stripTsig with ErrNoSig. This test is the pin on that, so a
+// dependency bump that aligned the two ReadMsg implementations would fail
+// here rather than silently open the hole.
+func TestTransferRejectsAnUnsignedReplyToASignedRequest(t *testing.T) {
+	f := newTransferFixture(t, "127.0.0.1:0", 0)
+	keyID := storeTSIGKey(t, f.st, "xfer-key."+transferApex)
+
+	primary := startTestPrimary(t, transferApex, primaryZoneRRs(t),
+		withTSIG(f.st.TSIGKeys()), withUnsignedReplies())
+
+	z := f.zone(t)
+	z.Primaries, z.TSIGKeyID = primary.addr, keyID
+	if err := f.st.Zones().UpdateZone(context.Background(), z); err != nil {
+		t.Fatalf("UpdateZone: %v", err)
+	}
+
+	_, err := f.transferrer().Transfer(context.Background(), f.zone(t))
+	if err == nil {
+		t.Fatal("transfer succeeded against a primary that answered unsigned")
+	}
+	// The request has to have reached the primary and been accepted by it —
+	// otherwise this passes for the wrong reason, on a primary that refused
+	// us outright or was never contacted at all.
+	if primary.requests() == 0 {
+		t.Fatal("the primary was never asked, so nothing about signing was tested")
+	}
+	if !errors.Is(err, dns.ErrNoSig) {
+		t.Errorf("error = %v, want it to wrap dns.ErrNoSig", err)
+	}
+
+	// Nothing was installed: a refused transfer must leave the zone exactly
+	// as it was, holding no records at all.
+	recs, rerr := f.st.Zones().Records(context.Background(), f.zoneID)
+	if rerr != nil {
+		t.Fatalf("Records: %v", rerr)
+	}
+	if len(recs) != 0 {
+		t.Errorf("installed %d records from an unsigned transfer, want 0", len(recs))
+	}
+}
+
 // The same primary, unsigned. This is what makes the test above mean
 // something: without it, a transfer that silently sent no TSIG would pass it
 // if the primary happened not to care.
@@ -602,68 +718,72 @@ func TestTransferFailsWhenTheZonesKeyIsGone(t *testing.T) {
 
 // A re-transfer is a replace, not a merge: what the primary dropped goes.
 func TestTransferReplacesRatherThanMerges(t *testing.T) {
-	first := startTestPrimary(t, transferApex, primaryZoneRRs(t))
-	f := newTransferFixture(t, first.addr, 0)
-	if _, err := f.transferrer().Transfer(context.Background(), f.zone(t)); err != nil {
-		t.Fatalf("first transfer: %v", err)
-	}
+	forEachDriver(t, func(t *testing.T, driver string) {
+		first := startTestPrimary(t, transferApex, primaryZoneRRs(t))
+		f := newTransferFixtureOn(t, driver, first.addr, 0)
+		if _, err := f.transferrer().Transfer(context.Background(), f.zone(t)); err != nil {
+			t.Fatalf("first transfer: %v", err)
+		}
 
-	// A second primary serving a smaller zone at a higher serial.
-	soa := mustRR(t, fmt.Sprintf("%s. 900 IN SOA ns1.%s. hostadmin.%s. %d 900 300 %d 900",
-		transferApex, transferApex, transferApex, primarySerial+1, primaryExpire))
-	second := startTestPrimary(t, transferApex, []dns.RR{
-		soa,
-		mustRR(t, fmt.Sprintf("%s. 3600 IN NS ns1.%s.", transferApex, transferApex)),
-		mustRR(t, fmt.Sprintf("ns1.%s. 3600 IN A 10.9.0.1", transferApex)),
-		soa,
+		// A second primary serving a smaller zone at a higher serial.
+		soa := mustRR(t, fmt.Sprintf("%s. 900 IN SOA ns1.%s. hostadmin.%s. %d 900 300 %d 900",
+			transferApex, transferApex, transferApex, primarySerial+1, primaryExpire))
+		second := startTestPrimary(t, transferApex, []dns.RR{
+			soa,
+			mustRR(t, fmt.Sprintf("%s. 3600 IN NS ns1.%s.", transferApex, transferApex)),
+			mustRR(t, fmt.Sprintf("ns1.%s. 3600 IN A 10.9.0.1", transferApex)),
+			soa,
+		})
+		z := f.zone(t)
+		z.Primaries = second.addr
+		if err := f.st.Zones().UpdateZone(context.Background(), z); err != nil {
+			t.Fatalf("UpdateZone: %v", err)
+		}
+		if _, err := f.transferrer().Transfer(context.Background(), f.zone(t)); err != nil {
+			t.Fatalf("second transfer: %v", err)
+		}
+
+		if m := f.ask(t, "bifrost."+transferApex, dns.TypeA); m.Rcode != dns.RcodeNameError {
+			t.Errorf("a name the second transfer dropped: rcode = %s, want NXDOMAIN", dns.RcodeToString[m.Rcode])
+		}
+		if got := f.zone(t).SOASerial; got != primarySerial+1 {
+			t.Errorf("serial = %d, want %d", got, primarySerial+1)
+		}
 	})
-	z := f.zone(t)
-	z.Primaries = second.addr
-	if err := f.st.Zones().UpdateZone(context.Background(), z); err != nil {
-		t.Fatalf("UpdateZone: %v", err)
-	}
-	if _, err := f.transferrer().Transfer(context.Background(), f.zone(t)); err != nil {
-		t.Fatalf("second transfer: %v", err)
-	}
-
-	if m := f.ask(t, "bifrost."+transferApex, dns.TypeA); m.Rcode != dns.RcodeNameError {
-		t.Errorf("a name the second transfer dropped: rcode = %s, want NXDOMAIN", dns.RcodeToString[m.Rcode])
-	}
-	if got := f.zone(t).SOASerial; got != primarySerial+1 {
-		t.Errorf("serial = %d, want %d", got, primarySerial+1)
-	}
 }
 
 // An unchanged zone re-transferred writes no record statements at all — the
 // reason the install diffs rather than deleting and re-adding every row on
 // every refresh.
 func TestTransferOfAnUnchangedZoneTouchesNoRecords(t *testing.T) {
-	primary := startTestPrimary(t, transferApex, primaryZoneRRs(t))
-	f := newTransferFixture(t, primary.addr, 0)
-	tr := f.transferrer()
-	if _, err := tr.Transfer(context.Background(), f.zone(t)); err != nil {
-		t.Fatalf("first transfer: %v", err)
-	}
-	before, err := f.st.Zones().Records(context.Background(), f.zoneID)
-	if err != nil {
-		t.Fatalf("Records: %v", err)
-	}
-	if _, err := tr.Transfer(context.Background(), f.zone(t)); err != nil {
-		t.Fatalf("second transfer: %v", err)
-	}
-	after, err := f.st.Zones().Records(context.Background(), f.zoneID)
-	if err != nil {
-		t.Fatalf("Records: %v", err)
-	}
-	if len(before) != len(after) {
-		t.Fatalf("record count changed across an identical transfer: %d then %d", len(before), len(after))
-	}
-	for i := range before {
-		if before[i].ID != after[i].ID {
-			t.Errorf("row %d changed id across an identical transfer: %d then %d — the install is not diffing",
-				i, before[i].ID, after[i].ID)
+	forEachDriver(t, func(t *testing.T, driver string) {
+		primary := startTestPrimary(t, transferApex, primaryZoneRRs(t))
+		f := newTransferFixtureOn(t, driver, primary.addr, 0)
+		tr := f.transferrer()
+		if _, err := tr.Transfer(context.Background(), f.zone(t)); err != nil {
+			t.Fatalf("first transfer: %v", err)
 		}
-	}
+		before, err := f.st.Zones().Records(context.Background(), f.zoneID)
+		if err != nil {
+			t.Fatalf("Records: %v", err)
+		}
+		if _, err := tr.Transfer(context.Background(), f.zone(t)); err != nil {
+			t.Fatalf("second transfer: %v", err)
+		}
+		after, err := f.st.Zones().Records(context.Background(), f.zoneID)
+		if err != nil {
+			t.Fatalf("Records: %v", err)
+		}
+		if len(before) != len(after) {
+			t.Fatalf("record count changed across an identical transfer: %d then %d", len(before), len(after))
+		}
+		for i := range before {
+			if before[i].ID != after[i].ID {
+				t.Errorf("row %d changed id across an identical transfer: %d then %d — the install is not diffing",
+					i, before[i].ID, after[i].ID)
+			}
+		}
+	})
 }
 
 // A zone split across several envelopes is the shape a large transfer
@@ -888,39 +1008,41 @@ func TestTransferRejectsADelegationOnlyZone(t *testing.T) {
 // what it had. An empty transfer that got through would delete every record
 // and then deny the names it had been answering a moment earlier.
 func TestAnEmptyTransferLeavesAServingZoneIntact(t *testing.T) {
-	good := startTestPrimary(t, transferApex, primaryZoneRRs(t))
-	f := newTransferFixture(t, good.addr, 0)
-	if _, err := f.transferrer().Transfer(context.Background(), f.zone(t)); err != nil {
-		t.Fatalf("first transfer: %v", err)
-	}
-	before := f.zone(t)
+	forEachDriver(t, func(t *testing.T, driver string) {
+		good := startTestPrimary(t, transferApex, primaryZoneRRs(t))
+		f := newTransferFixtureOn(t, driver, good.addr, 0)
+		if _, err := f.transferrer().Transfer(context.Background(), f.zone(t)); err != nil {
+			t.Fatalf("first transfer: %v", err)
+		}
+		before := f.zone(t)
 
-	empty := emptyPrimary(t)
-	z := before
-	z.Primaries = empty.addr
-	if err := f.st.Zones().UpdateZone(context.Background(), z); err != nil {
-		t.Fatalf("UpdateZone: %v", err)
-	}
-	if _, err := f.transferrer().Transfer(context.Background(), f.zone(t)); err == nil {
-		t.Fatal("empty transfer succeeded against a serving zone")
-	}
+		empty := emptyPrimary(t)
+		z := before
+		z.Primaries = empty.addr
+		if err := f.st.Zones().UpdateZone(context.Background(), z); err != nil {
+			t.Fatalf("UpdateZone: %v", err)
+		}
+		if _, err := f.transferrer().Transfer(context.Background(), f.zone(t)); err == nil {
+			t.Fatal("empty transfer succeeded against a serving zone")
+		}
 
-	recs, err := f.st.Zones().Records(context.Background(), f.zoneID)
-	if err != nil {
-		t.Fatalf("Records: %v", err)
-	}
-	if len(recs) != 5 {
-		t.Errorf("the zone holds %d records after a refused transfer, want its original 5", len(recs))
-	}
-	if after := f.zone(t); after.RefreshedAt != before.RefreshedAt || after.SOASerial != before.SOASerial {
-		t.Errorf("a refused transfer moved the zone row: refreshed_at %d -> %d, serial %d -> %d",
-			before.RefreshedAt, after.RefreshedAt, before.SOASerial, after.SOASerial)
-	}
-	m := f.ask(t, "bifrost."+transferApex, dns.TypeA)
-	if m.Rcode != dns.RcodeSuccess || len(m.Answer) != 2 {
-		t.Errorf("after a refused transfer: rcode = %s with %d answers, want NOERROR with 2 — the zone must answer as before",
-			dns.RcodeToString[m.Rcode], len(m.Answer))
-	}
+		recs, err := f.st.Zones().Records(context.Background(), f.zoneID)
+		if err != nil {
+			t.Fatalf("Records: %v", err)
+		}
+		if len(recs) != 5 {
+			t.Errorf("the zone holds %d records after a refused transfer, want its original 5", len(recs))
+		}
+		if after := f.zone(t); after.RefreshedAt != before.RefreshedAt || after.SOASerial != before.SOASerial {
+			t.Errorf("a refused transfer moved the zone row: refreshed_at %d -> %d, serial %d -> %d",
+				before.RefreshedAt, after.RefreshedAt, before.SOASerial, after.SOASerial)
+		}
+		m := f.ask(t, "bifrost."+transferApex, dns.TypeA)
+		if m.Rcode != dns.RcodeSuccess || len(m.Answer) != 2 {
+			t.Errorf("after a refused transfer: rcode = %s with %d answers, want NOERROR with 2 — the zone must answer as before",
+				dns.RcodeToString[m.Rcode], len(m.Answer))
+		}
+	})
 }
 
 // refreshed_at is "we checked" and moves every cycle; modified_at is "the

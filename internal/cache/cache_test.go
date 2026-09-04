@@ -214,3 +214,82 @@ func TestEviction(t *testing.T) {
 		t.Fatalf("len %d want 2", c.Len())
 	}
 }
+
+// Purge is what a routing change uses to invalidate the entries a route it no
+// longer has produced. It is scoped: only the suffix given, and only on a
+// label boundary.
+func TestPurgeDropsASuffixAndNothingElse(t *testing.T) {
+	clk := &fakeClock{t: time.Unix(1000, 0)}
+	c := New(Options{Now: clk.Now})
+	for _, name := range []string{"corp.example", "www.corp.example", "a.b.corp.example", "notcorp.example", "corp.example.net", "elsewhere.test"} {
+		h := c.Middleware()(answer(name, 300, "1.2.3.4"))
+		if _, err := h.ServeDNS(context.Background(), req(name)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if c.Len() != 6 {
+		t.Fatalf("precondition: %d entries cached, want 6", c.Len())
+	}
+
+	// "CORP.example." rather than "corp.example": a caller passes a zone
+	// name in whatever spelling the store holds, and entries are keyed by
+	// QName's lower-cased, dot-trimmed form.
+	if n := c.Purge("CORP.example."); n != 3 {
+		t.Errorf("purged %d entries, want the 3 at or under corp.example", n)
+	}
+	if c.Len() != 3 {
+		t.Errorf("%d entries left, want the 3 outside the suffix — notcorp.example, corp.example.net and elsewhere.test are not under it", c.Len())
+	}
+	// Named individually, because a count alone would pass if it had dropped
+	// the wrong three.
+	for _, name := range []string{"notcorp.example", "corp.example.net", "elsewhere.test"} {
+		resp, err := c.Middleware()(dnssrv.HandlerFunc(func(context.Context, *dnssrv.Request) (*dnssrv.Response, error) {
+			return nil, errors.New("upstream must not be reached")
+		})).ServeDNS(context.Background(), req(name))
+		if err != nil || resp.Decision != dnssrv.DecisionCached {
+			t.Errorf("%s was purged, and it is not under the suffix", name)
+		}
+	}
+}
+
+// The half a sweep of the map alone would miss.
+//
+// A query that reached the upstreams *before* a zone claimed the suffix comes
+// back with a pre-claim answer and puts it in the cache — and it lands after
+// the purge has already swept past. Left in, that entry is served for its
+// whole TTL and then stale for serve_stale_for beyond it, which is the same
+// day-long wrong answer the purge exists to prevent, reached through a window
+// one upstream round trip wide. And the window is not unlikely: the queries
+// that motivated claiming the suffix are the ones in flight while you claim
+// it.
+//
+// The purge lands here mid-lookup, which is what makes this deterministic
+// rather than a race the test hopes to lose.
+func TestPurgeDropsALookupThatWasAlreadyInFlight(t *testing.T) {
+	clk := &fakeClock{t: time.Unix(1000, 0)}
+	c := New(Options{Now: clk.Now})
+	var calls atomic.Int64
+	up := dnssrv.HandlerFunc(func(ctx context.Context, r *dnssrv.Request) (*dnssrv.Response, error) {
+		calls.Add(1)
+		// The claim landing while this lookup is out at the upstream.
+		c.Purge("corp.example")
+		return answer("www.corp.example", 300, "5.6.7.8").ServeDNS(ctx, r)
+	})
+	h := c.Middleware()(up)
+
+	if _, err := h.ServeDNS(context.Background(), req("www.corp.example")); err != nil {
+		t.Fatal(err)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("precondition: %d upstream calls, want 1 — the purge did not run mid-lookup", calls.Load())
+	}
+	if n := c.Len(); n != 0 {
+		t.Fatalf("%d entries cached, want 0: an answer produced before the purge was stored after it, and the claimed suffix now serves it", n)
+	}
+	if _, err := h.ServeDNS(context.Background(), req("www.corp.example")); err != nil {
+		t.Fatal(err)
+	}
+	if calls.Load() != 2 {
+		t.Error("the second query was answered from the cache, so the pre-purge answer outlived the purge")
+	}
+}

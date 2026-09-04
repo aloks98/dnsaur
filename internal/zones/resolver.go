@@ -2,6 +2,7 @@ package zones
 
 import (
 	"context"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -17,6 +18,10 @@ import (
 type Resolver struct {
 	zs   store.ZoneStore
 	snap atomic.Pointer[Index]
+	// rmu serialises Reload against itself. The snapshot is derived whole
+	// from the store, which makes the atomic swap enough to stop a reader
+	// seeing a torn Index -- but not enough to order two writers. See Reload.
+	rmu sync.Mutex
 	// now is the clock Answer is given, injected rather than read inside
 	// the zone so "this secondary's data has expired" is a decision a test
 	// can drive instead of one it has to wait for. Same purpose as
@@ -79,13 +84,21 @@ func NewResolver(zs store.ZoneStore, opts ...ResolverOption) *Resolver {
 //
 // The worst realistic case is several secondaries finishing their transfers
 // in the same scheduler tick once the startup spread (refresh.go,
-// startupSpread) has expired, each triggering a whole-store Reload. Measured
-// too (BenchmarkReloadConcurrent): sqlite's single connection
-// (internal/store/store.go, SetMaxOpenConns(1)) means concurrent Reloads
-// cannot overlap, so they queue rather than compound — end to end they cost
-// no more than the same calls made one after another, nowhere near the
-// 60-second floor (refresh.go, minInterval) under how often any one zone
-// can trigger this.
+// startupSpread) has expired, each triggering a whole-store Reload —
+// Refresher.RefreshDue starts one goroutine per due zone, so those reloads
+// are concurrent by design. Measured too (BenchmarkReloadConcurrent): end to
+// end they cost no more than the same calls made one after another, nowhere
+// near the 60-second floor (refresh.go, minInterval) under how often any one
+// zone can trigger this.
+//
+// **That cost measurement is not a safety argument, and this comment used to
+// read as though it were.** It said sqlite's single connection
+// (internal/store/store.go, SetMaxOpenConns(1)) meant concurrent Reloads
+// "cannot overlap". They can, and did. SetMaxOpenConns(1) serialises
+// individual queries; the two reads below are separate QueryContext calls
+// with the connection released in between and no transaction around them, and
+// it says nothing at all about snap.Store. Postgres does not set it in the
+// first place. The lost update that claim concealed is what rmu now prevents.
 //
 // And none of it sits on the query path: Middleware reads r.snap, an atomic
 // pointer, and never touches zs, so a Reload in progress burns CPU and the
@@ -93,7 +106,21 @@ func NewResolver(zs store.ZoneStore, opts ...ResolverOption) *Resolver {
 // deployment's scale looks nothing like these numbers, re-run the
 // benchmark before reaching for a per-zone rebuild on the strength of this
 // comment alone.
+// Reload is serialised against itself by rmu, held across both reads and the
+// swap. Two overlapping reloads would each derive a complete Index — no
+// tearing — but the one that read the store *first* could store its Index
+// *last*, and every zone that appeared between the two reads would vanish
+// from what the server serves, permanently, until something reloaded again.
+// Index.Find would stop claiming those zones, so their names would fall
+// through to the forwarder and the public internet would answer for a name
+// this server holds (§9.11.5), a primary's own names included. A lost update
+// rather than a data race, so -race never saw it.
+//
+// Readers are untouched: Snapshot and Middleware load the atomic pointer and
+// take no lock, so a query never waits on a reload.
 func (r *Resolver) Reload(ctx context.Context) error {
+	r.rmu.Lock()
+	defer r.rmu.Unlock()
 	zs, err := r.zs.Zones(ctx)
 	if err != nil {
 		return err
@@ -143,9 +170,28 @@ func (r *Resolver) Middleware() dnssrv.Middleware {
 			m := new(dns.Msg)
 			m.SetReply(req.Msg)
 			if !z.Answer(m, req.QName(), req.QType(), r.now().UnixMilli()) {
-				// forwarder/stub zone types name somewhere else to ask rather
-				// than holding data (Milestone D); until that lands, treat
-				// them the same as not being covered at all.
+				// A forwarder or stub zone names somewhere else to ask rather
+				// than holding data, so it declines here. **The fall-through
+				// is deliberate and permanent, not a stage waiting to be
+				// written**, and it is not the same as the name being
+				// uncovered: it routes the query through the *cache* on its
+				// way to the terminal forwarder, which holds a routing table
+				// keyed on exactly these zones' apexes
+				// (upstream.Forwarder.SetConditional, installed by
+				// app.ReloadZones) and sends it to that zone's own upstreams,
+				// never to the defaults.
+				//
+				// The cache in between may answer it first, which is the
+				// whole point of routing through it — and the routing table
+				// is below the cache, so a hit is served without the table
+				// being consulted. What makes that safe rather than a hole is
+				// that installing the table also purges the suffixes it
+				// changed (cache.Purge, from app.installConditional), so the
+				// only entries left beneath a claimed suffix are ones its own
+				// route produced. Answering here instead — the shape
+				// that looks tidier, since this middleware already found the
+				// zone — would short-circuit the cache and re-ask the
+				// corporate resolver on every repeat query. See §9.11.4.
 				return next.ServeDNS(ctx, req)
 			}
 			// A zone that answered SERVFAIL did not answer authoritatively —

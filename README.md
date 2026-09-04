@@ -24,6 +24,8 @@ of truth — if it's not listed as shipped, it doesn't work yet.
 | Secondary zones (AXFR in, TSIG, SOA-scheduled refresh) | Shipped |
 | Zone transfers out (AXFR to secondaries, TSIG-authenticated, allow-transfer ACL) | Shipped |
 | DNS NOTIFY, both directions (RFC 1996) — dnsaur tells its own secondaries when a zone changes, and transfers promptly when told by its own primary | Shipped |
+| Conditional forwarding zones (a suffix routed to upstreams you name, never to the default resolvers) | Shipped |
+| Stub zones (a suffix routed to nameservers fetched from a master — no AXFR permission needed on it) | Shipped |
 | Reverse DNS (PTR, RFC 6303 built-in zones, auto-PTR from A/AAAA) | Shipped |
 | Caching with TTL clamps, negative caching, serve-stale | Shipped |
 | Query log (SQLite/Postgres, buffered writes, retention pruning) | Shipped |

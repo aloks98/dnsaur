@@ -145,12 +145,25 @@ yet.
 Zones are checked before the cache and upstream, same as the old local
 records were — the miss behaviour above is the whole point of the change.
 
-Two types can be created: **primary**, a zone you author here, and
-**secondary**, a copy of one held elsewhere (see Secondary zones below).
-`stub` and `forwarder` exist in the type list for zones to come but are
-refused on create or edit with `400`. A fifth type, `internal`, also
-exists — see Built-in zones below; it's never created through this UI, only
-seeded.
+Four types can be created, and they split in two. **Primary** (a zone you
+author here) and **secondary** (a copy of one held elsewhere) hold records
+and answer from them. **Forwarder** and **stub** hold nothing: they claim
+the suffix and send every query beneath it somewhere else — see Forwarder
+zones and Stub zones below. A fifth type, `internal`, also exists — see
+Built-in zones below; it's never created through this UI, only seeded.
+
+The type is chosen in the create row at the top of the zones list, and the
+one field beside it changes with it: **Primary servers** for a secondary or
+a stub, **Forward to** for a forwarder, nothing for a primary. A secondary
+or a stub may also name a TSIG key there; a forwarder may not, because it
+signs nothing.
+
+Each row's name is a link into that zone's own page, and everything else it
+can be told to do is behind the **⋮** at the end of the row: **Disable** (or
+**Enable**), **Delete zone**, and — on a secondary or a stub that is not
+pulling cleanly — **Retry transfer** or **Fetch now**. Disabling takes
+effect at once and is one click to undo, so it isn't confirmed; deleting is.
+A built-in zone has no menu at all: its row says `BUILT-IN` instead.
 
 ### Secondary zones
 
@@ -176,15 +189,23 @@ Status on a secondary is not the same question as enabled/disabled, and the
 list says so:
 
 - **Refreshed 2h ago** — transferred within its schedule.
-- **Transfer failing** — the last attempt failed. The row underneath says
-  what failed, in the server's own words, and that it keeps serving the copy
-  it has.
+- **Transfer failing** — the last attempt failed. A second line inside the
+  same status cell dates the attempt and gives the failure in the server's
+  own words.
 - **Serving, transfer overdue** — its refresh came and went with nothing
   recorded against it. Usually the zone is disabled, so nothing is trying.
 - **Not answering** — either it has never transferred, or it is past the
   SOA expiry. Both mean the same thing: it holds nothing it can vouch for,
   so it answers `SERVFAIL` for its whole suffix rather than claiming names
   don't exist.
+
+A row in either of the last two states is marked at its edge and tinted, and
+**hovering its status** names the state — `NEVER TRANSFERRED`, `EXPIRED`,
+`LAST TRANSFER` — and says what it means for what is being answered: which
+names go unanswered, or which copy is still being served and how old it is.
+The hover is the explanation only; everything that says the row needs a
+human is on the row itself. **Retry transfer**, in the row's own actions
+menu, asks for a transfer now rather than waiting for the schedule.
 
 The failure reason is stored, not merely remembered, so restarting dnsaur
 does not make a zone that has been failing for a week look healthy. It is
@@ -199,15 +220,156 @@ fit. The zones list shows the same short form with the full text on hover.
 Nothing is rewritten: the short form is a piece of the message, not a
 paraphrase of it, and a message with no such shape is shown whole.
 
-None of this needs a reload. A secondary's state is the one thing here that
-changes with nobody touching it, so while one is on screen the zones list and
-the zone page re-read it every 30 seconds — the same tick the scheduler
-decides what is due on, so the screen is never more than one of its decisions
-behind — and again when you come back to the tab. A zone that recovers, starts
-failing or crosses its expiry says so on its own. The record list is not on a
-timer: it is re-read when a transfer actually lands, which is the only thing
-that changes it. A screen showing only primary zones does not poll at all,
-since nothing on it can change unless you change it.
+None of this needs a reload. A zone that pulls from a master — a secondary,
+or a stub — is the one thing here that changes with nobody touching it, so
+while one is on screen the zones list and the zone page re-read it every 30
+seconds — the same tick the scheduler decides what is due on, so the screen
+is never more than one of its decisions behind — and again when you come
+back to the tab. A zone that recovers, starts failing or crosses its expiry
+says so on its own. The record list is not on a timer: it is re-read when a
+transfer actually lands, which is the only thing that changes it. A screen
+with no secondary and no stub on it does not poll at all — a primary's
+records and a forwarder's upstreams change only when you change them.
+
+### Forwarder zones
+
+A forwarder holds no records at all. It claims a suffix and sends every
+query beneath it to the resolvers named in **Forward to** — a
+comma-separated list of `host[:port]`, port 53 assumed — instead of to the
+upstreams in Settings. That is what makes it a zone rather than a setting:
+one row claims the suffix, and there is nowhere else it can be claimed from.
+
+**A forwarder's page is short, and that is not a page that failed to load.**
+It carries the header, the **Forward to** row, and the zone actions. There
+is no SOA band, no records grid, no import or export, no allow-transfer and
+no notify row, because a forwarder has nothing to put in any of them. There
+is no **Refresh now** either: a forwarder has no master, so there would be
+nothing to fetch.
+
+The line on the page under the upstreams says the thing worth knowing:
+
+> This zone claims `corp.example` outright. With every upstream unreachable,
+> queries for it get SERVFAIL — they do not fall through to the default
+> resolvers.
+
+**That is deliberate, and it is the most surprising thing about the type.**
+A forwarder is not an override with a fallback. If the resolvers you named
+are down, or you saved the zone without naming any, every name under that
+suffix stops resolving instead of being answered by the public internet.
+For a split-horizon zone the fall-through would be the failure: an internal
+name would silently resolve to whatever the outside world says it is.
+[`architecture.md`](architecture.md#conditional-routing-forwarder-and-stub-zones)
+has the full reasoning.
+
+Two ways out of that state: fix the upstreams, or **disable the zone**. A
+disabled forwarder releases its suffix back to the upstreams in Settings,
+the same way a disabled primary gives its names back to the public answer.
+Either takes effect on the zone at once, but a name that already got a
+SERVFAIL keeps getting one for up to 30 seconds afterwards — failures are
+cached per name and type (RFC 9520) — so give it half a minute before
+concluding the fix didn't work.
+
+In the zones list a forwarder's status reads **Enabled**, and means only
+that. Whether its upstreams are answering is true or false *right now* and
+nothing about it is stored, so the list has nothing to report and does not
+invent it — hovering the status says as much. A forwarder gets no failure
+line, no fetch state and no retry action anywhere on the list.
+
+Answers routed this way are cached exactly like any other forwarded answer,
+and they show in the query log as **forwarded**, with the conditional
+upstream's address — not as `authoritative`, because no zone answered them.
+
+**Saving the zone clears what the cache already held for that suffix**, and
+so does disabling, deleting or retargeting it. The name you are claiming is
+usually one that resolves publicly right now — that is why you are claiming
+it — so without this the public answer would go on being served from the
+cache for its whole TTL, and longer still if the resolvers you named were
+also down. The clearing is scoped to the suffix whose routing changed, so
+editing records elsewhere does not cost you the cache.
+
+What is *not* cleared is a suffix's own answers when nothing about its
+routing changed. If the resolvers you named go down after they have been
+answering, queries for names they already answered are served from the cache
+past their TTL, marked at 30 seconds, for as long as **Serve stale for** in
+Settings allows — the same rule as any other forwarded name, and the answer
+is still your resolvers' own, never the public internet's.
+
+### Stub zones
+
+A stub claims a suffix the same way a forwarder does and routes it the same
+way. The difference is where the addresses come from: it **fetches** them.
+It asks its master two ordinary questions — the zone's SOA, for the serial
+and the schedule, and its NS records, with the nameservers' addresses in the
+reply — and routes to the nameservers that come back, re-asking on the
+schedule that SOA publishes. The master is typed into **Primary servers** in
+the create row, and the zone page calls the same field **Master**.
+
+**It is not a transfer**, and that is the reason to use one: the master
+needs no `allow-transfer` entry for dnsaur, so a stub works against a server
+that will not hand its zone to anybody. A TSIG key can still be named, for a
+master that requires signed queries.
+
+A stub's page drops the same bands a forwarder's does — no SOA, no create
+row, no record filter, no allow-transfer, no notify — but keeps two things
+a forwarder has no use for. The **records grid** stays, read-only, because
+the fetched NS set is worth seeing, and the header marks it
+**Fetched · Read-only**. And because a stub has a master, **Refresh now**
+fetches immediately rather than waiting for the schedule, and **Export**
+renders the NS set as a zone file. A forwarder has neither: nothing to
+fetch, and no records to export.
+
+Three states. Two carry a date, because a date is what makes them mean
+anything: **the NS set fetched *n* minutes ago**, and, on a failure, **the
+error in the server's own words under when it was attempted**, with what is
+still being served beside it. The third — **no NS set yet** — has no date
+and needs none: nothing has landed for a date to be about, and the master
+row above it already carries the failure's own date if there has been one.
+
+In the zones list a stub reads the same column a secondary does, in the
+words its own mechanism needs: **Fetched 5d ago**, **Fetch failing** — the
+set it already has is still being routed on — or **Not answering** when
+nothing has ever landed. That last one is the state worth spelling out. **A
+stub that has never fetched is not idle, it is a suffix-wide outage**: it
+holds no NS set, keeps its claim regardless, and answers `SERVFAIL` for
+every name beneath it. The list refuses to call that Enabled. Hovering the
+status names the state (`NEVER FETCHED`, `LAST FETCH`) and says what it
+means; the status cell dates the last attempt underneath and shows what the
+master said. **Fetch now**, in the row's actions menu, asks for one
+immediately.
+
+**Expired never appears on a stub**, in the list or anywhere else — see the
+third rule below. A zone retyped from secondary keeps the expiry stamp its
+last transfer wrote, and that number stops meaning anything the moment the
+type changes.
+
+Four rules are worth knowing before creating one:
+
+- **A nameserver inside the zone must arrive with its address.** For zone
+  `corp.example`, a nameserver called `ns1.corp.example` can only be reached
+  if the master sends its address alongside (DNS calls this *glue*) — looking
+  the name up would send the query straight back into this same zone and
+  need the answer it was looking for. One that arrives without an address is
+  skipped, and the server logs which. A nameserver *outside* the zone can't
+  loop like that, so it is looked up normally.
+- **If every nameserver is skipped, the suffix stops resolving.** Same rule
+  as a forwarder with no upstreams: the zone keeps its claim and answers
+  SERVFAIL rather than letting the public internet answer.
+- **A stub never expires.** A secondary past its SOA expiry stops answering,
+  because it can no longer vouch for the records it holds. A stub holds no
+  records it answers from — its NS set says *where to ask* — so it goes on
+  routing to the last set it fetched however old that is. An old but working
+  nameserver beats a self-inflicted SERVFAIL, and if the nameservers really
+  are gone the query fails anyway.
+- **Its upstreams are always port 53.** Neither glue nor an ordinary
+  address lookup carries a port, so there is nowhere for one to come from.
+  **Primary servers** still accepts `host:port` — that port is for the
+  fetch, so a master on 5353 is fine — but a stub cannot route to a
+  nameserver on a non-standard port.
+
+Its records are read-only for a stronger reason than a secondary's. A stub
+answers from none of them, but the routing table is rebuilt *from* them, so
+a hand-written NS record would redirect the whole claimed suffix until the
+next fetch overwrote it.
 
 ### Records
 

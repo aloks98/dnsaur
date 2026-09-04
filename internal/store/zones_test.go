@@ -691,3 +691,49 @@ func TestUpdateZonePersistsNotifyTo(t *testing.T) {
 		}
 	})
 }
+
+// updateZoneSQL binds every configuration column, and forward_to is one, so a
+// PATCH that changes it has to persist. The negative half of the
+// disjoint-column-sets rule is automatic here — there is no second writer of
+// this column — so this is the positive half only.
+func TestUpdateZonePersistsForwardTo(t *testing.T) {
+	forEachDriver(t, func(t *testing.T, s Store) {
+		ctx := context.Background()
+		name := testGroupName("fwd") + ".example"
+		id, err := s.Zones().AddZone(ctx, Zone{
+			Name: name, Type: "forwarder", Enabled: true,
+			SOANS: "ns1." + name, SOAMbox: "hostmaster." + name,
+			SOASerial: 1, SOARefresh: 3600, SOARetry: 600,
+			SOAExpire: 604800, SOAMinimum: 300, SOATTL: 900,
+		})
+		if err != nil {
+			t.Fatalf("AddZone: %v", err)
+		}
+
+		z, err := s.Zones().Zone(ctx, id)
+		if err != nil {
+			t.Fatalf("Zone: %v", err)
+		}
+		if z.ForwardTo != "" {
+			t.Fatalf("a new zone has forward_to = %q, want empty", z.ForwardTo)
+		}
+
+		z.ForwardTo = "10.0.0.1:53, 10.0.0.2:5353"
+		if err := s.Zones().UpdateZone(ctx, z); err != nil {
+			t.Fatalf("UpdateZone: %v", err)
+		}
+		got, err := s.Zones().Zone(ctx, id)
+		if err != nil {
+			t.Fatalf("Zone after update: %v", err)
+		}
+		if got.ForwardTo != z.ForwardTo {
+			t.Errorf("forward_to = %q, want %q", got.ForwardTo, z.ForwardTo)
+		}
+		// Every other column survived the round trip. A column-order
+		// mismatch between zoneColumns and scanZone shows up here as a
+		// neighbouring field holding this one's value.
+		if got.Name != name || got.Type != "forwarder" || got.SOASerial != 1 {
+			t.Errorf("neighbouring columns moved: %+v", got)
+		}
+	})
+}

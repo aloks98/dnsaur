@@ -2,6 +2,7 @@ package zones
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"math/rand/v2"
 	"strings"
@@ -11,19 +12,24 @@ import (
 	"github.com/aloks98/dnsaur/internal/store"
 )
 
-// The refresh schedule: what makes a secondary a copy rather than a snapshot.
+// The refresh schedule: what makes a zone that pulls from a master a copy
+// rather than a snapshot.
 //
-// Transfer knows how to fetch and install one zone once. This is what decides
+// Two types pull, and both are scheduled here. A secondary takes a whole zone
+// by AXFR (Transferrer); a stub takes only the apex SOA and NS by ordinary
+// query (StubFetcher). Each knows how to do that once. This is what decides
 // *when*, and the schedule is not this server's to invent — it is the one the
-// primary published in the zone's own SOA (RFC 1035 §3.3.13):
+// master published in the zone's own SOA (RFC 1035 §3.3.13):
 //
-//   - refresh: how long after a successful transfer to ask again.
+//   - refresh: how long after a successful pull to ask again.
 //   - retry: how long after a failed one to try again.
 //   - expire: how long the data may still be served with nothing having
-//     succeeded. That one is not enforced here at all; it is stamped onto the
-//     zone row by the install and read at answer time by Zone.Serving, which
-//     is the only place it can be enforced correctly — a scheduler that stops
-//     a zone answering would be racing every query already in flight.
+//     succeeded. A secondary's alone, and not enforced here at all: it is
+//     stamped onto the zone row by the install and read at answer time by
+//     Zone.Serving, which is the only place it can be enforced correctly — a
+//     scheduler that stops a zone answering would be racing every query
+//     already in flight. A stub is never given one, because it holds routing
+//     information rather than data that could go stale (§9.11.8).
 //
 // refreshed_at is the source of truth for "when did this last succeed", read
 // back from the store on every pass rather than cached here. The scheduler
@@ -67,11 +73,17 @@ const (
 	failureLogEvery = time.Hour
 )
 
-// Refresher keeps every secondary zone as close to its primary as that
-// primary's SOA asks for.
+// Refresher keeps every zone that pulls from a master as close to that
+// master as its SOA asks for: a secondary by AXFR, a stub by the two
+// ordinary queries its delegation takes.
 type Refresher struct {
 	zs store.ZoneStore
 	tr *Transferrer
+	// sf fetches a stub's delegation. Nil is a scheduler built without one
+	// (WithStubFetcher), which is a misconfiguration rather than a mode: a
+	// stub that is due is then recorded as a failed attempt, where an
+	// operator looking for why the zone is not routing will find it.
+	sf *StubFetcher
 
 	// now is the clock the whole schedule is decided against, injected for
 	// the same reason Resolver's and Transferrer's are: a test that cannot
@@ -140,6 +152,22 @@ func WithRefreshNow(now func() time.Time) RefreshOption {
 // with the width of the spread and must return a delay within it.
 func WithJitter(jitter func(d time.Duration) time.Duration) RefreshOption {
 	return func(r *Refresher) { r.jitter = jitter }
+}
+
+// WithStubFetcher gives the scheduler the worker a stub zone is refreshed
+// with. It is an option rather than a constructor argument because a stub is
+// fetched through a different object from a secondary's Transferrer — see
+// StubFetcher — and a scheduler that will only ever see secondaries needs
+// none.
+//
+// **In production the fetcher passed here must be built with
+// WithStubReload(App.ReloadZones).** A stub's upstreams are derived from the
+// NS records a fetch installs, so a fetch that republishes only the served
+// snapshot leaves the zone claiming its suffix against a routing table that
+// still has no addresses for it — SERVFAIL forever, and indistinguishable
+// from a fetch that never happened.
+func WithStubFetcher(sf *StubFetcher) RefreshOption {
+	return func(r *Refresher) { r.sf = sf }
 }
 
 // NewRefresher returns a Refresher that reads its zones from zs and transfers
@@ -222,7 +250,7 @@ func (r *Refresher) RefreshDue(ctx context.Context) error {
 	nowMs := r.now().UnixMilli()
 	var wg sync.WaitGroup
 	for _, z := range all {
-		if !isSecondary(z) {
+		if !pullsFromAMaster(z.Type) {
 			continue
 		}
 		// A disabled zone answers nothing (Index.Find skips it), so
@@ -288,17 +316,54 @@ func (r *Refresher) Refresh(ctx context.Context, zoneID int64) (TransferResult, 
 	return r.transfer(ctx, z, st)
 }
 
+// pull runs the one attempt z's type calls for: a secondary's AXFR, or a
+// stub's two ordinary queries.
+//
+// The branch is here, below the per-zone lock and above the recording, so
+// everything either kind of attempt shares is shared by construction — the
+// lock that stops two of them overlapping on one zone (the read-diff-install
+// window is the same window in both), the retry back-off, and the durable
+// record of how it went.
+//
+// A stub's outcome is reported in the scheduler's own vocabulary rather than
+// the fetcher's, because the scheduler's callers ask one question of every
+// zone. ExpiresAt stays zero for a stub, and that is not a gap: a stub is
+// never given an expiry, because it does not expire (§9.11.8, and see
+// StubFetcher.install).
+func (r *Refresher) pull(ctx context.Context, z store.Zone) (TransferResult, error) {
+	if !isStub(z) {
+		return r.tr.Transfer(ctx, z)
+	}
+	if r.sf == nil {
+		// Recorded as a failed attempt rather than skipped, so it lands in
+		// last_error where somebody asking why the zone is not routing will
+		// find it. A stub that were silently skipped would claim its suffix
+		// and SERVFAIL with nothing anywhere saying why.
+		return TransferResult{}, fmt.Errorf("zone %q is a stub and this scheduler was built with no stub fetcher", z.Name)
+	}
+	res, err := r.sf.Fetch(ctx, z)
+	if err != nil {
+		return TransferResult{}, err
+	}
+	return TransferResult{
+		Primary:     res.Master,
+		Serial:      res.Serial,
+		Records:     res.Records,
+		RefreshedAt: res.RefreshedAt,
+	}, nil
+}
+
 // transfer runs one attempt and records what it did. Its caller holds
 // st.xfer.
 //
-// It is the single funnel both outcomes pass through, which is why the
+// It is the single funnel every outcome passes through, which is why the
 // durable record of an attempt (zones.last_error / last_attempt) is written
-// from here rather than from inside Transferrer.Transfer. Transfer's job is
-// to fetch and install a zone; deciding that an attempt happened, and that
-// this one was the latest, is scheduling, and it belongs with the rest of the
-// scheduling state this type already keeps.
+// from here rather than from inside Transferrer.Transfer or
+// StubFetcher.Fetch. Their job is to fetch and install a zone; deciding that
+// an attempt happened, and that this one was the latest, is scheduling, and
+// it belongs with the rest of the scheduling state this type already keeps.
 func (r *Refresher) transfer(ctx context.Context, z store.Zone, st *zoneState) (TransferResult, error) {
-	res, err := r.tr.Transfer(ctx, z)
+	res, err := r.pull(ctx, z)
 	nowMs := r.now().UnixMilli()
 	if err != nil {
 		if ctx.Err() != nil {
@@ -404,6 +469,22 @@ func (r *Refresher) firstAttempt(z store.Zone, nowMs int64) int64 {
 	if !(&Zone{Zone: z}).Serving(nowMs) {
 		return 0
 	}
+	// The same rule for the one zone Serving does not speak for. A stub always
+	// serves, because it holds no data that could go stale (§9.11.8) — but one
+	// that has never fetched holds no delegation either, so it claims its
+	// suffix with no addresses behind it and SERVFAILs every name under it.
+	// That is a zone answering nothing, reached by the other route, and it is
+	// owed the same immediacy: nothing to lose by fetching now, a whole suffix
+	// to lose by waiting out a spread.
+	//
+	// Named by type rather than left as a bare RefreshedAt == 0, which is the
+	// same behaviour today — Serving has already returned for the only other
+	// type here — and would silently hand "no startup spread" to whatever type
+	// joins pullsFromAMaster next. Whether a new type has anything to lose by
+	// waiting is a decision for whoever adds it, not one to inherit.
+	if isStub(z) && z.RefreshedAt == 0 {
+		return 0
+	}
 	if nowMs < z.RefreshedAt+intervalMs(z.SOARefresh) {
 		// Not overdue at all — the ordinary schedule already says when, and a
 		// spread on top of it would only ever delay it further.
@@ -484,7 +565,14 @@ func (r *Refresher) noteFailure(ctx context.Context, z store.Zone, st *zoneState
 	// Expiry is read off the zone row, which the last successful transfer
 	// stamped; it is reported here because a failed attempt is the only event
 	// that can carry a zone across it.
-	expired := z.RefreshedAt != 0 && z.ExpiresAt != 0 && nowMs >= z.ExpiresAt
+	//
+	// A secondary only, because a secondary is the only type that expires.
+	// A stub's own install never writes expires_at (§9.11.8: its NS set is
+	// routing information, not data held on loan), but a row retyped from
+	// secondary to stub still carries the column — and announcing that such a
+	// zone "has stopped answering" would send an operator hunting an outage
+	// that is not happening, while the zone goes on routing perfectly well.
+	expired := isSecondary(z) && z.RefreshedAt != 0 && z.ExpiresAt != 0 && nowMs >= z.ExpiresAt
 	announceExpiry := expired && !st.expiredLogged
 	if announceExpiry {
 		st.expiredLogged = true
@@ -588,7 +676,34 @@ func intervalMs(seconds uint32) int64 {
 	return ms
 }
 
-// isSecondary reports whether z is a zone this server pulls from somewhere
-// else. Nothing else is transferred: a primary is authored here, and stub and
-// forwarder zones name somewhere to ask rather than holding data.
+// isSecondary reports whether z holds another server's zone on loan. It is
+// the one type that expires: see noteFailure.
 func isSecondary(z store.Zone) bool { return strings.EqualFold(z.Type, "secondary") }
+
+// isStub reports whether z names where to send its suffix's queries by
+// fetching a delegation rather than by holding data.
+func isStub(z store.Zone) bool { return strings.EqualFold(z.Type, "stub") }
+
+// pullsFromAMaster reports whether a zone of this type is one this scheduler
+// refreshes.
+//
+// A secondary pulls a whole zone by AXFR; a stub pulls only the apex SOA and
+// NS by ordinary query. Both are "ask a master, on the SOA's schedule, and
+// record how it went", which is what this scheduler is, so both belong in it
+// rather than in two loops that would drift.
+//
+// Nothing else is pulled at all: a primary is authored here, and a forwarder
+// names its upstreams outright in forward_to with nobody to ask.
+//
+// It takes the type rather than the row because the scheduler is not its only
+// caller: NotifyServer.decideZone asks the same question of a zones.Zone from
+// the served snapshot, and "which types have a master" is one rule with one
+// answer. (api.pullsFromAMaster is the third copy of it, in the package that
+// cannot import this one — its own comment says so.)
+func pullsFromAMaster(zoneType string) bool {
+	switch strings.ToLower(zoneType) {
+	case "secondary", "stub":
+		return true
+	}
+	return false
+}

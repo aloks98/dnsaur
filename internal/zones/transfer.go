@@ -287,28 +287,88 @@ func (t *Transferrer) Transfer(ctx context.Context, z store.Zone) (TransferResul
 
 // zoneKey resolves the zone's tsig_key_id to the key to sign with, or nil
 // when the zone names none.
-//
-// A zone naming a key that is not there fails before any primary is
-// contacted. That state is reachable — the D1 delete guard documents the
-// window that produces it — and the two alternatives are both worse:
-// transferring unsigned would send an unauthenticated request the operator
-// believes is authenticated, and a primary that requires TSIG would refuse
-// it anyway, reporting a refusal instead of the missing key that caused it.
 func (t *Transferrer) zoneKey(ctx context.Context, z store.Zone) (*store.TSIGKey, error) {
+	return zoneTSIGKey(ctx, t.keys, z)
+}
+
+// zoneTSIGKey resolves z's tsig_key_id against keys, or returns nil when the
+// zone names none. keys may be nil, which a zone naming a key treats as a
+// failure rather than as permission to send unsigned.
+//
+// A zone naming a key that is not there fails before any peer is contacted.
+// That state is reachable — the D1 delete guard documents the window that
+// produces it — and the two alternatives are both worse: sending unsigned
+// would send an unauthenticated request the operator believes is
+// authenticated, and a peer that requires TSIG would refuse it anyway,
+// reporting a refusal instead of the missing key that caused it.
+//
+// Package-level rather than a Transferrer method because the stub fetcher
+// (stub.go) has the identical rule and reaching the same code is what keeps
+// it identical: a second copy would drift on exactly the branch — keys ==
+// nil, or a key deleted out from under a zone — that nothing exercises until
+// it matters.
+func zoneTSIGKey(ctx context.Context, keys TSIGKeys, z store.Zone) (*store.TSIGKey, error) {
 	if z.TSIGKeyID == 0 {
 		return nil, nil
 	}
-	if t.keys == nil {
+	if keys == nil {
 		return nil, fmt.Errorf("zone %q names tsig key %d but no key store is attached", z.Name, z.TSIGKeyID)
 	}
-	k, ok, err := t.keys.Get(ctx, z.TSIGKeyID)
+	k, ok, err := keys.Get(ctx, z.TSIGKeyID)
 	if err != nil {
 		return nil, fmt.Errorf("zone %q: reading tsig key %d: %w", z.Name, z.TSIGKeyID, err)
 	}
 	if !ok {
-		return nil, fmt.Errorf("zone %q names tsig key %d, which no longer exists: the transfer cannot be signed", z.Name, z.TSIGKeyID)
+		// "requests" rather than "the transfer": this is reached by a stub
+		// fetch as well, and a stub makes ordinary queries and never
+		// transfers anything. Naming the wrong operation in the one error an
+		// operator reads to find a deleted key is a small cost with no
+		// upside.
+		return nil, fmt.Errorf("zone %q names tsig key %d, which no longer exists: its requests cannot be signed", z.Name, z.TSIGKeyID)
 	}
 	return &k, nil
+}
+
+// signedExchange sends m to ap and returns the reply, signed under key when
+// there is one.
+//
+// It is the one implementation of an *ordinary* (non-AXFR) signed DNS query
+// in this package: the SOA probe's and the stub fetcher's two queries. A
+// second copy is the bug that only shows against a peer requiring TSIG, and
+// the RFC 8945 §5.4 check below is the half a copy is most likely to omit,
+// because nothing fails without it until someone is spoofing.
+//
+// network is dns.Client.Net: "" is miekg's default (UDP), "tcp" is what a
+// truncated answer is re-asked over.
+//
+// The signing timestamp is real wall time, never an injected clock — it is
+// checked against the *peer's* clock inside a fudge window (RFC 8945
+// §5.2.3), so a test clock would produce a signature a real peer rejects.
+// See Transferrer.now.
+func signedExchange(ctx context.Context, network string, tsig dns.TsigProvider, ap netip.AddrPort, m *dns.Msg, key *store.TSIGKey) (*dns.Msg, error) {
+	c := &dns.Client{Net: network}
+	if key != nil {
+		// Signed under the key's own name and algorithm, which is what the
+		// peer looks the secret up by (RFC 8945 §4.2).
+		c.TsigProvider = tsig
+		m.SetTsig(dns.CanonicalName(key.Name), dns.CanonicalName(key.Algorithm), tsigFudge, time.Now().Unix())
+	}
+	reply, _, err := c.ExchangeContext(ctx, m, ap.String())
+	if err != nil {
+		return nil, err
+	}
+	// RFC 8945 §5.4: a signed request's response must be signed too.
+	// miekg's ExchangeContext verifies a TSIG only when the reply carries
+	// one ("if t := m.IsTsig(); t != nil" — client.go:267) — a reply with
+	// none skips verification entirely. Without this check, an off-path
+	// attacker who spoofs the peer's address and guesses the query ID and
+	// ephemeral port could hand back an unsigned answer for the right owner
+	// name and have it believed. Mirrors notifysend.go's identical check on
+	// its read loop.
+	if key != nil && reply.IsTsig() == nil {
+		return nil, errors.New("signed request got an unsigned reply")
+	}
+	return reply, nil
 }
 
 // fetch runs one AXFR against one primary and returns the RRs it sent, in
@@ -444,31 +504,14 @@ func (t *Transferrer) ProbeSerial(ctx context.Context, z store.Zone) (uint32, ne
 // probeOne runs one SOA query against one primary.
 func (t *Transferrer) probeOne(ctx context.Context, zoneName string, ap netip.AddrPort, key *store.TSIGKey) (uint32, error) {
 	m := new(dns.Msg).SetQuestion(dns.Fqdn(zoneName), dns.TypeSOA)
-	c := new(dns.Client)
-	if key != nil {
-		// The same provider and the same canonicalisation fetch signs an AXFR
-		// with (t.tsig, set from dnssrv.NewTSIGProvider(keys) at construction)
-		// — see fetch's own comment on why a second implementation here would
-		// be a bug that only shows up against a TSIG-requiring primary.
-		c.TsigProvider = t.tsig
-		m.SetTsig(dns.CanonicalName(key.Name), dns.CanonicalName(key.Algorithm), tsigFudge, time.Now().Unix())
-	}
-	reply, _, err := c.ExchangeContext(ctx, m, ap.String())
+	// The same provider and the same canonicalisation fetch signs an AXFR with
+	// (t.tsig, set from dnssrv.NewTSIGProvider(keys) at construction), and the
+	// same §5.4 check on the reply — see signedExchange for why a second
+	// implementation here would be a bug that only shows up against a
+	// TSIG-requiring primary.
+	reply, err := signedExchange(ctx, "", t.tsig, ap, m, key)
 	if err != nil {
 		return 0, err
-	}
-	// RFC 8945 §5.4: a signed request's response must be signed too.
-	// miekg's ExchangeContext verifies a TSIG only when the reply carries
-	// one ("if t := m.IsTsig(); t != nil" — client.go:267) — a reply with
-	// none skips verification entirely. Without this check, an off-path
-	// attacker who spoofs the primary's address and guesses the query ID
-	// and ephemeral port could hand back an unsigned SOA for the right
-	// owner name with a serial <= ours, and act would call the zone
-	// current — leaving it stale while reporting nothing wrong, the exact
-	// failure the owner-name check just below also exists to prevent.
-	// Mirrors notifysend.go's identical check on its read loop.
-	if key != nil && reply.IsTsig() == nil {
-		return 0, errors.New("SOA probe: signed request got an unsigned reply")
 	}
 	if reply.Rcode != dns.RcodeSuccess {
 		return 0, fmt.Errorf("SOA probe answered %s", dns.RcodeToString[reply.Rcode])

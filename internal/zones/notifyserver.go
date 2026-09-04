@@ -6,7 +6,6 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
-	"strings"
 	"sync"
 	"time"
 
@@ -157,10 +156,26 @@ func (n *NotifyServer) decideZone(m *dns.Msg) (*Zone, *notifyRefusal) {
 	if z == nil {
 		return nil, &notifyRefusal{rcode: dns.RcodeNotAuth, reason: "no such zone"}
 	}
-	// Only a secondary is told by anyone. A primary owns its data, so a
-	// NOTIFY for one is either a misconfiguration or an attempt to make this
-	// server pull its own zone from somewhere else.
-	if !strings.EqualFold(z.Type, "secondary") {
+	// Only a type that pulls from a master is told by anyone, which is the
+	// same rule the scheduler applies (pullsFromAMaster in refresh.go) and
+	// for the same reason: a NOTIFY is a hint that the master has moved on,
+	// and it is worth nothing to a zone with no master to re-ask.
+	//
+	// That is a secondary and a stub. A stub pulls its delegation by the
+	// same scheduler, under the same per-zone lock, recording the same
+	// attempt — Refresher.Refresh, which is what act calls, already branches
+	// on the type below this gate — so a master that has just moved its
+	// delegation says so exactly the way it does for a zone it AXFRs, and a
+	// gate naming only "secondary" would make this the one path that made a
+	// stub wait out its SOA refresh instead.
+	//
+	// A primary owns its data, so a NOTIFY for one is either a
+	// misconfiguration or an attempt to make this server pull its own zone
+	// from somewhere else. A forwarder names its upstreams outright in
+	// forward_to and has nobody to ask, so there is no work a NOTIFY for one
+	// could cause. Both are refused, and decidePeer's source check still
+	// applies to the two that are not.
+	if !pullsFromAMaster(z.Type) {
 		return nil, &notifyRefusal{rcode: dns.RcodeNotAuth, reason: "zone is type " + z.Type}
 	}
 	if !z.Enabled {

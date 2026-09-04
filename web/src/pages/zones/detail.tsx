@@ -79,6 +79,7 @@ import { useTSIGKeys } from "../../hooks/use-tsig-keys";
 import { StaleDataAlert } from "../../components/stale-data-alert";
 import { formatBytes, formatDuration, relativeTime } from "../../lib/format";
 import {
+  forwardTargets,
   isServing,
   lastTransferError,
   nextRefreshAt,
@@ -1429,6 +1430,311 @@ function AllowTransferBand({ zone }: { zone: Zone }) {
   );
 }
 
+// ── The upstream row: FORWARD TO for a forwarder, MASTER for a stub ───────
+
+/**
+ * Where a routing zone sends the queries it claims — one row serving both
+ * types the milestone adds, with its caption switching.
+ *
+ * A forwarder and a stub are the same mechanism with two sources for the
+ * addresses. Both claim a suffix outright and route everything beneath it;
+ * a forwarder's targets are typed into `forward_to` by the operator, a
+ * stub's are *derived from an NS set it fetches* from the masters in
+ * `primaries` (an SOA and an NS query with glue, deliberately not an AXFR —
+ * see internal/zones/stub.go). One row rather than two, because the question
+ * it answers is one question: where do this zone's queries go, and is that
+ * still working.
+ *
+ * It shares SoaBand's 152px label column, the same way TRANSFERS OUT and
+ * NOTIFY OUT do, so every caption on this page lands on one edge — and it
+ * is a *row* rather than a band for the same reason AllowTransferBand is:
+ * the value is one string, not a form.
+ *
+ * Read is the default, editing behind the pencil. The grammar is not checked
+ * here at all: `zones.ValidateForwardTo`/`ValidatePrimaries` are the real
+ * checks and a second implementation of `host[:port]` in this file would only
+ * drift from them, so the server's own message is what a malformed entry
+ * gets. The one client-side rule is a stub's master being required, which
+ * exists only to save a round trip that would always 400.
+ */
+function upstreamSchema(required: boolean, message: string) {
+  return z.object({
+    upstreams: z.string().superRefine((value, ctx) => {
+      if (required && value.trim() === "") ctx.addIssue({ code: "custom", message });
+    }),
+  });
+}
+type UpstreamFormValues = { upstreams: string };
+
+function UpstreamRow({ zone }: { zone: Zone }) {
+  const forwarder = zone.type === "forwarder";
+  // The field this row edits, and the only difference between the two shapes
+  // that reaches the wire. They are separate columns because they are
+  // separate things: the server 400s `primaries` on a forwarder and
+  // `forward_to` on anything else, so one shared column would be refused by
+  // whichever type it was not written for.
+  const saved = forwarder ? zone.forward_to : zone.primaries;
+  const label = forwarder ? "Forward to" : "Master";
+  // A stub with no master can never fetch, so it would claim its suffix and
+  // SERVFAIL it forever — checkZoneTransferConfig refuses it, and this
+  // mirrors that refusal rather than inventing one. A forwarder's empty
+  // `forward_to` is the opposite case: the server accepts it deliberately
+  // (the zone still claims the suffix, and every query beneath it becomes a
+  // SERVFAIL rather than a fall-through), so there is no rule to mirror.
+  const schema = useMemo(
+    () => upstreamSchema(!forwarder, "Where to fetch from, e.g. 192.168.150.1"),
+    [forwarder],
+  );
+
+  const [editing, setEditing] = useState(false);
+  const updateZone = useUpdateZone();
+  const form = useForm<UpstreamFormValues>({
+    resolver: zodResolver(schema),
+    defaultValues: { upstreams: saved },
+  });
+
+  // Reset only when the *saved* value changes — AllowTransferBand's own rule,
+  // and for the same reason: an unrelated refetch (a stub's own fetch poll
+  // landing, say) must not wipe an in-progress, unsaved edit.
+  useEffect(() => {
+    form.reset({ upstreams: saved });
+  }, [saved, form]);
+
+  useEffect(() => {
+    if (editing) form.setFocus("upstreams");
+  }, [editing, form]);
+
+  function onStartEdit() {
+    form.reset({ upstreams: saved });
+    setEditing(true);
+  }
+
+  function onCancelEdit() {
+    form.reset({ upstreams: saved });
+    setEditing(false);
+  }
+
+  function onSubmit(values: UpstreamFormValues) {
+    const trimmed = values.upstreams.trim();
+    updateZone.mutate(
+      { id: zone.id, ...(forwarder ? { forward_to: trimmed } : { primaries: trimmed }) },
+      {
+        onSuccess: () => {
+          toast.success(forwarder ? "Upstreams saved" : "Master saved");
+          setEditing(false);
+        },
+        // The server's own words — it is the only account of what was wrong
+        // with the value, since nothing here parses it.
+        onError: (err) =>
+          toast.error(
+            err instanceof ApiError
+              ? err.message
+              : forwarder
+                ? "Couldn't save the upstreams"
+                : "Couldn't save the master",
+          ),
+      },
+    );
+  }
+
+  /**
+   * The note beside the value, and for a stub it is the state of the fetch.
+   *
+   * **Never a date-less state where a date exists to be shown.** Two of a
+   * stub's three carry one: the set it holds and when it arrived, and —
+   * under a failure — the age of the set it is still routing to. The third,
+   * "no NS set yet", carries none and must not be given one: nothing has
+   * ever landed for a date to be about, and the grid below names the master
+   * being asked. The rule is that a date is never *withheld*, not that
+   * every state has one.
+   *
+   * Deliberately **not** derived through transferState: that function's
+   * `expired` branch reads `expires_at`, which a stub is never given
+   * (§9.11.8) but a row retyped from secondary can still carry — running one
+   * through it would put a zone that is routing perfectly well on screen as
+   * expired. `refreshed_at` and `lastTransferError` are the whole of what
+   * this needs, and neither involves an expiry.
+   */
+  const failure = forwarder ? null : lastTransferError(zone);
+  const upstreams = forwardTargets(saved);
+  let note = "";
+  if (forwarder) {
+    note =
+      upstreams.length === 0
+        ? ""
+        : `${upstreams.length} upstream${upstreams.length === 1 ? "" : "s"}`;
+  } else if (zone.refreshed_at === 0) {
+    note = "no NS set yet";
+  } else if (failure) {
+    // The age of the set, not of the fetch that failed to replace it: this
+    // line is about what is being served, and the failure's own date is on
+    // the line below.
+    note = `NS set from ${relativeTime(zone.refreshed_at)}`;
+  } else {
+    note = `NS set fetched ${relativeTime(zone.refreshed_at)}`;
+  }
+
+  return (
+    <Form {...form}>
+      <form
+        onSubmit={(e) => void form.handleSubmit(onSubmit)(e)}
+        noValidate
+        // The last row of the header group either way — for both types every
+        // band above it is dropped, so it carries the group's bottom rule
+        // itself.
+        className="grid shrink-0 grid-cols-[152px_1fr] border-b border-border bg-card"
+      >
+        <div className="flex items-start border-r border-border-muted px-3.5 py-[9px]">
+          {/* The blank first cell is what lines this caption's text up with
+              SOA's own chevron on every other zone type's page. */}
+          <span className="grid grid-cols-[12px_auto] items-center gap-[7px] font-mono text-[9.5px] leading-[1.3] font-semibold tracking-[0.14em] text-muted-foreground uppercase">
+            <span aria-hidden="true" />
+            <span>{label}</span>
+          </span>
+        </div>
+        <FormField
+          control={form.control}
+          name="upstreams"
+          render={({ field }) => (
+            <div className="min-w-0">
+              <div className="flex min-w-0 items-center gap-2.5 px-4 py-2">
+                {editing ? (
+                  <>
+                    <Input
+                      {...field}
+                      aria-label={label}
+                      placeholder={forwarder ? "10.0.0.1, 10.0.0.2:5353" : "192.168.150.1:53"}
+                      autoComplete="off"
+                      spellCheck={false}
+                      className="h-7 w-[280px] shrink-0 font-mono"
+                    />
+                    <div className="ml-auto flex shrink-0 items-center gap-1.5">
+                      <Button type="submit" size="sm" disabled={updateZone.isPending}>
+                        {updateZone.isPending ? "Saving…" : "Save"}
+                      </Button>
+                      <Button
+                        type="button"
+                        size="icon-sm"
+                        variant="ghost"
+                        aria-label={
+                          forwarder ? "Cancel editing upstreams" : "Cancel editing master"
+                        }
+                        onClick={onCancelEdit}
+                      >
+                        <X />
+                      </Button>
+                    </div>
+                  </>
+                ) : (
+                  <>
+                    <span
+                      className={cn(
+                        "min-w-0 shrink truncate font-mono text-[12.5px]",
+                        saved === "" ? "text-muted-foreground" : "text-foreground",
+                      )}
+                      title={saved === "" ? undefined : saved}
+                    >
+                      {saved === "" ? "none" : saved}
+                    </span>
+                    {note !== "" && (
+                      <span
+                        data-testid="upstream-note"
+                        className={cn(
+                          "shrink-0 font-mono text-[11px]",
+                          // A stale set is a warning about what is being
+                          // routed to, not a neutral fact about it.
+                          failure && zone.refreshed_at !== 0
+                            ? "text-warning-foreground"
+                            : "text-muted-foreground",
+                        )}
+                      >
+                        {note}
+                      </span>
+                    )}
+                    <Button
+                      type="button"
+                      size="icon-sm"
+                      variant="ghost"
+                      title={forwarder ? "Edit upstreams" : "Edit master"}
+                      aria-label={forwarder ? "Edit upstreams" : "Edit master"}
+                      className="ml-auto shrink-0"
+                      onClick={onStartEdit}
+                    >
+                      <Pencil />
+                    </Button>
+                  </>
+                )}
+              </div>
+              {editing && (
+                <div className="px-4 pb-2">
+                  <FormMessage />
+                </div>
+              )}
+              {/* The failed fetch, in the fetcher's own words, with the date
+                  of the attempt that produced it and the age of the set still
+                  being routed to. All three or none: an error with no date is
+                  a claim about the present made by an unknown past, and a
+                  failure with no account of what is still being served does
+                  not say whether the suffix is down. */}
+              {failure && !editing && (
+                <div className="grid grid-cols-[13px_1fr] gap-x-2 border-t border-border-muted px-4 pt-[7px] pb-2">
+                  <AlertCircle
+                    aria-hidden="true"
+                    className="mt-0.5 size-3.5 text-warning-foreground"
+                  />
+                  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2.5">
+                    <span className="shrink-0 font-mono text-[9.5px] font-semibold tracking-[0.14em] text-warning-foreground uppercase">
+                      Last fetch · {relativeTime(failure.at)}
+                    </span>
+                    <span
+                      data-testid="stub-fetch-error"
+                      title={failure.message}
+                      className="min-w-0 truncate font-mono text-[12.5px] text-warning-foreground"
+                    >
+                      {failure.message}
+                    </span>
+                    <span className="shrink-0 font-mono text-[11.5px] text-muted-foreground">
+                      {zone.refreshed_at === 0
+                        ? "Answering nothing until the first fetch succeeds."
+                        : `serving the NS set from ${relativeTime(zone.refreshed_at)}`}
+                    </span>
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+        />
+      </form>
+    </Form>
+  );
+}
+
+/**
+ * The one thing a forwarder's page has to say out loud, and the reason a page
+ * with a header, one row and two buttons does not read as one that failed to
+ * load.
+ *
+ * A claimed suffix is claimed *outright*: §9.11.5 makes a query beneath it
+ * with no reachable upstream a SERVFAIL rather than a fall-through past
+ * dnsaur to the default resolvers. That is the surprising half of the type —
+ * an operator who expects a forwarder to be an override will expect the
+ * fall-through — and it is the half that turns a broken upstream into a dead
+ * suffix. Explanation belongs in docs/; this is a consequence, and it belongs
+ * on screen.
+ */
+function ForwarderConsequence({ zone }: { zone: Zone }) {
+  return (
+    <div className="grid shrink-0 grid-cols-[13px_1fr] gap-x-2 px-4 py-2.5">
+      <AlertCircle aria-hidden="true" className="mt-0.5 size-3.5 text-muted-foreground" />
+      <span className="text-[12.5px] leading-normal text-pretty text-muted-foreground">
+        This zone claims <span className="font-mono text-foreground">{zone.name}</span> outright.
+        With every upstream unreachable, queries for it get SERVFAIL — they do not fall through to
+        the default resolvers.
+      </span>
+    </div>
+  );
+}
+
 // ── The notify-out band ───────────────────────────────────────────────────
 
 const notifyToFormSchema = z.object({
@@ -2019,13 +2325,25 @@ function ZoneFileActions({ zone }: { zone: Zone }) {
   const exportFile = useExportZoneFile();
   const importFile = useImportZoneFile();
 
-  // The two kinds of zone this server refuses writes into: the RFC 6303
-  // built-ins (seeded infrastructure) and a secondary (someone else's zone,
-  // on loan). Both 409 an import, so Import is omitted rather than left to
-  // fail on click — and for a secondary an import is worse than refused, it
-  // is meaningless: the next transfer would replace whatever it wrote.
-  // Export is offered for both: reading either is allowed.
-  const canImport = zone.type !== "internal" && zone.type !== "secondary";
+  /**
+   * A primary is the only zone whose records are authored here, so it is the
+   * only one an import means anything for. Gated on that *positive* set
+   * rather than on the set the server 409s, which keeps the two independent:
+   * recordWriteRefusal covers `internal`, `secondary` and `stub`, so every
+   * type this hides the control from is also refused server-side, and the
+   * gate stays right if that set changes again.
+   *
+   * The stub case was added late (it had been accepted, then thrown away by
+   * the next fetch's whole-set replace — and worse, read back by
+   * StubUpstreams into the routing table in between). Do not infer from that
+   * history that this gate is load-bearing for correctness: it is not, and
+   * must not become the only thing standing between a write and the store.
+   *
+   * Export is offered for a stub, a secondary and a built-in alike: reading
+   * is never refused. The exception is a forwarder, which holds nothing to
+   * render into a file — see the header's own gate.
+   */
+  const canImport = zone.type === "primary";
 
   // A dry run or a commit is actually on the wire. This is the window in
   // which a second file selection would buy a second full parse-and-diff of
@@ -2103,18 +2421,26 @@ function ZoneFileActions({ zone }: { zone: Zone }) {
 
   const applying = importFile.isPending && phase.kind === "diff";
 
+  // A forwarder holds no records at all — it claims a suffix and routes it —
+  // so the file it would export is an SOA and nothing else. The endpoint
+  // renders it happily; the button is omitted because the download is
+  // meaningless, not because the server refuses it.
+  const canExport = zone.type !== "forwarder";
+
   return (
     <>
-      <Button
-        type="button"
-        size="sm"
-        variant="outline"
-        onClick={onExport}
-        disabled={exportFile.isPending}
-      >
-        <Download />
-        Export
-      </Button>
+      {canExport && (
+        <Button
+          type="button"
+          size="sm"
+          variant="outline"
+          onClick={onExport}
+          disabled={exportFile.isPending}
+        >
+          <Download />
+          Export
+        </Button>
+      )}
 
       {canImport && (
         <>
@@ -2423,11 +2749,20 @@ export function ZoneDetail() {
    * column exists to remove.
    */
   function onRefreshNow() {
+    // A stub does not transfer, and calling what it does a transfer would be
+    // wrong in the one way the type exists to be right about: it asks its
+    // master two ordinary questions (SOA and NS with glue) precisely so it
+    // needs no allow_transfer permission on the far end. The endpoint is
+    // shared — POST /zones/{id}/refresh serves both, and refuses every other
+    // type with 400 — but the word is not.
+    const fetches = zone.data?.type === "stub";
     refreshZone.mutate(zoneId, {
       onSuccess: (result) =>
-        toast.success(`Transferred ${result.records} records from ${result.primary}`),
-      // A short toast to close the interaction; the band carries the detail.
-      onError: () => toast.error("The transfer failed"),
+        toast.success(
+          `${fetches ? "Fetched" : "Transferred"} ${result.records} records from ${result.primary}`,
+        ),
+      // A short toast to close the interaction; the row carries the detail.
+      onError: () => toast.error(fetches ? "The fetch failed" : "The transfer failed"),
     });
   }
 
@@ -2567,7 +2902,41 @@ export function ZoneDetail() {
    * where its contents come from, not of the zone itself.
    */
   const isSecondary = z.type === "secondary";
-  const recordsReadOnly = isInternal || isSecondary;
+  /**
+   * The two types Milestone D6 adds, which are the same shape on this page:
+   * neither holds authored data, both claim a suffix and route it, and
+   * neither has an SOA anybody here may write.
+   *
+   * `isRouting` is the artboard's `nameless`, and it is what every dropped
+   * band is gated on — the SOA band, the create row, the record filter,
+   * allow-transfer and notify-out. They differ in exactly one place: a stub
+   * has an NS set worth *seeing*, so it keeps the records grid (read-only),
+   * while a forwarder has no records at all and drops the grid with them.
+   */
+  const isForwarder = z.type === "forwarder";
+  const isStub = z.type === "stub";
+  const isRouting = isForwarder || isStub;
+  /**
+   * Both routing types join the built-in and the secondary here — the
+   * artboard's `isEditable` negated exactly.
+   *
+   * A stub's records are the NS set it fetched, and the next fetch replaces
+   * the whole set through the same DiffRecords the transfer uses, so a
+   * hand-written record survives only until the schedule comes round — the
+   * trap the secondary's own read-only-ness exists to close. A forwarder's
+   * case is simpler and stronger: it answers from no records at all
+   * (Zone.Answer returns handled=false for the type), so a record written
+   * into one would never be served by anything.
+   *
+   * The server refuses a stub's writes too (recordWriteRefusal names
+   * `internal`, `secondary` and `stub`), so hiding the controls there is the
+   * UI agreeing with the API rather than standing in for it. A **forwarder**
+   * is the one case where the server would still accept the write, and
+   * deliberately: nothing overwrites a forwarder's records, so a write into
+   * one is inert rather than lost, which is not a 409's complaint to make.
+   * Hiding the control is the whole of the guard there.
+   */
+  const recordsReadOnly = isInternal || isSecondary || isRouting;
 
   let body: ReactNode;
   if (records.isPending) {
@@ -2594,7 +2963,15 @@ export function ZoneDetail() {
     // the same fact the transfer band above states in more detail.
     const emptyMessage = isSecondary
       ? "Nothing transferred yet. The records will arrive with the first transfer from the primary."
-      : "No records yet. Add one above and dnsaur will answer for this zone directly.";
+      : isStub
+        ? // Present tense only while it is true. A stub with a recorded
+          // failure is not fetching, it has failed — and the MASTER row above
+          // already carries that error with its date, so this line says the
+          // one thing left: there is no set.
+          lastTransferError(z)
+          ? "No NS set yet."
+          : `Fetching the NS set from ${z.primaries}`
+        : "No records yet. Add one above and dnsaur will answer for this zone directly.";
     body = (
       <p className="p-6 text-center text-sm text-muted-foreground">
         {allRecords.length === 0 ? emptyMessage : "No records match this filter."}
@@ -2671,6 +3048,17 @@ export function ZoneDetail() {
             Pulled · Read-only
           </span>
         )}
+        {/* Fetched rather than pulled, because the difference is the whole
+            type: a stub asks two ordinary questions instead of transferring,
+            and so needs no allow_transfer permission on the master. A
+            forwarder gets no marker of its own — it has no records for the
+            word "read-only" to be about. */}
+        {isStub && (
+          <span className="inline-flex shrink-0 items-center gap-1.5 font-mono text-[9.5px] tracking-[0.12em] text-muted-foreground uppercase">
+            <ArrowDownToLine className="size-3" aria-hidden="true" />
+            Fetched · Read-only
+          </span>
+        )}
         <div className="ml-auto flex shrink-0 items-center gap-2">
           {!recordsReadOnly && (
             <Button type="button" size="sm" onClick={openAdd}>
@@ -2678,18 +3066,27 @@ export function ZoneDetail() {
               Add record
             </Button>
           )}
-          {/* The primary action for a copy: not "write a record", which it
-              cannot do, but "go and get the current version now". */}
-          {isSecondary && (
+          {/* The primary action for a zone that pulls: not "write a record",
+              which it cannot do, but "go and get the current version now".
+
+              `secondary || stub` — the API's own gate, verbatim
+              (pullsFromAMaster in zones_handlers.go, which answers everything
+              else 400 "only secondary and stub zones pull from a master"). A
+              forwarder is deliberately outside it: it has no master and
+              nothing to fetch, so the button would be a no-op that returns an
+              error. */}
+          {(isSecondary || isStub) && (
             <Button type="button" size="sm" onClick={onRefreshNow} disabled={refreshZone.isPending}>
               <RotateCw />
-              {refreshZone.isPending ? "Transferring…" : "Refresh now"}
+              {refreshZone.isPending ? (isStub ? "Fetching…" : "Transferring…") : "Refresh now"}
             </Button>
           )}
-          {/* Export renders for every zone, built-ins and secondaries
-              included — it is the one action that reads rather than writes.
-              Import and the rest stay behind the guard; see
-              ZoneFileActions. */}
+          {/* Export reads rather than writes, so it renders for the zones
+              every other control here omits: a built-in, a secondary and a
+              stub are all exportable. The one exception is a forwarder, which
+              holds no records to render into a file. Import and the rest stay
+              behind their own guards — see ZoneFileActions, which owns both
+              gates. */}
           <ZoneFileActions zone={z} />
           {!isInternal && (
             <>
@@ -2718,8 +3115,25 @@ export function ZoneDetail() {
 
       {/* SOA band, or — for a copy, whose SOA is its primary's and is
           overwritten by every transfer — the transfer band in its place. See
-          TransferBand's own comment. */}
-      {isSecondary ? <TransferBand zone={z} /> : <SoaBand zone={z} />}
+          TransferBand's own comment.
+
+          A forwarder and a stub get **neither**, and that is the correction
+          this branch carries: as `isSecondary ? … : …` alone it put both of
+          them in the else branch and offered an editable SOA form for an SOA
+          that is not theirs to author. A forwarder's is a formality nothing
+          reads (it answers from no records at all); a stub's arrives with
+          every fetch and is overwritten by the next one, exactly as a
+          secondary's is. What they get instead is the upstream row below. */}
+      {isSecondary ? <TransferBand zone={z} /> : isRouting ? null : <SoaBand zone={z} />}
+
+      {/* Where this zone's queries actually go — the one row a forwarder and
+          a stub share, its caption switching between FORWARD TO and MASTER.
+          See UpstreamRow's own comment. */}
+      {isRouting && <UpstreamRow zone={z} />}
+
+      {/* …and, for a forwarder, what happens when none of them answers. Not
+          decoration: see ForwarderConsequence. */}
+      {isForwarder && <ForwarderConsequence zone={z} />}
 
       {/* Who may transfer this zone, and who last did — applies to both a
           primary and a secondary (a secondary re-serves what it pulled), so
@@ -2729,10 +3143,12 @@ export function ZoneDetail() {
           and handleZonePatch 409s every PATCH to a built-in zone outright —
           an editable field here for one of those would be exactly the kind
           of control this header already omits rather than lets fail on
-          click (see isInternal's own comment above). stub/forwarder aren't
-          reachable through the create form today (CREATABLE_TYPES,
-          list.tsx), but gating on the allowed set rather than the excluded
-          one keeps this correct if that ever changes. See
+          click (see isInternal's own comment above). D6 is what made that
+          gating load-bearing rather than merely careful: CREATABLE_TYPES
+          (list.tsx) is now all four types and the create row renders a
+          select over it, so stub and forwarder zones arrive here through
+          the ordinary path. Gating on the allowed set is what kept this
+          correct across that change without an edit. See
           AllowTransferBand's own comment. */}
       {(z.type === "primary" || isSecondary) && <AllowTransferBand zone={z} />}
 
@@ -2742,89 +3158,105 @@ export function ZoneDetail() {
           that is a deliberate correction of the artboard's `!builtIn`. */}
       {(z.type === "primary" || isSecondary) && <NotifyBand zone={z} />}
 
-      {/* Filter bar */}
-      <div className="flex shrink-0 items-center gap-3 border-b border-border px-4 py-2.5">
-        <Input
-          value={nameFilter}
-          onChange={(e) => {
-            setNameFilter(e.target.value);
-            onFiltersTouched();
-          }}
-          placeholder="filter by name…"
-          aria-label="Filter by name"
-          className="w-[236px] shrink-0 grow-0 font-mono"
-        />
-        <div className="flex items-center gap-1.5">
-          <span className="font-mono text-[9.5px] tracking-[0.14em] text-muted-foreground uppercase">
-            Type
-          </span>
-          <NativeSelect
-            value={typeFilter}
+      {/* Filter bar — dropped for both routing types, a stub included. A
+          stub's grid is its fetched NS set: three or four rows, all named
+          "@", all of type NS. There is nothing to filter, and a filter over
+          nothing is a control that only ever hides the whole list. */}
+      {!isRouting && (
+        <div className="flex shrink-0 items-center gap-3 border-b border-border px-4 py-2.5">
+          <Input
+            value={nameFilter}
             onChange={(e) => {
-              setTypeFilter(e.target.value as "" | RecordType);
+              setNameFilter(e.target.value);
               onFiltersTouched();
             }}
-            aria-label="Filter by record type"
-          >
-            <NativeSelectOption value="">All types</NativeSelectOption>
-            {RECORD_TYPES.map((t) => (
-              <NativeSelectOption key={t} value={t}>
-                {t}
-              </NativeSelectOption>
-            ))}
-          </NativeSelect>
-        </div>
-        <span className="ml-auto font-mono text-[10.5px] text-muted-foreground">
-          {shownRecords.length} {shownRecords.length === 1 ? "record" : "records"}
-        </span>
-      </div>
-
-      {records.isError && records.data !== undefined && (
-        <div className="shrink-0 border-b border-border p-3">
-          <StaleDataAlert
-            what="records"
-            onRetry={() => void records.refetch()}
-            isRetrying={records.isFetching}
+            placeholder="filter by name…"
+            aria-label="Filter by name"
+            className="w-[236px] shrink-0 grow-0 font-mono"
           />
+          <div className="flex items-center gap-1.5">
+            <span className="font-mono text-[9.5px] tracking-[0.14em] text-muted-foreground uppercase">
+              Type
+            </span>
+            <NativeSelect
+              value={typeFilter}
+              onChange={(e) => {
+                setTypeFilter(e.target.value as "" | RecordType);
+                onFiltersTouched();
+              }}
+              aria-label="Filter by record type"
+            >
+              <NativeSelectOption value="">All types</NativeSelectOption>
+              {RECORD_TYPES.map((t) => (
+                <NativeSelectOption key={t} value={t}>
+                  {t}
+                </NativeSelectOption>
+              ))}
+            </NativeSelect>
+          </div>
+          <span className="ml-auto font-mono text-[10.5px] text-muted-foreground">
+            {shownRecords.length} {shownRecords.length === 1 ? "record" : "records"}
+          </span>
         </div>
       )}
 
-      {/* Records grid header — first, per the artboard, with the create row
+      {/* Everything from here down is about records, so a forwarder — which
+          has none, and can never have one — takes none of it: not the grid,
+          not the header above it, not the stale-records alert, and not the
+          add band. Its page ends at the consequence line above, and that
+          shortness is the design rather than a load that failed. A stub keeps
+          all of it except the add band, because a fetched NS set is worth
+          seeing. */}
+      {!isForwarder && (
+        <>
+          {records.isError && records.data !== undefined && (
+            <div className="shrink-0 border-b border-border p-3">
+              <StaleDataAlert
+                what="records"
+                onRetry={() => void records.refetch()}
+                isRetrying={records.isFetching}
+              />
+            </div>
+          )}
+
+          {/* Records grid header — first, per the artboard, with the create row
           sitting between it and the scrolling record rows (same order as
           the zones list). */}
-      <div
-        className={cn(
-          GRID,
-          "shrink-0 border-b border-border py-2",
-          "font-mono text-xs tracking-widest text-muted-foreground uppercase",
-        )}
-      >
-        <span>Name</span>
-        <span>Type</span>
-        <span className="text-right">TTL</span>
-        <span>Data</span>
-        <span className="text-right">Actions</span>
-      </div>
+          <div
+            className={cn(
+              GRID,
+              "shrink-0 border-b border-border py-2",
+              "font-mono text-xs tracking-widest text-muted-foreground uppercase",
+            )}
+          >
+            <span>Name</span>
+            <span>Type</span>
+            <span className="text-right">TTL</span>
+            <span>Data</span>
+            <span className="text-right">Actions</span>
+          </div>
 
-      {/* The add band — the one placement that is still a band, because a
+          {/* The add band — the one placement that is still a band, because a
           record that doesn't exist yet has no row to become. Omitted for a
           built-in zone (see isInternal's own comment), and, for a writable
           one, until Add record opens it: closed is the loaded state, not
           just a visual one — see addOpen's own comment above. Editing does
           not come through here; it happens in the record's own row below. */}
-      {!recordsReadOnly && addOpen && (
-        <RecordFormRow
-          key={addCue}
-          zoneId={z.id}
-          apex={z.name}
-          editing={null}
-          onDone={() => setAddOpen(false)}
-        />
-      )}
+          {!recordsReadOnly && addOpen && (
+            <RecordFormRow
+              key={addCue}
+              zoneId={z.id}
+              apex={z.name}
+              editing={null}
+              onDone={() => setAddOpen(false)}
+            />
+          )}
 
-      <div data-testid="zone-record-list" className="min-h-0 flex-1 overflow-y-auto">
-        {body}
-      </div>
+          <div data-testid="zone-record-list" className="min-h-0 flex-1 overflow-y-auto">
+            {body}
+          </div>
+        </>
+      )}
 
       <AlertDialog open={deleteZoneOpen} onOpenChange={setDeleteZoneOpen}>
         <AlertDialogContent>

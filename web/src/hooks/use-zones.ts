@@ -55,26 +55,33 @@ const TRANSFER_POLL_MS = REFRESH_TICK_MS;
 /**
  * Whether anything in this query's data can change with nobody touching it.
  *
- * Only a secondary can. Its records, serial and transfer stamps are written
- * by the scheduler in the background — on the SOA's refresh, on a retry when
- * a primary comes back, on crossing into expiry — so a screen showing one is
- * out of date the moment it stops asking. Everything else on these screens
- * (a primary's records, any zone's settings) changes only when an operator
+ * Only a zone that pulls from a master can. Its records, serial and refresh
+ * stamps are written by the scheduler in the background — on the SOA's
+ * refresh, on a retry when a master comes back, on a secondary crossing into
+ * expiry — so a screen showing one is out of date the moment it stops
+ * asking. Everything else on these screens (a primary's records, a
+ * forwarder's upstreams, any zone's settings) changes only when an operator
  * changes it, and the mutation that did it has already invalidated.
  *
- * So this is the single gate on both the poll and the focus revalidation
- * below. A homelab with primaries alone issues exactly the requests it did
- * before this existed: one per page.
+ * The set is `secondary || stub`, which is deliberately the *server's* own
+ * rule rather than a second one: internal/zones/refresh.go's
+ * `pullsFromAMaster` decides which zones the scheduler wakes for, and
+ * internal/api's gate on POST /refresh is the same predicate again. A stub
+ * left out of it would sit on "no NS set yet" until someone reloaded the
+ * page, because the first fetch that changes that is the scheduler's.
  *
- * Not narrowed further to *enabled* secondaries. A disabled one is skipped by
- * the scheduler, but it can still cross its expiry while on screen (a fact
- * about the clock, which the re-render is what surfaces) and can still be
- * re-enabled from another tab.
+ * A **forwarder** is not in it and must not be: its upstreams are typed in
+ * by hand and nothing in the background ever touches its row.
+ *
+ * Not narrowed further to *enabled* zones. A disabled one is skipped by the
+ * scheduler, but a secondary can still cross its expiry while on screen (a
+ * fact about the clock, which the re-render is what surfaces) and either can
+ * be re-enabled from another tab.
  */
 function watchesTransfers(zones: Zone | Zone[] | undefined): boolean {
   if (zones === undefined) return false;
-  const isSecondary = (zone: Zone) => zone.type === "secondary";
-  return Array.isArray(zones) ? zones.some(isSecondary) : isSecondary(zones);
+  const pullsFromAMaster = (zone: Zone) => zone.type === "secondary" || zone.type === "stub";
+  return Array.isArray(zones) ? zones.some(pullsFromAMaster) : pullsFromAMaster(zones);
 }
 
 interface ZoneCreateInput {
@@ -82,20 +89,31 @@ interface ZoneCreateInput {
   type?: Zone["type"];
   enabled?: boolean;
   /**
-   * Where a secondary pulls from: comma-separated `host[:port]`, port 53 by
-   * default. Required and non-empty for a secondary, and **refused with 400
-   * on any other type** — a zone that never transfers has no primaries, and
-   * the server will not store configuration nothing reads (see
-   * checkZoneTransferConfig in internal/api/zones_handlers.go). So this is
-   * omitted, not sent empty, for a primary.
+   * Where a secondary pulls the zone from, or a stub fetches its NS set
+   * from: comma-separated `host[:port]`, port 53 by default. Required and
+   * non-empty for both, and **refused with 400 on any other type** — a zone
+   * that never pulls has no primaries, and the server will not store
+   * configuration nothing reads (see checkZoneTransferConfig in
+   * internal/api/zones_handlers.go). So this is omitted, not sent empty, for
+   * a primary or a forwarder.
    */
   primaries?: string;
   /**
-   * The key a secondary signs its transfer requests with. Optional (0, or
-   * omitted, means an unsigned transfer), secondary-only on the same terms as
-   * `primaries`, and validated to name a key that exists.
+   * The key a secondary signs its transfer requests with, or a stub its
+   * SOA/NS queries with. Optional (0, or omitted, means unsigned), allowed
+   * on those two types alone on the same terms as `primaries`, and validated
+   * to name a key that exists.
    */
   tsig_key_id?: number;
+  /**
+   * Where a forwarder sends the queries it claims: comma-separated
+   * `host[:port]`, port 53 by default. **Forwarder-only** — the server 400s
+   * "forward_to applies to forwarder zones only" on anything else — and
+   * unlike `primaries` it may legitimately be empty, which claims the suffix
+   * and SERVFAILs every name beneath it rather than falling through. Omitted
+   * rather than sent empty in that case, on the same terms as the two above.
+   */
+  forward_to?: string;
   /**
    * Who may pull this zone by AXFR: a comma-separated list of address,
    * CIDR, or key:<tsig name> — see lib/acl.ts for the format. Optional;

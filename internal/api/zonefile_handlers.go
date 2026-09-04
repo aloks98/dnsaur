@@ -210,8 +210,10 @@ func (s *Server) handleZoneFileImport(w http.ResponseWriter, r *http.Request) {
 	// An import is the largest write there is, so the zones whose contents
 	// are authored elsewhere refuse it exactly as they refuse a single
 	// record — see recordWriteRefusal (zonerecords_handlers.go). For a
-	// secondary this is the write that mattered most: a file import replaces
-	// the whole zone, and the next transfer replaces it right back.
+	// secondary and a stub this is the write that matters most: a file import
+	// replaces the whole zone, and the next transfer or fetch replaces it
+	// right back. Gating the record routes alone would have left this one
+	// able to lose the entire set in a single request.
 	if msg := recordWriteRefusal(zone); msg != "" {
 		errJSON(w, http.StatusConflict, msg)
 		return

@@ -52,14 +52,14 @@ the DB, bumps a config version, and live components reload automatically —
 | Key | Default | Meaning |
 |---|---|---|
 | `instance.id` | random UUID, generated per install | Stable identifier for this instance (used by future HA sync) |
-| `upstreams` | `1.1.1.1:53,1.0.0.1:53,9.9.9.9:53` | Comma-separated upstream resolver addresses (host:port; bare IPv6 and missing ports are normalized) |
-| `upstream.strategy` | `race` | Upstream selection strategy: `race` (query all healthy upstreams in parallel, first good answer wins), `failover` (try them in configured order, fall through on error/SERVFAIL), or `fastest` (try them ordered by measured EWMA latency, fastest first) |
+| `upstreams` | `1.1.1.1:53,1.0.0.1:53,9.9.9.9:53` | Comma-separated upstream resolver addresses (host:port; bare IPv6 and missing ports are normalized). These are the **default** route — where a name no zone claims is sent. A suffix claimed by a `forwarder` or `stub` zone goes to that zone's upstreams instead, and never falls back to these; see Conditional forwarding below |
+| `upstream.strategy` | `race` | Upstream selection strategy: `race` (query all healthy upstreams in parallel, first good answer wins), `failover` (try them in configured order, fall through on error/SERVFAIL), or `fastest` (try them ordered by measured EWMA latency, fastest first). One setting for the whole server: it applies to a conditional route's upstreams exactly as it applies to the defaults, and there is no per-zone strategy |
 | `blocking.mode` | `null-ip` | How blocked queries are answered: `null-ip` (`0.0.0.0`) or `nxdomain` |
 | `blocking.ttl` | `30` | TTL (seconds) returned on blocked responses |
 | `cache.min_ttl` **†** | `0` | Minimum TTL (seconds) enforced on cached responses |
 | `cache.max_ttl` **†** | `86400` | Maximum TTL (seconds) clamp on cached responses |
 | `cache.max_entries` **†** | `10000` | Maximum number of entries held in the in-memory cache |
-| `cache.serve_stale_for` **†** | `86400` | How long (seconds) a stale cache entry may still be served if upstream is down |
+| `cache.serve_stale_for` **†** | `86400` | How long (seconds) a stale cache entry may still be served if upstream is down. It never applies across a routing change: adding, removing or retargeting a `forwarder` or `stub` zone drops what the cache held beneath that suffix, so a claimed suffix cannot be served an answer the default upstreams produced |
 | `lists.refresh_hours` **†** | `24` | How often blocklists/allowlists are re-downloaded and recompiled |
 | `qlog.retention_days` | `90` | How long query log rows are kept before the pruner deletes them |
 | `qlog.privacy` | `full` | Query log privacy mode: `full`, anonymized client IPs, or `none` (no per-query logging) |
@@ -78,6 +78,38 @@ revisited in a later phase.
 Two internal key prefixes (`instance.*` and future `stats.*` bookkeeping)
 are not meant to be user-edited and are excluded from the settings API
 (`GET /api/v1/settings`).
+
+## Conditional forwarding
+
+**There is no conditional-forwarding setting.** No `upstreams.conditional`
+key, no per-suffix entry in the table above, nothing to add one to — the
+settings API accepts exactly the keys listed there. A suffix is claimed by a
+**zone row**, and that is the only place it can be claimed, so there are
+never two configurations of the same suffix that can disagree.
+
+To send `corp.example` to a VPN resolver, `POST /api/v1/zones` a zone of
+type `forwarder` whose `name` is the suffix and whose `forward_to` names the
+resolvers — or a `stub`, which claims the suffix the same way but fetches
+its nameservers from a master instead of being told them. See
+[`docs/api.md`](api.md) for the fields each type takes,
+[`docs/dashboard.md`](dashboard.md#forwarder-zones) for doing it from the UI,
+and [`docs/architecture.md`](architecture.md) for how the routing table is
+built and swapped.
+
+The one thing to know before creating one: **a claimed suffix does not fall
+back to `upstreams`.** If the zone's own upstreams are unreachable, or it
+names none, queries beneath it get `SERVFAIL` rather than the public
+internet's answer. That is deliberate — for a split-horizon zone the
+fall-through *is* the leak — and
+[`docs/architecture.md`](architecture.md) carries the reasoning. Disabling
+the zone releases the suffix back to `upstreams`.
+
+`upstream.Config.Conditional` in the code is populated from zone rows and
+from nothing else. It read for two milestones as a settings key waiting to
+be wired up, because §4 of
+[the zones design spec](superpowers/specs/2026-08-08-zones-design.md)
+described D6 as *migrating* one into a zone row; there was no key to
+migrate, and that section now says so.
 
 ## Blocklist formats
 

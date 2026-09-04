@@ -134,11 +134,16 @@ Full parameter/response detail lives in `internal/api/openapi.yaml`
   asynchronous refresh of all lists).
 - **Zones** — `GET /zones`, `POST /zones`, `GET /zones/{id}`,
   `PATCH /zones/{id}`, `DELETE /zones/{id}` (cascades its records).
-  Authoritative DNS zones: a name inside an enabled zone is answered or
-  refused, never forwarded upstream. `name` alone is enough to create one —
-  SOA fields default to generated values, and an apex NS record is created
-  alongside it. `type` may be `"primary"` or `"secondary"`; `stub` and
-  `forwarder` exist in the schema but 400 today. `type: "internal"` is the fifth: the
+  A name inside an enabled zone is answered or routed by that zone, never
+  handed to the default upstreams. `name` alone is enough to create a
+  `primary` — SOA fields default to generated values, and an apex NS record
+  is created alongside it. **That apex NS is seeded for a `primary` only**:
+  every other type's contents come from somewhere else, and writing one would
+  be dnsaur authoring data in a zone it does not own. `type` may be
+  `"primary"`, `"secondary"`, `"forwarder"` or `"stub"`, and the four
+  sections below say what each additionally needs — the last two claim a
+  suffix and route it instead of answering from records of their own.
+  `type: "internal"` is the fifth: the
   built-in zones (`localhost` plus every RFC 6303 §4 reverse zone except
   the private ranges — `BuiltinZones` in `internal/store/builtins.go` has
   the exact list), seeded at migration and never created through this
@@ -155,8 +160,9 @@ Full parameter/response detail lives in `internal/api/openapi.yaml`
   comma-separated `host[:port]`, port 53 by default, stored as written and
   resolved at transfer time — and takes an optional `tsig_key_id` naming
   the key to sign transfers with.
-  Both fields are refused with `400` on any other type. **Its records are
-  read-only**: `POST`/`PUT`/`DELETE` under `/zones/{id}/records`, and
+  Both fields describe a master, so both apply to the two types that have
+  one — a `secondary` and a `stub` — and both are refused with `400` on any
+  other type. **Its records are read-only**: `POST`/`PUT`/`DELETE` under `/zones/{id}/records`, and
   `POST /zones/{id}/file`, all answer `409`, because the next transfer
   would replace whatever they wrote. It answers `SERVFAIL` for its whole
   suffix before its first transfer lands and again once `expires_at`
@@ -166,7 +172,11 @@ Full parameter/response detail lives in `internal/api/openapi.yaml`
   It answers only when the transfer has finished — `200` with the primary
   that answered, the serial and the record count, or `502` carrying the
   transfer's own error. A failed transfer changes nothing: the zone keeps
-  the records, serial and `refreshed_at` it already had.
+  the records, serial and `refreshed_at` it already had. The endpoint is
+  `secondary`-or-`stub` only, for the same reason `primaries` is: a
+  `primary` is authored here and a `forwarder` names its upstreams outright,
+  so neither has a master to ask, and both get `400 only secondary and stub
+  zones pull from a master`.
   Three read-only fields on the zone describe all of this. `refreshed_at`
   is the last transfer that **succeeded**; `last_attempt` is the last one
   **tried**, successful or not; and `last_error` is why that attempt failed,
@@ -174,6 +184,71 @@ Full parameter/response detail lives in `internal/api/openapi.yaml`
   written together and survive a restart — the scheduler's own view of a
   failure does not — so they are the honest answer to "is this zone
   working", and `last_error` should always be read beside `last_attempt`.
+- **Forwarder zones** — a `forwarder` claims a suffix and sends every query
+  beneath it to addresses you name, instead of to the `upstreams` setting.
+  It holds no records and answers nothing of its own; see
+  [`docs/architecture.md`](architecture.md) for how the routing table is
+  built and what happens when the addresses stop answering.
+  `forward_to` on `POST /zones` and `PATCH /zones/{id}` is that list: a
+  comma-separated list where each entry is `host[:port]`, port defaulting to
+  53 — e.g. `"10.0.0.1, 10.0.0.2:5353, ns.corp.example, [fd00::2]:5353"`.
+  There is no `key:` suffix, unlike `notify_to`: a forwarder sends ordinary
+  queries rather than transfers and signs nothing. **A hostname target is
+  never resolved by dnsaur at all**, which is where `forward_to` and
+  `primaries` genuinely differ rather than merely differing in timing: a
+  primary is resolved to addresses at transfer time, while a forward target
+  reaches the forwarder as a dial string and Go's own dialer resolves it on
+  every exchange. So a hostname forward target follows DNS per query, and
+  cannot go stale between zone reloads. **What's stored is the canonical
+  spelling, not what was typed**: the value is re-parsed and re-formatted on write (the port
+  always explicit, `", "`-separated) — the same rule `allow_transfer` and
+  `notify_to` follow above, for the same reason.
+  **Empty is the default, and it is accepted**: a forwarder that names no
+  upstreams still claims its suffix and answers `SERVFAIL` for it. That is
+  the point of the type, not a gap — see
+  [`docs/architecture.md`](architecture.md).
+  **A write that changes where a suffix routes also clears the cache
+  beneath it** — creating, patching, deleting or disabling a `forwarder` or
+  a `stub`. Without that, a name cached from `upstreams` before the zone
+  claimed it would go on being answered from that entry, which for a
+  split-horizon zone is the public internet answering an internal name. The
+  clearing is scoped to the suffix whose routing changed, so an ordinary
+  record write costs nothing.
+  `forward_to` is refused with `400` on every other type, and a forwarder
+  refuses `primaries`, `tsig_key_id`, `allow_transfer` and `notify_to`: it
+  has no master, and it serves no zone for anyone to pull or be told about.
+  `POST /zones/{id}/refresh` is refused too — there is nothing to fetch.
+  Records are the one thing it does *not* refuse: nothing overwrites them,
+  so a write is inert rather than lost, which is a different complaint from
+  the `409` a `secondary` or `stub` answers. Nothing serves them either.
+- **Stub zones** — a `stub` claims a suffix and routes it exactly as a
+  forwarder does, but the addresses are fetched rather than typed. It asks
+  its master two ordinary questions — `SOA` for the serial and the schedule,
+  `NS` for the delegation with glue in the ADDITIONAL section — and routes
+  to the nameservers that come back, on the schedule that SOA publishes.
+  **Not an AXFR**, which is the point rather than an optimisation: a stub
+  needs no `allow_transfer` permission on the far end, so it works against a
+  master that will not transfer its zone to anybody. See
+  [`docs/architecture.md`](architecture.md) for the fetch, the glue rule,
+  and why a stub does not expire.
+  Creating one requires `primaries` and takes an optional `tsig_key_id`, in
+  the same columns and with the same meaning a secondary gives them — a
+  master that requires TSIG on ordinary queries would otherwise refuse the
+  fetch. `forward_to`, `allow_transfer` and `notify_to` are all refused with
+  `400`: a stub's upstreams are not typed, and it serves no zone.
+  **Its records are read-only** — `POST`/`PUT`/`DELETE` under
+  `/zones/{id}/records`, and `POST /zones/{id}/file`, all answer `409` — and
+  the reason is stronger than a secondary's rather than milder. A stub
+  answers from none of its records, but the routing table is rebuilt *from*
+  them on every zone reload, so a hand-written apex NS record would redirect
+  the whole claimed suffix until the next fetch undid it. Reads are never
+  refused: `GET /zones/{id}/records` lists the fetched NS set and its glue,
+  and `GET /zones/{id}/file` exports it.
+  `POST /zones/{id}/refresh` fetches now, whatever the schedule says,
+  answering the same shape a secondary's transfer does — with one difference:
+  `expires_at` is always `0`, because a stub is never given one.
+  `refreshed_at`, `last_attempt` and `last_error` mean exactly what they mean
+  on a secondary.
 - **Zone transfers (outbound)** — any zone dnsaur holds, `primary` or
   `secondary`, can be transferred to another nameserver over AXFR (and
   IXFR, answered with a full AXFR — there is no journal yet to compute a
@@ -292,7 +367,10 @@ Full parameter/response detail lives in `internal/api/openapi.yaml`
   write conflicts return `409`: a CNAME beside another record at the same
   name (RFC 1034 §3.6.2), a CNAME at the zone apex (RFC 1912 §2.4), and a
   TTL that disagrees with the rest of an RRSet (RFC 2181 §5.2) — plus a
-  fourth, any write at all under an `internal` zone (see Zones above).
+  fourth, any write at all under a zone whose contents are authored
+  elsewhere: `internal`, `secondary` or `stub` (see those sections above).
+  A `forwarder` is deliberately not in that list — nothing overwrites its
+  records, so a write into one is inert rather than lost.
   Creating, updating or deleting an `A`/`AAAA` record also writes, moves,
   or removes the matching `PTR` in whichever enabled `primary` zone covers
   that address, inside the same request — see
@@ -336,9 +414,14 @@ Full parameter/response detail lives in `internal/api/openapi.yaml`
   forever after. Import never writes PTR records, the one exception to
   auto-PTR (see [`dashboard.md`](dashboard.md#auto-ptr)): a forward-zone
   import never rewrites a reverse zone it didn't name, so a reverse zone's
-  PTRs come from importing that zone's own file. Import into a
-  `type: "internal"` zone is refused with `409`, like any other write to
-  one (see Zones above) — export is unaffected.
+  PTRs come from importing that zone's own file. Import is refused with
+  `409` into every zone whose contents are authored elsewhere — `internal`,
+  `secondary` and `stub` — like any other write to one (see those sections
+  above). Export is unaffected: a built-in, a secondary and a stub all
+  render. A `forwarder` renders too — a valid master file carrying
+  `$ORIGIN`, `$TTL` and the zone's SOA, with no records under it, since it
+  holds none. That emptiness is why the dashboard offers Export on a stub
+  and not on a forwarder.
 - **TSIG keys** — `GET /tsig-keys`, `POST /tsig-keys`, `GET /tsig-keys/{id}`,
   `PUT /tsig-keys/{id}` (full replace — `name`, `algorithm` and `secret` are
   all required, same as create), `DELETE /tsig-keys/{id}`. A TSIG key (RFC

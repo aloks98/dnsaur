@@ -51,30 +51,58 @@ const apexNSTTL = 3600
 // zone hands out uncacheable, forever re-querying us on every miss.
 const defaultSOATTL uint32 = 900
 
-// The two zone types this API can create. Still narrower than the schema,
+// The four zone types this API can create. Still narrower than the schema,
 // which has allowed secondary | stub | forwarder | internal since Milestone
-// A: internal/zones/answer.go treats forwarder and stub as non-answering and
-// nothing populates them, and internal is reserved for the RFC 6303
-// built-ins seeded at migration. The rule is unchanged from Milestone A —
-// the API refuses any type it cannot serve correctly, because a type that
-// cannot be created cannot misbehave — and what changed is that secondary is
-// now one it can: Milestone D2 gives it a transfer to fill it from.
+// A: internal is reserved for the RFC 6303 built-ins seeded at migration and
+// stays refused. The rule is unchanged from Milestone A — the API refuses
+// any type it cannot serve correctly, because a type that cannot be created
+// cannot misbehave — and what changed since is that each of the other three
+// became one it can, as the milestone that makes it servable landed:
+// secondary in D2 (a transfer to fill it from), forwarder and stub here in
+// D6 (forward_to and primaries, respectively, to route their queries by).
 //
-// A secondary is only servable because it is *configured*, which is what
-// zoneCreate.Primaries and zoneCreate.TSIGKeyID are for and why they are
-// validated rather than merely stored.
+// A secondary or stub is only servable because it is *configured*, which is
+// what zoneCreate.Primaries and zoneCreate.TSIGKeyID are for and why they
+// are validated rather than merely stored; a forwarder likewise through
+// zoneCreate.ForwardTo.
 const (
 	zoneTypePrimary   = "primary"
 	zoneTypeSecondary = "secondary"
+	zoneTypeForwarder = "forwarder"
+	zoneTypeStub      = "stub"
 )
 
+// pullsFromAMaster reports whether a zone of this type has somewhere to pull
+// from: a secondary fetches the whole zone by AXFR, a stub only the apex SOA
+// and NS by ordinary query.
+//
+// One predicate for two questions that are the same question. It is the set
+// primaries/tsig_key_id apply to, because those describe the master; and it
+// is the set POST /zones/{id}/refresh acts on, because refreshing is asking
+// that master. Answering them separately is how the two drift — the refresh
+// gate went on saying "secondary" after stub zones learned to pull, which
+// left the dashboard offering a button the API refused.
+//
+// It is the counterpart of zones.pullsFromAMaster, which is the same rule for
+// the scheduler. They are deliberately not shared: this one answers about a
+// type an HTTP client just typed, that one about a stored row, and exporting
+// either into the other would tie an API contract to a scheduler's internals.
+func pullsFromAMaster(zoneType string) bool {
+	return strings.EqualFold(zoneType, zoneTypeSecondary) || strings.EqualFold(zoneType, zoneTypeStub)
+}
+
 // checkZoneTransferConfig validates the (type, primaries, tsig_key_id,
-// allow_transfer) quad as the zone would be stored, for create and patch
-// alike — a rule enforced on POST and not on PATCH is a rule with a way
-// around it. It returns the status code and message to answer with, or 0
-// when the configuration is sound.
-func (s *Server) checkZoneTransferConfig(ctx context.Context, zoneType, primaries string, tsigKeyID int64, allowTransfer, notifyTo string) (int, string) {
-	if zoneType == zoneTypeSecondary {
+// allow_transfer, notify_to, forward_to) tuple as the zone would be stored,
+// for create and patch alike — a rule enforced on POST and not on PATCH is a
+// rule with a way around it. It returns the status code and message to
+// answer with, or 0 when the configuration is sound.
+func (s *Server) checkZoneTransferConfig(ctx context.Context, zoneType, primaries string, tsigKeyID int64, allowTransfer, notifyTo, forwardTo string) (int, string) {
+	// primaries/tsig_key_id describe where a zone pulls from: a secondary by
+	// AXFR, a stub by ordinary SOA/NS query. Both are configured the same
+	// way, which is why they widen together rather than stub getting its own
+	// gate.
+	pullsAZone := pullsFromAMaster(zoneType)
+	if pullsAZone {
 		// Syntax only, deliberately: zones.ValidatePrimaries does not
 		// resolve, so a primary named by hostname is stored as written and
 		// looked up at transfer time. See internal/zones/primaries.go.
@@ -87,12 +115,25 @@ func (s *Server) checkZoneTransferConfig(ctx context.Context, zoneType, primarie
 		// configuration nothing reads, shown by the UI as though it meant
 		// something.
 		if primaries != "" {
-			return http.StatusBadRequest, "primaries applies to secondary zones only"
+			return http.StatusBadRequest, "primaries applies to secondary and stub zones only"
 		}
 		if tsigKeyID != 0 {
-			return http.StatusBadRequest, "tsig_key_id applies to secondary zones only"
+			return http.StatusBadRequest, "tsig_key_id applies to secondary and stub zones only"
 		}
 	}
+
+	if forwardTo != "" {
+		// A forwarder is the only type that sends queries somewhere of its
+		// own choosing. On anything else this would be configuration nothing
+		// reads, shown by the UI as though it meant something.
+		if zoneType != zoneTypeForwarder {
+			return http.StatusBadRequest, "forward_to applies to forwarder zones only"
+		}
+		if err := zones.ValidateForwardTo(forwardTo); err != nil {
+			return http.StatusBadRequest, err.Error()
+		}
+	}
+
 	if tsigKeyID != 0 {
 		// zones.tsig_key_id carries no foreign key — see the 0009 migration
 		// for why — so this is where a reference to a key that does not
@@ -105,6 +146,13 @@ func (s *Server) checkZoneTransferConfig(ctx context.Context, zoneType, primarie
 		}
 	}
 	if allowTransfer != "" {
+		// Only a primary or secondary serves a zone at all — a forwarder and
+		// a stub answer nothing of their own, so an ACL naming who may pull
+		// one from them would be configuration nothing reads, shown by the
+		// UI as though it meant something.
+		if zoneType != zoneTypePrimary && zoneType != zoneTypeSecondary {
+			return http.StatusBadRequest, "allow_transfer applies to primary and secondary zones only"
+		}
 		if err := zones.ValidateACL(allowTransfer); err != nil {
 			return http.StatusBadRequest, err.Error()
 		}
@@ -187,6 +235,25 @@ func canonicalNotifyTo(input string) (string, error) {
 	return zones.FormatNotifyTo(ts), nil
 }
 
+// canonicalForwardTo returns input in zones.FormatForwardTo's spelling — the
+// form the routing table is built from, so what is stored is what the router
+// will parse. input == "" returns "" without parsing.
+//
+// Called after checkZoneTransferConfig has validated the same string, so the
+// error is unreachable in practice; checked rather than discarded because
+// errcheck cannot know that, and a swallowed failure would be one call away
+// from storing whatever ParseForwardTo gave up on.
+func canonicalForwardTo(input string) (string, error) {
+	if input == "" {
+		return "", nil
+	}
+	ts, err := zones.ParseForwardTo(input)
+	if err != nil {
+		return "", err
+	}
+	return zones.FormatForwardTo(ts), nil
+}
+
 // normalizeZoneName lowercases name, strips a trailing dot, and validates
 // it. dns.IsDomainName gives RFC 1035 §2.3.4 (label <= 63 octets, name <=
 // 255 octets) but documents itself as "extremely liberal — almost any
@@ -237,17 +304,17 @@ func (s *Server) handleZoneGet(w http.ResponseWriter, r *http.Request) {
 // clients_handlers.go).
 type zoneCreate struct {
 	Name string `json:"name"`
-	// Type omitted means primary. primary and secondary are the two this
-	// API creates — see zoneTypePrimary.
+	// Type omitted means primary. primary, secondary, forwarder and stub are
+	// the four this API creates — see zoneTypePrimary.
 	Type string `json:"type"`
-	// Primaries is where a secondary pulls from: a comma-separated list of
-	// host[:port], port defaulting to 53. Required for a secondary, refused
-	// on any other type, and stored exactly as written — see
-	// internal/zones/primaries.go.
+	// Primaries is where a secondary or stub pulls from: a comma-separated
+	// list of host[:port], port defaulting to 53. Required for a secondary
+	// or stub, refused on any other type, and stored exactly as written —
+	// see internal/zones/primaries.go.
 	Primaries string `json:"primaries"`
-	// TSIGKeyID names the key a secondary signs its transfer requests with.
-	// Optional (0 means the transfer is unsigned), but when set it must name
-	// a key that exists.
+	// TSIGKeyID names the key a secondary or stub signs its requests with.
+	// Optional (0 means unsigned), but when set it must name a key that
+	// exists.
 	TSIGKeyID int64 `json:"tsig_key_id"`
 	// AllowTransfer is who may pull this zone by AXFR: a comma-separated
 	// list of address, CIDR, or key:<tsig name> — see zones.ParseACL for the
@@ -259,6 +326,10 @@ type zoneCreate struct {
 	// unlike Primaries/TSIGKeyID, it applies to both transfer types: a
 	// secondary that re-serves what it pulled has its own secondaries.
 	NotifyTo string `json:"notify_to"`
+	// ForwardTo is where a forwarder zone sends the queries it claims: a
+	// comma-separated list of host[:port]. Refused on every other type — see
+	// zoneTypeForwarder.
+	ForwardTo string `json:"forward_to"`
 	// Enabled is a pointer so "not sent" differs from "false".
 	Enabled *bool `json:"enabled"`
 	// SOA fields, all optional: omitted means the generated default, so a
@@ -286,11 +357,11 @@ func (s *Server) handleZoneCreate(w http.ResponseWriter, r *http.Request) {
 	zoneType := body.Type
 	if zoneType == "" {
 		zoneType = zoneTypePrimary
-	} else if zoneType != zoneTypePrimary && zoneType != zoneTypeSecondary {
-		errJSON(w, http.StatusBadRequest, "only primary and secondary zones are supported")
+	} else if zoneType != zoneTypePrimary && zoneType != zoneTypeSecondary && zoneType != zoneTypeForwarder && zoneType != zoneTypeStub {
+		errJSON(w, http.StatusBadRequest, "only primary, secondary, forwarder and stub zones are supported")
 		return
 	}
-	if code, msg := s.checkZoneTransferConfig(r.Context(), zoneType, body.Primaries, body.TSIGKeyID, body.AllowTransfer, body.NotifyTo); code != 0 {
+	if code, msg := s.checkZoneTransferConfig(r.Context(), zoneType, body.Primaries, body.TSIGKeyID, body.AllowTransfer, body.NotifyTo, body.ForwardTo); code != 0 {
 		errJSON(w, code, msg)
 		return
 	}
@@ -300,6 +371,11 @@ func (s *Server) handleZoneCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	notifyTo, err := canonicalNotifyTo(body.NotifyTo)
+	if err != nil {
+		errJSON(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	forwardTo, err := canonicalForwardTo(body.ForwardTo)
 	if err != nil {
 		errJSON(w, http.StatusBadRequest, err.Error())
 		return
@@ -348,15 +424,17 @@ func (s *Server) handleZoneCreate(w http.ResponseWriter, r *http.Request) {
 		SOAMinimum: soaMinimum,
 		// Fixed, not client-settable — see defaultSOATTL.
 		SOATTL: defaultSOATTL,
-		// Empty and 0 for a primary, both already checked by
-		// checkZoneTransferConfig above.
+		// Empty and 0 unless the type calls for them, both already checked
+		// by checkZoneTransferConfig above.
 		Primaries: body.Primaries,
 		TSIGKeyID: body.TSIGKeyID,
 		// The canonical spelling, not body.AllowTransfer — see
 		// canonicalAllowTransfer.
 		AllowTransfer: allowTransfer,
 		// The canonical spelling, not body.NotifyTo — see canonicalNotifyTo.
-		NotifyTo:   notifyTo,
+		NotifyTo: notifyTo,
+		// The canonical spelling, not body.ForwardTo — see canonicalForwardTo.
+		ForwardTo:  forwardTo,
 		CreatedAt:  now,
 		ModifiedAt: now,
 	})
@@ -424,6 +502,10 @@ type zonePatch struct {
 	// zones — see zoneCreate.NotifyTo. A pointer so absent (leave alone) and
 	// "" (clear it) are different.
 	NotifyTo *string `json:"notify_to"`
+	// ForwardTo, like Primaries, is a pointer so absent (leave alone) and ""
+	// (clear it — the zone names no upstreams) are different. See
+	// zoneCreate.ForwardTo.
+	ForwardTo *string `json:"forward_to"`
 }
 
 func (s *Server) handleZonePatch(w http.ResponseWriter, r *http.Request) {
@@ -437,8 +519,8 @@ func (s *Server) handleZonePatch(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusBadRequest, "invalid json")
 		return
 	}
-	if body.Type != nil && *body.Type != zoneTypePrimary && *body.Type != zoneTypeSecondary {
-		errJSON(w, http.StatusBadRequest, "only primary and secondary zones are supported")
+	if body.Type != nil && *body.Type != zoneTypePrimary && *body.Type != zoneTypeSecondary && *body.Type != zoneTypeForwarder && *body.Type != zoneTypeStub {
+		errJSON(w, http.StatusBadRequest, "only primary, secondary, forwarder and stub zones are supported")
 		return
 	}
 
@@ -498,11 +580,14 @@ func (s *Server) handleZonePatch(w http.ResponseWriter, r *http.Request) {
 	if body.NotifyTo != nil {
 		z.NotifyTo = *body.NotifyTo
 	}
+	if body.ForwardTo != nil {
+		z.ForwardTo = *body.ForwardTo
+	}
 	// Checked on the merged zone rather than on the body: a patch that sets
 	// type without primaries, or clears primaries without changing type,
 	// leaves a secondary with nowhere to pull from either way, and only the
 	// result says which.
-	if code, msg := s.checkZoneTransferConfig(r.Context(), z.Type, z.Primaries, z.TSIGKeyID, z.AllowTransfer, z.NotifyTo); code != 0 {
+	if code, msg := s.checkZoneTransferConfig(r.Context(), z.Type, z.Primaries, z.TSIGKeyID, z.AllowTransfer, z.NotifyTo, z.ForwardTo); code != 0 {
 		errJSON(w, code, msg)
 		return
 	}
@@ -523,6 +608,13 @@ func (s *Server) handleZonePatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	z.NotifyTo = notifyTo
+	// Same reasoning for ForwardTo — see canonicalForwardTo.
+	forwardTo, err := canonicalForwardTo(z.ForwardTo)
+	if err != nil {
+		errJSON(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	z.ForwardTo = forwardTo
 	z.ModifiedAt = time.Now().UnixMilli()
 
 	if err := s.deps.Store.Zones().UpdateZone(r.Context(), z); err != nil {
@@ -593,19 +685,25 @@ type zoneRefreshResult struct {
 	ExpiresAt   int64  `json:"expires_at"`
 }
 
-// handleZoneRefresh transfers one secondary zone now, whatever its schedule
-// says, and answers only once the transfer has finished. That is deliberately
-// synchronous: the caller pressed a button to find out whether the transfer
-// works, and a 202 would hand back "started" — which is the one thing they
-// already knew — leaving the answer (and the error, which is the whole point)
-// nowhere to be read. A transfer takes as long as one TCP conversation with
-// the primary, bounded by the Transferrer's own timeouts.
+// handleZoneRefresh pulls one zone from its master now, whatever its schedule
+// says, and answers only once that has finished. A secondary transfers the
+// whole zone by AXFR and a stub fetches its apex SOA and NS by ordinary
+// query; which of the two happens is the scheduler's business, and this
+// handler's answer has the same shape either way — except for expires_at,
+// which is 0 for a stub because a stub does not expire (§9.11.8).
 //
-// A failed transfer is a 502, not a 500: nothing here is broken, a server
-// this one depends on refused or could not be reached, and the message names
-// every primary that was tried. The zone is left exactly as it was — a failed
-// transfer changes nothing (see zones.Transferrer.Transfer) — so a 502 here
-// means "still serving what it had", never "half-applied".
+// Deliberately synchronous: the caller pressed a button to find out whether
+// it works, and a 202 would hand back "started" — which is the one thing they
+// already knew — leaving the answer (and the error, which is the whole point)
+// nowhere to be read. It takes as long as one conversation with the master,
+// bounded by that worker's own timeouts.
+//
+// A failure is a 502, not a 500: nothing here is broken, a server this one
+// depends on refused or could not be reached, and the message names every
+// master that was tried. The zone is left exactly as it was — a failed
+// transfer or fetch changes nothing (see zones.Transferrer.Transfer and
+// zones.StubFetcher.Fetch) — so a 502 here means "still serving what it had",
+// never "half-applied".
 func (s *Server) handleZoneRefresh(w http.ResponseWriter, r *http.Request) {
 	id, ok := pathID(r)
 	if !ok {
@@ -624,12 +722,14 @@ func (s *Server) handleZoneRefresh(w http.ResponseWriter, r *http.Request) {
 		storeErr(w, err)
 		return
 	}
-	// Only a secondary is a copy of someone else's zone. Asking a primary to
-	// transfer is not a failure to report against a primary — there is
-	// nowhere for it to pull from — so it is refused here rather than left to
-	// come back as a confusing 502 from Transfer's own type check.
-	if !strings.EqualFold(z.Type, zoneTypeSecondary) {
-		errJSON(w, http.StatusBadRequest, "only secondary zones are transferred")
+	// Only a zone with a master has anywhere to refresh from. A primary is
+	// authored on this server and a forwarder names its upstreams outright in
+	// forward_to, so for either this would be a button that does nothing —
+	// and asking for it is not a failure to report against anybody, so it is
+	// refused here rather than left to come back as a confusing 502 from the
+	// worker's own type check.
+	if !pullsFromAMaster(z.Type) {
+		errJSON(w, http.StatusBadRequest, "only secondary and stub zones pull from a master")
 		return
 	}
 	res, err := s.deps.ZoneRefresher.Refresh(r.Context(), id)

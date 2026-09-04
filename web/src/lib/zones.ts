@@ -131,6 +131,22 @@ export function transferErrorLead(message: string): string {
  */
 export type TransferState = "never" | "expired" | "failing" | "overdue" | "fresh";
 
+/**
+ * **A secondary's states, and only a secondary's.** `expired` is the reason
+ * this is not the general answer: `expires_at` is written by a transfer and
+ * by nothing else, so on any other type it is 0 — and a row retyped from
+ * secondary to stub keeps whatever value it had (see
+ * internal/zones/refresh.go, which makes the same carve-out for exactly this
+ * reason). A stub is *never given* an expiry, deliberately: its NS set is
+ * routing information, and an old-but-working nameserver beats a
+ * self-inflicted SERVFAIL. Run one through here and it either dates to the
+ * epoch or expires on a stamp that stopped meaning anything the moment it
+ * stopped being a secondary.
+ *
+ * A stub's own state is read off `refreshed_at` and `lastTransferError`
+ * alone — neither of which involves an expiry — by `pullState` below, which
+ * is what the zone screens ask when the type is not known to be a secondary.
+ */
 export function transferState(zone: Zone, now: number = Date.now()): TransferState {
   if (zone.refreshed_at === 0) return "never";
   if (zone.expires_at !== 0 && now >= zone.expires_at) return "expired";
@@ -144,6 +160,57 @@ export function transferState(zone: Zone, now: number = Date.now()): TransferSta
 }
 
 /**
+ * The two types that pull from a master — the server's own `pullsFromAMaster`
+ * (internal/api/zones_handlers.go), which is what decides that `primaries` is
+ * required and `tsig_key_id` allowed, and what the scheduler polls.
+ *
+ * It is also the gate on every health treatment the zone screens give a row.
+ * A **forwarder is deliberately outside it**: it claims a suffix and sends
+ * live queries on, so its upstreams' reachability is a fact about this
+ * instant and nothing about it is stored. There is no column to read, and a
+ * list that showed one would be inventing it.
+ */
+export function pullsFromAMaster(type: Zone["type"]): boolean {
+  return type === "secondary" || type === "stub";
+}
+
+/**
+ * The state of a pulled zone, asked of either type that pulls — and the whole
+ * reason it exists is that only one of them may be asked through an expiry.
+ *
+ * A stub is **never** run through `transferState`. `expires_at` is written by
+ * a transfer and by nothing else, and a row retyped from secondary to stub
+ * keeps every stamp the transfer left (handleZonePatch sets the type on a row
+ * read from the store and clears none of them), so an ordinary stub can carry
+ * a long-past expiry that stopped meaning anything the moment it stopped
+ * being a secondary. Reading it puts a zone that is routing perfectly well on
+ * screen as answering nothing.
+ *
+ * So a stub gets three states off `refreshed_at` and `lastTransferError`
+ * alone, neither of which involves an expiry — the same two the zone detail
+ * page's MASTER row derives its note from:
+ *
+ * - `never` — nothing has ever landed. It holds no NS set, and every name
+ *   under the suffix it claims answers SERVFAIL. Not idle: an outage.
+ * - `failing` — the last fetch failed; the set it already has is still being
+ *   routed on.
+ * - `fresh` — the set is current.
+ *
+ * `expired` is not among them by design (§9.11.8: an old-but-working
+ * nameserver beats a self-inflicted SERVFAIL), and neither is `overdue` —
+ * that state exists to stop a copy of unknown age reading as current, and a
+ * stub's row dates its set outright ("Fetched 5d ago") instead of claiming
+ * anything about it.
+ *
+ * Only meaningful for a type `pullsFromAMaster` accepts; callers gate on it.
+ */
+export function pullState(zone: Zone, now: number = Date.now()): TransferState {
+  if (zone.type === "secondary") return transferState(zone, now);
+  if (zone.refreshed_at === 0) return "never";
+  return lastTransferError(zone) !== null ? "failing" : "fresh";
+}
+
+/**
  * Whether this zone can answer from the records it holds — the client-side
  * twin of Zone.Serving (internal/zones/answer.go). Only a secondary can fail
  * it: a primary owns its data outright.
@@ -154,7 +221,29 @@ export function transferState(zone: Zone, now: number = Date.now()): TransferSta
  * would call it healthy at exactly the moment it is serving nothing.
  */
 export function isServing(zone: Zone, now: number = Date.now()): boolean {
+  // A stub is deliberately not in here beside the secondary, even though one
+  // that has never fetched routes nothing and SERVFAILs its whole suffix. It
+  // holds no data on loan, so there is no state it can fall out of; what it
+  // has instead is a fetch that has not landed yet, which the MASTER row
+  // dates and says outright. Zone.Serving on the server draws the line in the
+  // same place.
   if (zone.type !== "secondary") return true;
   const state = transferState(zone, now);
   return state !== "never" && state !== "expired";
+}
+
+/**
+ * The upstreams a forwarder zone names, one per entry.
+ *
+ * A count, not a parse: `forward_to` is read back in the server's own
+ * canonical spelling (`FormatForwardTo` — port always written, ", "-
+ * separated), so splitting it is reading a list the server wrote rather than
+ * a second implementation of the grammar. The empty string is no upstreams,
+ * which is a configuration and not a gap — see Zone.forward_to.
+ */
+export function forwardTargets(forwardTo: string): string[] {
+  return forwardTo
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter((entry) => entry !== "");
 }

@@ -13,7 +13,7 @@ import { expect, test } from "@playwright/test";
 const USERNAME = "e2e-admin";
 const PASSWORD = "correct horse battery staple";
 
-test("first-run setup, login, create a zone and add a record, dark mode persists across reload, create a TSIG key", async ({
+test("first-run setup, login, create a zone and add a record, dark mode persists across reload, create a TSIG key, pull a secondary, route a forwarder", async ({
   page,
 }) => {
   // --- first-run setup: create the admin account -----------------------
@@ -115,9 +115,9 @@ test("first-run setup, login, create a zone and add a record, dark mode persists
   await page.getByLabel("Zone name").fill("home.lan");
   await page.getByRole("button", { name: "Add", exact: true }).click();
 
-  // The zone name is a link straight into its detail page (Task 12). Exact,
-  // since the row's own Edit icon-button renders as a same-target link too
-  // ("Edit home.lan").
+  // The zone name is a link straight into its detail page (Task 12), and now
+  // the only one on the row — the pencil that used to point at the same place
+  // is gone, folded into the row's kebab along with everything else.
   await page.getByRole("link", { name: "home.lan", exact: true }).click();
 
   // The 15 built-ins stay behind their collapsed disclosure (never
@@ -325,7 +325,16 @@ test("first-run setup, login, create a zone and add a record, dark mode persists
   // it may speak for. An "Enabled" badge here would be the screen's most
   // misleading element.
   await expect(secondaryRow.getByText("Not answering")).toBeVisible();
-  await expect(secondaryRow.getByText("Never transferred")).toBeVisible();
+  // Nothing has been tried yet, and the row says exactly that rather than
+  // dating a failure that never happened.
+  await expect(secondaryRow.getByTestId("zone-pull-attempt")).toHaveText("never attempted");
+  // Which of the two "Not answering" states this is lives in the tooltip —
+  // the one thing here a jsdom test cannot really prove, since it needs a
+  // browser that actually hovers and a popup that actually positions itself.
+  await secondaryRow.getByTestId("zone-status").hover();
+  const secondaryTip = page.getByTestId("zone-status-tip");
+  await expect(secondaryTip).toContainText("Never transferred");
+  await expect(secondaryTip).toContainText("Answering nothing under branch.e412.in.");
 
   await page.getByRole("link", { name: "branch.e412.in", exact: true }).click();
   await expect(page.getByText("127.0.0.1:1", { exact: true })).toBeVisible();
@@ -358,6 +367,104 @@ test("first-run setup, login, create a zone and add a record, dark mode persists
   expect(leadText.length).toBeGreaterThan(0);
   expect(leadText.length).toBeLessThan(rawText.length);
   expect(rawText.endsWith(leadText)).toBe(true);
+
+  // --- a stub zone, and the row that used to lie about it ---------------
+  // The bug this list had: a stub was given the plain green "Enabled" of a
+  // primary, whatever state its fetch was in. One that has never fetched
+  // holds no NS set, and its suffix answers SERVFAIL rather than falling
+  // through to the default resolvers — a suffix-wide outage the row drew as
+  // health. Worth the real round trip because the server is what decides a
+  // stub is created with `primaries` and left with `refreshed_at` at 0.
+  //
+  // No TSIG key on this one, deliberately: the key's usage count is asserted
+  // as "1 zone" at the end of this test.
+  await topNav.getByRole("button", { name: "Zones", exact: true }).click();
+  await page.getByRole("menuitem", { name: "Zones" }).click();
+  await page.getByRole("button", { name: "New zone" }).first().click();
+  await page.getByLabel("Zone type").selectOption("stub");
+  await page.getByLabel("Zone name").fill("ad.corp.e412.in");
+  await page.getByLabel("Primary servers").fill("127.0.0.1:1");
+  await page.getByRole("button", { name: "Add", exact: true }).click();
+
+  const stubRow = page.locator('[data-testid="zone-row"]', { hasText: "ad.corp.e412.in" });
+  await expect(stubRow).toBeVisible();
+  await expect(stubRow.getByText("Not answering")).toBeVisible();
+  await expect(stubRow.getByText("Enabled")).toHaveCount(0);
+  // The last attempt is dated inside the status cell now rather than in a
+  // band across the foot of the row, so the row stays one grid line tall in
+  // every other column. Nothing has been tried yet, and it says exactly that.
+  await expect(stubRow.getByTestId("zone-pull-attempt")).toHaveText("never attempted");
+
+  // A stub fetches an NS set; it does not transfer, and it never expires. No
+  // noun on the row may say otherwise — including the menu item's. The menu
+  // is the one part of this row jsdom cannot really open (base-ui wants a
+  // pointer sequence it does not have), so this is where it is proved.
+  await stubRow.getByRole("button", { name: "Actions for ad.corp.e412.in" }).click();
+  const stubMenu = page.getByRole("menu");
+  await expect(stubMenu.getByRole("menuitem", { name: "Fetch now" })).toBeVisible();
+  await expect(stubMenu.getByRole("menuitem", { name: "Disable" })).toBeVisible();
+  await expect(stubMenu.getByRole("menuitem", { name: "Delete zone" })).toBeVisible();
+  // Drawn on the artboard, deliberately not built: no rename exists in this
+  // app or its API.
+  await expect(stubMenu.getByRole("menuitem", { name: "Rename" })).toHaveCount(0);
+  await page.keyboard.press("Escape");
+  await expect(stubMenu).toHaveCount(0);
+
+  await stubRow.getByTestId("zone-status").hover();
+  await expect(page.getByTestId("zone-status-tip")).toContainText("Never fetched");
+
+  // --- a forwarder zone, end to end ------------------------------------
+  // The one type whose whole configuration is a single column nothing else
+  // in this suite writes. Worth the real round trip for two things a mocked
+  // PATCH cannot judge: the server 400s `forward_to` on any type but this
+  // one, and it stores the value in its own canonical spelling
+  // (FormatForwardTo — the port always written), which is what comes back on
+  // the page rather than what was typed.
+  await topNav.getByRole("button", { name: "Zones", exact: true }).click();
+  await page.getByRole("menuitem", { name: "Zones" }).click();
+  await page.getByRole("button", { name: "New zone" }).first().click();
+  await page.getByLabel("Zone type").selectOption("forwarder");
+  await page.getByLabel("Zone name").fill("corp.example");
+  // The create row's own field for this type — "Forward to", not "Primary
+  // servers": posting `primaries` here is refused outright ("primaries
+  // applies to secondary and stub zones only"), so a shared field would fail
+  // every time.
+  await page.getByLabel("Forward to").fill("10.0.0.1, 10.0.0.2:5353");
+  await page.getByRole("button", { name: "Add", exact: true }).click();
+
+  const forwarderRow = page.locator('[data-testid="zone-row"]', { hasText: "corp.example" });
+  await expect(forwarderRow).toBeVisible();
+
+  await page.getByRole("link", { name: "corp.example", exact: true }).click();
+  // Canonical, not as typed: the port is explicit on both entries because
+  // the server wrote it back that way.
+  await expect(page.getByText("10.0.0.1:53, 10.0.0.2:5353")).toBeVisible();
+  await expect(page.getByText("2 upstreams")).toBeVisible();
+  // The line that stops a page with a header, one row and two buttons
+  // reading as one that failed to load.
+  await expect(page.getByText(/queries for it get SERVFAIL/)).toBeVisible();
+  // Nothing that assumes authored data: no SOA form, no records grid, and no
+  // Export (there is nothing under the apex to render into a file). Refresh
+  // is absent because POST /zones/{id}/refresh answers a forwarder 400 —
+  // there is no master to pull from.
+  await expect(page.getByRole("button", { name: "SOA", exact: true })).toHaveCount(0);
+  await expect(page.getByTestId("zone-record-list")).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Export" })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Refresh now" })).toHaveCount(0);
+
+  // Edit them through the real PATCH handler, then reload: read back from
+  // the server rather than from this tab, and in read mode (the default on a
+  // fresh load) rather than the input the pencil would have to open first.
+  // A page that had only remembered the response would come back showing the
+  // old pair.
+  await page.getByRole("button", { name: "Edit upstreams" }).click();
+  await page.getByLabel("Forward to", { exact: true }).fill("10.0.0.7:5353");
+  await page.getByRole("button", { name: "Save", exact: true }).click();
+  await expect(page.getByText("1 upstream")).toBeVisible();
+
+  await page.reload();
+  await expect(page.getByText("10.0.0.7:5353")).toBeVisible();
+  await expect(page.getByText("1 upstream")).toBeVisible();
 
   // And the key it names cannot now be deleted out from under it.
   await systemMenu.click();

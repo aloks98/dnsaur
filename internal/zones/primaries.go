@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
-	"strconv"
 	"strings"
 
 	"github.com/miekg/dns"
@@ -162,30 +161,9 @@ func splitPrimaries(s string) ([]primary, error) {
 }
 
 func parsePrimary(field string) (primary, error) {
-	host, portStr, err := net.SplitHostPort(field)
+	host, port, err := parseHostPort("primary", field, field)
 	if err != nil {
-		// net.SplitHostPort reports every shape it cannot split as an
-		// *net.AddrError, and two of those shapes are legal here: "missing
-		// port in address" for a bare host, and "too many colons in
-		// address" for a bare IPv6 literal. Both are the no-port form, so
-		// the whole field is the host. Anything that is not an AddrError is
-		// a failure to parse rather than a form to interpret.
-		var addrErr *net.AddrError
-		if !errors.As(err, &addrErr) {
-			return primary{}, fmt.Errorf("primary %q: %w", field, err)
-		}
-		host, portStr = field, ""
-	}
-	port := uint16(DefaultPrimaryPort)
-	if portStr != "" {
-		n, err := strconv.ParseUint(portStr, 10, 16)
-		if err != nil || n == 0 {
-			return primary{}, fmt.Errorf("primary %q: port must be between 1 and 65535", field)
-		}
-		port = uint16(n)
-	}
-	if !validPrimaryHost(host) {
-		return primary{}, fmt.Errorf("primary %q: host must be an IP address or a domain name", field)
+		return primary{}, err
 	}
 	return primary{host: host, port: port}, nil
 }

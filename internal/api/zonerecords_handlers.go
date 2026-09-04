@@ -39,10 +39,10 @@ type zoneRecordWrite struct {
 }
 
 // recordWriteRefusal reports why zone's records may not be written through
-// the API, or "" when they may. Reads are never refused by it — a built-in
-// and a secondary are both listable and exportable.
+// the API, or "" when they may. Reads are never refused by it — a built-in,
+// a secondary and a stub are all listable and exportable.
 //
-// Two zone types own their contents somewhere other than here:
+// Three zone types own their contents somewhere other than here:
 //
 //   - internal is seeded infrastructure (RFC 6303, internal/store/builtins.go),
 //     authored by a migration.
@@ -53,6 +53,22 @@ type zoneRecordWrite struct {
 //     authoritatively, which is the part that makes silently accepting it
 //     worse than refusing it: the operator is told nothing, and the zone
 //     serves an answer that disagrees with its primary.
+//   - stub is its master's, on the same terms and by the same mechanism:
+//     StubFetcher.Fetch installs what comes back through the very same
+//     DiffRecords, so a hand write is deleted on the SOA's own schedule with
+//     nothing to say so. It differs from the secondary in what the write does
+//     while it survives, and the difference is worse rather than milder. A
+//     stub answers from none of its records; StubUpstreams reads them back to
+//     rebuild the conditional routing table on every zone reload, so a
+//     hand-written apex NS record silently redirects the whole claimed suffix
+//     until the next fetch undoes it.
+//
+// A forwarder is deliberately not among them. Nothing overwrites its records
+// — it has no master, its routing comes from forward_to, and no scheduled job
+// touches its rows — so the rule this function encodes ("authored elsewhere,
+// and this write will be destroyed") is not true of one. A record written
+// into a forwarder is inert rather than lost, which is a different complaint
+// and not a 409's to make.
 //
 // 409 rather than 403 or 405: the request is well-formed and the caller is
 // permitted, and the same route accepts it for another zone. What refuses it
@@ -64,6 +80,15 @@ func recordWriteRefusal(zone store.Zone) string {
 		return "built-in zones cannot be changed"
 	case "secondary":
 		return "a secondary zone's records come from its primary; change them there"
+	case "stub":
+		// Fetched, never transferred. A stub asks its master two ordinary
+		// questions — SOA and NS with glue — precisely so it needs no
+		// allow_transfer permission on the far end, and that is the whole of
+		// what distinguishes it from a secondary. A message naming a transfer
+		// would send the operator looking for a mechanism that does not run
+		// here; zoneTSIGKey and handleZoneRefresh both had to have the same
+		// word taken out of them this milestone.
+		return "a stub zone's records are the NS set it fetches from its master; change them there"
 	}
 	return ""
 }

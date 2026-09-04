@@ -1,0 +1,20 @@
+-- +goose Up
+-- Where a `forwarder` zone sends the queries it claims.
+--
+-- A comma-separated list of host[:port], parsed by zones.ParseForwardTo and
+-- stored in that package's canonical spelling. Empty is the default and means
+-- the zone names no upstreams -- which is NOT a fall-through: a forwarder zone
+-- keeps its claim on the suffix and answers SERVFAIL, because a split-horizon
+-- name that fell through would resolve to whatever the public internet says it
+-- is. See section 9.11.5 of the zones design.
+--
+-- Only `forwarder` uses this column. A `stub` zone names its master in
+-- `primaries` instead, which is not an overload: for a secondary that column
+-- means "the server I pull this zone from", and for a stub it means "the
+-- server I fetch this zone's NS set from" -- the same sentence with a smaller
+-- payload. Contrast zones.tsig_key_id, which D4 refused to overload precisely
+-- because its meaning would have flipped by zone type.
+--
+-- No foreign key and no second table: this is one text column on the zone that
+-- owns it, and nothing else reads or writes it.
+ALTER TABLE zones ADD COLUMN forward_to TEXT NOT NULL DEFAULT '';

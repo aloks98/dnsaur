@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -46,17 +47,35 @@ func defaultSettings() map[string]string {
 
 // swappable lets us rebuild the tail of the pipeline (forwarder) on
 // settings changes without restarting listeners.
+//
+// It holds the *upstream.Forwarder beside the Handler it produced, under the
+// same lock, because the two have to be swapped and read as one thing. The
+// pipeline needs the Handler; installing a zone reload's conditional routing
+// table needs the Forwarder (SetConditional is not on Handler); and a reload
+// that pushed its table onto a Forwarder that is no longer the one serving
+// queries would have installed nothing at all.
 type swappable struct {
 	mu  sync.RWMutex
 	h   dnssrv.Handler
+	f   *upstream.Forwarder
 	has bool // true once set has been called at least once
 }
 
-func (s *swappable) set(h dnssrv.Handler) {
+func (s *swappable) set(f *upstream.Forwarder) {
 	s.mu.Lock()
-	s.h = h
+	s.f = f
+	s.h = f.Handler()
 	s.has = true
 	s.mu.Unlock()
+}
+
+// forwarder returns the Forwarder currently serving queries, or nil before
+// the first set. It is how App.ReloadZones reaches SetConditional: a.fwd is
+// a dnssrv.Handler, which has no such method.
+func (s *swappable) forwarder() *upstream.Forwarder {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.f
 }
 
 // isSet reports whether a handler has ever been installed. Used by
@@ -98,10 +117,38 @@ type App struct {
 	// that decides whether an arriving NOTIFY is acted on, sharing
 	// zoneRefresh so a notify-triggered transfer takes the same per-zone
 	// lock a scheduled one does. Both attached to every listener in Start.
-	notifier  *zones.Notifier
-	notifyIn  *zones.NotifyServer
-	logger    *qlog.Logger
-	fwd       *swappable
+	notifier *zones.Notifier
+	notifyIn *zones.NotifyServer
+	logger   *qlog.Logger
+	fwd      *swappable
+	// dnsCache is the pipeline's cache, held here rather than left local to
+	// Start because a routing change has to be able to invalidate it: an
+	// entry is keyed on (qname, qtype) with no record of which route
+	// produced it, so a name cached from the default upstreams before a zone
+	// claimed its suffix would go on being served from that entry
+	// afterwards. Written once in Start, before anything that reads it
+	// exists, and never again.
+	dnsCache *cache.Cache
+	// routes is the conditional table last installed, kept so the next
+	// install can tell which suffixes actually changed rather than purging
+	// the whole cache on every record edit. Read and replaced only in
+	// installConditional, whose three callers all hold routeMu — and reading
+	// it is in-memory work, so routeMu still never touches the store.
+	routes map[string][]string
+	// routeMu serialises the two writers of the conditional routing table
+	// against each other: ReloadZones, which reads which forwarder is live
+	// and installs on it, and applySettings, which builds a replacement
+	// forwarder, installs on it and makes it live. Each is a
+	// read-modify-write spanning both objects, so serialising inside
+	// SetConditional is not enough — the interleaving that loses a route
+	// happens above it, here.
+	//
+	// Held only by those two. ServeDNS never takes it, so the query path is
+	// not on this lock, and the order is always routeMu -> swappable.mu and
+	// is never inverted. The cost is one mutex per zone reload — contended,
+	// by construction, in exactly the interleaving it exists to order, and
+	// uncontended the rest of the time.
+	routeMu   sync.Mutex
 	servers   []*dnssrv.Server
 	apiSrv    *http.Server
 	apiAddr   string
@@ -150,12 +197,37 @@ func New(ctx context.Context, cfg *config.Config, version string) (*App, error) 
 	// signs the next transfer, not the next restart.
 	a.zoneRefresh = zones.NewRefresher(st.Zones(),
 		zones.NewTransferrer(st.Zones(), st.TSIGKeys(),
-			zones.WithReload(a.resolver.Reload),
+			// **ReloadZones, not resolver.Reload.** The conditional routing
+			// table is derived from the served snapshot, so republishing the
+			// snapshot alone publishes half a reload: a forwarder or stub zone
+			// that claimed a suffix since the last full reload is in what the
+			// resolver serves and absent from what the forwarder routes with,
+			// and its names fall through to the default upstreams — §9.11.5's
+			// failure, reached through the one path that used to skip the
+			// table. Signature-compatible, and installConditional is nil-safe
+			// for the window before any forwarder exists.
+			zones.WithReload(a.ReloadZones),
 			// The cascade: a secondary that just installed a zone may have
 			// downstream secondaries of its own. Nothing cascade-specific
 			// happens here — the pass compares serials, and the install has
 			// just written the primary's serial verbatim.
-			zones.WithNotifyWake(a.notifier.Wake)))
+			zones.WithNotifyWake(a.notifier.Wake)),
+		// The other worker the same schedule drives: a stub pulls its
+		// delegation with two ordinary queries instead of an AXFR, so it is a
+		// separate object from the Transferrer — and therefore does *not*
+		// inherit the reload above. It needs its own, and it needs the same
+		// one.
+		//
+		// **ReloadZones, not resolver.Reload**, and for a stub the
+		// consequence is not a corner case but the feature: its upstreams are
+		// derived from the NS records the fetch has just installed, so
+		// republishing the snapshot without reinstalling the routing table
+		// leaves the zone claiming its suffix with no addresses behind it.
+		// Every query for it SERVFAILs, forever, looking exactly like a fetch
+		// that never happened — while the rows sit in the database and the
+		// zone page shows the delegation.
+		zones.WithStubFetcher(zones.NewStubFetcher(st.Zones(), st.TSIGKeys(),
+			zones.WithStubReload(a.ReloadZones))))
 	// The other direction: what a.zoneRefresh's Transferrer pulls from
 	// someone else's TransferServer, this one serves to a peer pulling from
 	// us. It reads a.resolver's live snapshot, so a zone this server
@@ -246,6 +318,137 @@ func buildForwarder(upstreams []string, strategy string) (*upstream.Forwarder, e
 	return upstream.New(upstream.Config{Upstreams: upstreams, Strategy: strategy})
 }
 
+// conditionalRoutes maps each enabled forwarder and stub zone's apex to the
+// addresses its queries go to.
+//
+// A zone that names no usable upstreams is still included, with an empty
+// list. That is deliberate: pick returns the empty slice, every attempt
+// fails, and the handler answers SERVFAIL — so the zone keeps its claim on
+// the suffix instead of falling through to the default resolvers and letting
+// a public answer shadow an internal name (§9.11.5). Omitting it would be the
+// fall-through this design refuses.
+//
+// A disabled zone is skipped entirely, which releases its suffix back to the
+// defaults — the same meaning "disabled" has on every other path.
+//
+// It walks the resolver's snapshot rather than the store, for two reasons.
+// The snapshot is what the server is actually serving, so the routing table
+// cannot describe a zone the resolver has not loaded yet. And a stub's
+// upstreams are derived from its NS records and their glue, which live on
+// zones.Zone — store.Zone carries the row only, so reading the store would
+// make StubUpstreams impossible to call without a second query per zone.
+func (a *App) conditionalRoutes() map[string][]string {
+	routes := map[string][]string{}
+	for _, z := range a.resolver.Snapshot().Zones() {
+		if !z.Enabled {
+			continue
+		}
+		switch strings.ToLower(z.Type) {
+		case "forwarder":
+			targets, err := zones.ParseForwardTo(z.ForwardTo)
+			if err != nil {
+				// Fails closed: an unparseable stored value names no
+				// upstreams, so the zone SERVFAILs rather than forwarding
+				// somewhere unintended. The API validates on write, so
+				// reaching this means a hand-edited row.
+				slog.Warn("zone forward_to will not parse; the zone will answer SERVFAIL",
+					"zone", z.Name, "err", err)
+				routes[z.Name] = nil
+				continue
+			}
+			addrs := make([]string, 0, len(targets))
+			for _, t := range targets {
+				addrs = append(addrs, t.Addr())
+			}
+			routes[z.Name] = addrs
+		case "stub":
+			// Derived from the fetched NS set; empty until the first fetch
+			// lands, which claims the suffix and SERVFAILs meanwhile.
+			routes[z.Name] = zones.StubUpstreams(z)
+		}
+	}
+	return routes
+}
+
+// installConditional pushes the served snapshot's routing table onto f, then
+// drops the cached answers for every suffix whose routing that just changed.
+//
+// f is passed rather than read from a.fwd so applySettings can install onto a
+// forwarder that has not gone live yet — see the ordering note there.
+//
+// **The purge is not an optimisation and the order is not arbitrary.** The
+// pipeline is resolver → cache → forwarder, and only the forwarder holds the
+// routing table: a cache entry is keyed on (qname, qtype) with no record of
+// which route produced it, so a hit is served without pick ever being
+// reached. Without the purge, a name cached from the *default* upstreams
+// before a zone claimed its suffix goes on being answered from that entry —
+// and that is not a corner, it is the feature's own motivating workflow, since
+// a split-horizon forwarder zone is added precisely because the name resolves
+// publicly today. Worse, when the claimed suffix's upstreams are all down the
+// cache serves that public entry *stale* with rcode NOERROR, for
+// serve_stale_for (a day, by default) past its own TTL, where §9.11.5 requires
+// SERVFAIL. The mirror case is the same defect the other way: releasing a
+// suffix leaves internal answers cached for names that should now resolve
+// publicly.
+//
+// Install first, purge second. Purging first would leave a window in which
+// the suffix is unclaimed and a miss re-fills the cache from the defaults,
+// which is the direction that leaks.
+func (a *App) installConditional(f *upstream.Forwarder) {
+	if f == nil {
+		return // no forwarder has ever been installed; applySettings is about to
+	}
+	routes := a.conditionalRoutes()
+	if err := f.SetConditional(routes); err != nil {
+		// Nothing was installed, so nothing changed and a.routes is left
+		// alone: the next install still sees this table as new and purges it.
+		slog.Error("installing conditional routes failed", "err", err)
+		return
+	}
+	changed := changedSuffixes(a.routes, routes)
+	a.routes = routes
+	if len(changed) == 0 || a.dnsCache == nil {
+		return
+	}
+	if n := a.dnsCache.Purge(changed...); n > 0 {
+		slog.Debug("cache purged where routing changed", "suffixes", len(changed), "entries", n)
+	}
+}
+
+// changedSuffixes lists every suffix that is in exactly one of prev and next,
+// or in both against a different set of upstreams. Those are the suffixes
+// whose cached answers may have been produced by a route that no longer
+// applies; the rest of the table is untouched, so an ordinary record edit —
+// which reloads zones and reinstalls this table — purges nothing at all.
+//
+// The upstreams are compared as a set rather than a list. Order decides which
+// address is *tried* first, not which of them may answer, so a reordering
+// invalidates nothing.
+func changedSuffixes(prev, next map[string][]string) []string {
+	var out []string
+	for suffix, ups := range next {
+		if was, ok := prev[suffix]; !ok || !sameUpstreams(was, ups) {
+			out = append(out, suffix)
+		}
+	}
+	for suffix := range prev {
+		if _, ok := next[suffix]; !ok {
+			out = append(out, suffix)
+		}
+	}
+	return out
+}
+
+func sameUpstreams(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	x, y := slices.Clone(a), slices.Clone(b)
+	slices.Sort(x)
+	slices.Sort(y)
+	return slices.Equal(x, y)
+}
+
 // applySettings re-reads DB settings into live components.
 func (a *App) applySettings(ctx context.Context) {
 	mode := a.getSetting(ctx, "blocking.mode")
@@ -267,8 +470,13 @@ func (a *App) applySettings(ctx context.Context) {
 		if a.fwd.isSet() {
 			// A working forwarder already exists (e.g. from a previous
 			// successful applySettings) — keep serving queries with it
-			// rather than replacing it with something broken.
+			// rather than replacing it with something broken. The reload
+			// above may still have moved a zone, so the table goes on
+			// anyway: the forwarder is kept, its routing is not frozen.
 			slog.Error("keeping previous upstream config", "err", err)
+			a.routeMu.Lock()
+			a.installConditional(a.fwd.forwarder())
+			a.routeMu.Unlock()
 			return
 		}
 		// No forwarder has ever been installed: swappable.h would stay nil
@@ -294,12 +502,35 @@ func (a *App) applySettings(ctx context.Context) {
 			}
 		}
 	}
-	a.fwd.set(fwd.Handler())
+	// **Before it goes live, not after.** fwd is brand new and its
+	// conditional table is empty; a settings edit that installed the routes
+	// after the swap would leave a window in which every forwarder and stub
+	// zone's suffix resolves through the default upstreams — a split-horizon
+	// name answered by the public internet, which is the failure §9.11.5
+	// exists to prevent. Get it wrong and nothing fails until an unrelated
+	// zone edit happens to reinstall the table.
+	a.routeMu.Lock()
+	a.installConditional(fwd)
+	a.fwd.set(fwd)
+	a.routeMu.Unlock()
 }
 
 func (a *App) Start(ctx context.Context) error {
 	runCtx, cancel := context.WithCancel(context.Background())
 	a.cancel = cancel
+
+	// Before applySettings, not after. applySettings installs the conditional
+	// routing table, and installing it is also what purges the cache of the
+	// suffixes that table just claimed or released (installConditional). Built
+	// afterwards, the first install would have nothing to purge and the field
+	// would be written while the settings watcher below could already be
+	// reading it.
+	a.dnsCache = cache.New(cache.Options{
+		MinTTL:        time.Duration(a.getInt(ctx, "cache.min_ttl", 0)) * time.Second,
+		MaxTTL:        time.Duration(a.getInt(ctx, "cache.max_ttl", 86400)) * time.Second,
+		ServeStaleFor: time.Duration(a.getInt(ctx, "cache.serve_stale_for", 86400)) * time.Second,
+		MaxEntries:    int(a.getInt(ctx, "cache.max_entries", 10000)),
+	})
 
 	a.applySettings(ctx)
 
@@ -307,19 +538,13 @@ func (a *App) Start(ctx context.Context) error {
 	a.logger = qlog.New(a.st.QueryLog(), qlog.Options{
 		Privacy: a.getSetting(ctx, "qlog.privacy"), InstanceID: instanceID,
 	})
-	dnsCache := cache.New(cache.Options{
-		MinTTL:        time.Duration(a.getInt(ctx, "cache.min_ttl", 0)) * time.Second,
-		MaxTTL:        time.Duration(a.getInt(ctx, "cache.max_ttl", 86400)) * time.Second,
-		ServeStaleFor: time.Duration(a.getInt(ctx, "cache.serve_stale_for", 86400)) * time.Second,
-		MaxEntries:    int(a.getInt(ctx, "cache.max_entries", 10000)),
-	})
 	handler := dnssrv.Chain(a.fwd,
 		a.logger.Middleware(),
 		dnssrv.Recover(),
 		a.registry.Middleware(),
 		a.engine.Middleware(),
 		a.resolver.Middleware(),
-		dnsCache.Middleware(),
+		a.dnsCache.Middleware(),
 	)
 	for _, addr := range a.cfg.DNSListen {
 		// The key store, not a snapshot of it: a key created through the API
@@ -432,8 +657,32 @@ func (a *App) DNSAddr() string {
 
 func (a *App) HTTPAddr() string { return a.apiAddr }
 
-func (a *App) ReloadClients(ctx context.Context) error  { return a.registry.Reload(ctx) }
-func (a *App) ReloadZones(ctx context.Context) error    { return a.resolver.Reload(ctx) }
+func (a *App) ReloadClients(ctx context.Context) error { return a.registry.Reload(ctx) }
+
+// ReloadZones rebuilds the served snapshot and installs the routing table it
+// implies, in that order: the table is derived from the snapshot, so pushing
+// it first would publish the previous reload's routes.
+//
+// A failed reload returns without touching the forwarder, which keeps the
+// table already installed. Clearing every claimed suffix because one store
+// read failed would send internal names to the public internet — the
+// opposite of the direction §9.11.5 fails in.
+func (a *App) ReloadZones(ctx context.Context) error {
+	if err := a.resolver.Reload(ctx); err != nil {
+		return err
+	}
+	// Which forwarder is live, the build, and the install are one step: a
+	// settings change landing between them would install this table on the
+	// forwarder it is retiring, and the table that survived would be the one
+	// applySettings built from a snapshot taken before this reload's zone
+	// existed. That loses a claimed suffix to the public internet, which is
+	// the direction adding or enabling a zone fails in.
+	a.routeMu.Lock()
+	defer a.routeMu.Unlock()
+	a.installConditional(a.fwd.forwarder())
+	return nil
+}
+
 func (a *App) RefreshFilters(ctx context.Context) error { return a.refresher.RefreshAll(ctx) }
 func (a *App) NotifyZones()                             { a.notifier.Wake() }
 
