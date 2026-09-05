@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"net"
 	"strings"
 	"sync"
@@ -1173,6 +1174,123 @@ func TestAClaimedSuffixStillServesItsOwnAnswersStale(t *testing.T) {
 		// upstream is refusing every query by now.
 		if ttl := m.Answer[0].Header().Ttl; ttl != 30 {
 			t.Errorf("TTL %d, want 30 — a stale answer is served at 30, so this was not the stale path", ttl)
+		}
+	})
+}
+
+// blockingSOAPrimary is a primary that receives a query and never answers
+// it: it reports the arrival on the returned channel and holds the handler
+// until the test ends. It is how a test catches the work an inbound NOTIFY
+// starts *while it is still running*, rather than racing it.
+func blockingSOAPrimary(t *testing.T) (string, chan struct{}) {
+	t.Helper()
+	probed := make(chan struct{}, 4)
+	release := make(chan struct{})
+	addr := mockDNS(t, func(dns.ResponseWriter, *dns.Msg) {
+		select {
+		case probed <- struct{}{}:
+		default:
+		}
+		<-release
+	})
+	// Registered *after* mockDNS's own cleanup so it runs before it:
+	// dns.Server.Shutdown waits for its in-flight handlers, and a handler
+	// still parked on release would hang the test binary rather than fail
+	// the test.
+	t.Cleanup(func() { close(release) })
+	return addr, probed
+}
+
+// logWatcher closes seen the first time a record's message contains msg.
+// A channel rather than a slice because the assertion below is about
+// *ordering* — what had already happened when Shutdown returned — and a
+// slice read afterwards cannot say that.
+type logWatcher struct {
+	msg  string
+	once sync.Once
+	seen chan struct{}
+}
+
+func (h *logWatcher) Enabled(context.Context, slog.Level) bool { return true }
+
+func (h *logWatcher) Handle(_ context.Context, r slog.Record) error {
+	if strings.Contains(r.Message, h.msg) {
+		h.once.Do(func() { close(h.seen) })
+	}
+	return nil
+}
+
+func (h *logWatcher) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *logWatcher) WithGroup(string) slog.Handler      { return h }
+
+// watchLogs installs h as the default logger for one test.
+func watchLogs(t *testing.T, msg string) *logWatcher {
+	t.Helper()
+	h := &logWatcher{msg: msg, seen: make(chan struct{})}
+	prev := slog.Default()
+	slog.SetDefault(slog.New(h))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	return h
+}
+
+// An inbound NOTIFY replies first and works afterwards (RFC 1996 §4.7), so
+// the work runs in a goroutine of its own under a context the request's
+// cancellation cannot reach. That goroutine used to be tracked by nothing:
+// a NOTIFY admitted moments before shutdown could still be probing a primary
+// or installing a transferred zone while Shutdown closed the store under it.
+//
+// This is the ordering test, and it belongs here because this is where the
+// lifetime is owned: App.Shutdown cancels runCtx, waits on App.wg, and only
+// then closes the store. NotifyServer.Run is what puts the work goroutine
+// inside that wait, and dropping it from a.bg is the production change this
+// test exists to fail on.
+//
+// The primary never answers the SOA probe, so the work is reliably in flight
+// when Shutdown is called; the log line act writes on its way out is the
+// signal that the goroutine has finished, and it is written before wg.Done,
+// so "seen by the time Shutdown returned" is exactly the property.
+func TestShutdownWaitsForTheWorkAnInboundNotifyStarted(t *testing.T) {
+	forEachDriver(t, func(t *testing.T, driver string) {
+		primary, probed := blockingSOAPrimary(t)
+		a := newTestAppOn(t, driver)
+
+		const apex = "notified.example"
+		mustAddZone(t, a, store.Zone{
+			Name: apex, Type: "secondary", Enabled: true, Primaries: primary,
+			SOANS: "ns1." + apex, SOAMbox: "hostadmin." + apex,
+			SOASerial: 1, SOARefresh: 3600, SOARetry: 600, SOAExpire: 604800,
+			SOAMinimum: 300, SOATTL: 900,
+			// Non-zero, so the NOTIFY takes the probe path rather than the
+			// never-transferred shortcut — and far from due, so the refresh
+			// scheduler has no reason to touch this zone during the test.
+			RefreshedAt: time.Now().UnixMilli(),
+		})
+		mustReloadZones(t, a)
+
+		watcher := watchLogs(t, "SOA probe after a notify failed")
+
+		m := new(dns.Msg).SetNotify(dns.Fqdn(apex))
+		reply, _, err := new(dns.Client).Exchange(m, a.DNSAddr())
+		if err != nil {
+			t.Fatalf("NOTIFY: %v", err)
+		}
+		if reply.Rcode != dns.RcodeSuccess {
+			t.Fatalf("NOTIFY answered %s, want NOERROR", dns.RcodeToString[reply.Rcode])
+		}
+		select {
+		case <-probed:
+		case <-time.After(5 * time.Second):
+			t.Fatal("the NOTIFY was answered but no SOA probe reached the primary")
+		}
+
+		if err := a.Shutdown(context.Background()); err != nil {
+			t.Fatalf("Shutdown: %v", err)
+		}
+		select {
+		case <-watcher.seen:
+		default:
+			t.Fatal("Shutdown returned while the goroutine an admitted NOTIFY started was still probing a primary — " +
+				"its lifetime is outside App.wg, so the store closes underneath it")
 		}
 	})
 }

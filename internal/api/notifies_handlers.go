@@ -26,21 +26,47 @@ type notifyRow struct {
 	CreatedAt      int64  `json:"created_at"`
 }
 
+// notifyAttemptsIn is how many attempts have been made against the round the
+// zone is in *now* — which is what `attempts` means everywhere else in this
+// feature, and the number the notifier will act on next.
+//
+// zones.Notifier.maybeSend is the definition: `if row.pending_serial != want
+// { attempts = 0 } // a new round`. A target that used its whole budget
+// against serial 100 has made no attempt at all against 101, and the next
+// pass will send to it. Reading n.Attempts raw here is what made the API and
+// the notifier mean different things by one word.
+func notifyAttemptsIn(zoneSerial uint32, n store.ZoneNotify) int {
+	if n.PendingSerial != zoneSerial {
+		return 0
+	}
+	return n.Attempts
+}
+
 // notifyStateOf reduces a target's row to the one word the dashboard shows.
 //
 // Derived here rather than in the client for the reason D3's transfer status
-// is: a status two clients could compute differently is not a status.
+// is: a status two clients could compute differently is not a status. The
+// same rule applied once more, between the API and the notifier: `gave_up`
+// is scoped to the round, exactly as maybeSend scopes it, so the screen
+// cannot say a target was given up on while the pass is about to send to it.
 //
 // **The order is the logic.** `never` is not simply notified_at == 0 — a
 // target that has never been delivered *and* has exhausted its attempts is
 // gave_up, and reading notified_at alone would show a target that has failed
 // five times as though nothing had been tried.
+//
+// And `never` is the one check that reads n.Attempts *raw* rather than
+// through notifyAttemptsIn. It is the only state the dashboard does not
+// count as behind, so it has to mean "nothing has ever happened to this
+// target", not "nothing has happened in this round" — a target whose old
+// round failed five times and whose new round has not started yet is
+// retrying, and it is behind.
 func notifyStateOf(zoneSerial uint32, n store.ZoneNotify) string {
 	behind := n.NotifiedAt == 0 || zones.SerialNewer(zoneSerial, n.NotifiedSerial)
 	if !behind {
 		return "current"
 	}
-	if n.Attempts >= zones.MaxNotifyAttempts {
+	if notifyAttemptsIn(zoneSerial, n) >= zones.MaxNotifyAttempts {
 		return "gave_up"
 	}
 	if n.NotifiedAt == 0 && n.Attempts == 0 {
@@ -76,10 +102,13 @@ func (s *Server) handleZoneNotifiesList(w http.ResponseWriter, r *http.Request) 
 			State:          notifyStateOf(zone.SOASerial, n),
 			NotifiedSerial: n.NotifiedSerial,
 			NotifiedAt:     n.NotifiedAt,
-			Attempts:       n.Attempts,
-			MaxAttempts:    zones.MaxNotifyAttempts,
-			LastError:      n.LastError,
-			CreatedAt:      n.CreatedAt,
+			// Round-scoped, like State above: "retrying · try 5/5" against a
+			// serial nothing has been attempted for is the same stale
+			// reading, one column over.
+			Attempts:    notifyAttemptsIn(zone.SOASerial, n),
+			MaxAttempts: zones.MaxNotifyAttempts,
+			LastError:   n.LastError,
+			CreatedAt:   n.CreatedAt,
 		})
 	}
 	writeJSON(w, http.StatusOK, out)

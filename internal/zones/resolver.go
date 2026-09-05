@@ -116,6 +116,15 @@ func NewResolver(zs store.ZoneStore, opts ...ResolverOption) *Resolver {
 // this server holds (§9.11.5), a primary's own names included. A lost update
 // rather than a data race, so -race never saw it.
 //
+// **What rmu does not do is make the two reads one transaction, and that is a
+// separate window it deliberately leaves open.** A reload racing a *writer*
+// can read Zones() before a write and AllRecords() after it, and serve a
+// newer record set against an older zone row. It is transient and
+// self-repairing — every write reaches here again through
+// api.Server.reloadZones, and the next pass installs a pair that agrees —
+// where the lost update above was permanent, which is the whole reason one is
+// closed here and the other is not.
+//
 // Readers are untouched: Snapshot and Middleware load the atomic pointer and
 // take no lock, so a query never waits on a reload.
 func (r *Resolver) Reload(ctx context.Context) error {

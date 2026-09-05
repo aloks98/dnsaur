@@ -146,12 +146,17 @@ it.
 See `docs/superpowers/specs/2026-08-08-zones-design.md` §9.5.5 for the
 full gate, in order, with every row's reasoning.
 
+The transfer branch checks the opcode as well as the qtype, which is what
+keeps the two branches disjoint: `Opcode == NOTIFY, Qtype == AXFR` is a
+NOTIFY and goes to the NOTIFY branch below, not to the transfer handler
+that happens to be tested first.
+
 ## Zone NOTIFY (RFC 1996)
 
 Like AXFR/IXFR above, NOTIFY does not go through the middleware pipeline.
 `Server.serve` branches on it — `dns.OpcodeNotify` is an *opcode*, not a
-qtype, so the transfer branch's qtype check does not catch it and this is a
-second, independent branch ahead of the pipeline — and hands the raw
+qtype, so there is no qtype the transfer branch could route it by and this
+is a second, independent branch ahead of the pipeline — and hands the raw
 `dns.ResponseWriter` to a `Notifies` handler (`internal/zones.NotifyServer`,
 wired in via `dnssrv.WithNotifies`). Unlike a transfer, a NOTIFY reply
 *could* fit through `Handler`'s one-`*Response` shape mechanically, so the
@@ -250,7 +255,11 @@ has no honest baseline to be gated against.
 **Outbound: the queue, and why the trigger is serial detection, never call
 sites.** `internal/zones.Notifier` runs on its own tick (5s) plus an
 explicit `Wake()`, and reconciles a durable queue (`zone_notifies`, the
-0012 migration) against every enabled zone's `notify_to`. That queue carries
+0012 migration) against every enabled zone's `notify_to` — reading the queue
+once per pass and writing only to the zones whose rows actually disagree
+with their `notify_to`, so an install with no NOTIFY configured (the fifteen
+RFC 6303 built-ins and nothing else) costs one query per tick and no
+transactions at all. That queue carries
 no "pending" column at all. Whether a target needs telling is *derived*,
 every pass, by comparing the zone's current `soa_serial` against what that
 target last acknowledged — never stored as a flag some code path has to

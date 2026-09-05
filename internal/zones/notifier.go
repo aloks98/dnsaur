@@ -159,15 +159,34 @@ func (n *Notifier) Wake() {
 
 // Pass reconciles every zone's rows and sends whatever is due.
 //
-// **Two phases, and the order is a correctness requirement rather than
-// tidiness.** Every zone is parsed and reconciled first; only once every
-// zone's rows are settled is the queue read back, in one query, to decide
-// what to send. Reading it earlier — before a zone's own reconcile has run —
-// would hand maybeSend a zero-value row for a target Reconcile is about to
-// insert, and a send decided against a row with no id can only fail to
-// record itself: the send happens, NoteDelivered/NoteAttempt addresses
-// `WHERE id = 0` and matches nothing, and because notified_at stays 0 the
-// target looks "never told" again on the very next pass too.
+// **The queue is read first, reconciled second, and re-read only if
+// something changed — and the *order of the last two* is a correctness
+// requirement rather than tidiness.** Nothing may be sent against a snapshot
+// taken before that zone's reconcile ran: maybeSend would get a zero-value
+// row for a target Reconcile is about to insert, and a send decided against
+// a row with no id can only fail to record itself — the send happens,
+// NoteDelivered/NoteAttempt addresses `WHERE id = 0` and matches nothing,
+// and because notified_at stays 0 the target looks "never told" again on the
+// very next pass too.
+//
+// The read *before* the reconciles is what makes the reconciles skippable.
+// Reconcile is a transaction, and this used to open one per enabled zone per
+// tick whether or not that zone had anything to reconcile — every install
+// carries the fifteen RFC 6303 built-ins, most configure no NOTIFY at all,
+// so the steady state was fifteen-odd read-only transactions every five
+// seconds discovering, each time, that there was nothing to do. Now one
+// query answers that for every zone at once, and a zone whose rows already
+// match its notify_to is not written to.
+//
+// It costs a second read of the queue on the passes that *do* reconcile, and
+// that is the right way round: reconciling is rare (an operator edited a
+// zone), and the alternative — trusting the pre-reconcile snapshot for the
+// zones just written — is the `WHERE id = 0` bug above.
+//
+// A stale pre-read cannot cause a missed reconcile that matters. The
+// notifier is the only writer of these rows; the only other way they change
+// is a zone being deleted, which takes them with it (ON DELETE CASCADE), and
+// a zone that no longer exists is not in `all` either.
 //
 // The error reported is a failure to *read* — the zone list, or the queue
 // itself. A zone whose notify_to will not parse, or whose reconcile failed,
@@ -180,7 +199,14 @@ func (n *Notifier) Pass(ctx context.Context) error {
 	}
 	nowMs := n.now().UnixMilli()
 
+	// One query, before anything is written: what every zone's rows are now.
+	rowsByZone, err := n.rowsByZone(ctx)
+	if err != nil {
+		return err
+	}
+
 	parsed := make(map[int64][]NotifyTarget, len(all))
+	reconciled := false
 	for _, z := range all {
 		// A disabled zone tells nobody, for the mirror of the reason
 		// refresh.go skips one: it answers nothing (Zone.Serving), so this
@@ -206,17 +232,26 @@ func (n *Notifier) Pass(ctx context.Context) error {
 				"zone", z.Name, "err", err)
 			continue
 		}
+		if rowsMatch(rowsByZone[z.ID], targets) {
+			// Nothing to insert and nothing to delete: the overwhelmingly
+			// common case, and the one that must not cost a transaction.
+			parsed[z.ID] = targets
+			continue
+		}
 		if err := n.reconcile(ctx, z, targets, nowMs); err != nil {
 			slog.Warn("reconciling notify targets failed", "zone", z.Name, "err", err)
 			continue
 		}
+		reconciled = true
 		parsed[z.ID] = targets
 	}
 
-	// One query, after every row that should exist does.
-	rowsByZone, err := n.rowsByZone(ctx)
-	if err != nil {
-		return err
+	// Re-read only when a row was actually written; see this function's own
+	// comment for why sending against the earlier snapshot would not do.
+	if reconciled {
+		if rowsByZone, err = n.rowsByZone(ctx); err != nil {
+			return err
+		}
 	}
 	for _, z := range all {
 		// Deduped by address: ParseNotifyTo does not dedupe, and Reconcile
@@ -242,6 +277,31 @@ func (n *Notifier) Pass(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// rowsMatch reports whether the rows a zone already has are exactly the ones
+// its targets call for, in which case Reconcile would be a transaction that
+// wrote nothing.
+//
+// Deduped by address on the way through, for the reason Reconcile itself
+// dedupes: ParseNotifyTo does not, so `10.0.0.2, 10.0.0.2` is two targets and
+// one row, and comparing the lengths without deduping would report a
+// difference on every pass forever.
+func rowsMatch(have map[string]store.ZoneNotify, targets []NotifyTarget) bool {
+	want := make(map[string]bool, len(targets))
+	for _, t := range targets {
+		addr := t.Addr()
+		if want[addr] {
+			continue
+		}
+		want[addr] = true
+		if _, ok := have[addr]; !ok {
+			return false
+		}
+	}
+	// Every wanted target has a row; the only remaining difference is a row
+	// with no target, which is a delete Reconcile has to make.
+	return len(want) == len(have)
 }
 
 // reconcile makes zone_notifies match z's current notify_to exactly.

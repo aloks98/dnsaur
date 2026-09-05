@@ -40,8 +40,18 @@ func WithTransfers(t Transfers) Option {
 }
 
 // isTransferQuery reports whether m is the kind of query the intercept owns:
-// exactly one question, because a transfer names one zone, asking for AXFR or
-// IXFR.
+// an ordinary QUERY carrying exactly one question, because a transfer names
+// one zone, asking for AXFR or IXFR.
+//
+// **The opcode is half of that and not a formality.** A transfer request is
+// a QUERY; a message with `Opcode == NOTIFY, Qtype == AXFR` is a NOTIFY,
+// however odd, and belongs to the branch below this one. Without this check
+// the qtype alone decided, so the first branch in serve claimed a message
+// that says NOTIFY in the one header field there is for saying what a
+// message is. Not a hole — both handlers apply their own ACL and TSIG rules,
+// and decide would have refused it exactly as it refuses any unauthorised
+// transfer — but the dispatch is now two branches deep, and the next person
+// adding a third should not have to re-derive which one wins.
 //
 // The one-question half is not what keeps a malformed transfer out of the
 // pipeline, and it is worth knowing which layer does. miekg rejects any
@@ -60,6 +70,9 @@ func WithTransfers(t Transfers) Option {
 // a guard for a direct caller — the interface is exported — rather than a row
 // a peer can reach. transfers_test.go pins both.
 func isTransferQuery(m *dns.Msg) bool {
+	if m.Opcode != dns.OpcodeQuery {
+		return false
+	}
 	if len(m.Question) != 1 {
 		return false
 	}

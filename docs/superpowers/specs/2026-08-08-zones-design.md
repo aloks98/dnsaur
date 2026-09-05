@@ -1565,32 +1565,67 @@ Each was found by review, judged real, and deliberately not fixed in D4.
   asymmetry between two functions in one library, which is exactly what a
   dependency bump can align without anyone noticing; the pin exists so that
   would fail a test rather than silently open the hole.
-- **`BumpSerial` cannot wrap.** `soa_serial = soa_serial + 1` on a zone at
+All five landed on 2026-09-05, one commit each, and are struck through
+below. The statement of each problem is left standing rather than deleted:
+this section is the record of what D4 knew and carried, and a list that
+erases the finding once it is fixed cannot be read back as one.
+
+- ~~**`BumpSerial` cannot wrap.**~~ — **fixed 2026-09-05 (`b770be2`).**
+  `soa_serial = soa_serial + 1` on a zone at
   4294967295 writes 4294967296, and every later `scanZone` into `uint32` fails
   with a range error, taking the zone out of service. Pre-existing since
   Milestone A. It undercuts D4's own wrap story: `SerialNewer` is careful
   across the wrap and the import path wraps correctly, while the commonest
   serial-advancing path in the product cannot reach 0 at all.
-- **`NotifyServer`'s work goroutine is detached from `App.wg`.** A NOTIFY
+  The increment is now `(soa_serial + 1) % 4294967296`, which is the modulo
+  operator in both dialects and keeps the increment atomic in SQL.
+  `TestBumpSerialWrapsAtMaxUint32` runs on both drivers and asserts the
+  read-back, since the failure was an unreadable row rather than a wrong
+  number.
+- ~~**`NotifyServer`'s work goroutine is detached from `App.wg`.**~~ —
+  **fixed 2026-09-05 (`6f00e3a`).** A NOTIFY
   admitted near shutdown can probe or transfer against a closed store.
   Bounded to a confusing log line — the transaction rolls back atomically and
   nothing panics or hangs — but the lifetime is genuinely unmanaged.
-- **`notifyStateOf` ignores `pending_serial`, so the API and the pass disagree
-  about "gave up".** `maybeSend` scopes give-up to the *round* and resets
+  `NotifyServer.Run` is now that lifetime, in `a.bg` like every other worker
+  App owns: on shutdown it stops admitting work, cancels what is running and
+  waits for it. Two tests — the mechanism in `internal/zones`, the wiring in
+  `internal/app` (both drivers), where the lifetime is actually owned.
+- ~~**`notifyStateOf` ignores `pending_serial`, so the API and the pass
+  disagree about "gave up".**~~ — **fixed 2026-09-05 (`713c382`).**
+  `maybeSend` scopes give-up to the *round* and resets
   `attempts` when the serial advances; the API scopes it to the *target* and
   does not. A target that exhausted its budget at serial 100 and then sees 101
   reads `gave_up` on screen for up to the remaining back-off while the
   notifier considers it a fresh round. Not a lie — the target genuinely has
   not acknowledged — but the two components mean different things by one word.
-- **`isTransferQuery` does not check the opcode**, so a message with
+  **The round won**: it is what the pass acts on, and it is what `docs/api.md`
+  already documented ("it starts over from `attempts: 0` on the next serial
+  bump"), so the code was the outlier. `attempts` is scoped with it, or the
+  screen would read "retrying · try 5/5" against a serial nothing has been
+  tried for. `never` still reads `attempts` raw: it is the one state the
+  dashboard does not count as behind, so it has to keep meaning "nothing has
+  ever happened here".
+- ~~**`isTransferQuery` does not check the opcode**~~ — **fixed 2026-09-05
+  (`81ff78d`)**, so a message with
   `Opcode == NOTIFY, Qtype == AXFR` routes to `Transfers` rather than
   `Notifies`. The ACL still applies, so it is not a hole; it is now two
   branches deep in `serve` and the next person adding a third will not
-  re-derive it.
-- **`Reconcile` opens a transaction per enabled zone per pass**, including the
+  re-derive it. The branch now requires `Opcode == QUERY`, with the mirror
+  test — an ordinary AXFR still reaching `Transfers` — so the fix cannot
+  degenerate into routing everything to `Notifies`.
+- ~~**`Reconcile` opens a transaction per enabled zone per pass**~~ — **fixed
+  2026-09-05 (`a349f13`)**, including the
   common case of a zone with no targets at all. With the RFC 6303 built-ins
   seeded, that is roughly twenty read-only transactions every five seconds on
-  an install using no NOTIFY at all.
+  an install using no NOTIFY at all. **Batched in the pass, not skipped in the
+  store**: the pass reads the queue once up front — a query it already made,
+  moved earlier — and calls `Reconcile` only for the zones whose rows
+  disagree with their `notify_to`, so the store-side alternative's per-zone
+  `SELECT` is avoided too and `Reconcile` stays exactly as atomic for the
+  calls that remain. It re-reads the queue after reconciling, and only then,
+  because sending against the pre-reconcile snapshot is the `WHERE id = 0`
+  bug the two-phase order exists to prevent.
 
 ### 9.11 Milestone D6: `forwarder` and `stub` zones
 

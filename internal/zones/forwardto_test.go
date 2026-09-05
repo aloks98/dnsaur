@@ -56,10 +56,13 @@ func TestParseForwardToRejects(t *testing.T) {
 		{"port zero", "10.0.0.1:0", "port"},
 		{"port above the range", "10.0.0.1:70000", "port"},
 		{"a non-numeric port", "10.0.0.1:dns", "port"},
-		// These two are the only inputs that reach validPrimaryHost: anything
-		// with an internal space is rejected as a whole-field parse failure
-		// first, so a multi-word input would exercise a different branch while
-		// still producing a message containing "host".
+		// These two exercise validPrimaryHost, and the list stops there
+		// because a third input would land on the same branch rather than a
+		// new one. This is where forward_to differs from notify_to, whose
+		// otherwise identical table skips a multi-word entry because its
+		// `key:` branch claims one first: there is no key branch here, so
+		// "a b" is simply a bare host to net.SplitHostPort — the no-port
+		// form — and reaches validPrimaryHost exactly as "a/b" does.
 		{"a host with a forbidden character", "a/b", "host"},
 		{"a host with an empty label", "a..b", "host"},
 	}

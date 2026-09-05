@@ -51,8 +51,12 @@ func WithNotifies(n Notifies) Option {
 }
 
 // isNotify reports whether m is a NOTIFY: an opcode, not a qtype, which is
-// exactly why isTransferQuery does not catch it and why this is a second
-// branch rather than another case in that one.
+// why this is a second branch rather than another case in isTransferQuery —
+// there is no qtype that means "notify".
+//
+// It is also why isTransferQuery checks the opcode: the two branches would
+// otherwise overlap on `Opcode == NOTIFY, Qtype == AXFR`, and the transfer
+// branch, being first, would win a message that is a NOTIFY.
 //
 // The question count is not checked here. miekg rejects any message whose
 // header QDCOUNT is not 1 with FORMERR of its own accord

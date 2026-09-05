@@ -241,3 +241,64 @@ func TestNotifyTimeoutIsItsOwn(t *testing.T) {
 			dnssrv.NotifyTimeout, dnssrv.TransferTimeout)
 	}
 }
+
+// Two branches deep in serve, and the first one used to win on a message
+// that belongs to the second: isTransferQuery read only the qtype, so
+// `Opcode == NOTIFY, Qtype == AXFR` — a shape nothing legitimate sends, and
+// one anybody can — went to Transfers.
+//
+// **Not a security hole.** Both handlers apply their own ACL and their own
+// TSIG rules, and TransferServer's decide would have refused this exactly as
+// it refuses any other unauthorised transfer. It is a routing bug: the
+// message says NOTIFY in the one field the DNS header has for saying what a
+// message is, and dispatch read a different field. With a third branch one
+// day, deriving that from serve alone is work nobody should have to repeat.
+//
+// The assertion is on which handler ran, not on the rcode, because the
+// dispatch is the property.
+func TestANotifyAskingForAXFRGoesToTheNotifyHandler(t *testing.T) {
+	h := &notifyPipelineHandler{}
+	n := &recordingNotifies{}
+	ft := &fakeTransfers{}
+	srv := dnssrv.NewServer("127.0.0.1:0", h, dnssrv.WithNotifies(n), dnssrv.WithTransfers(ft))
+	if err := srv.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = srv.Shutdown(context.Background()) })
+
+	m := new(dns.Msg).SetNotify("example.com.")
+	m.Question[0].Qtype = dns.TypeAXFR
+	c := new(dns.Client)
+	if _, _, err := c.Exchange(m, srv.Addr()); err != nil {
+		t.Fatalf("exchange: %v", err)
+	}
+
+	if calls, _, opcode, _ := n.snapshot(); calls != 1 || opcode != dns.OpcodeNotify {
+		t.Errorf("ServeNotify called %d times (opcode %d), want 1 NOTIFY — "+
+			"the qtype decided the route and the opcode did not", calls, opcode)
+	}
+	if calls, _, _, _, _ := ft.snapshot(); calls != 0 {
+		t.Errorf("ServeTransfer handled %d messages, want 0: a NOTIFY is not a transfer request", calls)
+	}
+	if got := h.calls.Load(); got != 0 {
+		t.Errorf("the pipeline handled %d messages, want 0", got)
+	}
+}
+
+// The mirror of it, so the fix cannot be "route everything to Notifies": an
+// ordinary AXFR is Opcode QUERY and still belongs to Transfers.
+func TestAnOrdinaryAXFRStillGoesToTheTransferHandler(t *testing.T) {
+	h := &notifyPipelineHandler{}
+	n := &recordingNotifies{}
+	ft := &fakeTransfers{}
+	addr := startServer(t, h, dnssrv.WithNotifies(n), dnssrv.WithTransfers(ft))
+
+	askAXFR(t, addr) // sends it over TCP, which is the only way a transfer arrives
+
+	if calls, _, _, qtype, _ := ft.snapshot(); calls != 1 || qtype != dns.TypeAXFR {
+		t.Errorf("ServeTransfer called %d times (qtype %d), want 1 AXFR", calls, qtype)
+	}
+	if calls, _, _, _ := n.snapshot(); calls != 0 {
+		t.Errorf("ServeNotify handled %d messages, want 0", calls)
+	}
+}

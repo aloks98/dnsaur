@@ -52,6 +52,11 @@ type stubMasterConfig struct {
 	// cannot survive.
 	ns   []string
 	glue []string
+	// nsInAuthority moves the delegation from the ANSWER section to
+	// AUTHORITY, leaving the SOA answer authoritative and untouched: a master
+	// that is referring us to those nameservers rather than speaking for the
+	// zone as them. The one shape that tells the two sections apart.
+	nsInAuthority bool
 	// keys, when set, makes the master verify TSIG on every query and refuse
 	// anything that did not arrive correctly signed — the posture a master
 	// handing out an internal delegation actually runs with.
@@ -122,6 +127,10 @@ func startStubMaster(t *testing.T, zone string, cfg stubMasterConfig) *stubMaste
 				reply.Answer = []dns.RR{soa}
 			case dns.TypeNS:
 				for _, line := range cfg.ns {
+					if cfg.nsInAuthority {
+						reply.Ns = append(reply.Ns, mustRR(t, line))
+						continue
+					}
 					reply.Answer = append(reply.Answer, mustRR(t, line))
 				}
 				for _, line := range cfg.glue {
@@ -590,6 +599,46 @@ func TestStubFetchRejectsTheWrongZonesAnswer(t *testing.T) {
 				t.Errorf("StubUpstreams = %v, want none: nothing may have been installed", u)
 			}
 		})
+	}
+}
+
+// A delegation in AUTHORITY is a referral, and a referral is not this zone's
+// delegation to install: it is somebody else's, handed over by a master that
+// does not speak for this zone. ask reads the ANSWER section only, and this
+// is what says so.
+//
+// The fixture is built so the rule is the only thing under test. The SOA
+// query is still answered authoritatively, in ANSWER and for this very apex,
+// so the fetch gets past the soa == nil check — which is the check that
+// happens to refuse a real-world referring master first, and which would
+// otherwise hide whether ask reads AUTHORITY at all. What is left is a
+// master whose only NS records are in the section ask does not read.
+//
+// Glue is present in ADDITIONAL, deliberately: reading AUTHORITY would find
+// a nameserver with an address and install a working-looking route to it, so
+// the mistake this pins is not a fetch that fails noisily but one that
+// succeeds and points the suffix somewhere the master never claimed to speak
+// for.
+func TestStubFetchIgnoresADelegationInTheAuthoritySection(t *testing.T) {
+	master := startStubMaster(t, transferApex, stubMasterConfig{
+		serial:        primarySerial,
+		ns:            []string{stubNSLine("ns1." + transferApex)},
+		glue:          []string{fmt.Sprintf("ns1.%s. 3600 IN A 10.9.0.1", transferApex)},
+		nsInAuthority: true,
+	})
+	f := newTransferFixture(t, master.addr, 0, asZoneType("stub"))
+
+	_, err := f.stubFetcher().Fetch(context.Background(), f.zone(t))
+	if err == nil {
+		t.Fatal("Fetch installed a delegation the master carried in AUTHORITY: a referral is not the zone's own NS set")
+	}
+	// The message, so a fetch that failed for some other reason — an
+	// unreachable master, a rejected SOA — cannot pass as this rule holding.
+	if !strings.Contains(err.Error(), "no NS for "+transferApex) {
+		t.Errorf("Fetch failed with %v, want the NS query to have found nothing in ANSWER", err)
+	}
+	if u := upstreamsFromSnapshot(t, f); len(u) != 0 {
+		t.Errorf("StubUpstreams = %v, want none: nothing may have been installed", u)
 	}
 }
 

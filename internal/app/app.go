@@ -611,6 +611,13 @@ func (a *App) Start(ctx context.Context) error {
 		// at the current serial — and catches up anything that changed while
 		// the process was down.
 		a.notifier.Run,
+		// The inbound half's lifetime, not a worker: it does nothing until
+		// runCtx ends, and then stops NotifyServer admitting new work and
+		// waits for the goroutine an admitted NOTIFY started. Being in this
+		// list is what puts that goroutine inside a.wg, so Shutdown waits
+		// for it before closing the store rather than pulling the store out
+		// from under a transfer.
+		a.notifyIn.Run,
 		func(c context.Context) { a.refresher.Run(c, refreshEvery) },
 		func(c context.Context) {
 			for {

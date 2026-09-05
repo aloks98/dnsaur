@@ -80,11 +80,21 @@ type NotifyServer struct {
 	// drive the throttle rather than wait for it.
 	now func() time.Time
 
-	// mu guards lastAct, the throttle state behind admit. Held only across
-	// the check — the probe and the transfer happen well outside it, so a
-	// slow primary cannot serialise other zones' NOTIFYs.
+	// mu guards lastAct, the throttle state behind admit, and stopped, the
+	// half of the work lifetime that has to be decided atomically with
+	// wg.Add. Held only across those checks — the probe and the transfer
+	// happen well outside it, so a slow primary cannot serialise other
+	// zones' NOTIFYs.
 	mu      sync.Mutex
 	lastAct map[int64]time.Time
+	stopped bool
+
+	// work is the context every goroutine ServeNotify starts runs under, and
+	// wg counts them. Together they are this server's lifetime: see Run,
+	// which is what App waits on.
+	work     context.Context
+	stopWork context.CancelFunc
+	wg       sync.WaitGroup
 }
 
 // NotifyServerOption configures a NotifyServer at construction.
@@ -120,6 +130,10 @@ func NewNotifyServer(r *Resolver, zs store.ZoneStore, rf Refreshes, opts ...Noti
 		res: r, zs: zs, refresher: rf, now: time.Now,
 		lastAct: make(map[int64]time.Time),
 	}
+	// Not derived from a caller's context on purpose: the work must outlive
+	// the request that started it (RFC 1996 §4.7 replies first and acts
+	// after), and the only thing allowed to end it is Run.
+	n.work, n.stopWork = context.WithCancel(context.Background())
 	for _, opt := range opts {
 		opt(n)
 	}
@@ -325,19 +339,77 @@ func (n *NotifyServer) ServeNotify(ctx context.Context, w dns.ResponseWriter, m 
 		return
 	}
 
-	// A background context, not ctx: dnssrv cancels ctx the moment
-	// ServeNotify returns, and a transfer started under it would be cut off
-	// mid-zone. The same reasoning recordAttempt uses for its own write.
-	go func() {
-		workCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), dnssrv.TransferTimeout)
-		defer cancel()
+	// Not ctx: dnssrv cancels it the moment ServeNotify returns, and a
+	// transfer started under it would be cut off mid-zone. The same
+	// reasoning recordAttempt uses for its own write. startWork's context
+	// comes from this server's own lifetime instead, so the work outlives
+	// the request and nothing else.
+	if !n.startWork(func(workCtx context.Context) {
 		row, err := n.zs.Zone(workCtx, z.ID)
 		if err != nil {
 			slog.Warn("reading a zone after a notify failed", "zone", z.Name, "err", err)
 			return
 		}
 		n.act(workCtx, row)
+	}) {
+		slog.Debug("notify work skipped: the server is shutting down",
+			"zone", z.Name, "peer", peer)
+	}
+}
+
+// Run is this server's lifetime, in the shape App gives every other
+// long-lived worker it owns: a func(context.Context) in a.bg, started under
+// App.wg and waited on by App.Shutdown before it closes the store.
+//
+// It exists because the work an admitted NOTIFY starts happens in a
+// goroutine that, by design, does not inherit the request's context — so
+// without this nothing at all held a reference to it, and a NOTIFY admitted
+// moments before shutdown could still be probing a primary or installing a
+// transferred zone while the store closed underneath it.
+//
+// When the context ends it does both halves, in this order: stop admitting
+// new work, then cancel what is running and wait for it. Cancelling as well
+// as waiting is what keeps shutdown bounded — a probe against a primary that
+// has stopped answering would otherwise hold it for as long as
+// dnssrv.TransferTimeout — and cancelling is safe: a transfer install is one
+// transaction that rolls back whole, and the bookkeeping writes downstream
+// of it already run on contexts stripped of cancellation.
+//
+// A NotifyServer whose Run is never called (every test that does not build
+// one, and any embedder) is unaffected: nothing ever sets stopped, and work
+// runs under a context nothing cancels.
+func (n *NotifyServer) Run(ctx context.Context) {
+	<-ctx.Done()
+	n.mu.Lock()
+	n.stopped = true
+	n.mu.Unlock()
+	n.stopWork()
+	n.wg.Wait()
+}
+
+// startWork runs f in a goroutine this server's lifetime covers, and reports
+// whether it started one at all. False means Run's context has already
+// ended: the reply has gone out, but there is nobody left to do the work
+// for, and starting a goroutine here after wg.Wait returned would both
+// escape the lifetime and race Add against Wait.
+//
+// The Add is under mu with the stopped check, which is what makes that
+// impossible rather than unlikely.
+func (n *NotifyServer) startWork(f func(context.Context)) bool {
+	n.mu.Lock()
+	if n.stopped {
+		n.mu.Unlock()
+		return false
+	}
+	n.wg.Add(1)
+	n.mu.Unlock()
+	go func() {
+		defer n.wg.Done()
+		workCtx, cancel := context.WithTimeout(n.work, dnssrv.TransferTimeout)
+		defer cancel()
+		f(workCtx)
 	}()
+	return true
 }
 
 // act is what a NOTIFY causes, after the reply has already gone out.

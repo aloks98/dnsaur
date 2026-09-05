@@ -103,7 +103,8 @@ type ZoneStore interface {
 	DeleteZone(ctx context.Context, id int64) error
 	// BumpSerial increments soa_serial in SQL rather than read-modify-write,
 	// so two concurrent record edits on the same zone can't land on the
-	// same serial.
+	// same serial. It increments in the uint32 space: 4294967295 bumps to 0,
+	// not to a value no read of the row can scan. See bumpSerialSQL.
 	BumpSerial(ctx context.Context, zoneID int64) error
 	Records(ctx context.Context, zoneID int64) ([]ZoneRecord, error)
 	// AllRecords returns every record for every zone, grouped by zone ID, in
@@ -278,8 +279,23 @@ func (z *zoneStore) DeleteZone(ctx context.Context, id int64) error {
 	return z.s.execOne(ctx, `DELETE FROM zones WHERE id = ?`, id)
 }
 
+// bumpSerialSQL advances a zone's serial by one *in the uint32 space*.
+//
+// The modulo is the whole statement. soa_serial is a 64-bit column on both
+// drivers (sqlite INTEGER, postgres BIGINT) — 0012 explains why it has to be
+// — so a plain `soa_serial + 1` on a zone at 4294967295 stores 4294967296
+// quite happily, and every later read of that row fails scanning it into
+// uint32 and takes the zone out of service. Serials wrap: SerialNewer
+// compares across the wrap (RFC 1982) and the import path's Go arithmetic
+// wraps for free; this is the third and commonest way a serial advances, and
+// it wraps here, in SQL, so that the increment stays atomic.
+//
+// `%` is the modulo operator in both dialects, and the operand is never
+// negative, so the sign-of-remainder difference between them cannot arise.
+const bumpSerialSQL = `UPDATE zones SET soa_serial = (soa_serial + 1) % 4294967296, modified_at = ? WHERE id = ?`
+
 func (z *zoneStore) BumpSerial(ctx context.Context, zoneID int64) error {
-	return z.s.execOne(ctx, `UPDATE zones SET soa_serial = soa_serial + 1, modified_at = ? WHERE id = ?`, time.Now().UnixMilli(), zoneID)
+	return z.s.execOne(ctx, bumpSerialSQL, time.Now().UnixMilli(), zoneID)
 }
 
 func (z *zoneStore) Records(ctx context.Context, zoneID int64) ([]ZoneRecord, error) {

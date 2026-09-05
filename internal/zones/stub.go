@@ -387,6 +387,53 @@ func (f *StubFetcher) nsRecords(ctx context.Context, z store.Zone, ns []dns.RR, 
 	return recs
 }
 
+// stubAbsoluteNames returns the record names a stub holds that are *absolute*
+// names rather than apex-relative ones, keyed the way normalizeName spells a
+// stored name.
+//
+// A stub is the one zone type whose zone_records.name column is not uniformly
+// relative. nsRecords stores an out-of-zone nameserver's addresses under the
+// nameserver's own name ("ns.example.net" in zone corp.lan), because
+// RelRecordName has no apex to strip off it and leaves it alone — see the
+// contrast RelRecordName's own comment draws with RelName. Nothing that
+// *serves* a zone is affected, since a stub serves no records at all
+// (Zone.Answer returns handled=false for the type) and StubUpstreams looks
+// the name up by exactly that spelling. Render is affected: a master file
+// under "$ORIGIN corp.lan." reads that same text as relative and the exported
+// file would address ns.example.net.corp.lan.
+//
+// Which name is which cannot be decided from the name alone — "ns.example.net"
+// under a primary is a perfectly ordinary relative name, served at
+// ns.example.net.corp.lan (RecordFQDN), and it must keep exporting that way.
+// It is decided the same way it was written: a glue name is absolute exactly
+// when the apex NS RRset names it and it is not under the apex, which is the
+// nsRecords branch that stored it unstripped. Disabled records count here —
+// they are not rendered, but a disabled NS still says what its glue's name
+// means.
+func stubAbsoluteNames(z store.Zone, recs []store.ZoneRecord) map[string]bool {
+	if !strings.EqualFold(z.Type, "stub") {
+		return nil
+	}
+	apex := dns.CanonicalName(dns.Fqdn(z.Name))
+	var out map[string]bool
+	for _, r := range recs {
+		if !strings.EqualFold(r.Type, "NS") || normalizeName(r.Name) != apexName {
+			continue
+		}
+		// The rdata of an NS is its target, in the spelling RDataOf produced —
+		// the same read StubUpstreams makes of the same column.
+		target := dns.CanonicalName(dns.Fqdn(r.RData))
+		if target == "." || dns.IsSubDomain(apex, target) {
+			continue
+		}
+		if out == nil {
+			out = make(map[string]bool)
+		}
+		out[normalizeName(r.RData)] = true
+	}
+	return out
+}
+
 // glueFor returns the addresses extra carries for name. Only A and AAAA, and
 // only at exactly that owner name: everything else in an ADDITIONAL section
 // is somebody else's business.

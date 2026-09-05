@@ -91,3 +91,85 @@ func TestRenderStartsWithOriginAndTTL(t *testing.T) {
 		t.Errorf("want a $TTL directive, got:\n%s", out)
 	}
 }
+
+// renderedOwners parses out and returns, per A record address, the owner name
+// the file itself resolves it to — under the $ORIGIN the file carries, which
+// is the whole of what the two tests below are about. Comparing owner names
+// after the parser has applied the origin is what makes the assertion
+// discriminating: the wrong spelling still parses, it just names a different
+// host.
+func renderedOwners(t *testing.T, out string) map[string]string {
+	t.Helper()
+	got := map[string]string{}
+	zp := dns.NewZoneParser(strings.NewReader(out), "", "")
+	for rr, ok := zp.Next(); ok; rr, ok = zp.Next() {
+		if a, isA := rr.(*dns.A); isA {
+			got[a.A.String()] = rr.Header().Name
+		}
+	}
+	if err := zp.Err(); err != nil {
+		t.Fatalf("rendered file does not parse: %v\n---\n%s", err, out)
+	}
+	return got
+}
+
+// A stub stores an out-of-zone nameserver's addresses under the nameserver's
+// own name (stub.go, nsRecords), because RelRecordName has no apex to strip
+// off "ns.example.net" in zone e412.in and leaves it alone. Every other
+// zone_records.name in the server is apex-relative, so writing that one
+// through Render unchanged puts it under $ORIGIN and the exported file claims
+// an address for ns.example.net.e412.in. — a name nobody asked about, while
+// the nameserver the delegation actually names has no address at all.
+//
+// The in-zone nameserver in the same fixture is the other half of the rule:
+// its name IS relative ("ns1" for ns1.e412.in), and it has to keep rendering
+// relative. A fix that qualified every name would export ns1. at the root.
+func TestRenderWritesAStubsOutOfZoneGlueUnderItsOwnName(t *testing.T) {
+	z := testZone()
+	z.Type = "stub"
+	recs := []store.ZoneRecord{
+		{Name: "@", Type: "NS", TTL: 3600, RData: "ns.example.net.", Enabled: true},
+		{Name: "@", Type: "NS", TTL: 3600, RData: "ns1.e412.in.", Enabled: true},
+		{Name: "ns.example.net", Type: "A", TTL: 3600, RData: "10.9.0.7", Enabled: true},
+		{Name: "ns1", Type: "A", TTL: 3600, RData: "10.9.0.1", Enabled: true},
+		// Deliberately hostile, and synthetic: a record stored under the
+		// *full* spelling of an in-zone nameserver. A stub cannot produce it
+		// (nsRecords strips the apex off an in-zone target, and the record
+		// API refuses to write into a stub at all), so it is here to keep the
+		// rule standing on its own two conditions — named by the apex NS set
+		// AND outside the apex — rather than on RelRecordName's stripping
+		// two functions away. This name is relative like any other: it means
+		// ns1.e412.in.e412.in.
+		{Name: "ns1.e412.in", Type: "A", TTL: 3600, RData: "10.9.0.2", Enabled: true},
+	}
+
+	owners := renderedOwners(t, zones.Render(z, recs))
+	if got := owners["10.9.0.7"]; got != "ns.example.net." {
+		t.Errorf("out-of-zone glue is owned by %q, want ns.example.net. — the exported file addresses a name the delegation does not name", got)
+	}
+	if got := owners["10.9.0.1"]; got != "ns1.e412.in." {
+		t.Errorf("in-zone glue is owned by %q, want ns1.e412.in.", got)
+	}
+	if got := owners["10.9.0.2"]; got != "ns1.e412.in.e412.in." {
+		t.Errorf("owner = %q, want ns1.e412.in.e412.in. — a name the apex NS set spells in full is still relative unless it is outside the apex", got)
+	}
+}
+
+// The same stored name on any other zone type is a *relative* name and must
+// keep rendering as one. A record written through POST /zones/{id}/records
+// named "ns.example.net" in zone e412.in is served at ns.example.net.e412.in.
+// (RecordFQDN), so exporting it absolute would change where it points.
+// Render is shared by every zone type; only a stub stores an absolute name in
+// that column.
+func TestRenderKeepsARelativeNameRelativeOnAPrimary(t *testing.T) {
+	z := testZone()
+	recs := []store.ZoneRecord{
+		{Name: "@", Type: "NS", TTL: 3600, RData: "ns.example.net.", Enabled: true},
+		{Name: "ns.example.net", Type: "A", TTL: 3600, RData: "10.9.0.7", Enabled: true},
+	}
+
+	owners := renderedOwners(t, zones.Render(z, recs))
+	if got := owners["10.9.0.7"]; got != "ns.example.net.e412.in." {
+		t.Errorf("owner = %q, want ns.example.net.e412.in. — a primary's stored name is relative and is served under the apex", got)
+	}
+}

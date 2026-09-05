@@ -317,7 +317,9 @@ Full parameter/response detail lives in `internal/api/openapi.yaml`
   this target acknowledged; meaningless until `notified_at` is non-zero),
   `notified_at` (unix ms of the last round that landed, `0` = never
   delivered), `attempts` (how many times the *current* round has been
-  tried), `max_attempts` (the round budget, currently `5`, sent alongside
+  tried — a target that spent its whole budget against an older serial
+  reports `0` here as soon as the zone's serial moves, because that is a new
+  round), `max_attempts` (the round budget, currently `5`, sent alongside
   `attempts` so a client never hardcodes the denominator), `last_error`
   (the most recent failure in the sender's own words, `""` when the last
   attempt landed or none has been tried), and `created_at` (unix ms the
@@ -335,10 +337,15 @@ Full parameter/response detail lives in `internal/api/openapi.yaml`
     mistaken for current). Nothing to do.
   - **`retrying`** — behind the current serial, and `attempts` is still
     under `max_attempts`. Mid-round; nothing to do yet.
-  - **`gave_up`** — behind the current serial, and `attempts` has reached
-    `max_attempts`. **This is not a failure the operator needs to act on**:
-    the round simply rests, and it starts over from `attempts: 0` on the
-    next serial bump — the zone's own next edit — with no action required.
+  - **`gave_up`** — behind the current serial, and the *current round* has
+    reached `max_attempts`. **This is not a failure the operator needs to act
+    on**: the round simply rests, and it starts over from `attempts: 0` on
+    the next serial bump — the zone's own next edit — with no action
+    required. The round is what the state is scoped to, so a target that
+    exhausted its budget against serial 100 reads `retrying` the moment the
+    zone reaches 101, not when the notifier's next pass gets to it: the
+    notifier has already decided to send, and the two must not disagree
+    about a word.
     (This is also what a target that has *never* been delivered *and* has
     exhausted its attempts reports — `never` means "not yet tried", not
     "tried and failed", so that combination is `gave_up`, not `never`.)

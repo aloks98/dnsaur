@@ -33,11 +33,25 @@ func Render(z store.Zone, recs []store.ZoneRecord) string {
 	fmt.Fprintf(&b, "\t%d ; expire\n", z.SOAExpire)
 	fmt.Fprintf(&b, "\t%d ) ; minimum\n", z.SOAMinimum)
 
+	// A stub's out-of-zone glue is the one stored name that is not relative to
+	// the apex, and writing it out under $ORIGIN would address a name the
+	// delegation does not name. Every other zone type — and every other name a
+	// stub holds — is relative and passes through unchanged. See
+	// stubAbsoluteNames for why the name alone cannot decide this.
+	absolute := stubAbsoluteNames(z, recs)
+
 	for _, r := range recs {
 		if !r.Enabled {
 			continue
 		}
-		fmt.Fprintf(&b, "%s %d IN %s %s\n", r.Name, r.TTL, r.Type, r.RData)
+		name := r.Name
+		if absolute[normalizeName(name)] {
+			// The trailing dot is the whole of the fix: it is what makes a
+			// master file read the owner as the name it already is rather
+			// than as a name under the origin.
+			name = normalizeName(name) + "."
+		}
+		fmt.Fprintf(&b, "%s %d IN %s %s\n", name, r.TTL, r.Type, r.RData)
 	}
 
 	return b.String()

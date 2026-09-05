@@ -6,6 +6,7 @@ import (
 	"maps"
 	"net"
 	"runtime"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -344,6 +345,31 @@ func TestSetConditionalReplacesRoutes(t *testing.T) {
 		return resp.Upstream
 	}
 
+	// The route itself, not merely which upstream answered. Under failover
+	// the first candidate answers and resp.Upstream reports it, so a
+	// replacement that *merged* -- new upstreams first, the outgoing ones
+	// appended behind them -- serves every query from the new one and is
+	// invisible to routedTo. It is not invisible to a zone: the old
+	// nameserver stays a fallback the operator has already removed, and it
+	// answers the moment the new one is unhealthy. The addresses are compared
+	// in order because the order is what the strategies consume.
+	routeFor := func(stage, suffix string) []string {
+		t.Helper()
+		tbl := f.condTableLoad()
+		if tbl == nil {
+			t.Fatalf("%s: no conditional table at all", stage)
+		}
+		ups, ok := tbl.routes[suffix]
+		if !ok {
+			t.Fatalf("%s: no route for %s; table has %v", stage, suffix, slices.Sorted(maps.Keys(tbl.routes)))
+		}
+		addrs := make([]string, 0, len(ups))
+		for _, u := range ups {
+			addrs = append(addrs, u.addr)
+		}
+		return addrs
+	}
+
 	// No conditional routes yet: the default answers.
 	if got := routedTo("before SetConditional"); got != pub {
 		t.Fatalf("before SetConditional: upstream = %s, want the default %s", got, pub)
@@ -355,6 +381,9 @@ func TestSetConditionalReplacesRoutes(t *testing.T) {
 	if got := routedTo("after SetConditional"); got != corp {
 		t.Fatalf("after SetConditional: upstream = %s, want %s", got, corp)
 	}
+	if got := routeFor("after SetConditional", "corp.example"); !slices.Equal(got, []string{corp}) {
+		t.Fatalf("after SetConditional: route = %v, want exactly [%s]", got, corp)
+	}
 
 	// Replacing the table re-routes; the old route is gone, not merged.
 	if err := f.SetConditional(map[string][]string{"corp.example": {other}}); err != nil {
@@ -363,6 +392,9 @@ func TestSetConditionalReplacesRoutes(t *testing.T) {
 	if got := routedTo("after replacement"); got != other {
 		t.Fatalf("after replacement: upstream = %s, want %s", got, other)
 	}
+	if got := routeFor("after replacement", "corp.example"); !slices.Equal(got, []string{other}) {
+		t.Fatalf("after replacement: route = %v, want exactly [%s] — %s is gone, not demoted behind it", got, other, corp)
+	}
 
 	// An empty table releases the suffix back to the defaults.
 	if err := f.SetConditional(nil); err != nil {
@@ -370,6 +402,9 @@ func TestSetConditionalReplacesRoutes(t *testing.T) {
 	}
 	if got := routedTo("after clearing"); got != pub {
 		t.Fatalf("after clearing: upstream = %s, want the default %s", got, pub)
+	}
+	if tbl := f.condTableLoad(); tbl != nil {
+		t.Errorf("after clearing: the conditional table is still installed with %v", slices.Sorted(maps.Keys(tbl.routes)))
 	}
 }
 

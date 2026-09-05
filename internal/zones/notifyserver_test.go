@@ -29,9 +29,20 @@ type fakeRefresher struct {
 	// ctxAlive records whether the context Refresh was handed was still
 	// live when it ran — the whole point of the background handoff.
 	ctxAlive bool
+	// entered, when non-nil, gets one non-blocking send per call *before*
+	// gate is waited on. gate alone cannot tell a test that the work
+	// goroutine is running, only that it has finished, and a lifetime test
+	// has to catch it in flight.
+	entered chan struct{}
 }
 
 func (f *fakeRefresher) Refresh(ctx context.Context, zoneID int64) (zones.TransferResult, error) {
+	if f.entered != nil {
+		select {
+		case f.entered <- struct{}{}:
+		default:
+		}
+	}
 	if f.gate != nil {
 		<-f.gate
 	}
@@ -650,4 +661,91 @@ func TestNotifyResolvesPrimariesOnlyAfterTheZoneChecksPass(t *testing.T) {
 			t.Error("a NOTIFY that passed decideZone never resolved its primaries — the stub is not wired up")
 		}
 	})
+}
+
+// The work a NOTIFY starts outlives the request (the test above), which used
+// to mean it outlived everything: the goroutine was `go func()` with nothing
+// holding a reference to it, so a NOTIFY admitted moments before shutdown
+// could still be probing a primary, or transferring a zone into the store,
+// while App.Shutdown closed that store underneath it.
+//
+// Run is the lifetime. It is the shape every other long-lived worker in App
+// has — a func(context.Context) in a.bg, waited on by App.wg — and it does
+// two things when its context ends: stops the server admitting new work, and
+// waits for the work already admitted to unwind.
+//
+// The three assertions are the three halves of that (the middle one is what
+// makes the first meaningful):
+//
+//   - Run does not return while admitted work is in flight;
+//   - it does return once that work finishes;
+//   - and after it has returned, a NOTIFY that still gets a reply starts no
+//     goroutine at all — not even one that is going to give up, because
+//     that one would be outside the WaitGroup Wait has already returned
+//     from, and it still reaches the store on its way to giving up.
+//
+// The last assertion is about the store read, not about the transfer.
+// Cancelling the work context alone stops the transfer, so a server that
+// only cancelled would pass an assertion phrased as "no refresh ran" while
+// still spawning an untracked goroutine that reads a store which is about to
+// close. The log line that read writes on failure is what tells the two
+// apart.
+func TestNotifyServerRunWaitsForTheWorkItAdmitted(t *testing.T) {
+	logs := captureLogs(t)
+	clock := time.Date(2026, 9, 5, 12, 0, 0, 0, time.UTC)
+	f := newNotifyFixture(t, notifyZone(),
+		zones.WithNotifyServerNow(func() time.Time { return clock }))
+	f.rf.entered = make(chan struct{}, 4)
+	f.rf.gate = make(chan struct{})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	runDone := make(chan struct{})
+	go func() { defer close(runDone); f.ns.Run(ctx) }()
+
+	if rc := f.notify(t, notifyApex, dns.TypeSOA, "10.0.0.1", "", nil).Rcode; rc != dns.RcodeSuccess {
+		t.Fatalf("rcode = %s, want NOERROR", dns.RcodeToString[rc])
+	}
+	select {
+	case <-f.rf.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the work the NOTIFY admitted never started")
+	}
+
+	// Shutdown, with the transfer still running.
+	cancel()
+	select {
+	case <-runDone:
+		t.Fatal("Run returned while the work it admitted was still in flight — " +
+			"App.wg would have released and the store would close underneath it")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(f.rf.gate)
+	select {
+	case <-runDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run never returned after the work it was waiting for finished")
+	}
+	if f.rf.count() != 1 {
+		t.Fatalf("Refresh ran %d times, want 1", f.rf.count())
+	}
+
+	// A NOTIFY after the lifetime has ended. The clock moves past the
+	// throttle so that a server which *would* have worked is not excused by
+	// admit() instead.
+	clock = clock.Add(time.Minute)
+	if rc := f.notify(t, notifyApex, dns.TypeSOA, "10.0.0.1", "", nil).Rcode; rc != dns.RcodeSuccess {
+		t.Fatalf("rcode after shutdown = %s, want NOERROR", dns.RcodeToString[rc])
+	}
+	select {
+	case <-f.rf.entered:
+		t.Fatal("a NOTIFY admitted after Run returned started work nothing is waiting for")
+	case <-time.After(200 * time.Millisecond):
+	}
+	for _, r := range logs() {
+		if r.Message == "reading a zone after a notify failed" {
+			t.Fatal("a NOTIFY admitted after Run returned still spawned a goroutine that read the store — " +
+				"it is outside the WaitGroup Shutdown already waited on")
+		}
+	}
 }

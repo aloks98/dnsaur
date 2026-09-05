@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -413,5 +414,129 @@ func TestNotifierDoesNotRetryARefusedTarget(t *testing.T) {
 	}
 	if got := r.received.Load(); got != 1 {
 		t.Errorf("responder saw %d requests after a second pass, want 1 — a REFUSED target was retried", got)
+	}
+}
+
+// countingNotifies is the real store with a tally of Reconcile calls. The
+// embedded interface keeps it honest: every other method is the store's own,
+// so the pass under test is the one that runs against real rows.
+type countingNotifies struct {
+	store.NotifyStore
+	reconciles atomic.Int64
+}
+
+func (c *countingNotifies) Reconcile(ctx context.Context, zoneID int64, targets []string, now int64) error {
+	c.reconciles.Add(1)
+	return c.NotifyStore.Reconcile(ctx, zoneID, targets, now)
+}
+
+// Reconcile is a transaction — two statements that must land together — and
+// the pass used to open one per enabled zone per tick, including for a zone
+// with no targets at all. Every install has the fifteen RFC 6303 built-ins
+// seeded (internal/store/builtins.go) and most have no NOTIFY configured
+// anywhere, so the steady state was fifteen-odd read-only transactions every
+// five seconds to discover, each time, that there was nothing to do.
+//
+// The pass reads the queue once up front and reconciles only the zones whose
+// rows disagree with their notify_to. The store's Reconcile is unchanged:
+// when it is called, it still does the whole thing atomically.
+//
+// The fixture is the real one — a store carrying its built-in zones — so
+// "nothing to reconcile" is the shape an ordinary install actually has,
+// rather than one zone in isolation.
+func TestPassReconcilesOnlyTheZonesWhoseTargetsChanged(t *testing.T) {
+	ctx := context.Background()
+	st := openTestStore(t)
+	id, err := st.Zones().AddZone(ctx, store.Zone{
+		Name: notifyApex, Type: "primary", Enabled: true,
+		NotifyTo: "10.0.0.2:53, 10.0.0.3:53",
+		SOANS:    "ns1." + notifyApex, SOAMbox: "hostmaster." + notifyApex,
+		SOASerial: 10, SOARefresh: 3600, SOARetry: 600,
+		SOAExpire: 604800, SOAMinimum: 300, SOATTL: 900,
+	})
+	if err != nil {
+		t.Fatalf("AddZone: %v", err)
+	}
+	ns := &countingNotifies{NotifyStore: st.Notifies()}
+	clock := time.Date(2026, 9, 5, 12, 0, 0, 0, time.UTC)
+	n := zones.NewNotifier(st.Zones(), ns, st.TSIGKeys(),
+		zones.WithNotifyNow(func() time.Time { return clock }),
+		zones.WithNotifySender(&fakeSender{}))
+	pass := func() {
+		t.Helper()
+		if err := n.Pass(ctx); err != nil {
+			t.Fatalf("Pass: %v", err)
+		}
+	}
+	targets := func() map[string]bool {
+		t.Helper()
+		rows, err := st.Notifies().ByZone(ctx, id)
+		if err != nil {
+			t.Fatalf("ByZone: %v", err)
+		}
+		out := map[string]bool{}
+		for _, r := range rows {
+			out[r.Target] = true
+		}
+		return out
+	}
+
+	// The first pass has real work: the two rows do not exist yet. One zone
+	// has targets, so one reconcile — not sixteen.
+	pass()
+	if got := ns.reconciles.Load(); got != 1 {
+		t.Fatalf("first pass reconciled %d zones, want 1 (the other fifteen have no targets)", got)
+	}
+	if got := targets(); len(got) != 2 {
+		t.Fatalf("rows = %v, want the two targets", got)
+	}
+
+	// The steady state: every row already matches every notify_to.
+	pass()
+	pass()
+	if got := ns.reconciles.Load(); got != 1 {
+		t.Errorf("two further passes reconciled %d zones in total, want the original 1 — "+
+			"a pass with nothing to reconcile must open no transaction", got)
+	}
+
+	// And the skip must not be "never reconcile": an edited list still
+	// converges on the next pass.
+	z, err := st.Zones().Zone(ctx, id)
+	if err != nil {
+		t.Fatalf("Zone: %v", err)
+	}
+	z.NotifyTo = "10.0.0.3:53, 10.0.0.9:53"
+	if err := st.Zones().UpdateZone(ctx, z); err != nil {
+		t.Fatalf("UpdateZone: %v", err)
+	}
+	pass()
+	if got := ns.reconciles.Load(); got != 2 {
+		t.Errorf("after an edit, %d reconciles in total, want 2", got)
+	}
+	if got := targets(); !got["10.0.0.3:53"] || !got["10.0.0.9:53"] || len(got) != 2 {
+		t.Errorf("rows = %v, want exactly the edited list", got)
+	}
+
+	// Clearing the list is a change too, and the one a skip keyed on
+	// "targets is empty" would get wrong: the rows have to go.
+	z, err = st.Zones().Zone(ctx, id)
+	if err != nil {
+		t.Fatalf("Zone: %v", err)
+	}
+	z.NotifyTo = ""
+	if err := st.Zones().UpdateZone(ctx, z); err != nil {
+		t.Fatalf("UpdateZone: %v", err)
+	}
+	pass()
+	if got := ns.reconciles.Load(); got != 3 {
+		t.Errorf("after clearing notify_to, %d reconciles in total, want 3", got)
+	}
+	if got := targets(); len(got) != 0 {
+		t.Errorf("rows = %v, want none: the zone notifies nobody now", got)
+	}
+	// ...and once they are gone it is back to nothing to do.
+	pass()
+	if got := ns.reconciles.Load(); got != 3 {
+		t.Errorf("a pass after the rows were deleted reconciled again (%d in total, want 3)", got)
 	}
 }

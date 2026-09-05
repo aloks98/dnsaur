@@ -737,3 +737,53 @@ func TestUpdateZonePersistsForwardTo(t *testing.T) {
 		}
 	})
 }
+
+// TestBumpSerialWrapsAtMaxUint32 is the input that discriminates: a zone at
+// 4294967295. `soa_serial + 1` writes 4294967296, which is a perfectly happy
+// value in an sqlite INTEGER and a postgres BIGINT and no longer a serial —
+// every subsequent read of that zone fails scanning it into uint32, and the
+// zone is out of service until somebody edits the row by hand.
+//
+// A serial is uint32 and wraps, which the rest of the product already knows:
+// zones.SerialNewer compares across the wrap (RFC 1982) and the zone-file
+// import path increments in Go arithmetic that wraps for free. This is the
+// commonest serial-advancing path of the three, and it is the one that could
+// not reach 0 at all.
+//
+// Bumping 7 to 8 (above) cannot fail this way, which is why that test alone
+// left the defect in place from Milestone A to D4.
+func TestBumpSerialWrapsAtMaxUint32(t *testing.T) {
+	forEachDriver(t, func(t *testing.T, s Store) {
+		ctx := context.Background()
+		id, err := s.Zones().AddZone(ctx, Zone{
+			Name: testGroupName("wrap.test"), Type: "primary", Enabled: true,
+			SOASerial: 4294967295,
+		})
+		if err != nil {
+			t.Fatalf("AddZone: %v", err)
+		}
+		if err := s.Zones().BumpSerial(ctx, id); err != nil {
+			t.Fatalf("BumpSerial: %v", err)
+		}
+		// Reading it back is half the assertion: the failure mode is not a
+		// wrong serial but an unreadable row.
+		z, err := s.Zones().Zone(ctx, id)
+		if err != nil {
+			t.Fatalf("Zone after bumping 4294967295: %v", err)
+		}
+		if z.SOASerial != 0 {
+			t.Errorf("SOASerial = %d, want 0 (wrapped)", z.SOASerial)
+		}
+		// And the zone must keep working afterwards: 0 -> 1, not stuck.
+		if err := s.Zones().BumpSerial(ctx, id); err != nil {
+			t.Fatalf("BumpSerial after wrap: %v", err)
+		}
+		z, err = s.Zones().Zone(ctx, id)
+		if err != nil {
+			t.Fatalf("Zone after the wrap: %v", err)
+		}
+		if z.SOASerial != 1 {
+			t.Errorf("SOASerial = %d, want 1", z.SOASerial)
+		}
+	})
+}

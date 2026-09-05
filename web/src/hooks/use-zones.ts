@@ -251,11 +251,13 @@ export function useZoneRecords(zoneId: number) {
  * internal/api/notifies_handlers.go) — GET /zones/{id}/notifies's own row,
  * Task 11's read side of D4.
  *
- * `state` is derived server-side from `notified_at`, `notified_serial` and
- * `attempts` against the zone's current `soa_serial`, deliberately never
- * left for the client to infer from those columns — see notifyStateOf's own
- * comment: two clients could compute it differently, and a status that can
- * disagree with itself is not a status.
+ * `state` is derived server-side from `notified_at`, `notified_serial`,
+ * `attempts` and `pending_serial` against the zone's current `soa_serial`,
+ * deliberately never left for the client to infer from those columns — see
+ * notifyStateOf's own comment: two clients could compute it differently, and
+ * a status that can disagree with itself is not a status. `pending_serial`
+ * is what scopes `state` and `attempts` to the round the notifier is in, so
+ * neither can describe a round the zone has already moved past.
  */
 export interface ZoneNotify {
   /** host:port, as written in the zone's notify_to (port always explicit).
@@ -268,7 +270,8 @@ export interface ZoneNotify {
   /** Unix ms of the last round that landed; 0 = never delivered. */
   notified_at: number;
   /** How many times the current round has been tried. Reset to 0 by a
-   * delivery that lands. */
+   * delivery that lands, and by the zone's serial moving on — a budget spent
+   * against an older serial is not this round's. */
   attempts: number;
   /** The round budget attempts is compared against — sent alongside
    * attempts so "try 3/5" never hardcodes the denominator. */
