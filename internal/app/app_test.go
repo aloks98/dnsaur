@@ -17,37 +17,6 @@ import (
 	"github.com/miekg/dns"
 )
 
-func TestParseUpstreams(t *testing.T) {
-	cases := []struct {
-		name string
-		in   string
-		want []string
-	}{
-		{"trims spaces", " 1.1.1.1:53 , 8.8.8.8:53 ", []string{"1.1.1.1:53", "8.8.8.8:53"}},
-		{"drops empties", "1.1.1.1:53,,  ,9.9.9.9:53", []string{"1.1.1.1:53", "9.9.9.9:53"}},
-		{"appends missing port", "1.1.1.1,dns.example.com", []string{"1.1.1.1:53", "dns.example.com:53"}},
-		{"keeps existing port", "1.1.1.1:5353", []string{"1.1.1.1:5353"}},
-		{"brackets bare ipv6", "::1", []string{"[::1]:53"}},
-		{"leaves bracketed ipv6 with port as-is", "[::1]:53", []string{"[::1]:53"}},
-		{"adds port to bracketed ipv6 missing one", "[::1]", []string{"[::1]:53"}},
-		{"empty string yields nothing", "", nil},
-		{"all whitespace/commas yields nothing", " , , ", nil},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			got := parseUpstreams(tc.in)
-			if len(got) != len(tc.want) {
-				t.Fatalf("parseUpstreams(%q) = %v, want %v", tc.in, got, tc.want)
-			}
-			for i := range got {
-				if got[i] != tc.want[i] {
-					t.Fatalf("parseUpstreams(%q) = %v, want %v", tc.in, got, tc.want)
-				}
-			}
-		})
-	}
-}
-
 // TestApplySettingsFallsBackWhenNoForwarderYet reproduces the "nil forwarder
 // on first applySettings failure" bug: if upstream.New fails while
 // swappable.h has never been set, every DNS query used to panic (recovered,
@@ -1293,4 +1262,97 @@ func TestShutdownWaitsForTheWorkAnInboundNotifyStarted(t *testing.T) {
 				"its lifetime is outside App.wg, so the store closes underneath it")
 		}
 	})
+}
+
+// applySettings rebuilds the forwarder on every settings write and must
+// retire the one it displaces.
+//
+// swappable.set returns the displaced Forwarder and has exactly one call
+// site. A second call site that dropped that return value would leak up to
+// four pooled TLS connections per upstream, per save, with nothing failing —
+// the symptom arrives weeks later as "too many open files". Nothing asserted
+// this: app_test drives a live settings change, so the path executes, but
+// the close itself was unobserved.
+func TestApplySettingsClosesTheForwarderItDisplaces(t *testing.T) {
+	ctx := context.Background()
+	a := newTestApp(t, withUpstreams(mockDNS(t, answerA("5.6.7.8"))))
+
+	old := a.fwd.forwarder()
+	if old == nil {
+		t.Fatal("no forwarder was ever installed")
+	}
+	if old.Closed() {
+		t.Fatal("the live forwarder is already closed")
+	}
+
+	// SetInternal, not Set: this drives applySettings directly rather than
+	// waking the watcher, so the assertion runs after exactly one swap.
+	if err := a.Store().Settings().SetInternal(ctx, "upstreams", mockDNS(t, answerA("6.6.6.6"))); err != nil {
+		t.Fatalf("SetInternal(upstreams): %v", err)
+	}
+	a.applySettings(ctx)
+
+	if a.fwd.forwarder() == old {
+		t.Fatal("the forwarder was not replaced, so there was nothing to close")
+	}
+	if !old.Closed() {
+		t.Error("the displaced forwarder was never closed: every settings save leaks its pooled connections")
+	}
+}
+
+// Rung three of the applySettings ladder — the hardcoded plaintext defaults
+// — had never executed under test.
+//
+// Before this milestone it was unreachable for upstream reasons at all:
+// parsing an upstream could not fail, so buildForwarder only failed on a bad
+// strategy string, which rung two already handles (see
+// TestApplySettingsFallsBackWhenNoForwarderYet). ParseUpstreams can now
+// reject, which makes the rung reachable *because of the upstreams value
+// itself*, and its defaults are 1.1.1.1:53,1.0.0.1:53,9.9.9.9:53 — plaintext.
+//
+// So an operator whose stored value asks for DNS-over-TLS can end up with
+// every query in the clear against public resolvers, with the settings page
+// still showing the encrypted value and an ERROR log as the only signal.
+// The choice is to keep resolving; the requirement is that it is visible.
+func TestApplySettingsRecordsAnEncryptionDowngradeOnTheLastRung(t *testing.T) {
+	ctx := context.Background()
+	// Parses as far as the scheme and no further: missing "#name". Nothing
+	// dials here — the defaults' forwarder is built, not used.
+	a := newTestApp(t, withUpstreams("tls://1.1.1.1:853"))
+
+	if !a.fwd.isSet() {
+		t.Fatal("no forwarder installed: the ladder did not reach its last rung")
+	}
+	active, reason := a.UpstreamDowngrade()
+	if !active {
+		t.Fatal("the server is resolving in the clear against the default resolvers and says nothing about it")
+	}
+	if !strings.Contains(reason, "tls://1.1.1.1:853") {
+		t.Errorf("reason = %q, want the rejected entry named", reason)
+	}
+
+	// And it clears when the operator fixes the setting. A warning that
+	// survives the fix is worse than no warning.
+	if err := a.Store().Settings().SetInternal(ctx, "upstreams", "tls://1.1.1.1:853#cloudflare-dns.com"); err != nil {
+		t.Fatalf("SetInternal(upstreams): %v", err)
+	}
+	a.applySettings(ctx)
+	if active, reason := a.UpstreamDowngrade(); active {
+		t.Errorf("still downgraded after a successful apply with encrypted upstreams: %q", reason)
+	}
+}
+
+// The same rung with a *plaintext* stored value is not a downgrade: falling
+// from one set of plaintext resolvers to another takes nothing away, and
+// warning about it would spend the operator's attention on a non-event.
+func TestApplySettingsDoesNotCallAPlaintextFallbackADowngrade(t *testing.T) {
+	// "#name" has no meaning on a plain entry, so this reaches the same rung.
+	a := newTestApp(t, withUpstreams("1.1.1.1:53#cloudflare-dns.com"))
+
+	if !a.fwd.isSet() {
+		t.Fatal("no forwarder installed: the ladder did not reach its last rung")
+	}
+	if active, reason := a.UpstreamDowngrade(); active {
+		t.Errorf("a plaintext value that would not parse was reported as an encryption downgrade: %q", reason)
+	}
 }

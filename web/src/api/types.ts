@@ -13,6 +13,21 @@ export interface HealthStatus {
   version: string;
 }
 
+/**
+ * GET /resolver/status — state of the running resolver that is not a
+ * setting, and so deliberately not part of the flat GET /settings map.
+ *
+ * `encryption_downgraded` means the stored `upstreams` value asked for
+ * tls:// or https://, would not parse, and the server fell back to its
+ * hardcoded plaintext resolvers: queries are going out in the clear while
+ * the settings page still shows the encrypted value. `reason` is the parse
+ * failure.
+ */
+export interface ResolverStatus {
+  encryption_downgraded: boolean;
+  reason: string;
+}
+
 export interface Group {
   id: number;
   name: string;

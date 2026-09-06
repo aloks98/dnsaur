@@ -1,14 +1,24 @@
 package api
 
 import (
+	"errors"
+	"fmt"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/aloks98/dnsaur/internal/upstream"
 )
 
-var editableSettings = map[string]func(string) bool{
-	"upstreams":             func(v string) bool { return strings.TrimSpace(v) != "" },
+// A validator returns why a value is refused, so the 400 can say it. It was
+// a bool: every rejection read "invalid value for upstreams", which names
+// the field and not the problem — unhelpful for a free-text setting with a
+// grammar, and the reason the upstreams entry was never given a real check
+// at all.
+var editableSettings = map[string]func(string) error{
+	"upstreams":             validUpstreams,
 	"upstream.strategy":     oneOf("failover", "fastest", "race"),
 	"blocking.mode":         oneOf("null-ip", "nxdomain"),
 	"blocking.ttl":          nonNegInt,
@@ -21,25 +31,34 @@ var editableSettings = map[string]func(string) bool{
 	"qlog.privacy":          oneOf("full", "anon", "none"),
 }
 
-func oneOf(vals ...string) func(string) bool {
-	return func(v string) bool {
-		for _, x := range vals {
-			if v == x {
-				return true
-			}
+// validUpstreams runs the same parser applySettings runs, so a value that
+// saves is a value that will build a forwarder.
+func validUpstreams(v string) error {
+	_, err := upstream.ParseUpstreams(v)
+	return err
+}
+
+func oneOf(vals ...string) func(string) error {
+	return func(v string) error {
+		if slices.Contains(vals, v) {
+			return nil
 		}
-		return false
+		return fmt.Errorf("must be one of: %s", strings.Join(vals, ", "))
 	}
 }
 
-func nonNegInt(v string) bool {
+func nonNegInt(v string) error {
 	n, err := strconv.ParseInt(v, 10, 64)
-	return err == nil && n >= 0
+	if err != nil || n < 0 {
+		return errors.New("must be a whole number, zero or more")
+	}
+	return nil
 }
 
 func (s *Server) settingsRoutes() {
 	s.route("GET /api/v1/settings", s.requireAuth(s.handleSettingsGet))
 	s.route("PUT /api/v1/settings", s.requireAuth(s.handleSettingsPut))
+	s.route("GET /api/v1/resolver/status", s.requireAuth(s.handleResolverStatus))
 	s.route("GET /api/v1/blocking", s.requireAuth(s.handleBlockingGet))
 	s.route("POST /api/v1/blocking/pause", s.requireAuth(s.handlePause))
 	s.route("DELETE /api/v1/blocking/pause", s.requireAuth(s.handleResume))
@@ -59,6 +78,33 @@ func (s *Server) handleSettingsGet(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, all)
 }
 
+// resolverStatus is what the settings screen needs to know about the running
+// resolver that is not a setting. One field today, plus its reason; a flat
+// object rather than a bare boolean so the next such fact does not need a
+// second endpoint.
+type resolverStatus struct {
+	// EncryptionDowngraded: the stored `upstreams` asked for tls:// or
+	// https://, would not parse, and the server is resolving through the
+	// hardcoded plaintext defaults instead. Queries are going out in the
+	// clear while the settings page still shows the operator's encrypted
+	// value, which is why this needs saying somewhere other than the log.
+	EncryptionDowngraded bool `json:"encryption_downgraded"`
+	// Reason is the parse failure, verbatim, or "" when nothing is wrong.
+	Reason string `json:"reason"`
+}
+
+// handleResolverStatus answers the one round trip the settings page makes
+// for server state. Deps.ResolverStatus is nil in test servers with no App
+// behind them; a server with no forwarder has downgraded nothing, so that
+// answers false.
+func (s *Server) handleResolverStatus(w http.ResponseWriter, r *http.Request) {
+	var out resolverStatus
+	if s.deps.ResolverStatus != nil {
+		out.EncryptionDowngraded, out.Reason = s.deps.ResolverStatus.UpstreamDowngrade()
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
 type settingPut struct {
 	Key   string `json:"key"`
 	Value string `json:"value"`
@@ -75,8 +121,10 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusBadRequest, "setting not editable: "+body.Key)
 		return
 	}
-	if !validate(body.Value) {
-		errJSON(w, http.StatusBadRequest, "invalid value for "+body.Key)
+	if err := validate(body.Value); err != nil {
+		// The prefix stays: it is what the existing suite and the web form
+		// both key off. The reason is appended, not substituted.
+		errJSON(w, http.StatusBadRequest, "invalid value for "+body.Key+": "+err.Error())
 		return
 	}
 	if err := s.deps.Store.Settings().Set(r.Context(), body.Key, body.Value); err != nil {

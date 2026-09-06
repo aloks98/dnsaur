@@ -627,3 +627,13 @@ upstream configuration fails to build, it keeps the previous working
 forwarder rather than replacing it with something broken, falling back
 through progressively safer defaults only if no forwarder has ever been
 installed.
+
+That last rung has one consequence worth stating out loud: **the hardcoded
+defaults are plaintext.** If the stored `upstreams` value asked for
+DNS-over-TLS or DNS-over-HTTPS and would not parse, resolving through them
+is not a smaller version of what was configured but the opposite of it. The
+choice is still to keep resolving — a resolver that stops entirely is worse
+than one that resolves unencrypted — but never silently: `App` records the
+downgrade, `GET /resolver/status` reports it, and the settings screen shows
+a persistent warning until the setting is fixed. The record clears the
+moment a later apply installs a forwarder built from the stored value.

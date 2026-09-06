@@ -46,6 +46,27 @@ type ZoneRefresher interface {
 	Refresh(ctx context.Context, zoneID int64) (zones.TransferResult, error)
 }
 
+// ResolverStatus reports state of the running resolver that the dashboard
+// has to show but that is not a setting — today, exactly one thing: whether
+// the forwarder in use is the hardcoded plaintext fallback, installed
+// because the stored `upstreams` value asked for an encrypted transport and
+// would not parse.
+//
+// It is not folded into GET /settings on purpose. That response is a flat
+// key -> value map of *settings*, pure enough that handleSettingsGet strips
+// the internal keys out of it; this is server state, and a value in that map
+// that no PUT could ever write would be a different kind of thing wearing
+// the same shape.
+//
+// An interface, and nil-tolerant (see handleResolverStatus): internal/app is
+// what implements it, and internal/app imports this package, so the concrete
+// type cannot be named here.
+type ResolverStatus interface {
+	// UpstreamDowngrade reports whether encrypted upstreams were replaced by
+	// plaintext defaults, and why.
+	UpstreamDowngrade() (active bool, reason string)
+}
+
 type Deps struct {
 	Store    store.Store
 	Auth     *auth.Service
@@ -60,7 +81,11 @@ type Deps struct {
 	// business transferring zones. The handler answers 503 rather than
 	// panicking; see handleZoneRefresh.
 	ZoneRefresher ZoneRefresher
-	Version       string
+	// ResolverStatus may be nil, and is in every test server with no App
+	// behind it. The handler then answers "nothing wrong", which is the
+	// truthful answer for a server that has no forwarder to have downgraded.
+	ResolverStatus ResolverStatus
+	Version        string
 	// Static serves the embedded web dashboard on non-/api paths. Nil
 	// disables it (e.g. tests that don't care about the SPA).
 	Static fs.FS

@@ -306,7 +306,7 @@ func TestNewRejectsUnknownStrategy(t *testing.T) {
 // "fastest" sorts forever. A later fast success must still be able to pull
 // ewma back down, i.e. the clamp isn't a permanent floor.
 func TestMarkResultPenalizesFailingUpstreamEwma(t *testing.T) {
-	u := newUp("127.0.0.1:1", 100*time.Millisecond)
+	u := newUp(Upstream{Scheme: SchemePlain, Addr: "127.0.0.1:1", Canonical: "127.0.0.1:1"}, 100*time.Millisecond)
 	timeoutMicro := (100 * time.Millisecond).Microseconds()
 
 	u.markResult(false, 0, time.Now(), timeoutMicro)

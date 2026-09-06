@@ -113,6 +113,16 @@ Full parameter/response detail lives in `internal/api/openapi.yaml`
   what each means and which require a restart to take effect). There is
   no separate "upstreams" resource — upstream servers live in the
   `upstreams` setting.
+- **Resolver status** — `GET /resolver/status`
+  (`{encryption_downgraded, reason}`). Server state rather than a setting,
+  which is why it is not in the `GET /settings` map. `encryption_downgraded`
+  is true when the stored `upstreams` value named `tls://` or `https://`,
+  failed to parse, and the server fell back to its hardcoded **plaintext**
+  default resolvers — so queries are travelling in the clear while the
+  settings page still shows the encrypted value. `reason` carries the parse
+  failure. It clears as soon as a settings apply installs a forwarder built
+  from the stored value. The settings screen shows it as a persistent
+  warning; see [`docs/configuration.md`](configuration.md#upstreams).
 - **Blocking** — `GET /blocking?group_id=` (pause status),
   `POST /blocking/pause` (`{group_id, minutes}`, pauses 1–1440 minutes),
   `DELETE /blocking/pause?group_id=` (resume/cancel a pause).

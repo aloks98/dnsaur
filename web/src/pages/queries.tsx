@@ -48,6 +48,7 @@ import {
 } from "../hooks/use-queries";
 import { useLiveTailPaused, usePublishLiveTailStatus } from "../lib/live-tail";
 import { durationLabel, rowKey } from "../lib/query-rows";
+import { parseUpstreams } from "../lib/upstreams";
 
 // The group a query is attributed to when its client matched no client entry
 // at all — internal/clients/registry.go's Lookup falls back to
@@ -63,6 +64,32 @@ const ROW_HEIGHT_ESTIMATE = 29;
 /** What the log renders where a value genuinely isn't knowable. Never a
  * guess, and never a blank cell that reads as a rendering bug. */
 const UNKNOWN = "—";
+
+/**
+ * What to show in the Upstream column: the address the query actually went
+ * to.
+ *
+ * Response.Upstream is the canonical entry, which for an encrypted upstream
+ * is the whole thing — `tls://1.1.1.1:853#cloudflare-dns.com`, 37 characters
+ * into a 128px truncating cell. Rendered whole, every DoT row read as the
+ * same `tls://1.1.1.1:85…` prefix, so the two upstreams of a Cloudflare
+ * preset were indistinguishable exactly when there was a second one worth
+ * telling apart.
+ *
+ * The address is the part that differs per row (every upstream in a list
+ * shares one scheme — see internal/upstream/addr.go's mixed_schemes rule),
+ * and it is what this column showed before encrypted transports existed. The
+ * full canonical form is on the cell's `title`, and in the inspector rail
+ * unabridged.
+ *
+ * parseUpstreams rather than a local split: it is the grammar this string
+ * was produced by. Anything it does not recognise is shown verbatim — a
+ * truncated value beats an empty cell.
+ */
+function upstreamAddr(canonical: string): string {
+  const parsed = parseUpstreams(canonical);
+  return parsed.ok && parsed.entries.length === 1 ? parsed.entries[0].addr : canonical;
+}
 
 /**
  * Render counters, exported as a test seam rather than as telemetry.
@@ -670,8 +697,16 @@ const QUERY_COLUMNS: ColumnDef<QueryEntry>[] = [
     accessorKey: "upstream",
     header: "Upstream",
     size: 128,
-    meta: { headerClassName: "px-4", cellClassName: "truncate px-4 text-muted-foreground" },
-    cell: ({ row }) => row.original.upstream || UNKNOWN,
+    meta: { headerClassName: "px-4", cellClassName: "px-4 text-muted-foreground" },
+    cell: ({ row }) => {
+      const full = row.original.upstream;
+      if (!full) return UNKNOWN;
+      return (
+        <span title={full} className="block truncate">
+          {upstreamAddr(full)}
+        </span>
+      );
+    },
   },
   {
     accessorKey: "duration_ms",

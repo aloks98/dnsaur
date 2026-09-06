@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { Outlet, useLocation } from "react-router";
 import { CommandPalette } from "./command-palette";
+import { EncryptionDowngradeBanner } from "./encryption-downgrade-banner";
 import { ErrorBoundary } from "./error-boundary";
 import { TopNav } from "./top-nav";
 
@@ -19,6 +20,12 @@ export function AppShell() {
     // height and then stopped short of the bottom of the page.
     <div className="flex h-screen flex-col overflow-hidden bg-background">
       <TopNav onOpenCommandPalette={() => setPaletteOpen(true)} />
+      {/* A fact about the running server, not about any one screen — it has
+          to follow the operator everywhere the same way an "API
+          unreachable" state would, so it lives beside TopNav rather than
+          inside a single page. Renders null (nothing on screen, nothing in
+          the layout) whenever nothing is wrong. */}
+      <EncryptionDowngradeBanner />
       {/* No gutter, and no scrolling here. Every screen is a full-bleed
           grid of hairline-separated bands whose rules have to meet the
           viewport edges rather than float inside a 24px frame, and each

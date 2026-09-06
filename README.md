@@ -33,9 +33,10 @@ of truth — if it's not listed as shipped, it doesn't work yet.
 | Hot-reload of DB-managed settings | Shipped |
 | REST API + auth (sessions, scoped tokens, TOTP) | Shipped |
 | Web dashboard | Shipped |
+| Encrypted upstreams (DNS-over-TLS, DNS-over-HTTPS) | Shipped |
 | HA config sync (primary/replica) | Planned |
 | DHCP | Planned |
-| Encrypted DNS (DoH/DoT upstream and serving) | Planned |
+| Encrypted DNS serving (DoH/DoT for clients of dnsaur) | Planned |
 | DNSSEC | Planned |
 
 There's no published Docker image yet, but you no longer need to hand-edit

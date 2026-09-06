@@ -33,7 +33,9 @@ import { ApiError } from "../api/client";
 import type { Settings } from "../api/types";
 import { useSettings, useUpdateSetting } from "../hooks/use-settings";
 import { StaleDataAlert } from "../components/stale-data-alert";
-import { requiredText } from "../lib/schemas";
+import { UpstreamsField } from "../components/upstreams-field";
+import { WARNING_STRIP_TINT } from "../components/warning-strip";
+import { parseUpstreams } from "../lib/upstreams";
 
 // --- field model -------------------------------------------------------
 // One row per key in internal/api/settings_handlers.go's editableSettings
@@ -58,7 +60,6 @@ interface SelectOption {
 interface BaseField {
   key: string;
   label: string;
-  description: string;
   /** cache.* and lists.refresh_hours are read once at startup — see
    * docs/configuration.md's "restart required" note — everything else
    * hot-reloads live. */
@@ -68,21 +69,39 @@ interface BaseField {
   schema: z.ZodType<string, string>;
 }
 
-interface TextField extends BaseField {
+/** The static one-liner under a field. On BaseField's subtypes rather than
+ * on BaseField itself: the `upstreams` editor renders its own hint, which
+ * tracks the transport currently on screen, and a description on that field
+ * is never shown. Declared here, it was dead text that read as live
+ * configuration; declared as a property those three kinds have and
+ * UpstreamsSettingField does not, it cannot be written again. */
+interface DescribedField extends BaseField {
+  description: string;
+}
+
+interface TextField extends DescribedField {
   kind: "text";
   placeholder?: string;
 }
 
-interface IntField extends BaseField {
+interface IntField extends DescribedField {
   kind: "int";
 }
 
-interface SelectField extends BaseField {
+interface SelectField extends DescribedField {
   kind: "select";
   options: SelectOption[];
 }
 
-type SettingField = TextField | IntField | SelectField;
+/** The `upstreams` setting's structured editor — see
+ * ../components/upstreams-field.tsx. Named distinctly from the
+ * `UpstreamsField` component it pairs with so the two can be imported into
+ * the same file without a collision. */
+interface UpstreamsSettingField extends BaseField {
+  kind: "upstreams";
+}
+
+type SettingField = TextField | IntField | SelectField | UpstreamsSettingField;
 
 interface SettingGroup {
   title: string;
@@ -91,11 +110,21 @@ interface SettingGroup {
   fields: SettingField[];
 }
 
-/** Mirrors editableSettings["upstreams"]: `strings.TrimSpace(v) != ""` —
- * nothing more. The server does no host:port format checking, so this
- * must not invent stricter format rules and false-reject a legitimate
- * entry (the lesson from Tasks 9-11's own over-strict validators). */
-const nonEmptySchema = requiredText("Required.");
+/** Mirrors editableSettings["upstreams"], which now runs the same grammar
+ * this schema does: `internal/upstream/addr.go`'s ParseUpstreams, format
+ * checking included (this stopped being a bare non-empty check earlier in
+ * this milestone). `parseUpstreams` is the TypeScript mirror of that same
+ * grammar (see ../lib/upstreams.ts), so this schema calls it directly rather
+ * than re-deriving a second copy of its rules, and surfaces its rejection
+ * reason verbatim — a value this accepts is one the server accepts, and a
+ * value this rejects is one the server would 400. */
+const upstreamsSchema = z
+  .string()
+  .trim()
+  .superRefine((value, ctx) => {
+    const result = parseUpstreams(value);
+    if (!result.ok) ctx.addIssue({ code: "custom", message: result.error.message });
+  });
 
 /** Mirrors editableSettings' oneOf(...) checks (upstream.strategy,
  * blocking.mode, qlog.privacy): membership in a fixed, exact-match set.
@@ -153,16 +182,18 @@ const SETTING_DEFAULTS: Record<string, string> = {
 const SETTING_GROUPS: SettingGroup[] = [
   {
     title: "Upstreams",
-    description: "Where dnsaur forwards queries it doesn't answer locally or from cache.",
+    description: "Where queries go when not answered locally.",
     icon: Server,
     fields: [
       {
+        // No `description`: this kind cannot carry one (see DescribedField).
+        // upstreams-field.tsx renders its own hint, which tracks the
+        // transport currently selected — a static string here could not,
+        // since this config object is built once rather than per-render.
         key: "upstreams",
-        kind: "text",
-        label: "Upstream resolvers",
-        description: "Comma-separated host:port pairs, tried in order.",
-        placeholder: "1.1.1.1:53,1.0.0.1:53,9.9.9.9:53",
-        schema: nonEmptySchema,
+        kind: "upstreams",
+        label: "Resolvers",
+        schema: upstreamsSchema,
       },
       {
         key: "upstream.strategy",
@@ -449,10 +480,15 @@ function SettingRow({
             <div className="flex items-baseline gap-2">
               <FormLabel>{field.label}</FormLabel>
               <span className="font-mono text-xs text-muted-foreground">{field.key}</span>
+              {/* What is unsaved, at the one field it's on — the same fact
+                  SaveBar states for the form as a whole. */}
+              {fieldState.isDirty && <span aria-hidden className="ml-auto size-1.5 bg-warning" />}
             </div>
 
             {field.kind === "select" ? (
               <SettingRadioList field={field} value={rhfField.value} onChange={rhfField.onChange} />
+            ) : field.kind === "upstreams" ? (
+              <UpstreamsField value={rhfField.value} onChange={rhfField.onChange} />
             ) : (
               <FormControl>
                 <Input
@@ -470,10 +506,14 @@ function SettingRow({
 
             {/* The description stays put — it says what the setting does,
                 which is worth knowing whether or not the field has been
-                touched. Only an error displaces it. */}
+                touched. Only an error displaces it. UpstreamsField is the
+                one exception: its own hint tracks the transport currently
+                selected, which a static per-field description can't, so
+                that kind has no `description` to render (see
+                DescribedField). */}
             {fieldState.error ? (
               <FormMessage />
-            ) : (
+            ) : field.kind === "upstreams" ? null : (
               <FormDescription>{field.description}</FormDescription>
             )}
           </FormItem>
@@ -542,7 +582,7 @@ function SaveBar({
     <div
       className={cn(
         "flex shrink-0 items-center gap-3.5 border-b border-border px-5 py-2.5",
-        dirty && "bg-warning/8 shadow-[inset_3px_0_0_var(--warning)]",
+        dirty && WARNING_STRIP_TINT,
       )}
     >
       <output className="flex min-w-0 items-baseline gap-2.5">

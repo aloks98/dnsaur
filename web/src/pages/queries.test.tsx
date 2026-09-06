@@ -1707,3 +1707,31 @@ test("the inspector rail closes, and picking a row brings it back", async () => 
   await user.click(await screen.findByText("closable.example.com"));
   expect(await screen.findByRole("heading", { name: /why this decision/i })).toBeInTheDocument();
 });
+
+// Response.Upstream is the canonical entry, which for DoT is
+// `tls://<addr>#<name>` — 37 characters into a 128px truncating cell. Shown
+// whole, every Cloudflare DoT row read as the same `tls://1.1.1.1:85…`
+// prefix and the two upstreams could not be told apart, which is the one
+// thing this column is for. The address is what differs per row; the full
+// canonical form stays on the cell's title and in the inspector rail.
+test("the Upstream column shows the address and keeps the canonical entry on hover", async () => {
+  renderQueryLog();
+  const source = await firstSource();
+
+  act(() =>
+    source.emit(
+      entry({ q_name: "one.example.com", upstream: "tls://1.1.1.1:853#cloudflare-dns.com" }),
+    ),
+  );
+  act(() =>
+    source.emit(
+      entry({ q_name: "two.example.com", upstream: "tls://1.0.0.1:853#cloudflare-dns.com" }),
+    ),
+  );
+
+  await screen.findByText("two.example.com");
+  const one = within(rowFor("one.example.com")).getByText("1.1.1.1:853");
+  const two = within(rowFor("two.example.com")).getByText("1.0.0.1:853");
+  expect(one).toHaveAttribute("title", "tls://1.1.1.1:853#cloudflare-dns.com");
+  expect(two).toHaveAttribute("title", "tls://1.0.0.1:853#cloudflare-dns.com");
+});

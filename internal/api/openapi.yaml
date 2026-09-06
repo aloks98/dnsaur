@@ -13,7 +13,11 @@ info:
     response documented on each mutating operation below.
     There is no separate "upstreams" resource: upstream DNS servers are
     configured via the "upstreams" key in /settings (a comma-separated
-    list), alongside "upstream.strategy".
+    list), alongside "upstream.strategy". Each entry is plain by default
+    ("1.1.1.1:53") or, with a scheme, DNS-over-TLS
+    ("tls://1.1.1.1:853#cloudflare-dns.com") or DNS-over-HTTPS
+    ("https://1.1.1.1/dns-query#cloudflare-dns.com") — see the "upstreams"
+    key under PUT /settings for the full grammar.
 servers:
   - url: /api/v1
 security:
@@ -802,6 +806,43 @@ paths:
         "403":
           $ref: "#/components/responses/ReadOnlyToken"
 
+  /resolver/status:
+    get:
+      tags: [Settings]
+      summary: State of the running resolver that is not a setting
+      description: >
+        Server state, deliberately kept out of GET /settings, whose response
+        is a flat map of settings only.
+
+
+        "encryption_downgraded" is true when the stored "upstreams" value
+        named tls:// or https://, failed to parse at startup or on a settings
+        reload, and the server fell back to its hardcoded plaintext default
+        resolvers — so queries are travelling in the clear while the settings
+        page still shows the operator's encrypted value. "reason" carries the
+        parse failure. It clears as soon as a later settings apply installs a
+        forwarder built from the stored value.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  encryption_downgraded: { type: boolean }
+                  reason:
+                    type: string
+                    description: why the value would not parse; empty when nothing is wrong
+                example:
+                  encryption_downgraded: true
+                  reason: 'upstream "tls://1.1.1.1:853": missing "#name"'
+        "401":
+          description: authentication required
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
   /settings:
     get:
       tags: [Settings]
@@ -809,7 +850,9 @@ paths:
       description: >
         Keys with the "instance." and "stats." prefixes are internal and
         omitted. The "upstreams" key holds a comma-separated list of
-        upstream DNS servers; there is no separate /upstreams resource.
+        upstream DNS servers, each plain or, with a scheme and "#name",
+        DNS-over-TLS or DNS-over-HTTPS (see PUT /settings for the
+        grammar); there is no separate /upstreams resource.
       responses:
         "200":
           description: OK
@@ -844,6 +887,19 @@ paths:
         cache.serve_stale_for (non-negative ints), lists.refresh_hours
         (non-negative int), qlog.retention_days (non-negative int),
         qlog.privacy (full|anon|none). All other keys are rejected.
+
+
+        "upstreams" is a comma-separated list of entries, each plain
+        ("1.1.1.1:53", or "udp://1.1.1.1:53" with the scheme written out),
+        DNS-over-TLS ("tls://1.1.1.1:853#cloudflare-dns.com"), or
+        DNS-over-HTTPS ("https://1.1.1.1/dns-query#cloudflare-dns.com").
+        Ports default to 53/853/443 and the DoH path defaults to
+        "/dns-query". For tls:// and https:// the host must be an IP
+        literal and "#name" (the name the certificate must present) is
+        required; "#name" on a plain entry is rejected; every entry in
+        the list must share one scheme. A value that fails this grammar
+        is rejected with 400 and a reason naming the problem, rather than
+        being accepted and silently dropped at the next restart.
       requestBody:
         required: true
         content:

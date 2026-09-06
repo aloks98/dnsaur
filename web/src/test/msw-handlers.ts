@@ -6,6 +6,7 @@ import type {
   List,
   MeResponse,
   QueryEntry,
+  ResolverStatus,
   Rule,
   SetupState,
   Settings,
@@ -171,6 +172,13 @@ export const handlers = [
   http.get("/api/v1/settings", () => {
     const settings: Settings = {};
     return HttpResponse.json(settings);
+  }),
+
+  // Nothing wrong by default — the settings page asks on every render, and
+  // a test that wants the warning overrides this via server.use().
+  http.get("/api/v1/resolver/status", () => {
+    const status: ResolverStatus = { encryption_downgraded: false, reason: "" };
+    return HttpResponse.json(status);
   }),
 
   http.get("/api/v1/health", () => {

@@ -206,6 +206,27 @@ JSON *string* even for numeric settings. **204** on success.
 
 Full key list, defaults and reload behaviour in §3.9.
 
+#### `GET /api/v1/resolver/status`
+Server state, not a setting — deliberately not folded into the flat map
+above.
+
+```json
+{ "encryption_downgraded": false, "reason": "" }
+```
+
+`encryption_downgraded` is true when the stored `upstreams` value named
+`tls://` or `https://`, failed to parse, and the server fell back to its
+hardcoded **plaintext** default resolvers; `reason` is the parse failure.
+The settings screen renders a persistent `--warning` strip above the save
+bar while it is true, with `reason` beneath it. It clears server-side as
+soon as a settings apply installs a forwarder built from the stored value,
+so the dashboard polls this every 5s while it is true and not at all
+otherwise.
+
+| Status | Error string |
+|---|---|
+| 401 | `authentication required` |
+
 #### Blocking pause
 | Endpoint | Params | Success |
 |---|---|---|

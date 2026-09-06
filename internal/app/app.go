@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/aloks98/dnsaur/internal/api"
@@ -61,12 +62,19 @@ type swappable struct {
 	has bool // true once set has been called at least once
 }
 
-func (s *swappable) set(f *upstream.Forwarder) {
+// set installs f and returns the Forwarder it displaced, or nil if this is
+// the first. The caller closes it — outside the lock, because Close walks
+// every upstream and the documented order is routeMu -> swappable.mu (see
+// App.routeMu): doing it here would put a slow, transport-touching call
+// inside the lock every query path reads through.
+func (s *swappable) set(f *upstream.Forwarder) *upstream.Forwarder {
 	s.mu.Lock()
+	old := s.f
 	s.f = f
 	s.h = f.Handler()
 	s.has = true
 	s.mu.Unlock()
+	return old
 }
 
 // forwarder returns the Forwarder currently serving queries, or nil before
@@ -148,7 +156,20 @@ type App struct {
 	// is never inverted. The cost is one mutex per zone reload — contended,
 	// by construction, in exactly the interleaving it exists to order, and
 	// uncontended the rest of the time.
-	routeMu   sync.Mutex
+	routeMu sync.Mutex
+	// downgrade records that applySettings fell all the way to the hardcoded
+	// plaintext defaults while the stored `upstreams` asked for an encrypted
+	// transport — see the third rung of the ladder in applySettings and
+	// UpstreamDowngrade. Server state, not a setting: it is not in the
+	// settings map and GET /settings does not carry it (that response is a
+	// flat key -> value map of settings, and handleSettingsGet strips even
+	// the internal ones). It lives here because applySettings is the only
+	// thing that can know it, and it is read through the API by the settings
+	// screen, which is the only place that can act on it.
+	//
+	// atomic.Pointer, and nil for "no downgrade", so the query path and the
+	// API handler never contend with a settings write.
+	downgrade atomic.Pointer[downgradeState]
 	servers   []*dnssrv.Server
 	apiSrv    *http.Server
 	apiAddr   string
@@ -285,31 +306,6 @@ func (a *App) getInt(ctx context.Context, key string, fallback int64) int64 {
 		return fallback
 	}
 	return v
-}
-
-// parseUpstreams splits a comma-separated upstreams setting into a clean
-// address list: entries are trimmed, empties are dropped (logged at debug),
-// and a missing port gets ":53" appended. Bare IPv6 literals (no brackets,
-// no port) are bracketed first so the appended port parses correctly.
-func parseUpstreams(s string) []string {
-	parts := strings.Split(s, ",")
-	out := make([]string, 0, len(parts))
-	for _, p := range parts {
-		p = strings.TrimSpace(p)
-		if p == "" {
-			slog.Debug("skipping empty upstream entry")
-			continue
-		}
-		if _, _, err := net.SplitHostPort(p); err != nil {
-			if strings.Contains(p, ":") && !strings.HasPrefix(p, "[") {
-				p = "[" + p + "]:53" // bare IPv6 literal, e.g. "::1"
-			} else {
-				p += ":53"
-			}
-		}
-		out = append(out, p)
-	}
-	return out
 }
 
 // buildForwarder wraps upstream.New with the same defaulted timeout/strategy
@@ -450,6 +446,58 @@ func sameUpstreams(a, b []string) bool {
 }
 
 // applySettings re-reads DB settings into live components.
+// downgradeState is why the running forwarder is not what the operator
+// configured. Immutable once stored.
+type downgradeState struct {
+	reason string
+}
+
+// UpstreamDowngrade reports whether queries are travelling in the clear
+// against the hardcoded default resolvers because the stored `upstreams`
+// value — which asked for tls:// or https:// — could not be parsed, and why.
+//
+// It satisfies api.ResolverStatus. False and "" is the normal case, and is
+// also what a server that has never run applySettings reports.
+func (a *App) UpstreamDowngrade() (bool, string) {
+	if d := a.downgrade.Load(); d != nil {
+		return true, d.reason
+	}
+	return false, ""
+}
+
+// setDowngrade records reason, or clears the record when reason is empty.
+//
+// **Clearing is as load-bearing as setting.** A warning that survives the
+// operator fixing the setting is worse than no warning: it teaches them to
+// ignore the one banner that means their DNS is unencrypted. Every path that
+// installs a forwarder built from the stored value calls this with "".
+func (a *App) setDowngrade(reason string) {
+	if reason == "" {
+		a.downgrade.Store(nil)
+		return
+	}
+	a.downgrade.Store(&downgradeState{reason: reason})
+}
+
+// namesEncryptedScheme reports whether raw — the stored `upstreams` string,
+// unparsed, because the point is that it would not parse — asks for an
+// encrypted transport anywhere in it.
+//
+// Deliberately a scan of the raw text rather than anything cleverer: the
+// value has already been refused by the real grammar, so this is reading an
+// intent out of something known to be broken, and the only honest way to do
+// that is to look for the schemes by name.
+func namesEncryptedScheme(raw string) bool {
+	for entry := range strings.SplitSeq(raw, ",") {
+		e := strings.ToLower(strings.TrimSpace(entry))
+		if strings.HasPrefix(e, string(upstream.SchemeDoT)+"://") ||
+			strings.HasPrefix(e, string(upstream.SchemeDoH)+"://") {
+			return true
+		}
+	}
+	return false
+}
+
 func (a *App) applySettings(ctx context.Context) {
 	mode := a.getSetting(ctx, "blocking.mode")
 	a.engine.SetBlocking(mode, uint32(a.getInt(ctx, "blocking.ttl", 30)))
@@ -463,8 +511,13 @@ func (a *App) applySettings(ctx context.Context) {
 		a.logger.SetPrivacy(a.getSetting(ctx, "qlog.privacy"))
 	}
 
-	upstreams := parseUpstreams(a.getSetting(ctx, "upstreams"))
+	rawUpstreams := a.getSetting(ctx, "upstreams")
+	upstreams := strings.Split(rawUpstreams, ",")
 	strategy := a.getSetting(ctx, "upstream.strategy")
+	// Empty unless the ladder below reaches its last rung with an encrypted
+	// value stored; see setDowngrade, and note that it is written on every
+	// successful path too, because clearing matters as much as setting.
+	var downgradeReason string
 	fwd, err := buildForwarder(upstreams, strategy)
 	if err != nil {
 		if a.fwd.isSet() {
@@ -492,7 +545,25 @@ func (a *App) applySettings(ctx context.Context) {
 			// way back to the hardcoded defaults so the server can resolve
 			// something instead of staying dead.
 			slog.Error("invalid upstream settings, using defaults", "err", err)
-			fwd, err = buildForwarder(parseUpstreams(defaultSettings()["upstreams"]), "race")
+			// **The defaults are plaintext.** If the stored value asked for
+			// tls:// or https:// then resolving through 1.1.1.1:53 is not a
+			// smaller version of what the operator wanted, it is the opposite
+			// of it: every query goes out in the clear, and before this
+			// milestone this rung could not be reached for upstream reasons
+			// at all, so nothing above the exchanger ever had to think about
+			// it. §5's "never downgrade" holds inside the forwarder, and this
+			// is one level above it — exactly where §5 does not look.
+			//
+			// The owner's call is to keep resolving rather than fail closed —
+			// a homelab whose DNS stops entirely is a worse Monday than one
+			// that resolves unencrypted — but not silently: the fact is
+			// recorded here and the settings screen shows it until the
+			// setting is fixed. An ERROR log alone is not a signal; nobody
+			// reads a resolver's log on a good day.
+			if namesEncryptedScheme(rawUpstreams) {
+				downgradeReason = err.Error()
+			}
+			fwd, err = buildForwarder(strings.Split(defaultSettings()["upstreams"], ","), "race")
 			if err != nil {
 				// The hardcoded defaults are static and known-good; this
 				// should be unreachable, but don't panic — leave the
@@ -511,8 +582,31 @@ func (a *App) applySettings(ctx context.Context) {
 	// zone edit happens to reinstall the table.
 	a.routeMu.Lock()
 	a.installConditional(fwd)
-	a.fwd.set(fwd)
+	old := a.fwd.set(fwd)
 	a.routeMu.Unlock()
+	// Set beside the forwarder it describes, and on every path that reaches
+	// here, so a later apply that succeeds clears what an earlier one
+	// recorded.
+	a.setDowngrade(downgradeReason)
+	if old != nil && old != fwd {
+		// After the swap and outside routeMu: the new forwarder is already
+		// serving, so nothing waits on this.
+		//
+		// **In-flight queries are not drained, and this is safe anyway.**
+		// swappable.set replaces the handler; a query that read s.h before
+		// the swap can still be mid-Exchange on the old forwarder. What
+		// makes closing it correct is that both encrypted Close
+		// implementations touch *idle* connections only — dotExchanger.Close
+		// empties the pool (dot.go), dohExchanger.Close calls
+		// CloseIdleConnections (doh.go) — and a connection carrying an
+		// in-flight query is checked out of the pool, so neither reaches it.
+		// It is closed when that query finishes, by put()'s closed check.
+		//
+		// The reason matters: written as "nothing can still be using these",
+		// this comment is exactly the premise under which someone later
+		// "improves" Close into something that tears down live connections.
+		_ = old.Close()
+	}
 }
 
 func (a *App) Start(ctx context.Context) error {
@@ -566,7 +660,9 @@ func (a *App) Start(ctx context.Context) error {
 		Store: a.st, Auth: auth.New(a.st.Users(), a.st.Tokens()),
 		Engine: a.engine, Reloader: a, Logger: a.logger, Refresher: a.refresher,
 		ZoneRefresher: a.zoneRefresh,
-		Version:       a.version, Static: web.Dist(),
+		// a, again: App is what knows the ladder fell to plaintext defaults.
+		ResolverStatus: a,
+		Version:        a.version, Static: web.Dist(),
 	})
 	ln, err := net.Listen("tcp", a.cfg.HTTPListen)
 	if err != nil {
@@ -711,5 +807,8 @@ func (a *App) Shutdown(ctx context.Context) error {
 		a.cancel()
 	}
 	a.wg.Wait() // qlog drains its buffer on ctx cancel before returning
+	if f := a.fwd.forwarder(); f != nil {
+		_ = f.Close()
+	}
 	return a.st.Close()
 }

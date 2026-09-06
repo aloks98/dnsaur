@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"math/rand/v2"
 	"sort"
 	"strings"
 	"sync"
@@ -24,18 +23,30 @@ type Config struct {
 }
 
 type up struct {
-	addr      string
-	udp, tcp  *dns.Client
+	addr      string // Upstream.Canonical — identity, display, reuse key
+	ex        exchanger
 	ewmaMicro atomic.Int64
 	fails     atomic.Int32
 	downUntil atomic.Int64 // unix nano
 }
 
-func newUp(addr string, timeout time.Duration) *up {
-	return &up{
-		addr: addr,
-		udp:  &dns.Client{Net: "udp", Timeout: timeout},
-		tcp:  &dns.Client{Net: "tcp", Timeout: timeout},
+// encryptedTimeout is the floor for a DoT or DoH exchange.
+//
+// A warm pooled connection answers in one round trip, well inside the 2s
+// default. A cold one pays a TCP handshake and a TLS handshake first, and
+// 2s is tight enough that the first query to a distant resolver fails on a
+// configuration that is working. Only raised, never lowered: a caller
+// asking for more still gets it.
+const encryptedTimeout = 5 * time.Second
+
+func newUp(u Upstream, timeout time.Duration) *up {
+	switch u.Scheme {
+	case SchemeDoT:
+		return &up{addr: u.Canonical, ex: newDoTExchanger(u, max(timeout, encryptedTimeout), nil)}
+	case SchemeDoH:
+		return &up{addr: u.Canonical, ex: newDoHExchanger(u, max(timeout, encryptedTimeout), nil)}
+	default:
+		return &up{addr: u.Canonical, ex: newPlainExchanger(u.Addr, timeout)}
 	}
 }
 
@@ -89,16 +100,25 @@ type Forwarder struct {
 
 	fmu       sync.Mutex
 	failCache map[failKey]time.Time
+
+	// closed records that Close has run, so a second call is a real no-op
+	// rather than a second walk over every exchanger, and so an owner's
+	// lifecycle handling can be asserted on. App.applySettings closes the
+	// Forwarder it displaces on every settings write; without something to
+	// read here, the only evidence a future call site had not silently
+	// dropped one would be a descriptor count. See App's swap and
+	// TestApplySettingsClosesTheForwarderItDisplaces.
+	closed atomic.Bool
 }
+
+// Closed reports whether Close has been called.
+func (f *Forwarder) Closed() bool { return f.closed.Load() }
 
 // maxFailCacheEntries bounds failCache growth: once it's reached, New
 // insertions trigger a sweep of expired entries before adding.
 const maxFailCacheEntries = 4096
 
 func New(cfg Config) (*Forwarder, error) {
-	if len(cfg.Upstreams) == 0 {
-		return nil, errors.New("no upstreams configured")
-	}
 	if cfg.Timeout == 0 {
 		cfg.Timeout = 2 * time.Second
 	}
@@ -110,9 +130,17 @@ func New(cfg Config) (*Forwarder, error) {
 	default:
 		return nil, fmt.Errorf("unknown strategy %q: must be one of failover, fastest, race", cfg.Strategy)
 	}
+	// Parsed here rather than by the caller so a Forwarder built directly in
+	// a test takes exactly the grammar a stored setting does. Config.Upstreams
+	// stays []string: a bare "127.0.0.1:5353" is a plain upstream, which is
+	// what every existing caller means by it.
+	ups, err := parseEntries(cfg.Upstreams)
+	if err != nil {
+		return nil, err
+	}
 	f := &Forwarder{strategy: cfg.Strategy, timeout: cfg.Timeout, now: time.Now, failCache: map[failKey]time.Time{}}
-	for _, a := range cfg.Upstreams {
-		f.def = append(f.def, newUp(a, cfg.Timeout))
+	for _, u := range ups {
+		f.def = append(f.def, newUp(u, cfg.Timeout))
 	}
 	// The conditional table is built through the same path a runtime swap
 	// takes, so there is one construction path and the existing
@@ -123,46 +151,26 @@ func New(cfg Config) (*Forwarder, error) {
 	return f, nil
 }
 
-func scramble(name string, rnd *rand.Rand) string {
-	b := []byte(name)
-	for i, c := range b {
-		if c >= 'a' && c <= 'z' && rnd.IntN(2) == 1 {
-			b[i] = c - 32
-		}
-	}
-	return string(b)
-}
-
-// exchange sends m to u with 0x20 case randomization and TCP fallback.
+// exchange sends m to u and records the outcome.
+//
+// The copy is made here because the exchanger is free to mutate what it is
+// given — plainExchanger scrambles the question's case, the encrypted ones
+// add padding and rewrite the ID — and req.Msg belongs to the caller, who
+// may still be racing this exchange against another upstream.
 func (f *Forwarder) exchange(ctx context.Context, m *dns.Msg, u *up) (*dns.Msg, error) {
-	orig := m.Question[0].Name
-	sent := m.Copy()
-	rnd := rand.New(rand.NewPCG(rand.Uint64(), rand.Uint64()))
-	sent.Question[0].Name = scramble(strings.ToLower(orig), rnd)
 	start := f.now()
-	r, _, err := u.udp.ExchangeContext(ctx, sent, u.addr)
-	if err == nil && r.Truncated {
-		r, _, err = u.tcp.ExchangeContext(ctx, sent, u.addr)
-	}
+	r, err := u.ex.Exchange(ctx, m.Copy())
 	ok := err == nil && r != nil
-	if ok && (len(r.Question) != 1 || r.Question[0].Name != sent.Question[0].Name) {
-		ok = false
-		err = fmt.Errorf("upstream %s: 0x20 case check failed", u.addr)
-	}
-	u.markResult(ok && r.Rcode != dns.RcodeServerFailure, f.now().Sub(start), f.now(), f.timeout.Microseconds())
+	f.markLatency(u, ok && r.Rcode != dns.RcodeServerFailure, start)
 	if !ok {
 		return nil, err
 	}
-	// restore original case everywhere it echoes
-	r.Question[0].Name = orig
-	for _, sec := range [][]dns.RR{r.Answer, r.Ns, r.Extra} {
-		for _, rr := range sec {
-			if strings.EqualFold(rr.Header().Name, orig) {
-				rr.Header().Name = orig
-			}
-		}
-	}
 	return r, nil
+}
+
+func (f *Forwarder) markLatency(u *up, ok bool, start time.Time) {
+	now := f.now()
+	u.markResult(ok, now.Sub(start), now, f.timeout.Microseconds())
 }
 
 func (f *Forwarder) pick(qname string) []*up {
@@ -204,7 +212,38 @@ func (f *Forwarder) SetConditional(routes map[string][]string) error {
 	f.cmu.Lock()
 	defer f.cmu.Unlock()
 
+	// Upstreams the outgoing table had and the new one does not are orphans:
+	// nothing will route to them again, and each may be holding pooled TLS
+	// connections. Reuse-by-address above means the ones that survive keep
+	// their pool along with their EWMA and backoff, which is the point —
+	// a zone edit must not cost every upstream its connections.
+	//
+	// **This closes without draining, and that is only safe because every
+	// conditional upstream is plaintext.** A reader that loaded the previous
+	// table can still be exchanging on an orphan when this runs; readers take
+	// no lock, by design (see the note above). Today every *up built below is
+	// constructed SchemePlain, and plainExchanger.Close is a no-op, so there
+	// is nothing to take away mid-query. If per-zone encrypted forwarding
+	// ever lands (deferred, spec §12) that stops being true and this needs
+	// revisiting — App.applySettings' swap has the same shape and gets away
+	// with it for a different reason (only idle pooled connections are
+	// touched), which does not transfer here, because closing an orphan can
+	// race a query that is still choosing a connection.
+	closeOrphans := func(old *condTable, kept map[*up]bool) {
+		if old == nil {
+			return
+		}
+		for _, ups := range old.routes {
+			for _, u := range ups {
+				if !kept[u] {
+					_ = u.ex.Close()
+				}
+			}
+		}
+	}
+
 	if len(routes) == 0 {
+		closeOrphans(f.cond.Load(), nil)
 		f.cond.Store(nil)
 		return nil
 	}
@@ -213,8 +252,12 @@ func (f *Forwarder) SetConditional(routes map[string][]string) error {
 	// outgoing table so a swap adopts rather than rebuilds, and added to as
 	// new ones are minted so one address named under two suffixes shares a
 	// single *up -- and with it a single failure count and backoff window.
+	//
+	// old is captured once, here, rather than re-loaded below: re-loading
+	// after f.cond.Store(t) would return the table this call just installed.
 	byAddr := map[string]*up{}
-	if old := f.cond.Load(); old != nil {
+	old := f.cond.Load()
+	if old != nil {
 		for _, ups := range old.routes {
 			for _, u := range ups {
 				byAddr[u.addr] = u
@@ -229,6 +272,7 @@ func (f *Forwarder) SetConditional(routes map[string][]string) error {
 		set:    filter.NewDomainSet(),
 		routes: make(map[string][]*up, len(routes)),
 	}
+	kept := map[*up]bool{}
 	for suffix, addrs := range routes {
 		if len(addrs) == 0 {
 			// A suffix with no upstreams still claims the name: pick returns
@@ -243,15 +287,54 @@ func (f *Forwarder) SetConditional(routes map[string][]string) error {
 		for _, a := range addrs {
 			u, ok := byAddr[a]
 			if !ok {
-				u = newUp(a, f.timeout)
+				// Zone forwarding (forwarder and stub zones) stays plaintext:
+				// a is a bare address string, never a scheme URL.
+				u = newUp(Upstream{Scheme: SchemePlain, Addr: a, Canonical: a}, f.timeout)
 				byAddr[a] = u
 			}
 			ups = append(ups, u)
+			kept[u] = true
 		}
 		t.routes[strings.ToLower(strings.TrimSuffix(suffix, "."))] = ups
 	}
+	closeOrphans(old, kept)
 	f.cond.Store(t)
 	return nil
+}
+
+// Close releases every upstream's transport. A Forwarder is not usable
+// afterwards.
+//
+// This exists because App.applySettings replaces the Forwarder on every
+// settings write and drops the old one. That was free while every transport
+// was a dns.Client holding nothing; with pooled TLS connections it is a
+// file-descriptor leak per save.
+func (f *Forwarder) Close() error {
+	f.cmu.Lock()
+	defer f.cmu.Unlock()
+	if f.closed.Swap(true) {
+		return nil // already closed; every exchanger's Close is a no-op by now
+	}
+	seen := map[*up]bool{}
+	var first error
+	closeAll := func(ups []*up) {
+		for _, u := range ups {
+			if seen[u] {
+				continue // one *up can be named under several suffixes
+			}
+			seen[u] = true
+			if err := u.ex.Close(); err != nil && first == nil {
+				first = err
+			}
+		}
+	}
+	closeAll(f.def)
+	if t := f.cond.Load(); t != nil {
+		for _, ups := range t.routes {
+			closeAll(ups)
+		}
+	}
+	return first
 }
 
 func (f *Forwarder) condTableLoad() *condTable { return f.cond.Load() }

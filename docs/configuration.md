@@ -52,7 +52,7 @@ the DB, bumps a config version, and live components reload automatically —
 | Key | Default | Meaning |
 |---|---|---|
 | `instance.id` | random UUID, generated per install | Stable identifier for this instance (used by future HA sync) |
-| `upstreams` | `1.1.1.1:53,1.0.0.1:53,9.9.9.9:53` | Comma-separated upstream resolver addresses (host:port; bare IPv6 and missing ports are normalized). These are the **default** route — where a name no zone claims is sent. A suffix claimed by a `forwarder` or `stub` zone goes to that zone's upstreams instead, and never falls back to these; see Conditional forwarding below |
+| `upstreams` | `1.1.1.1:53,1.0.0.1:53,9.9.9.9:53` | Comma-separated upstream resolvers. Each entry is plain (`host:port`; bare IPv6 and missing ports are normalized) or, with a scheme, DNS-over-TLS (`tls://`) or DNS-over-HTTPS (`https://`) — see Encrypted upstreams below for the grammar. These are the **default** route — where a name no zone claims is sent. A suffix claimed by a `forwarder` or `stub` zone goes to that zone's upstreams instead, and never falls back to these; see Conditional forwarding below |
 | `upstream.strategy` | `race` | Upstream selection strategy: `race` (query all healthy upstreams in parallel, first good answer wins), `failover` (try them in configured order, fall through on error/SERVFAIL), or `fastest` (try them ordered by measured EWMA latency, fastest first). One setting for the whole server: it applies to a conditional route's upstreams exactly as it applies to the defaults, and there is no per-zone strategy |
 | `blocking.mode` | `null-ip` | How blocked queries are answered: `null-ip` (`0.0.0.0`) or `nxdomain` |
 | `blocking.ttl` | `30` | TTL (seconds) returned on blocked responses |
@@ -78,6 +78,85 @@ revisited in a later phase.
 Two internal key prefixes (`instance.*` and future `stats.*` bookkeeping)
 are not meant to be user-edited and are excluded from the settings API
 (`GET /api/v1/settings`).
+
+## Encrypted upstreams
+
+An `upstreams` entry may add a scheme and, for the encrypted schemes, a
+`#name` suffix — the convention Unbound
+(`forward-addr: 1.1.1.1@853#cloudflare-dns.com`) and systemd-resolved
+(`DNS=1.1.1.1#cloudflare-dns.com`) already use:
+
+```
+1.1.1.1:53                                     plain (unchanged)
+udp://1.1.1.1:53                               plain, scheme written explicitly
+tls://1.1.1.1:853#cloudflare-dns.com           DoT, port defaults to 853
+https://1.1.1.1/dns-query#cloudflare-dns.com   DoH, port 443, path defaults to /dns-query
+```
+
+The parser (`internal/upstream/addr.go`, mirrored for the dashboard by
+`web/src/lib/upstreams.ts` against the shared fixture
+`internal/upstream/testdata/grammar.json`) rejects, each with a reason: a
+`tls://` or `https://` host that isn't an IP literal; `tls://` or `https://`
+without `#name`; `#name` on a plain entry; and a list that mixes schemes.
+This rejection now happens at save time — `PUT /api/v1/settings` returns
+400 with the reason — where it was previously accepted and silently
+dropped the next time dnsaur restarted.
+
+**Why an address, not a hostname.** Reaching `cloudflare-dns.com` requires
+a DNS lookup, and dnsaur *is* the DNS — on boot it would need an upstream
+to find its upstream. Separately, TLS certificates are issued to names,
+not addresses, so dialing `1.1.1.1` and checking the certificate against
+`1.1.1.1` fails even when it is genuinely Cloudflare. Hence two values: the
+address to dial, and the name the certificate must present. Unbound,
+systemd-resolved, Stubby and Knot all ask for the address the same way.
+The full analysis (including the alternative of a bootstrap resolver, and
+why dnsaur doesn't take it) is in
+[the design spec](superpowers/specs/2026-09-05-encrypted-upstreams-design.md).
+
+**What encryption buys, and what it does not.** Once an upstream is
+`tls://` or `https://`, the path to it — the ISP first among them — stops
+seeing which names this network looks up. **The resolver you chose still
+sees every one of them.** Encryption moves trust from "everyone on the
+path" to "the operator you picked"; it does not remove it. Removing that
+too means dnsaur doing its own recursion instead of forwarding, which is a
+deliberately later release (task #68).
+
+**Presets.** The dashboard's upstreams editor offers these providers for
+both transports; each round-trips through the same parser as a hand-typed
+value:
+
+| Provider | DoT | DoH |
+|---|---|---|
+| Cloudflare | `tls://1.1.1.1:853#cloudflare-dns.com`, `tls://1.0.0.1:853#cloudflare-dns.com` | `https://1.1.1.1:443/dns-query#cloudflare-dns.com` |
+| Quad9 | `tls://9.9.9.9:853#dns.quad9.net`, `tls://149.112.112.112:853#dns.quad9.net` | `https://9.9.9.9:443/dns-query#dns.quad9.net` |
+| Google | `tls://8.8.8.8:853#dns.google`, `tls://8.8.4.4:853#dns.google` | `https://8.8.8.8:443/dns-query#dns.google` |
+
+**All entries must share one scheme.** Under the `race` strategy every
+upstream is queried simultaneously, so one plaintext entry leaks every
+name regardless of what the encrypted entries in the same list are doing.
+Under `fastest`, plaintext always wins the race because it skips the TLS
+handshake. A mixed list does not degrade to partial privacy — under two of
+the three strategies it gives none, while still looking configured.
+
+**If the stored value ever stops parsing, encryption is switched off, and
+the dashboard says so.** `PUT /settings` refuses a value the grammar
+rejects, so this is not reachable by editing the setting through the
+dashboard or the API — it takes a hand-edited database row, a partially
+written one, or a future tightening of the grammar across an upgrade. When
+it happens, dnsaur falls back through its startup ladder and the last rung
+is the hardcoded **plaintext** defaults, so every query goes out in the
+clear. It keeps resolving on purpose — a resolver that stops entirely is
+worse — but the settings screen carries a persistent warning ("Encryption
+is off …") with the parse failure beneath it until the value is fixed, and
+`GET /resolver/status` reports the same fact for anything scripting against
+the API. The warning clears as soon as a saved value builds a forwarder.
+
+**This is the global setting only.** It governs the default route's
+transport. A `forwarder` zone's `forward_to` (see
+[Conditional forwarding](#conditional-forwarding) below) stays plaintext
+`host:port` — it names internal resolvers on trusted networks, not public
+ones reached over the open internet, so there is nothing here for TLS to
+protect.
 
 ## Conditional forwarding
 

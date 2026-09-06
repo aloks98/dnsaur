@@ -1,0 +1,48 @@
+{
+  "accept": [
+    { "in": "1.1.1.1:53", "scheme": "udp", "addr": "1.1.1.1:53", "verifyName": "", "path": "", "canonical": "1.1.1.1:53" },
+    { "in": "1.1.1.1", "scheme": "udp", "addr": "1.1.1.1:53", "verifyName": "", "path": "", "canonical": "1.1.1.1:53" },
+    { "in": "udp://9.9.9.9:53", "scheme": "udp", "addr": "9.9.9.9:53", "verifyName": "", "path": "", "canonical": "9.9.9.9:53" },
+    { "in": "resolver.lan:5353", "scheme": "udp", "addr": "resolver.lan:5353", "verifyName": "", "path": "", "canonical": "resolver.lan:5353" },
+    { "in": "::1", "scheme": "udp", "addr": "[::1]:53", "verifyName": "", "path": "", "canonical": "[::1]:53" },
+    { "in": "[::1]:53", "scheme": "udp", "addr": "[::1]:53", "verifyName": "", "path": "", "canonical": "[::1]:53" },
+    { "in": "[::1]", "scheme": "udp", "addr": "[::1]:53", "verifyName": "", "path": "", "canonical": "[::1]:53" },
+    { "in": "tls://1.1.1.1:853#cloudflare-dns.com", "scheme": "tls", "addr": "1.1.1.1:853", "verifyName": "cloudflare-dns.com", "path": "", "canonical": "tls://1.1.1.1:853#cloudflare-dns.com" },
+    { "in": "tls://1.1.1.1#cloudflare-dns.com", "scheme": "tls", "addr": "1.1.1.1:853", "verifyName": "cloudflare-dns.com", "path": "", "canonical": "tls://1.1.1.1:853#cloudflare-dns.com" },
+    { "in": "tls://[2606:4700:4700::1111]:853#cloudflare-dns.com", "scheme": "tls", "addr": "[2606:4700:4700::1111]:853", "verifyName": "cloudflare-dns.com", "path": "", "canonical": "tls://[2606:4700:4700::1111]:853#cloudflare-dns.com" },
+    { "in": "https://1.1.1.1/dns-query#cloudflare-dns.com", "scheme": "https", "addr": "1.1.1.1:443", "verifyName": "cloudflare-dns.com", "path": "/dns-query", "canonical": "https://1.1.1.1:443/dns-query#cloudflare-dns.com" },
+    { "in": "https://9.9.9.9#dns.quad9.net", "scheme": "https", "addr": "9.9.9.9:443", "verifyName": "dns.quad9.net", "path": "/dns-query", "canonical": "https://9.9.9.9:443/dns-query#dns.quad9.net" },
+    { "in": "https://8.8.8.8:8443/resolve#dns.google", "scheme": "https", "addr": "8.8.8.8:8443", "verifyName": "dns.google", "path": "/resolve", "canonical": "https://8.8.8.8:8443/resolve#dns.google" },
+    { "in": "tls://1.1.1.1:853#a%2Db", "scheme": "tls", "addr": "1.1.1.1:853", "verifyName": "a-b", "path": "", "canonical": "tls://1.1.1.1:853#a-b" },
+    { "in": "https://1.1.1.1/a%2Fb#dns.example.net", "scheme": "https", "addr": "1.1.1.1:443", "verifyName": "dns.example.net", "path": "/a%2Fb", "canonical": "https://1.1.1.1:443/a%2Fb#dns.example.net" }
+  ],
+  "reject": [
+    { "in": "tls://cloudflare-dns.com:853#cloudflare-dns.com", "code": "host_not_ip" },
+    { "in": "https://dns.google/dns-query#dns.google", "code": "host_not_ip" },
+    { "in": "tls://1.1.1.1:853", "code": "missing_name" },
+    { "in": "https://1.1.1.1/dns-query", "code": "missing_name" },
+    { "in": "tls://1.1.1.1:853#", "code": "missing_name" },
+    { "in": "1.1.1.1:53#cloudflare-dns.com", "code": "name_on_plain" },
+    { "in": "udp://1.1.1.1:53#cloudflare-dns.com", "code": "name_on_plain" },
+    { "in": "quic://1.1.1.1:853#dns.adguard.com", "code": "bad_scheme" },
+    { "in": "tls://1.1.1.1:99999#cloudflare-dns.com", "code": "bad_addr" },
+    { "in": "tls://1.1.1.1:domain#cloudflare-dns.com", "code": "bad_addr" },
+    { "in": "tls://user:pw@1.1.1.1:853#cloudflare-dns.com", "code": "bad_url" },
+    { "in": "https://1.1.1.1/dns-query?ct=1#cloudflare-dns.com", "code": "bad_url" },
+    { "in": "tls://@1.1.1.1:853#name", "code": "bad_url" },
+    { "in": "tls://010.0.0.1:853#name", "code": "host_not_ip" },
+    { "in": "tls://1.1.1.1:853#a%zz", "code": "bad_url" },
+    { "in": "udp://1.1.1.1:53#a%zz", "code": "bad_url" }
+  ],
+  "acceptList": [
+    { "in": "tls://1.1.1.1:853#cloudflare-dns.com, tls://1.0.0.1:853#cloudflare-dns.com", "count": 2 },
+    { "in": "1.1.1.1:53, , 9.9.9.9:53", "count": 2 },
+    { "in": "1.1.1.1:53,9.9.9.9", "count": 2 }
+  ],
+  "rejectList": [
+    { "in": "1.1.1.1:53,tls://9.9.9.9:853#dns.quad9.net", "code": "mixed_schemes" },
+    { "in": "tls://1.1.1.1:853#a,https://9.9.9.9/dns-query#b", "code": "mixed_schemes" },
+    { "in": "", "code": "empty" },
+    { "in": "  ,  ", "code": "empty" }
+  ]
+}
