@@ -584,6 +584,7 @@ moment you save.
 | **Cache** | TTL floor/ceiling, size, and stale-serving |
 | **Query log** | How much per-query detail is recorded, and for how long |
 | **Lists** | How often subscriptions refresh |
+| **Protocols** | Whether clients can reach dnsaur over DNS-over-TLS / DNS-over-HTTPS, and the certificate both present |
 
 **Upstream strategy** is one of:
 
@@ -601,6 +602,39 @@ moment you save.
 - `full` — the client IP as seen
 - `anon` — last octet masked (`192.168.11.104` → `192.168.11.0`)
 - `none` — nothing recorded; history already stored is kept
+
+### Protocols
+
+Each protocol is a checkbox, a listen address, and a line underneath saying
+what is **actually** true right now — the two are separate facts and are
+allowed to disagree:
+
+- `○ off` — the setting is false.
+- `● listening on :853` — enabled, and the socket is open.
+- `● not listening — <reason>` — enabled, and the bind failed. The reason
+  is the server's, verbatim. dnsaur retries every 30 seconds, so this
+  clears itself once the cause is gone.
+- `◌ status unavailable` — the server could not be asked. Nothing is
+  claimed about the listener either way, which is the point: it may well be
+  serving. Do not untick the box to "fix" it.
+
+Underneath, one line for the certificate: `Expires 14 Nov 2026`, `Expires
+in 9 days — 17 Sep 2026` once inside the 14-day warning window, `Expired —
+14 Nov 2026` once past it, the server's own rejection if a save was
+refused, `Status unavailable.` when the server could not be asked, or `No
+certificate loaded.` when there is nothing to describe.
+
+**Set the certificate before ticking a box.** Both paths and the checkbox
+can go in one save — the form orders the writes for you — but the server
+validates each write against what is already stored, so the certificate has
+to be valid for the protocol to enable. Clearing either path needs *both*
+protocols off first — while either one is enabled, an incomplete keypair is
+the live configuration, and accepting it would take the listener down at
+the next reconcile.
+
+The three states that mean something is wrong — a failed bind, an expiring
+certificate, and the upstream-encryption downgrade — also appear as banners
+across the top of every screen, not just this one.
 
 ### What needs a restart
 

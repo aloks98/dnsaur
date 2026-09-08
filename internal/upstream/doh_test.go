@@ -8,6 +8,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aloks98/dnsaur/internal/certtest"
+	"github.com/aloks98/dnsaur/internal/dnssrv"
 	"github.com/miekg/dns"
 )
 
@@ -30,7 +32,7 @@ func echoReply(ip string) func(*dns.Msg) *dns.Msg {
 }
 
 func TestDoHExchange(t *testing.T) {
-	cert, pool := testCertFor(t, dohName)
+	cert, pool := certtest.For(t, dohName)
 	addr, rec := startDoH(t, cert, echoReply("10.0.0.2"))
 	e := newDoHExchanger(dohUpstream(addr), 5*time.Second, pool)
 	t.Cleanup(func() { _ = e.Close() })
@@ -57,7 +59,7 @@ func TestDoHExchange(t *testing.T) {
 // back. Losing the restore breaks nothing visible until something matches
 // on it, which is exactly why it is asserted here.
 func TestDoHZeroesTheWireIDAndRestoresIt(t *testing.T) {
-	cert, pool := testCertFor(t, dohName)
+	cert, pool := certtest.For(t, dohName)
 	addr, rec := startDoH(t, cert, echoReply("10.0.0.2"))
 	e := newDoHExchanger(dohUpstream(addr), 5*time.Second, pool)
 	t.Cleanup(func() { _ = e.Close() })
@@ -77,10 +79,10 @@ func TestDoHZeroesTheWireIDAndRestoresIt(t *testing.T) {
 }
 
 func TestDoHPadsWhatItSendsAndStripsWhatItGets(t *testing.T) {
-	cert, pool := testCertFor(t, dohName)
+	cert, pool := certtest.For(t, dohName)
 	addr, rec := startDoH(t, cert, func(m *dns.Msg) *dns.Msg {
 		r := echoReply("10.0.0.2")(m)
-		_ = padQuery(r, paddingBlock) // a compliant server pads its replies
+		_ = dnssrv.Pad(r, dnssrv.PaddingBlockQuery) // a compliant server pads its replies
 		return r
 	})
 	e := newDoHExchanger(dohUpstream(addr), 5*time.Second, pool)
@@ -90,8 +92,8 @@ func TestDoHPadsWhatItSendsAndStripsWhatItGets(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Exchange: %v", err)
 	}
-	if n := rec.lastSize.Load(); n%paddingBlock != 0 {
-		t.Errorf("the server received %d bytes, not a multiple of %d", n, paddingBlock)
+	if n := rec.lastSize.Load(); n%dnssrv.PaddingBlockQuery != 0 {
+		t.Errorf("the server received %d bytes, not a multiple of %d", n, dnssrv.PaddingBlockQuery)
 	}
 	if opt := r.IsEdns0(); opt != nil {
 		for _, o := range opt.Option {
@@ -103,7 +105,7 @@ func TestDoHPadsWhatItSendsAndStripsWhatItGets(t *testing.T) {
 }
 
 func TestDoHTreatsNon200AsFailure(t *testing.T) {
-	cert, pool := testCertFor(t, dohName)
+	cert, pool := certtest.For(t, dohName)
 	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, "over quota", http.StatusTooManyRequests)
 	}))
@@ -121,7 +123,7 @@ func TestDoHTreatsNon200AsFailure(t *testing.T) {
 }
 
 func TestDoHRejectsAMismatchedCertificate(t *testing.T) {
-	cert, pool := testCertFor(t, "somewhere.else")
+	cert, pool := certtest.For(t, "somewhere.else")
 	addr, _ := startDoH(t, cert, echoReply("10.0.0.2"))
 	e := newDoHExchanger(dohUpstream(addr), 5*time.Second, pool) // expects doh.test
 	t.Cleanup(func() { _ = e.Close() })
@@ -147,7 +149,7 @@ func TestDoHKeepsAPercentEncodedPath(t *testing.T) {
 		t.Fatalf("parsed path = %q, want the escape kept as %q", ups[0].Path, "/a%2Fb")
 	}
 
-	cert, pool := testCertFor(t, dohName)
+	cert, pool := certtest.For(t, dohName)
 	addr, rec := startDoH(t, cert, echoReply("10.0.0.7"))
 	u := ups[0]
 	u.Addr = addr

@@ -1,6 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "../api/client";
 import type { ResolverStatus, Settings } from "../api/types";
+import { somethingIsWrong } from "../lib/serving";
 
 // Canonical settings-domain hooks — GET /settings (Settings page, Task 12)
 // and PUT /settings (both the setup wizard's starter-upstreams write and
@@ -8,7 +9,31 @@ import type { ResolverStatus, Settings } from "../api/types";
 export const settingsKeys = {
   all: ["settings"] as const,
   resolverStatus: ["resolver", "status"] as const,
+  /** Not a query: a timestamp useUpdateSetting writes and
+   * useResolverStatus reads, so a `serve.*` save can turn the status poll
+   * on for a few seconds. It lives in the cache rather than in a module
+   * variable because the cache is per-provider — one settle window per
+   * rendered app, not one shared by every test in a file. Deliberately not
+   * under the `resolverStatus` key: that key is invalidated on every save,
+   * and a prefix match would sweep an entry that has no queryFn to refetch
+   * with. */
+  serveSettleUntil: ["serve-settle-until"] as const,
 };
+
+/** How long after a `serve.*` write the status is polled regardless of what
+ * it currently says, and how often during that window.
+ *
+ * The reconcile that makes a serve.* write real runs asynchronously off the
+ * settings watcher (internal/app/serve.go, driven from app.go), so the
+ * single refetch useUpdateSetting triggers routinely lands before it. Five
+ * seconds of one-second polling is the difference between a checkbox whose
+ * reality line updates and one that reads "off" under a ticked box until
+ * the operator navigates away and back. */
+const SERVE_SETTLE_MS = 5_000;
+const SERVE_SETTLE_POLL_MS = 1_000;
+
+/** How often the status is polled while something is actually wrong. */
+const TROUBLE_POLL_MS = 5_000;
 
 // The server strips instance.* and stats.* internal keys before returning
 // (see internal/api/settings_handlers.go's handleSettingsGet), so this is
@@ -27,20 +52,33 @@ export function useSettings() {
 // GET /resolver/status — server state the settings screen has to show and
 // that is not a setting: whether the running forwarder is the plaintext
 // fallback installed because an encrypted `upstreams` value would not parse
-// (see internal/app/app.go's applySettings ladder). One round trip, made
-// once alongside the settings themselves.
+// (see internal/app/app.go's applySettings ladder), what the two encrypted
+// listeners are actually doing, and the certificate's expiry. One round
+// trip, made once alongside the settings themselves.
 //
-// Polled only while something is wrong. Saving a corrected value invalidates
-// this query, but the server applies settings asynchronously — the watcher
-// goroutine reacts to the write — so the refetch that immediately follows a
-// save can still catch the old state. Five seconds of polling while the
-// warning is up closes that window; when nothing is wrong there is nothing
-// to poll for.
+// Polled in two situations, and otherwise not at all.
+//
+// While something is wrong — `somethingIsWrong`, shared with the shell
+// banners so the two cannot drift. This is what clears a bind-failure
+// banner on its own once the operator stops whatever was holding the port:
+// the server retries the bind (internal/app/serve.go's runServingRetry) and
+// this notices. The predicate used to be `encryption_downgraded` alone,
+// which was every fact the endpoint carried when it was written and is now
+// one of three.
+//
+// And briefly after any `serve.*` save, whatever the status currently says
+// — because right then it says nothing is wrong, and it is about to stop
+// being true. See SERVE_SETTLE_MS.
 export function useResolverStatus() {
+  const qc = useQueryClient();
   return useQuery({
     queryKey: settingsKeys.resolverStatus,
     queryFn: () => api.get<ResolverStatus>("/resolver/status"),
-    refetchInterval: (query) => (query.state.data?.encryption_downgraded ? 5_000 : false),
+    refetchInterval: (query) => {
+      const settleUntil = qc.getQueryData<number>(settingsKeys.serveSettleUntil) ?? 0;
+      if (Date.now() < settleUntil) return SERVE_SETTLE_POLL_MS;
+      return somethingIsWrong(query.state.data) ? TROUBLE_POLL_MS : false;
+    },
   });
 }
 
@@ -48,8 +86,14 @@ export function useUpdateSetting() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (v: { key: string; value: string }) => api.put<void>("/settings", v),
-    onSuccess: () => {
+    onSuccess: (_data, variables) => {
       void qc.invalidateQueries({ queryKey: settingsKeys.all });
+      // A saved `serve.*` key opens the settle window before the refetch
+      // below, so the refetch that lands first already knows to keep
+      // asking — the reconcile it is racing has not necessarily run yet.
+      if (variables.key.startsWith("serve.")) {
+        qc.setQueryData(settingsKeys.serveSettleUntil, Date.now() + SERVE_SETTLE_MS);
+      }
       // A saved `upstreams` may have just ended (or begun) a downgrade.
       void qc.invalidateQueries({ queryKey: settingsKeys.resolverStatus });
     },

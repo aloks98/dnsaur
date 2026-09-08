@@ -36,7 +36,7 @@ of truth — if it's not listed as shipped, it doesn't work yet.
 | Encrypted upstreams (DNS-over-TLS, DNS-over-HTTPS) | Shipped |
 | HA config sync (primary/replica) | Planned |
 | DHCP | Planned |
-| Encrypted DNS serving (DoH/DoT for clients of dnsaur) | Planned |
+| Encrypted DNS serving (DoH/DoT for clients of dnsaur) | Shipped |
 | DNSSEC | Planned |
 
 There's no published Docker image yet, but you no longer need to hand-edit

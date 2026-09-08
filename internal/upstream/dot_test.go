@@ -5,6 +5,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aloks98/dnsaur/internal/certtest"
+	"github.com/aloks98/dnsaur/internal/dnssrv"
 	"github.com/miekg/dns"
 )
 
@@ -16,7 +18,7 @@ func dotUpstream(addr string) Upstream {
 }
 
 func TestDoTExchange(t *testing.T) {
-	cert, pool := testCertFor(t, dotName)
+	cert, pool := certtest.For(t, dotName)
 	addr, _ := startDoT(t, cert, answerA("10.0.0.1"))
 	e := newDoTExchanger(dotUpstream(addr), 5*time.Second, pool)
 	t.Cleanup(func() { _ = e.Close() })
@@ -37,7 +39,7 @@ func TestDoTExchange(t *testing.T) {
 // succeeded would pass with no pool at all — the accept count is the whole
 // test.
 func TestDoTReusesConnections(t *testing.T) {
-	cert, pool := testCertFor(t, dotName)
+	cert, pool := certtest.For(t, dotName)
 	addr, ln := startDoT(t, cert, answerA("10.0.0.1"))
 	e := newDoTExchanger(dotUpstream(addr), 5*time.Second, pool)
 	t.Cleanup(func() { _ = e.Close() })
@@ -57,7 +59,7 @@ func TestDoTReusesConnections(t *testing.T) {
 // an intermittent SERVFAIL that also drives a healthy upstream toward being
 // marked down.
 func TestDoTRetriesOnceOnAStaleConnection(t *testing.T) {
-	cert, pool := testCertFor(t, dotName)
+	cert, pool := certtest.For(t, dotName)
 	addr, ln := startDoT(t, cert, answerA("10.0.0.1"))
 	e := newDoTExchanger(dotUpstream(addr), 5*time.Second, pool)
 	t.Cleanup(func() { _ = e.Close() })
@@ -83,7 +85,7 @@ func TestDoTRetriesOnceOnAStaleConnection(t *testing.T) {
 // A connection idle longer than the pool's own deadline is discarded rather
 // than handed out.
 func TestDoTDiscardsIdleConnections(t *testing.T) {
-	cert, pool := testCertFor(t, dotName)
+	cert, pool := certtest.For(t, dotName)
 	addr, ln := startDoT(t, cert, answerA("10.0.0.1"))
 	e := newDoTExchanger(dotUpstream(addr), 5*time.Second, pool)
 	e.idleTimeout = time.Millisecond
@@ -105,7 +107,7 @@ func TestDoTDiscardsIdleConnections(t *testing.T) {
 // is no plaintext retry and no "try anyway" — see
 // TestEncryptedUpstreamNeverFallsBackToPlaintext for the other half.
 func TestDoTRejectsAMismatchedCertificate(t *testing.T) {
-	cert, pool := testCertFor(t, "somewhere.else")
+	cert, pool := certtest.For(t, "somewhere.else")
 	addr, _ := startDoT(t, cert, answerA("10.0.0.1"))
 	e := newDoTExchanger(dotUpstream(addr), 5*time.Second, pool) // expects dot.test
 	t.Cleanup(func() { _ = e.Close() })
@@ -118,7 +120,7 @@ func TestDoTRejectsAMismatchedCertificate(t *testing.T) {
 // The query reaches the server padded, so its length says nothing about the
 // name inside it.
 func TestDoTPadsWhatItSends(t *testing.T) {
-	cert, pool := testCertFor(t, dotName)
+	cert, pool := certtest.For(t, dotName)
 	sizes := make(chan int, 4)
 	addr, _ := startDoT(t, cert, func(w dns.ResponseWriter, m *dns.Msg) {
 		wire, err := m.Pack()
@@ -128,7 +130,7 @@ func TestDoTPadsWhatItSends(t *testing.T) {
 		// Reply padded too, so the strip below has something to remove.
 		r := new(dns.Msg)
 		r.SetReply(m)
-		_ = padQuery(r, paddingBlock)
+		_ = dnssrv.Pad(r, dnssrv.PaddingBlockQuery)
 		_ = w.WriteMsg(r)
 	})
 	e := newDoTExchanger(dotUpstream(addr), 5*time.Second, pool)
@@ -140,8 +142,8 @@ func TestDoTPadsWhatItSends(t *testing.T) {
 	}
 	select {
 	case n := <-sizes:
-		if n%paddingBlock != 0 {
-			t.Errorf("the server received %d bytes, not a multiple of %d", n, paddingBlock)
+		if n%dnssrv.PaddingBlockQuery != 0 {
+			t.Errorf("the server received %d bytes, not a multiple of %d", n, dnssrv.PaddingBlockQuery)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("the server never recorded a query size")
@@ -165,7 +167,7 @@ func TestDoTPadsWhatItSends(t *testing.T) {
 // EOF. Empty the pool without closing what was in it and the descriptor
 // leaks exactly as §6 describes, with every existing test still green.
 func TestDoTCloseReleasesPooledConnections(t *testing.T) {
-	cert, pool := testCertFor(t, dotName)
+	cert, pool := certtest.For(t, dotName)
 	addr, ln := startDoT(t, cert, answerA("10.0.0.4"))
 	e := newDoTExchanger(dotUpstream(addr), 5*time.Second, pool)
 

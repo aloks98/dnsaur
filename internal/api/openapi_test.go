@@ -1,6 +1,7 @@
 package api
 
 import (
+	"regexp"
 	"sort"
 	"strings"
 	"testing"
@@ -153,4 +154,98 @@ func sortedKeys[V any](m map[string]V) []string {
 	}
 	sort.Strings(keys)
 	return keys
+}
+
+// TestOpenAPISettingsKeysMatchEditableSettings pins the PUT /settings
+// description's list of editable keys to the editableSettings map the
+// handler actually validates against.
+//
+// The list is prose, hand-maintained, and sits beside a route/method
+// cross-check that has been automated since it was written — which is
+// exactly where drift lands. It is in sync today (17/17); nothing kept it
+// that way, and an operator reading the document is entitled to a list that
+// is neither short nor long.
+//
+// Only dotted keys are checked in the "documented but not editable"
+// direction. "upstreams" is the one editable key with no dot in it, and it
+// is checked by name below; a token grammar loose enough to catch a future
+// undotted key would also catch ordinary prose.
+func TestOpenAPISettingsKeysMatchEditableSettings(t *testing.T) {
+	srv, _, _ := testServer(t)
+	w := doReq(t, srv.Handler(), "GET", "/api/v1/openapi.yaml", "", nil)
+	if w.Code != 200 {
+		t.Fatalf("GET openapi.yaml: %d", w.Code)
+	}
+	// map[string]any all the way down, not a typed struct: a path item can
+	// also carry a "parameters" sequence beside its operations, which a
+	// struct with only operation-shaped fields refuses to unmarshal.
+	var doc struct {
+		Paths map[string]map[string]any `yaml:"paths"`
+	}
+	if err := yaml.Unmarshal(w.Body.Bytes(), &doc); err != nil {
+		t.Fatalf("invalid yaml: %v", err)
+	}
+	put, ok := doc.Paths["/settings"]["put"].(map[string]any)
+	if !ok {
+		t.Fatal("openapi.yaml has no PUT /settings operation")
+	}
+	description, _ := put["description"].(string)
+	if description == "" {
+		t.Fatal("PUT /settings has no description in openapi.yaml")
+	}
+
+	// The key list is the sentence between these two markers. Bounded
+	// deliberately: the rest of the description explains the `upstreams`
+	// grammar and names schemes and hostnames that a key-shaped token
+	// grammar would otherwise pick up.
+	const opening = "Editable keys:"
+	const closing = "All other keys are rejected."
+	_, rest, ok := strings.Cut(description, opening)
+	if !ok {
+		t.Fatalf("PUT /settings description no longer starts its key list with %q", opening)
+	}
+	list, ok := strings.CutSuffix(strings.TrimSpace(mustCutBefore(t, rest, closing)), ".")
+	if !ok {
+		list = strings.TrimSpace(mustCutBefore(t, rest, closing))
+	}
+
+	documented := map[string]bool{}
+	for _, token := range settingsKeyToken.FindAllString(list, -1) {
+		documented[token] = true
+	}
+
+	for key := range editableSettings {
+		if strings.Contains(key, ".") {
+			if !documented[key] {
+				t.Errorf("editableSettings has %q but openapi.yaml's key list does not name it", key)
+			}
+			continue
+		}
+		if !strings.Contains(list, key) {
+			t.Errorf("editableSettings has %q but openapi.yaml's key list does not name it", key)
+		}
+	}
+	for key := range documented {
+		if _, editable := editableSettings[key]; !editable {
+			t.Errorf("openapi.yaml's key list names %q, which PUT /settings would reject as not editable", key)
+		}
+	}
+}
+
+// settingsKeyToken matches a dotted settings key ("cache.min_ttl") and
+// nothing else in the surrounding prose: lowercase letters, digits and
+// underscores in each segment, no hyphens (which rules out "null-ip") and
+// no leading digit (which rules out "1.1.1.1").
+var settingsKeyToken = regexp.MustCompile(`\b[a-z][a-z0-9_]*(?:\.[a-z0-9_]+)+\b`)
+
+// mustCutBefore returns everything in s before marker, failing the test if
+// marker is absent — the marker is a structural assumption about the
+// document, not something to silently fall back from.
+func mustCutBefore(t *testing.T, s, marker string) string {
+	t.Helper()
+	before, _, ok := strings.Cut(s, marker)
+	if !ok {
+		t.Fatalf("openapi.yaml's PUT /settings description no longer contains %q", marker)
+	}
+	return before
 }

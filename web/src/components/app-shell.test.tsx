@@ -1,9 +1,12 @@
 import { http, HttpResponse } from "msw";
+import type { QueryClient } from "@tanstack/react-query";
 import { expect, test } from "vitest";
 import { Route, Routes } from "react-router";
-import { screen } from "@testing-library/react";
+import { screen, waitFor } from "@testing-library/react";
 import { server } from "../test/msw-server";
 import { renderWithProviders } from "../test/render";
+import { settingsKeys } from "../hooks/use-settings";
+import type { ResolverStatus } from "../api/types";
 import { AppShell } from "./app-shell";
 import { SettingsPage } from "../pages/settings";
 
@@ -13,11 +16,27 @@ import { SettingsPage } from "../pages/settings";
 // to follow the operator everywhere, the same way an "API unreachable"
 // banner would, or someone who lands on Query Log or Zones never learns.
 // Mounted once, in the shell, rather than duplicated per page.
+//
+// ServingBanners (below) is mounted right beside it for the same reason —
+// see serving-banners.tsx's own doc comment — so this file covers both.
+
+const OFF_SERVING: ResolverStatus["serving"] = {
+  dot: { enabled: false, listening: false, addr: "" },
+  doh: { enabled: false, listening: false, addr: "" },
+};
 
 function mockDowngraded(reason = 'upstream "tls://1.1.1.1:853": missing "#name"') {
   server.use(
     http.get("/api/v1/resolver/status", () =>
-      HttpResponse.json({ encryption_downgraded: true, reason }),
+      HttpResponse.json({ encryption_downgraded: true, reason, serving: OFF_SERVING }),
+    ),
+  );
+}
+
+function mockResolverStatus(status: Omit<ResolverStatus, "encryption_downgraded" | "reason">) {
+  server.use(
+    http.get("/api/v1/resolver/status", () =>
+      HttpResponse.json({ encryption_downgraded: false, reason: "", ...status }),
     ),
   );
 }
@@ -75,7 +94,7 @@ test("the banner still appears on the Settings route, now via the shell rather t
 // shell's steady state everywhere else in the suite; pinned explicitly here
 // once, on a non-Settings route, since that's the route newly in scope.
 test("no banner anywhere in the shell when the server reports nothing wrong", async () => {
-  renderWithProviders(
+  const result = renderWithProviders(
     <Routes>
       <Route element={<AppShell />}>
         <Route index element={<h1>Some other page</h1>} />
@@ -85,9 +104,135 @@ test("no banner anywhere in the shell when the server reports nothing wrong", as
 
   expect(screen.getByText("Some other page")).toBeInTheDocument();
   // There's no fetch-backed element in this tree to key a findBy* off (the
-  // dummy route renders synchronously), so give the resolver-status query —
-  // the only async work here, mocked with no artificial delay — a beat to
-  // settle before asserting on its absence.
-  await new Promise((resolve) => setTimeout(resolve, 50));
+  // dummy route renders synchronously), so the wait is on the
+  // resolver-status query itself reaching success. A bare setTimeout here
+  // would pass on a slow machine because the response had not landed yet —
+  // which is the one way a negative assertion can be green and mean
+  // nothing.
+  await settledStatus(result);
+  expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+});
+
+/** Waits until GET /resolver/status has actually resolved, so a following
+ * "no banner" assertion is about the answer rather than about its absence.
+ * `result` is renderWithProviders' return, which carries the QueryClient. */
+async function settledStatus(result: { queryClient: QueryClient }): Promise<void> {
+  await waitFor(() =>
+    expect(result.queryClient.getQueryState(settingsKeys.resolverStatus)?.status).toBe("success"),
+  );
+}
+
+function renderOnOtherRoute() {
+  return renderWithProviders(
+    <Routes>
+      <Route element={<AppShell />}>
+        <Route index element={<h1>Some other page</h1>} />
+      </Route>
+    </Routes>,
+  );
+}
+
+// The Protocols group's own shell banners — see serving-banners.tsx. Same
+// "follows the operator everywhere" reasoning as the encryption-downgrade
+// banner above, pinned the same way: on a route that is not Settings.
+
+test("a DoT listener that's enabled but not listening shows a shell banner on a non-Settings route", async () => {
+  mockResolverStatus({
+    serving: {
+      dot: {
+        enabled: true,
+        listening: false,
+        addr: ":853",
+        error: "listen tcp :853: bind: permission denied",
+      },
+      doh: { enabled: false, listening: false, addr: "" },
+    },
+  });
+
+  renderOnOtherRoute();
+
+  const alert = await screen.findByRole("alert");
+  expect(alert).toHaveTextContent(
+    "DNS-over-TLS is enabled but not listening — listen tcp :853: bind: permission denied",
+  );
+});
+
+test("a DoH listener that's enabled but not listening shows a shell banner", async () => {
+  mockResolverStatus({
+    serving: {
+      dot: { enabled: false, listening: false, addr: "" },
+      doh: {
+        enabled: true,
+        listening: false,
+        addr: ":443",
+        error: "listen tcp :443: bind: permission denied",
+      },
+    },
+  });
+
+  renderOnOtherRoute();
+
+  const alert = await screen.findByRole("alert");
+  expect(alert).toHaveTextContent(
+    "DNS-over-HTTPS is enabled but not listening — listen tcp :443: bind: permission denied",
+  );
+});
+
+test("a certificate expiring within the warning window shows a shell banner", async () => {
+  mockResolverStatus({
+    serving: OFF_SERVING,
+    certificate: { not_after: "2026-09-17T00:00:00Z", expiring_soon: true },
+  });
+
+  renderOnOtherRoute();
+
+  const alert = await screen.findByRole("alert");
+  expect(alert).toHaveTextContent(/TLS certificate expires in \d+ days? — 17 Sep 2026/);
+});
+
+// The artboard's own reason this is a list rather than a single banner: DoT
+// and DoH fail independently, and a certificate can be expiring at the same
+// time either of those is broken — spec's "shell banners are a list".
+test("a failed DoT listener, a failed DoH listener and an expiring certificate all show at once", async () => {
+  mockResolverStatus({
+    serving: {
+      dot: {
+        enabled: true,
+        listening: false,
+        addr: ":853",
+        error: "listen tcp :853: bind: permission denied",
+      },
+      doh: {
+        enabled: true,
+        listening: false,
+        addr: ":443",
+        error: "listen tcp :443: bind: permission denied",
+      },
+    },
+    certificate: { not_after: "2026-09-17T00:00:00Z", expiring_soon: true },
+  });
+
+  renderOnOtherRoute();
+
+  const alerts = await screen.findAllByRole("alert");
+  expect(alerts).toHaveLength(3);
+  const text = alerts.map((a) => a.textContent).join("\n");
+  expect(text).toContain("DNS-over-TLS is enabled but not listening");
+  expect(text).toContain("DNS-over-HTTPS is enabled but not listening");
+  expect(text).toContain("TLS certificate expires in");
+});
+
+test("a protocol that is enabled and listening gets no banner", async () => {
+  mockResolverStatus({
+    serving: {
+      dot: { enabled: true, listening: true, addr: ":853" },
+      doh: { enabled: false, listening: false, addr: "" },
+    },
+  });
+
+  const result = renderOnOtherRoute();
+
+  expect(screen.getByText("Some other page")).toBeInTheDocument();
+  await settledStatus(result);
   expect(screen.queryByRole("alert")).not.toBeInTheDocument();
 });

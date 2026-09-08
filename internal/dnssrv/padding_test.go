@@ -1,4 +1,4 @@
-package upstream
+package dnssrv
 
 import (
 	"strings"
@@ -26,15 +26,15 @@ func TestPadQueryRoundsUpToBlock(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			m := query(name)
-			if err := padQuery(m, paddingBlock); err != nil {
-				t.Fatalf("padQuery: %v", err)
+			if err := Pad(m, PaddingBlockQuery); err != nil {
+				t.Fatalf("Pad: %v", err)
 			}
 			wire, err := m.Pack()
 			if err != nil {
 				t.Fatalf("Pack: %v", err)
 			}
-			if len(wire)%paddingBlock != 0 {
-				t.Errorf("packed length %d is not a multiple of %d", len(wire), paddingBlock)
+			if len(wire)%PaddingBlockQuery != 0 {
+				t.Errorf("packed length %d is not a multiple of %d", len(wire), PaddingBlockQuery)
 			}
 		})
 	}
@@ -46,8 +46,8 @@ func TestPadQueryHidesNameLength(t *testing.T) {
 	short, long := query("a.com"), query("a.com")
 	long.Question[0].Name = dns.Fqdn(strings.Repeat("w", 40) + ".example.com")
 	for _, m := range []*dns.Msg{short, long} {
-		if err := padQuery(m, paddingBlock); err != nil {
-			t.Fatalf("padQuery: %v", err)
+		if err := Pad(m, PaddingBlockQuery); err != nil {
+			t.Fatalf("Pad: %v", err)
 		}
 	}
 	a, _ := short.Pack()
@@ -61,12 +61,12 @@ func TestPadQueryHidesNameLength(t *testing.T) {
 // may then retry on a fresh connection.
 func TestPadQueryIsIdempotent(t *testing.T) {
 	m := query("example.com")
-	if err := padQuery(m, paddingBlock); err != nil {
-		t.Fatalf("first padQuery: %v", err)
+	if err := Pad(m, PaddingBlockQuery); err != nil {
+		t.Fatalf("first Pad: %v", err)
 	}
 	first, _ := m.Pack()
-	if err := padQuery(m, paddingBlock); err != nil {
-		t.Fatalf("second padQuery: %v", err)
+	if err := Pad(m, PaddingBlockQuery); err != nil {
+		t.Fatalf("second Pad: %v", err)
 	}
 	again, _ := m.Pack()
 	if len(first) != len(again) {
@@ -90,8 +90,8 @@ func TestPadQueryAddsOPTWhenAbsent(t *testing.T) {
 	if m.IsEdns0() != nil {
 		t.Fatal("fixture already has an OPT record; the test proves nothing")
 	}
-	if err := padQuery(m, paddingBlock); err != nil {
-		t.Fatalf("padQuery: %v", err)
+	if err := Pad(m, PaddingBlockQuery); err != nil {
+		t.Fatalf("Pad: %v", err)
 	}
 	if m.IsEdns0() == nil {
 		t.Error("no OPT record after padding")
@@ -109,7 +109,7 @@ func TestStripPaddingKeepsTheOPT(t *testing.T) {
 		&dns.EDNS0_NSID{Nsid: "abc"},
 	)
 
-	stripPadding(m)
+	StripPadding(m)
 
 	got := m.IsEdns0()
 	if got == nil {
@@ -135,7 +135,7 @@ func TestStripPaddingKeepsAnEmptiedOPT(t *testing.T) {
 	opt := m.IsEdns0()
 	opt.Option = append(opt.Option, &dns.EDNS0_PADDING{Padding: make([]byte, 40)})
 
-	stripPadding(m)
+	StripPadding(m)
 
 	if m.IsEdns0() == nil {
 		t.Fatal("the OPT record was dropped when padding was its only option")
@@ -148,8 +148,8 @@ func TestStripPaddingKeepsAnEmptiedOPT(t *testing.T) {
 // A message with no OPT at all is left alone rather than panicking.
 func TestStripPaddingToleratesNoOPT(t *testing.T) {
 	m := query("example.com")
-	stripPadding(m)
+	StripPadding(m)
 	if m.IsEdns0() != nil {
-		t.Error("stripPadding invented an OPT record")
+		t.Error("StripPadding invented an OPT record")
 	}
 }

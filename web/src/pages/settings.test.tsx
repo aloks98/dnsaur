@@ -25,6 +25,12 @@ function fullSettings(overrides: Partial<Settings> = {}): Settings {
     "lists.refresh_hours": "24",
     "qlog.retention_days": "90",
     "qlog.privacy": "full",
+    "serve.dot.enabled": "false",
+    "serve.dot.listen": ":853",
+    "serve.doh.enabled": "false",
+    "serve.doh.listen": ":443",
+    "serve.tls.cert": "",
+    "serve.tls.key": "",
     ...overrides,
   };
 }
@@ -43,6 +49,7 @@ test("renders each grouped Card section with the current values populated", asyn
   expect(screen.getByText("Cache")).toBeInTheDocument();
   expect(screen.getByText("Query log")).toBeInTheDocument();
   expect(screen.getByText("Lists")).toBeInTheDocument();
+  expect(screen.getByText("Protocols")).toBeInTheDocument();
 
   // The upstreams field is the structured editor now (see
   // upstreams-field.test.tsx for its own coverage): Plain is selected and
@@ -187,9 +194,11 @@ test("every section says whether it applies on save or waits for a restart", asy
   // The badge belongs to the section, not the field: cache.* is read once
   // when Start() builds the cache and lists.refresh_hours once when the
   // refresh ticker is scheduled, so those two groups are restart-only in
-  // their entirety. Everything else is re-read on every settings write.
+  // their entirety. Everything else is re-read on every settings write —
+  // Protocols included: reconcileServing (internal/app/serve.go) applies
+  // every serve.* write live, on the same write that changed it.
   const restartSections = ["Cache", "Lists"];
-  const instantSections = ["Upstreams", "Blocking", "Query log"];
+  const instantSections = ["Upstreams", "Blocking", "Query log", "Protocols"];
 
   for (const title of restartSections) {
     const section = screen.getByRole("heading", { name: title }).closest("section")!;
@@ -353,3 +362,225 @@ test("a failing background refetch after a partial save keeps the form and its d
 // running server, not about Settings specifically. SettingsPage rendered in
 // isolation — as every other test in this file does — no longer mounts any
 // banner at all, so there is nothing left to pin here.
+
+// --- multi-key saves: the ordering PUT /settings actually requires --------
+//
+// `PUT /api/v1/settings` is one key per request, and its cross-field
+// validation (internal/api/settings_handlers.go's validateCrossField)
+// re-reads the store on every one of them. So a save that changes several
+// dependent keys is only correct if it sends them in dependency order —
+// which is a property of the *interaction* between the form and the API,
+// and is exactly what a handler that answers 204 to everything cannot
+// test. This handler mirrors validateCrossField instead.
+
+/** An msw PUT handler holding a settings store and applying the same
+ * cross-field rules the Go handler does, so a request that would 400 in
+ * production 400s here. `certPairs` says which cert/key pairs load; any
+ * other complete pair is a mismatch, the way tls.LoadX509KeyPair would
+ * report it.
+ *
+ * The snapshot-then-await-then-write shape is the point, not incidental.
+ * handleSettingsPut reads the whole settings map, validates against what it
+ * read, and only then writes — so two requests in flight at once both judge
+ * the state as it was before either landed. Validating against the live
+ * object here would make this handler serialise where the real server does
+ * not, and every concurrency bug in the caller would pass. */
+function settingsPutMirror(
+  stored: Record<string, string>,
+  certPairs: [string, string][],
+  seen: string[],
+) {
+  const loads = (cert: string, key: string) => certPairs.some(([c, k]) => c === cert && k === key);
+  return http.put("/api/v1/settings", async ({ request }) => {
+    const { key, value } = (await request.json()) as { key: string; value: string };
+    seen.push(key);
+    const current = { ...stored };
+    await delay(5);
+    const reject = (message: string) =>
+      HttpResponse.json({ error: `invalid value for ${key}: ${message}` }, { status: 400 });
+
+    if (key === "serve.dot.enabled" || key === "serve.doh.enabled") {
+      if (value === "true") {
+        const cert = current["serve.tls.cert"] ?? "";
+        const certKey = current["serve.tls.key"] ?? "";
+        if (cert === "" || certKey === "") {
+          return reject("set serve.tls.cert and serve.tls.key first");
+        }
+        if (!loads(cert, certKey)) return reject("tls: private key does not match public key");
+      }
+    }
+    if (key === "serve.tls.cert" || key === "serve.tls.key") {
+      const cert = key === "serve.tls.cert" ? value : (current["serve.tls.cert"] ?? "");
+      const certKey = key === "serve.tls.key" ? value : (current["serve.tls.key"] ?? "");
+      if (cert === "" || certKey === "") {
+        if (current["serve.dot.enabled"] === "true" || current["serve.doh.enabled"] === "true") {
+          return reject("turn DNS-over-TLS and DNS-over-HTTPS off before clearing the certificate");
+        }
+      } else if (!loads(cert, certKey)) {
+        return reject("tls: private key does not match public key");
+      }
+    }
+    stored[key] = value;
+    return new HttpResponse(null, { status: 204 });
+  });
+}
+
+const CERT = "/etc/ssl/dnsaur/fullchain.pem";
+const KEY = "/etc/ssl/dnsaur/privkey.pem";
+const OTHER_KEY = "/etc/ssl/other/privkey.pem";
+
+// The first thing every operator does on a fresh install: type both
+// certificate paths, tick DNS-over-TLS, press Save. All three keys go in
+// one submit, and the enable is only valid once both paths are stored.
+test("enabling a protocol and setting its certificate saves in one press", async () => {
+  const user = userEvent.setup();
+  const stored: Record<string, string> = { ...fullSettings() };
+  const seen: string[] = [];
+  mockSettings(fullSettings());
+  server.use(settingsPutMirror(stored, [[CERT, KEY]], seen));
+  const successSpy = vi.spyOn(toast, "success");
+  const errorSpy = vi.spyOn(toast, "error");
+  // Cleared, not merely spied: vi.spyOn hands back the same mock when an
+  // earlier test in this file already spied on the same method, history
+  // included — so a waitFor on "was it called with X" that an earlier test
+  // already satisfied would resolve before this test has done anything.
+  successSpy.mockClear();
+  errorSpy.mockClear();
+
+  renderWithProviders(<SettingsPage />);
+  await screen.findByText("Protocols");
+
+  await user.type(screen.getByLabelText("Certificate"), CERT);
+  await user.type(screen.getByLabelText("Private key"), KEY);
+  await user.click(screen.getByRole("checkbox", { name: /DNS-over-TLS/ }));
+  await user.click(screen.getAllByRole("button", { name: /^save changes$/i })[0]);
+
+  await waitFor(() => expect(successSpy).toHaveBeenCalledWith("3 settings updated"));
+  expect(errorSpy).not.toHaveBeenCalled();
+  expect(stored["serve.tls.cert"]).toBe(CERT);
+  expect(stored["serve.tls.key"]).toBe(KEY);
+  expect(stored["serve.dot.enabled"]).toBe("true");
+  // The enable must be dispatched after both paths, not merely succeed.
+  expect(seen.indexOf("serve.dot.enabled")).toBeGreaterThan(seen.indexOf("serve.tls.cert"));
+  expect(seen.indexOf("serve.dot.enabled")).toBeGreaterThan(seen.indexOf("serve.tls.key"));
+});
+
+// The same root cause's second face. Both certificate paths in one save,
+// and they do not form a loadable pair: the server only runs the pair check
+// when a request can see both halves, so writing them concurrently means
+// nobody checks and a broken pair stores with a 204.
+test("a mismatched certificate pair saved in one press is rejected, not stored", async () => {
+  const user = userEvent.setup();
+  const stored: Record<string, string> = { ...fullSettings() };
+  const seen: string[] = [];
+  mockSettings(fullSettings());
+  server.use(settingsPutMirror(stored, [[CERT, KEY]], seen));
+  const errorSpy = vi.spyOn(toast, "error");
+  // Cleared, not merely spied: vi.spyOn hands back the same mock when a
+  // previous test in this file already spied on toast.error, history
+  // included.
+  errorSpy.mockClear();
+
+  renderWithProviders(<SettingsPage />);
+  await screen.findByText("Protocols");
+
+  await user.type(screen.getByLabelText("Certificate"), CERT);
+  await user.type(screen.getByLabelText("Private key"), OTHER_KEY);
+  await user.click(screen.getAllByRole("button", { name: /^save changes$/i })[0]);
+
+  await waitFor(() => expect(errorSpy).toHaveBeenCalled());
+  expect(stored["serve.tls.key"]).not.toBe(OTHER_KEY);
+  // And the reason reaches the certificate line, where "did I type the
+  // right path" is answered.
+  expect(await screen.findByText(/private key does not match public key/i)).toBeInTheDocument();
+});
+
+// Turning a protocol off and clearing its certificate in the same save.
+// The disable has to land first: clearing a path under a live protocol is
+// refused (spec §6), so the reverse order fails on a save that is entirely
+// coherent as a whole.
+test("turning a protocol off and clearing its certificate saves in one press", async () => {
+  const user = userEvent.setup();
+  const initial = fullSettings({
+    "serve.dot.enabled": "true",
+    "serve.tls.cert": CERT,
+    "serve.tls.key": KEY,
+  });
+  const stored: Record<string, string> = { ...initial };
+  const seen: string[] = [];
+  mockSettings(initial);
+  server.use(settingsPutMirror(stored, [[CERT, KEY]], seen));
+  const successSpy = vi.spyOn(toast, "success");
+  const errorSpy = vi.spyOn(toast, "error");
+  successSpy.mockClear();
+  errorSpy.mockClear();
+
+  renderWithProviders(<SettingsPage />);
+  await screen.findByText("Protocols");
+
+  await user.click(screen.getByRole("checkbox", { name: /DNS-over-TLS/ }));
+  await user.clear(screen.getByLabelText("Certificate"));
+  await user.clear(screen.getByLabelText("Private key"));
+  await user.click(screen.getAllByRole("button", { name: /^save changes$/i })[0]);
+
+  await waitFor(() => expect(successSpy).toHaveBeenCalledWith("3 settings updated"));
+  expect(errorSpy).not.toHaveBeenCalled();
+  expect(stored["serve.dot.enabled"]).toBe("false");
+  expect(stored["serve.tls.cert"]).toBe("");
+  expect(seen.indexOf("serve.dot.enabled")).toBeLessThan(seen.indexOf("serve.tls.cert"));
+});
+
+// --- I2: the status poll has to cover what the reconcile is about to do ---
+//
+// The reconcile that makes a serve.* write real runs asynchronously off the
+// settings watcher (internal/app/serve.go, driven from app.go), so the
+// single refetch useUpdateSetting triggers routinely lands before it has
+// run. With no interval and refetchOnWindowFocus off, nothing corrected it
+// afterwards: the line under a freshly ticked box read "○ off" until the
+// operator navigated away and back.
+test("saving a serve.* setting keeps the status polling until the reconcile lands", async () => {
+  const user = userEvent.setup();
+  let statusReads = 0;
+  // Reality lags intent, exactly as it does on the server: the reconcile
+  // has not run when the first refetch after the save arrives.
+  let reconciled = false;
+  mockSettings(fullSettings());
+  server.use(
+    http.get("/api/v1/resolver/status", () => {
+      statusReads += 1;
+      return HttpResponse.json({
+        encryption_downgraded: false,
+        reason: "",
+        serving: {
+          dot: reconciled
+            ? { enabled: true, listening: true, addr: ":853" }
+            : { enabled: false, listening: false, addr: "" },
+          doh: { enabled: false, listening: false, addr: "" },
+        },
+      });
+    }),
+    http.put("/api/v1/settings", () => new HttpResponse(null, { status: 204 })),
+  );
+
+  renderWithProviders(<SettingsPage />);
+  await screen.findByText("Protocols");
+  await waitFor(() => expect(statusReads).toBeGreaterThan(0));
+
+  const listen = screen.getByLabelText("DNS-over-TLS listen address");
+  await user.clear(listen);
+  await user.type(listen, ":8853");
+  await user.click(screen.getAllByRole("button", { name: /^save changes$/i })[0]);
+
+  // The save's own invalidation accounts for one extra read. Anything
+  // beyond that is the settle-window poll, which is the whole point: at
+  // this moment the status says nothing is wrong, and it is about to stop
+  // being true.
+  const afterSave = statusReads;
+  reconciled = true;
+  await waitFor(() => expect(statusReads).toBeGreaterThan(afterSave + 1), { timeout: 4000 });
+  expect(
+    await within(screen.getByRole("group", { name: "DNS-over-TLS" })).findByText(
+      "listening on :853",
+    ),
+  ).toBeInTheDocument();
+});

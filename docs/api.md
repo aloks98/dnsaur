@@ -109,20 +109,42 @@ Full parameter/response detail lives in `internal/api/openapi.yaml`
   `upstreams`, `upstream.strategy`, `blocking.mode`, `blocking.ttl`,
   `cache.min_ttl`, `cache.max_ttl`, `cache.max_entries`,
   `cache.serve_stale_for`, `lists.refresh_hours`, `qlog.retention_days`,
-  `qlog.privacy` — see [`docs/configuration.md`](configuration.md) for
-  what each means and which require a restart to take effect). There is
-  no separate "upstreams" resource — upstream servers live in the
-  `upstreams` setting.
+  `qlog.privacy`, `serve.dot.enabled`, `serve.dot.listen`,
+  `serve.doh.enabled`, `serve.doh.listen`, `serve.tls.cert`,
+  `serve.tls.key` — see [`docs/configuration.md`](configuration.md) for
+  what each means and which require a restart to take effect). Enabling
+  `serve.dot.enabled`/`serve.doh.enabled` requires `serve.tls.cert` and
+  `serve.tls.key` to already name a loadable certificate pair, or the
+  write is rejected naming which to set first; and clearing either path
+  while a protocol is still enabled is rejected for the same reason, from
+  the other direction. `serve.dot.listen`/`serve.doh.listen` take
+  `host:port` with the port in 1-65535 — port 0 is refused, since it binds
+  whatever is free and reports an address no client was ever told. **One
+  key per call is not incidental**: each write is validated against the
+  values already stored, so a client changing several dependent keys has to
+  order them — certificate paths before the `enabled` flags that check
+  them, and disables before a path is cleared. There is no separate
+  "upstreams" resource — upstream servers live in the `upstreams` setting.
 - **Resolver status** — `GET /resolver/status`
-  (`{encryption_downgraded, reason}`). Server state rather than a setting,
-  which is why it is not in the `GET /settings` map. `encryption_downgraded`
-  is true when the stored `upstreams` value named `tls://` or `https://`,
-  failed to parse, and the server fell back to its hardcoded **plaintext**
-  default resolvers — so queries are travelling in the clear while the
-  settings page still shows the encrypted value. `reason` carries the parse
-  failure. It clears as soon as a settings apply installs a forwarder built
-  from the stored value. The settings screen shows it as a persistent
-  warning; see [`docs/configuration.md`](configuration.md#upstreams).
+  (`{encryption_downgraded, reason, serving, certificate}`). Server state
+  rather than a setting, which is why it is not in the `GET /settings`
+  map. `encryption_downgraded`/`reason` cover the upstream side exactly as
+  before: true when the stored `upstreams` value named `tls://` or
+  `https://`, failed to parse, and the server fell back to its hardcoded
+  **plaintext** default resolvers — so queries are travelling in the clear
+  while the settings page still shows the encrypted value. It clears as
+  soon as a settings apply installs a forwarder built from the stored
+  value. `serving.dot`/`serving.doh` report the encrypted *serving* side
+  instead — each `{enabled, listening, addr, error}`, since a protocol can
+  be enabled but not actually bound (a taken port, a certificate that will
+  not load). A failed bind is retried every 30 seconds, so this clears on
+  its own once the cause is gone. `certificate` is present only while a
+  certificate is actually in use — absent when neither protocol is enabled,
+  when no paths are configured, and when none has ever loaded — and carries
+  `{not_after, expiring_soon}`, the 14-day expiry warning. See
+  [`docs/configuration.md`](configuration.md#encrypted-serving) for the
+  full story, including why a bind failure surfaces here rather than only
+  in the log.
 - **Blocking** — `GET /blocking?group_id=` (pause status),
   `POST /blocking/pause` (`{group_id, minutes}`, pauses 1–1440 minutes),
   `DELETE /blocking/pause?group_id=` (resume/cancel a pause).

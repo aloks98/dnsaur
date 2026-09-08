@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/aloks98/dnsaur/internal/dnssrv"
 	"github.com/miekg/dns"
 )
 
@@ -73,14 +74,14 @@ func newDoTExchanger(u Upstream, timeout time.Duration, roots *x509.CertPool) *d
 }
 
 func (e *dotExchanger) Exchange(ctx context.Context, m *dns.Msg) (*dns.Msg, error) {
-	if err := padQuery(m, paddingBlock); err != nil {
+	if err := dnssrv.Pad(m, dnssrv.PaddingBlockQuery); err != nil {
 		return nil, err
 	}
 	if c := e.get(); c != nil {
 		r, _, err := e.client.ExchangeWithConnContext(ctx, m, c)
 		if err == nil {
 			e.put(c)
-			stripPadding(r)
+			dnssrv.StripPadding(r)
 			return r, nil
 		}
 		_ = c.Close()
@@ -107,7 +108,7 @@ func (e *dotExchanger) Exchange(ctx context.Context, m *dns.Msg) (*dns.Msg, erro
 		return nil, err
 	}
 	e.put(c)
-	stripPadding(r)
+	dnssrv.StripPadding(r)
 	return r, nil
 }
 

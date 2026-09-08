@@ -43,6 +43,12 @@ func defaultSettings() map[string]string {
 		"lists.refresh_hours":   "24",
 		"qlog.retention_days":   "90",
 		"qlog.privacy":          "full",
+		"serve.dot.enabled":     "false",
+		"serve.dot.listen":      ":853",
+		"serve.doh.enabled":     "false",
+		"serve.doh.listen":      ":443",
+		"serve.tls.cert":        "",
+		"serve.tls.key":         "",
 	}
 }
 
@@ -170,6 +176,16 @@ type App struct {
 	// atomic.Pointer, and nil for "no downgrade", so the query path and the
 	// API handler never contend with a settings write.
 	downgrade atomic.Pointer[downgradeState]
+	// handler is the same pipeline every listener serves through — plain
+	// :53, and (Task 8) DoT and DoH. Built once in Start, before the first
+	// applySettings call, so a restart with either encrypted protocol
+	// already enabled has a real handler to hand its listener rather than
+	// a nil interface.
+	handler dnssrv.Handler
+	// serving is the encrypted-listener reconciler's own state: which of
+	// DoT and DoH are actually running, and what applySettings last found
+	// out trying to converge them to settings. See serve.go.
+	serving   servingReconciler
 	servers   []*dnssrv.Server
 	apiSrv    *http.Server
 	apiAddr   string
@@ -499,6 +515,19 @@ func namesEncryptedScheme(raw string) bool {
 }
 
 func (a *App) applySettings(ctx context.Context) {
+	// Reconciling DoT/DoH is independent of whether the forwarder rebuild
+	// below succeeds — a broken `upstreams` value and a DoT/DoH settings
+	// change can land in the same write, or simply be stored at the same
+	// time by coincidence — so it must run on every exit from this
+	// function, including the early return a few lines down that keeps the
+	// previous forwarder rather than only on the common path. Deferred
+	// rather than called explicitly at every return: everything above it
+	// in the function body has already run by the time a deferred call
+	// fires, which is what gives "after the forwarder swap" (Task 8's
+	// brief) on the path that reaches it, while still covering the paths
+	// that return before it.
+	defer a.reconcileServing(ctx)
+
 	mode := a.getSetting(ctx, "blocking.mode")
 	a.engine.SetBlocking(mode, uint32(a.getInt(ctx, "blocking.ttl", 30)))
 	if err := a.registry.Reload(ctx); err != nil {
@@ -626,13 +655,17 @@ func (a *App) Start(ctx context.Context) error {
 		MaxEntries:    int(a.getInt(ctx, "cache.max_entries", 10000)),
 	})
 
-	a.applySettings(ctx)
-
+	// Also before applySettings, and for the same reason the cache is: the
+	// first applySettings call below reconciles DoT and DoH against
+	// whatever the store already has — a restart with either enabled from
+	// a previous run — and that reconcile needs a real pipeline handler to
+	// give its listener, not the nil interface a field declared but never
+	// assigned would hand it.
 	instanceID := a.getSetting(ctx, "instance.id")
 	a.logger = qlog.New(a.st.QueryLog(), qlog.Options{
 		Privacy: a.getSetting(ctx, "qlog.privacy"), InstanceID: instanceID,
 	})
-	handler := dnssrv.Chain(a.fwd,
+	a.handler = dnssrv.Chain(a.fwd,
 		a.logger.Middleware(),
 		dnssrv.Recover(),
 		a.registry.Middleware(),
@@ -640,17 +673,40 @@ func (a *App) Start(ctx context.Context) error {
 		a.resolver.Middleware(),
 		a.dnsCache.Middleware(),
 	)
+
+	a.applySettings(ctx)
+	// applySettings has, by this line, possibly started DoT and/or DoH from
+	// settings a previous run stored. Every failure below therefore has to
+	// take them back down: Start's contract is all-or-nothing, and
+	// cmd/dnsaur/main.go does not call Shutdown on a Start error. Harmless
+	// in production (the process exits and the OS reclaims the socket), but
+	// internal/app's tests are one long-lived process, and a leaked listener
+	// there wedges its port for every test that follows.
+	stopWhatStarted := func() {
+		if err := a.serving.shutdownAll(context.Background()); err != nil {
+			slog.Error("stopping encrypted listeners after a failed start", "err", err)
+		}
+		for _, s := range a.servers {
+			if err := s.Shutdown(context.Background()); err != nil {
+				slog.Error("stopping a DNS listener after a failed start", "err", err)
+			}
+		}
+		a.servers = nil
+		cancel()
+	}
+
 	for _, addr := range a.cfg.DNSListen {
 		// The key store, not a snapshot of it: a key created through the API
 		// is live on the next signed message rather than the next restart.
 		// a.xfrOut and a.notifyIn are each the same instance on every
 		// listener, so a transfer or a notify answers identically regardless
 		// of which address a peer dials.
-		s := dnssrv.NewServer(addr, handler,
+		s := dnssrv.NewServer(addr, a.handler,
 			dnssrv.WithTSIGKeys(a.st.TSIGKeys()),
 			dnssrv.WithTransfers(a.xfrOut),
 			dnssrv.WithNotifies(a.notifyIn))
 		if err := s.Start(); err != nil {
+			stopWhatStarted()
 			return err
 		}
 		a.servers = append(a.servers, s)
@@ -666,6 +722,7 @@ func (a *App) Start(ctx context.Context) error {
 	})
 	ln, err := net.Listen("tcp", a.cfg.HTTPListen)
 	if err != nil {
+		stopWhatStarted()
 		return err
 	}
 	a.apiAddr = ln.Addr().String()
@@ -714,6 +771,11 @@ func (a *App) Start(ctx context.Context) error {
 		// for it before closing the store rather than pulling the store out
 		// from under a transfer.
 		a.notifyIn.Run,
+		// Re-attempts DoT/DoH while either is enabled and not listening, so
+		// a bind failure whose cause the operator has since cleared stops
+		// needing an unrelated settings write to notice — see
+		// runServingRetry.
+		a.runServingRetry,
 		func(c context.Context) { a.refresher.Run(c, refreshEvery) },
 		func(c context.Context) {
 			for {
@@ -800,15 +862,35 @@ func (a *App) Shutdown(ctx context.Context) error {
 	if a.apiSrv != nil {
 		_ = a.apiSrv.Shutdown(ctx)
 	}
+	var errs []error
 	for _, s := range a.servers {
-		_ = s.Shutdown(ctx)
+		if err := s.Shutdown(ctx); err != nil {
+			errs = append(errs, err)
+		}
 	}
+	// Cancel before the encrypted listeners come down, not after. a.wg.Wait
+	// below waits for an in-flight applySettings, and applySettings ends in
+	// a reconcile that can start listeners. shutdownAll holds that pass's
+	// own lock and marks the reconciler closed, so a racing pass can no
+	// longer commit a listener behind it; cancelling first is what keeps
+	// this prompt rather than what makes it correct — a pass that has not
+	// yet read settings dies there, instead of making shutdownAll wait out
+	// a bind attempt and a listener drain before it can take the lock.
 	if a.cancel != nil {
 		a.cancel()
+	}
+	// The encrypted listeners the reconciler is holding, if any — a.servers
+	// above is only ever the plain :53 listeners built once in Start.
+	if err := a.serving.shutdownAll(ctx); err != nil {
+		errs = append(errs, err)
 	}
 	a.wg.Wait() // qlog drains its buffer on ctx cancel before returning
 	if f := a.fwd.forwarder(); f != nil {
 		_ = f.Close()
 	}
-	return a.st.Close()
+	// Joined rather than "first wins": a socket that would not close is a
+	// separate fact from a store that would not close, and the caller
+	// (cmd/dnsaur) prints whatever comes back.
+	errs = append(errs, a.st.Close())
+	return errors.Join(errs...)
 }

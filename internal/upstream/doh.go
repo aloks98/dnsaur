@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/aloks98/dnsaur/internal/dnssrv"
 	"github.com/miekg/dns"
 )
 
@@ -66,7 +67,7 @@ func newDoHExchanger(u Upstream, timeout time.Duration, roots *x509.CertPool) *d
 }
 
 func (e *dohExchanger) Exchange(ctx context.Context, m *dns.Msg) (*dns.Msg, error) {
-	if err := padQuery(m, paddingBlock); err != nil {
+	if err := dnssrv.Pad(m, dnssrv.PaddingBlockQuery); err != nil {
 		return nil, err
 	}
 	// RFC 8484 §4.1: the ID carries no meaning over HTTP, and a constant
@@ -107,7 +108,7 @@ func (e *dohExchanger) Exchange(ctx context.Context, m *dns.Msg) (*dns.Msg, erro
 		return nil, fmt.Errorf("doh %s: %w", e.url, err)
 	}
 	r.Id = id
-	stripPadding(r)
+	dnssrv.StripPadding(r)
 	return r, nil
 }
 

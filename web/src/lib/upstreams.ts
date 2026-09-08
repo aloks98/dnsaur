@@ -471,6 +471,21 @@ export function parseUpstreams(value: string): ParseResult {
 }
 
 /**
+ * The port an entry of this scheme uses when it does not state one —
+ * addr.go's defaultPlainPort/defaultDoTPort/defaultDoHPort.
+ *
+ * Exported for the upstreams editor, which has to recognise "this is the
+ * outgoing transport's default port" when the operator switches transport:
+ * a `tls://` row on 853 becomes an `https://` row on 443, while a port the
+ * operator typed themselves is theirs to keep.
+ */
+export function defaultPortFor(scheme: UpstreamScheme): string {
+  if (scheme === "tls") return DEFAULT_DOT_PORT;
+  if (scheme === "https") return DEFAULT_DOH_PORT;
+  return DEFAULT_PLAIN_PORT;
+}
+
+/**
  * Assembles `scheme://addr[path]#name`, the inverse of the canonical form —
  * what the preset picker calls to build an entry, such that
  * `parseUpstreams(buildUpstream(...)).entries[0].canonical === buildUpstream(...)`.

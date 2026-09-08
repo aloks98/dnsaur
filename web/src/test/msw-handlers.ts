@@ -175,9 +175,19 @@ export const handlers = [
   }),
 
   // Nothing wrong by default — the settings page asks on every render, and
-  // a test that wants the warning overrides this via server.use().
+  // a test that wants a warning overrides this via server.use(). Both
+  // protocols default to off-and-not-listening (matching serve.*.enabled's
+  // own "false" default in fullSettings()) and no certificate has ever
+  // loaded, so `certificate` stays omitted rather than merely falsy.
   http.get("/api/v1/resolver/status", () => {
-    const status: ResolverStatus = { encryption_downgraded: false, reason: "" };
+    const status: ResolverStatus = {
+      encryption_downgraded: false,
+      reason: "",
+      serving: {
+        dot: { enabled: false, listening: false, addr: "" },
+        doh: { enabled: false, listening: false, addr: "" },
+      },
+    };
     return HttpResponse.json(status);
   }),
 

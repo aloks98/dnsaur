@@ -101,14 +101,7 @@ func TestFormatPrimariesRoundTrips(t *testing.T) {
 // machine's own resolver or on anything outside the process.
 func mockNameserver(t *testing.T, handler dns.HandlerFunc) string {
 	t.Helper()
-	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	ln, err := net.Listen("tcp", pc.LocalAddr().String())
-	if err != nil {
-		t.Fatal(err)
-	}
+	pc, ln := listenBothProtocols(t)
 	u := &dns.Server{PacketConn: pc, Handler: handler}
 	s := &dns.Server{Listener: ln, Handler: handler}
 	go func() { _ = u.ActivateAndServe() }()

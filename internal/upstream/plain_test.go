@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aloks98/dnsaur/internal/dnssrv"
 	"github.com/miekg/dns"
 )
 
@@ -12,7 +13,7 @@ import (
 // TestDoHPadsWhatItSendsAndStripsWhatItGets deliver "an encrypted query is
 // padded"; this delivers "a plain one is not", which nothing asserted.
 //
-// The refactor it exists to catch is a plausible one: hoisting padQuery out
+// The refactor it exists to catch is a plausible one: hoisting dnssrv.Pad out
 // of the two encrypted exchangers and into Forwarder.exchange, where the
 // message is already being copied. Every other test in the package still
 // passes afterwards, and every plaintext query starts carrying 128-byte
@@ -60,9 +61,9 @@ func TestPlainQueryIsNotPadded(t *testing.T) {
 		}
 		// Belt and braces: padding is what would make the length a multiple
 		// of the block, and this query is far shorter than one block.
-		if s.raw >= paddingBlock {
+		if s.raw >= dnssrv.PaddingBlockQuery {
 			t.Errorf("the plaintext query was %d bytes, at or past the %d-byte padding block: "+
-				"short as it is, that can only mean it was padded", s.raw, paddingBlock)
+				"short as it is, that can only mean it was padded", s.raw, dnssrv.PaddingBlockQuery)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("the upstream never recorded a query")

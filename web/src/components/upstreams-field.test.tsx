@@ -292,10 +292,10 @@ test("changing transport clears the Custom pin, so a row set that still matches 
   fireEvent.click(screen.getByRole("button", { name: /^quad9$/i }));
   fireEvent.click(screen.getByRole("button", { name: /^custom$/i }));
 
-  // tls <-> https is the one transport change that leaves the rows
-  // byte-for-byte untouched (both are "encrypted", so changeTransport's
-  // carry-over logic doesn't fire) — round-tripping through it means any
-  // difference in the resulting chip is down to the pin, not a row rewrite.
+  // tls <-> https keeps every row and touches only a default port (853
+  // <-> 443), so a full round trip lands back on the exact addresses it
+  // started from — which means any difference in the resulting chip is
+  // down to the pin, not a row rewrite.
   fireEvent.click(screen.getByRole("radio", { name: /^https/i }));
   fireEvent.click(screen.getByRole("radio", { name: /^tls/i }));
 
@@ -349,4 +349,71 @@ test("removing a row leaves focus in the row that was being edited", () => {
 
   expect(screen.getAllByLabelText("Address")).toHaveLength(2);
   expect(document.activeElement).toHaveValue("9.9.9.9:853");
+});
+
+// --- switching between two encrypted transports -------------------------
+//
+// changeTransport had a branch for encrypted -> plain and one for plain ->
+// encrypted, and none for tls <-> https, so the address carried across
+// verbatim and `1.1.1.1:853` became `https://1.1.1.1:853/dns-query`.
+// Confirmed live: Cloudflare answers TLS on 853 but never negotiates h2, so
+// dnsaur completed the handshake, sent an HTTP/2 POST, and the far end
+// never replied — every query hung to the 5s upstream timeout and fell back
+// to serve-stale.
+
+test("switching DNS-over-TLS to DNS-over-HTTPS moves the default port and keeps the names", () => {
+  const onChange = vi.fn<(next: string) => void>();
+  render(<UpstreamsField value="" onChange={onChange} />);
+
+  fireEvent.click(screen.getByRole("radio", { name: /^tls/i }));
+  fireEvent.click(screen.getByRole("button", { name: /^cloudflare$/i }));
+  onChange.mockClear();
+
+  fireEvent.click(screen.getByRole("radio", { name: /^https/i }));
+
+  expect(onChange).toHaveBeenLastCalledWith(
+    "https://1.1.1.1:443/dns-query#cloudflare-dns.com," +
+      "https://1.0.0.1:443/dns-query#cloudflare-dns.com",
+  );
+  expect(screen.getAllByLabelText("Address").map((el) => (el as HTMLInputElement).value)).toEqual([
+    "1.1.1.1:443",
+    "1.0.0.1:443",
+  ]);
+});
+
+test("switching DNS-over-HTTPS to DNS-over-TLS moves the default port back", () => {
+  const onChange = vi.fn<(next: string) => void>();
+  render(
+    <UpstreamsField value="https://1.1.1.1:443/dns-query#cloudflare-dns.com" onChange={onChange} />,
+  );
+  onChange.mockClear();
+
+  fireEvent.click(screen.getByRole("radio", { name: /^tls/i }));
+
+  expect(onChange).toHaveBeenLastCalledWith("tls://1.1.1.1:853#cloudflare-dns.com");
+});
+
+test("a non-default port survives a switch between encrypted transports unchanged", () => {
+  const onChange = vi.fn<(next: string) => void>();
+  // :8853 is not DoT's default, so it is the operator's choice and stays
+  // theirs. Nothing is cleared either way — the addresses are still valid.
+  render(<UpstreamsField value="tls://1.1.1.1:8853#dns.example.net" onChange={onChange} />);
+  onChange.mockClear();
+
+  fireEvent.click(screen.getByRole("radio", { name: /^https/i }));
+
+  expect(onChange).toHaveBeenLastCalledWith("https://1.1.1.1:8853/dns-query#dns.example.net");
+  expect(screen.getAllByLabelText("Address").map((el) => (el as HTMLInputElement).value)).toEqual([
+    "1.1.1.1:8853",
+  ]);
+});
+
+test("a bracketed IPv6 address keeps its brackets across an encrypted switch", () => {
+  const onChange = vi.fn<(next: string) => void>();
+  render(<UpstreamsField value="tls://[2606:4700::1111]:853#one.one" onChange={onChange} />);
+  onChange.mockClear();
+
+  fireEvent.click(screen.getByRole("radio", { name: /^https/i }));
+
+  expect(onChange).toHaveBeenLastCalledWith("https://[2606:4700::1111]:443/dns-query#one.one");
 });

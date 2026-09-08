@@ -14,6 +14,40 @@ export interface HealthStatus {
 }
 
 /**
+ * One encrypted protocol's status (Go: api.ProtocolStatus) — intent (from
+ * settings) alongside reality (whether the socket actually bound). The two
+ * are allowed to disagree: a privileged port already taken, or a
+ * certificate that will not load *at the moment a listener is (re)started*,
+ * leaves `enabled` true and `listening` false. A certificate that stops
+ * reading under an already-running listener does not — it keeps serving
+ * from the keypair it cached, so that disagreement only surfaces at the
+ * next start. `error` is the bind failure in that case, and is omitted
+ * (`undefined`) whenever there's nothing wrong — mirrors the Go struct's
+ * `omitempty`.
+ */
+export interface ProtocolStatus {
+  enabled: boolean;
+  listening: boolean;
+  addr: string;
+  error?: string;
+}
+
+/** DoT and DoH's ProtocolStatus side by side — they fail independently, so
+ * this is never collapsed to one boolean. */
+export interface ServingStatus {
+  dot: ProtocolStatus;
+  doh: ProtocolStatus;
+}
+
+/** The loaded certificate's expiry, as GET /resolver/status reports it.
+ * Only present at all when a certificate has actually loaded — see
+ * ResolverStatus.certificate. */
+export interface CertificateStatus {
+  not_after: string;
+  expiring_soon: boolean;
+}
+
+/**
  * GET /resolver/status — state of the running resolver that is not a
  * setting, and so deliberately not part of the flat GET /settings map.
  *
@@ -22,10 +56,20 @@ export interface HealthStatus {
  * hardcoded plaintext resolvers: queries are going out in the clear while
  * the settings page still shows the encrypted value. `reason` is the parse
  * failure.
+ *
+ * `serving` is each encrypted protocol's intent alongside reality (see
+ * ProtocolStatus). `certificate` is the loaded certificate's expiry, and is
+ * **omitted entirely** — not merely falsy — when no certificate has ever
+ * loaded successfully: a fresh install with nothing configured yet, and a
+ * configured pair that has never once read cleanly, both look like this.
+ * That is a different fact from "expires soon", and conflating the two
+ * would put a spurious expiry warning on every fresh install.
  */
 export interface ResolverStatus {
   encryption_downgraded: boolean;
   reason: string;
+  serving: ServingStatus;
+  certificate?: CertificateStatus;
 }
 
 export interface Group {

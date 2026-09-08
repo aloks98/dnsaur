@@ -63,17 +63,24 @@ the DB, bumps a config version, and live components reload automatically —
 | `lists.refresh_hours` **†** | `24` | How often blocklists/allowlists are re-downloaded and recompiled |
 | `qlog.retention_days` | `90` | How long query log rows are kept before the pruner deletes them |
 | `qlog.privacy` | `full` | Query log privacy mode: `full`, anonymized client IPs, or `none` (no per-query logging) |
+| `serve.dot.enabled` | `false` | Serve DNS-over-TLS (RFC 7858) to clients on `serve.dot.listen`. Enabling requires `serve.tls.cert`/`serve.tls.key` to already name a certificate that loads — see Encrypted serving below |
+| `serve.dot.listen` | `:853` | Address the DoT listener binds — TCP only, since DoT has no datagram transport. `host:port`, host empty for all interfaces, port 1-65535 |
+| `serve.doh.enabled` | `false` | Serve DNS-over-HTTPS (RFC 8484, `/dns-query`) to clients on `serve.doh.listen`. Same certificate requirement as `serve.dot.enabled` |
+| `serve.doh.listen` | `:443` | Address the DoH listener binds — same `host:port` grammar as `serve.dot.listen` |
+| `serve.tls.cert` | *(empty)* | Absolute path to the PEM certificate DoT and DoH both present. Empty means neither protocol can be enabled yet |
+| `serve.tls.key` | *(empty)* | Absolute path to the PEM private key matching `serve.tls.cert` |
 
 **†** — Restart-required exception. `cache.*` sizing/TTL settings and
 `lists.refresh_hours` are read once at startup (the cache and the
 background refresh ticker are sized/scheduled then); a running instance
 must be restarted to pick up changes to these keys. Everything else in the
-table — blocking mode/TTL, upstreams, upstream strategy, clients, groups,
-lists, rules, zones and their records, and query-log privacy — applies
-live, no restart needed: settings keys through the change-notification
-channel, and clients, filters and zones through a reload the write handler
-triggers directly. This is a documented Phase 1 limitation, expected to be
-revisited in a later phase.
+table — blocking mode/TTL, upstreams, upstream strategy, the six
+`serve.*` encrypted-serving keys, clients, groups, lists, rules, zones and
+their records, and query-log privacy — applies live, no restart needed:
+settings keys through the change-notification channel, and clients,
+filters and zones through a reload the write handler triggers directly.
+This is a documented Phase 1 limitation, expected to be revisited in a
+later phase.
 
 Two internal key prefixes (`instance.*` and future `stats.*` bookkeeping)
 are not meant to be user-edited and are excluded from the settings API
@@ -157,6 +164,188 @@ transport. A `forwarder` zone's `forward_to` (see
 `host:port` — it names internal resolvers on trusted networks, not public
 ones reached over the open internet, so there is nothing here for TLS to
 protect.
+
+## Encrypted serving
+
+The six `serve.*` settings above are the other half of encrypted DNS: not
+what dnsaur trusts to resolve a name (Encrypted upstreams, above) but
+whether a client reaching dnsaur itself gets DNS-over-TLS or
+DNS-over-HTTPS instead of plain UDP/TCP port 53. Both apply live — enabling,
+disabling, or repointing a listen address or certificate reconciles the
+running listeners on the next settings write, no restart. Toggling one
+protocol never disturbs the other's live connections; only the protocol
+whose configuration actually changed is stopped and restarted.
+
+**Order matters: save the certificate before enabling.** `PUT /settings`
+refuses `serve.dot.enabled=true` or `serve.doh.enabled=true` unless
+`serve.tls.cert` and `serve.tls.key` are both already set to an absolute
+path and load as a matching pair — the same `tls.LoadX509KeyPair` call the
+listener itself makes before binding. The rejection says so directly, "set
+serve.tls.cert and serve.tls.key first", rather than a bare "invalid
+value", because the fields that make the write valid are not the field
+being written. Disabling never has this requirement — an operator must
+always be able to turn a protocol off, including when the certificate has
+gone missing, which is exactly when they most need to.
+
+```
+serve.tls.cert  /etc/letsencrypt/live/dns.example.com/fullchain.pem
+serve.tls.key   /etc/letsencrypt/live/dns.example.com/privkey.pem
+```
+
+The rule runs the other way too: **clearing `serve.tls.cert` or
+`serve.tls.key` while either protocol is enabled is refused.** An empty
+path is not a configuration the reconciler can act on — it would stop the
+running listener and then fail to start it again with `certificate: stat :
+no such file or directory`, an error naming nothing. Turn the protocol off
+first, then clear the paths.
+
+**Rotating to a *different* path is a four-step change, with downtime.**
+A direct swap of one half is rejected as a mismatched pair, since the new
+certificate does not match the old key, so moving to a new directory means:
+turn both protocols off, clear both paths, set both new paths, turn the
+protocols back on. This is deliberate rather than an omission — the case it
+would optimise for barely exists, because certbot renews *in place*, over
+the same two paths, and that path needs no settings change at all (see
+Certificate delivery, below).
+
+### What a DoH client has to send
+
+The endpoint is RFC 8484's, at `/dns-query`, and the path is not
+configurable. A `GET` carries the query as base64url in the `dns`
+parameter; a `POST` carries it as the request body and **must be typed
+`Content-Type: application/dns-message`** — anything else is answered
+`415`. Accepting an untyped or wrongly typed body would hide a client's
+misconfiguration until it met a resolver that checks. Queries larger than
+65535 bytes are rejected rather than truncated, and zone transfers and
+NOTIFY are refused on this transport: neither has a meaning inside an HTTP
+request/response.
+
+### The bootstrap chain
+
+A DoT client is configured with a **hostname**, not an address — Android's
+Private DNS accepts nothing else. Getting from that hostname to an open,
+certificate-validated connection goes through plain DNS first:
+
+1. The device resolves `dns.example.com` using the resolver the network
+   already handed it, which is dnsaur, in plaintext, on port 53.
+2. dnsaur answers with its own address.
+3. Only then does the device open DoT (or DoH) to that address and
+   validate the certificate against the hostname.
+
+**Plain DNS bootstraps encrypted DNS.** The consequence for deployment:
+**the DoT/DoH hostname must resolve to the listener's address for internal
+clients**, and dnsaur is the thing that makes that true — typically an
+`A`/`AAAA` record in a zone dnsaur itself serves, pointing the hostname at
+dnsaur's own address (see [`docs/dashboard.md`](dashboard.md#records) for
+adding one). Skip this and the first deployment fails confusingly: the
+handshake never completes, which looks like a certificate problem and is
+actually a DNS one — the hostname never resolved, or resolved somewhere
+else.
+
+### DNS-01 is the only usable ACME challenge
+
+When that hostname resolves to a private address for internal clients,
+Let's Encrypt's own servers cannot reach it: HTTP-01 needs to fetch a URL
+under the hostname, and TLS-ALPN-01 needs to open a TLS connection to it,
+and both require the public internet to reach whatever address the
+hostname resolves to. DNS-01 only needs a TXT record published in the
+domain's public zone, which has nothing to do with how the hostname
+resolves internally — so it is the one challenge type that still works
+here.
+
+### The key-permissions trap
+
+certbot writes `privkey.pem` `0600 root:root`. dnsaur binds ports 53 and
+853, both privileged, so it runs either as root or with
+`CAP_NET_BIND_SERVICE` — and in the second case it cannot read a
+root-only key. A certbot deploy hook fixes it on every renewal, not just
+the first time:
+
+```sh
+#!/bin/sh
+# /etc/letsencrypt/renewal-hooks/deploy/dnsaur.sh
+chgrp dnsaur "/etc/letsencrypt/live/$RENEWED_LINEAGE/privkey.pem"
+chmod 640 "/etc/letsencrypt/live/$RENEWED_LINEAGE/privkey.pem"
+```
+
+(`dnsaur` is whichever group the process actually runs as — adjust to
+match.) Without the hook, the very next renewal silently reintroduces the
+problem a one-off `chmod` just fixed.
+
+This is exactly what save-time validation (above) is for: `PUT /settings`
+runs `tls.LoadX509KeyPair` on the two paths before accepting the write, so
+a permissions problem is a 400 naming `serve.tls.cert`/`serve.tls.key`
+with the OS error that names the unreadable file — at the moment the
+certificate is saved, not a failed bind discovered at three in the
+morning.
+
+### Certificate delivery is out of scope
+
+dnsaur reads a certificate; it does not obtain one. How the file gets to
+`serve.tls.cert`/`serve.tls.key` — certbot running on the dnsaur host, an
+`rsync` from a host that does, a manual copy — makes no difference to
+dnsaur: the reload watches the *file*, not the process that wrote it
+(`internal/dnssrv/certs.go` compares both files' mtimes on every
+handshake and reloads the pair together whenever either one has changed).
+Whichever delivery mechanism is used, the next handshake after a write
+picks up the new keypair, with no restart and no settings change. There
+is no certificate-upload or ACME-client feature to look for here, on
+purpose — accepting an uploaded key would put private key material in the
+settings table, which `GET /settings` returns wholesale.
+
+The safety net for a delivery mechanism that quietly stops — a disabled
+timer, a hook that stopped firing, a copy job someone forgot about — is
+the **expiry warning**: `GET /resolver/status`'s `certificate` field
+carries the loaded certificate's `not_after` and an `expiring_soon` flag
+that is true once it is within 14 days of that date. The threshold is
+fixed, not a setting, because an operator who could tune it could tune it
+to never fire.
+
+The field describes a certificate that is actually in use: it is **absent
+entirely** when neither protocol is enabled, when no keypair is configured,
+and when none has ever loaded — three different reasons that all amount to
+"there is no certificate to warn about". And it follows a renewal without
+waiting for a client: reading the status re-checks both files' mtimes, so
+a certbot renewal on a quiet resolver clears the warning at the next status
+read rather than at the next handshake.
+
+### A bind failure is reported, not just logged
+
+`serve.dot.enabled`/`serve.doh.enabled` are intent; whether a socket is
+actually open is a separate fact, and the two are allowed to disagree — a
+privileged port already taken by something else, or a certificate that
+will not load at the moment a listener starts, leaves the setting `true`
+and the listener down. `GET /resolver/status`'s
+`serving.dot`/`serving.doh` carry both fields (`enabled`, `listening`)
+plus the bind `error` when they disagree, so a protocol that is enabled
+but not listening is visible on screen instead of only in the log — the
+same "intent is not reality" pattern the encryption-downgrade warning
+above already uses for upstreams.
+
+A certificate that stops being readable **under an already-running
+listener** is a different case, and does not bring it down: the listener
+keeps serving from the keypair it already loaded, and nothing re-probes the
+filesystem for a configuration that has not changed. The disagreement only
+appears the next time that listener has a reason to start — a restart, an
+address change, or a certificate-path change.
+
+**The warning clears on its own.** dnsaur re-attempts the bind every 30
+seconds while either protocol is enabled and not listening, so stopping
+whatever was holding the port is enough; there is no settings write to make
+and nothing to restart. When both protocols are converged, nothing is
+retried and nothing is polled.
+
+### What this protects, and what it does not
+
+Once DoT or DoH is enabled, **other devices on the same network stop
+seeing which names a client looks up** — a compromised IoT device, a
+guest, anything else on the segment can no longer read plaintext DNS off
+the wire. **dnsaur itself still sees every query, exactly as before.**
+This mirrors [Encrypted upstreams](#encrypted-upstreams)'s own caveat: the
+resolver you chose still sees everything you send it. Encrypted serving
+protects the local hop the same way encrypted upstreams protects the
+outbound one — neither removes dnsaur, or whichever upstream it forwards
+to, from the trust picture. Only the network paths in between.
 
 ## Conditional forwarding
 

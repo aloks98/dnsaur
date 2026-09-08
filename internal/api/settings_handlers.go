@@ -1,9 +1,12 @@
 package api
 
 import (
+	"crypto/tls"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -29,6 +32,12 @@ var editableSettings = map[string]func(string) error{
 	"lists.refresh_hours":   nonNegInt,
 	"qlog.retention_days":   nonNegInt,
 	"qlog.privacy":          oneOf("full", "anon", "none"),
+	"serve.dot.enabled":     boolean,
+	"serve.dot.listen":      listenAddr,
+	"serve.doh.enabled":     boolean,
+	"serve.doh.listen":      listenAddr,
+	"serve.tls.cert":        absPathOrEmpty,
+	"serve.tls.key":         absPathOrEmpty,
 }
 
 // validUpstreams runs the same parser applySettings runs, so a value that
@@ -51,6 +60,113 @@ func nonNegInt(v string) error {
 	n, err := strconv.ParseInt(v, 10, 64)
 	if err != nil || n < 0 {
 		return errors.New("must be a whole number, zero or more")
+	}
+	return nil
+}
+
+// boolean is the grammar for serve.*.enabled: exactly "true" or "false",
+// not anything strconv.ParseBool would also accept ("1", "T", "on"), so the
+// stored value is what a template or a JS `=== "true"` check expects.
+func boolean(v string) error {
+	if v == "true" || v == "false" {
+		return nil
+	}
+	return errors.New("must be true or false")
+}
+
+// listenAddr checks the shape a net.Listen call needs — a host (possibly
+// empty, meaning all interfaces) and a numeric port — without attempting to
+// bind it. Whether the port is actually free is a runtime question the
+// reconciler answers; checking it here would race the reconciler's own bind
+// a moment later and reject a value for a reason that has nothing to do
+// with the value itself.
+func listenAddr(v string) error {
+	_, port, err := net.SplitHostPort(v)
+	if err != nil {
+		return fmt.Errorf("must be a host:port address: %w", err)
+	}
+	n, err := strconv.Atoi(port)
+	// 1, not 0. Port 0 is a valid argument to net.Listen and means "give me
+	// whatever is free", so it saves, binds, and reports Listening: true on
+	// an address no client was ever told and that changes on every restart.
+	// There is no configuration in which that is what the operator meant.
+	if err != nil || n < 1 || n > 65535 {
+		return errors.New("port must be numeric, 1-65535")
+	}
+	return nil
+}
+
+// absPathOrEmpty is the grammar for serve.tls.cert/key: empty (no
+// certificate configured yet) or an absolute path. It does not check that
+// the file exists or is readable — that needs the *other* path too (a cert
+// alone can't be loaded), which is exactly what validateCrossField is for.
+func absPathOrEmpty(v string) error {
+	if v == "" || filepath.IsAbs(v) {
+		return nil
+	}
+	return errors.New("must be an absolute path")
+}
+
+// validateCrossField runs after the per-key validator, with the value that
+// is about to be written and the store's current values for everything
+// else. It exists because "enable DoT" is only valid against the state of
+// serve.tls.cert and serve.tls.key, which a per-key validator cannot see.
+//
+// It also catches a broken certificate pair as soon as both halves would
+// exist, whether or not a protocol is being enabled at that moment — the
+// same "fail at the save that caused it" reasoning as the upstreams
+// validator, rather than waiting until the unrelated later save that
+// happens to flip enabled to true.
+func validateCrossField(key, value string, current map[string]string) error {
+	switch key {
+	case "serve.dot.enabled", "serve.doh.enabled":
+		if value != "true" {
+			// Disabling never requires a certificate: an operator must
+			// always be able to turn a protocol off, including when the
+			// certificate has gone missing — which is exactly when they
+			// most need to.
+			return nil
+		}
+		return validCertPair(current["serve.tls.cert"], current["serve.tls.key"])
+	case "serve.tls.cert", "serve.tls.key":
+		cert, certKey := current["serve.tls.cert"], current["serve.tls.key"]
+		if key == "serve.tls.cert" {
+			cert = value
+		} else {
+			certKey = value
+		}
+		if cert == "" || certKey == "" {
+			// Staging the configuration one path at a time, in either
+			// order, is how an operator gets to a complete keypair before
+			// enabling anything — that must not fail. Once a protocol is
+			// enabled, though, an incomplete keypair is no longer a stage
+			// on the way somewhere: it is the live configuration, and
+			// accepting it takes the listener down at the next reconcile
+			// with "certificate: stat : no such file or directory", an
+			// error naming an empty path. Spec §6 lists "no certificate is
+			// configured" as knowable at save time and so rejectable —
+			// this is that check, at the save that would cause it.
+			if current["serve.dot.enabled"] == "true" || current["serve.doh.enabled"] == "true" {
+				return errors.New("turn DNS-over-TLS and DNS-over-HTTPS off before clearing the certificate")
+			}
+			return nil
+		}
+		return validCertPair(cert, certKey)
+	default:
+		return nil
+	}
+}
+
+// validCertPair is the one place that decides a certificate configuration
+// is usable: both paths set, and tls.LoadX509KeyPair — the exact call the
+// reconciler will make to build a tls.Config — succeeds on them. A value
+// that saves here is a value that will load there.
+func validCertPair(cert, key string) error {
+	if cert == "" || key == "" {
+		return errors.New("set serve.tls.cert and serve.tls.key first")
+	}
+	if _, err := tls.LoadX509KeyPair(cert, key); err != nil {
+		return err
 	}
 	return nil
 }
@@ -79,9 +195,10 @@ func (s *Server) handleSettingsGet(w http.ResponseWriter, r *http.Request) {
 }
 
 // resolverStatus is what the settings screen needs to know about the running
-// resolver that is not a setting. One field today, plus its reason; a flat
-// object rather than a bare boolean so the next such fact does not need a
-// second endpoint.
+// resolver that is not a setting: the upstream-encryption downgrade (E1),
+// what the two encrypted listeners are actually doing (Task 8's
+// servingState), and the certificate's expiry — a flat object so the next
+// such fact does not need a second endpoint.
 type resolverStatus struct {
 	// EncryptionDowngraded: the stored `upstreams` asked for tls:// or
 	// https://, would not parse, and the server is resolving through the
@@ -91,16 +208,43 @@ type resolverStatus struct {
 	EncryptionDowngraded bool `json:"encryption_downgraded"`
 	// Reason is the parse failure, verbatim, or "" when nothing is wrong.
 	Reason string `json:"reason"`
+	// Serving is intent (from settings) alongside reality (whether the
+	// socket actually bound), per encrypted protocol — they fail
+	// independently, so this is never collapsed to one boolean.
+	Serving servingStatus `json:"serving"`
+	// Certificate is the loaded certificate's expiry, or absent entirely
+	// when none has ever loaded successfully.
+	Certificate *certificateStatus `json:"certificate,omitempty"`
+}
+
+// servingStatus carries DoT and DoH's api.ProtocolStatus side by side.
+type servingStatus struct {
+	DoT ProtocolStatus `json:"dot"`
+	DoH ProtocolStatus `json:"doh"`
+}
+
+// certificateStatus is the loaded certificate's expiry as the API reports
+// it. Only present in resolverStatus.Certificate when a certificate has
+// actually loaded — see handleResolverStatus.
+type certificateStatus struct {
+	NotAfter     time.Time `json:"not_after"`
+	ExpiringSoon bool      `json:"expiring_soon"`
 }
 
 // handleResolverStatus answers the one round trip the settings page makes
 // for server state. Deps.ResolverStatus is nil in test servers with no App
-// behind them; a server with no forwarder has downgraded nothing, so that
-// answers false.
+// behind them; a server with no forwarder has downgraded nothing, no
+// listeners to report, and no certificate loaded, so those all answer their
+// zero values.
 func (s *Server) handleResolverStatus(w http.ResponseWriter, r *http.Request) {
 	var out resolverStatus
 	if s.deps.ResolverStatus != nil {
 		out.EncryptionDowngraded, out.Reason = s.deps.ResolverStatus.UpstreamDowngrade()
+		dot, doh := s.deps.ResolverStatus.Serving()
+		out.Serving = servingStatus{DoT: dot, DoH: doh}
+		if notAfter, expiringSoon, ok := s.deps.ResolverStatus.CertExpiry(); ok {
+			out.Certificate = &certificateStatus{NotAfter: notAfter, ExpiringSoon: expiringSoon}
+		}
 	}
 	writeJSON(w, http.StatusOK, out)
 }
@@ -124,6 +268,21 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 	if err := validate(body.Value); err != nil {
 		// The prefix stays: it is what the existing suite and the web form
 		// both key off. The reason is appended, not substituted.
+		errJSON(w, http.StatusBadRequest, "invalid value for "+body.Key+": "+err.Error())
+		return
+	}
+	// The per-key validator only ever sees this one value. Whether it is
+	// coherent with the rest of the configuration — enabling DoT against a
+	// certificate that is missing or broken — needs the current settings,
+	// so that check reads the store before the write is accepted.
+	current, err := s.deps.Store.Settings().All(r.Context())
+	if err != nil {
+		storeErr(w, err)
+		return
+	}
+	if err := validateCrossField(body.Key, body.Value, current); err != nil {
+		// Same shape as the per-key rejection above: one handler, one error
+		// format, whether the field that failed is spelled body.Key.
 		errJSON(w, http.StatusBadRequest, "invalid value for "+body.Key+": "+err.Error())
 		return
 	}

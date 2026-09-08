@@ -2,6 +2,9 @@ package dnssrv
 
 import (
 	"context"
+	"crypto/tls"
+	"errors"
+	"io"
 	"log/slog"
 	"net"
 	"net/netip"
@@ -18,7 +21,15 @@ type Server struct {
 	notifies  Notifies
 	udp       *dns.Server
 	tcp       *dns.Server
-	bound     string
+	// The sockets the two dns.Servers above were activated on, kept so
+	// Shutdown can close them itself when miekg declines to -- see
+	// Shutdown.
+	pc    net.PacketConn
+	ln    net.Listener
+	bound string
+
+	tlsConfig *tls.Config
+	encrypted bool
 }
 
 // Option configures a Server before Start. Nothing here can be changed
@@ -48,6 +59,20 @@ func NewServer(addr string, h Handler, opts ...Option) *Server {
 }
 
 func (s *Server) Start() error {
+	if s.tlsConfig != nil {
+		ln, err := tls.Listen("tcp", s.addr, s.tlsConfig)
+		if err != nil {
+			return err
+		}
+		s.bound = ln.Addr().String()
+		s.ln = ln
+		// Net is deliberately unset: ActivateAndServe uses the Listener it
+		// is given, and this one already speaks TLS.
+		s.tcp = &dns.Server{Listener: ln, Handler: dns.HandlerFunc(s.serve), TsigProvider: s.tsig}
+		serveInBackground(s.tcp, "dot")
+		return nil
+	}
+
 	// Check if port is fixed (not ephemeral)
 	_, port, _ := net.SplitHostPort(s.addr)
 	isEphemeral := port == "0" || port == ""
@@ -75,22 +100,15 @@ func (s *Server) Start() error {
 
 		// Successfully bound both UDP and TCP
 		mux := dns.HandlerFunc(s.serve)
+		s.pc, s.ln = pc, ln
 		// Both listeners get the provider. A zone transfer only ever arrives
 		// over TCP, but RFC 8945 puts TSIG on any message, and a provider on
 		// one socket and not the other would make verification depend on which
 		// one a peer happened to use.
 		s.udp = &dns.Server{PacketConn: pc, Handler: mux, TsigProvider: s.tsig}
 		s.tcp = &dns.Server{Listener: ln, Handler: mux, TsigProvider: s.tsig}
-		go func() {
-			if err := s.udp.ActivateAndServe(); err != nil {
-				slog.Error("udp server error", "err", err)
-			}
-		}()
-		go func() {
-			if err := s.tcp.ActivateAndServe(); err != nil {
-				slog.Error("tcp server error", "err", err)
-			}
-		}()
+		serveInBackground(s.udp, "udp")
+		serveInBackground(s.tcp, "tcp")
 		return nil
 	}
 
@@ -99,16 +117,97 @@ func (s *Server) Start() error {
 
 func (s *Server) Addr() string { return s.bound }
 
+// serveInBackground starts srv and returns once it is actually serving --
+// or once it has failed, whichever happens first.
+//
+// The wait is the whole point, and it is not cosmetic. miekg's
+// ShutdownContext returns "dns: server not started" *before* it closes
+// anything (server.go:411-416) while srv.started is still false, which it
+// is for the whole window between ActivateAndServe being scheduled and the
+// goroutine actually reaching it. A Shutdown landing in that window
+// therefore closes nothing, and the goroutine then runs, sets started, and
+// serves the socket for the rest of the process's life: the address cannot
+// be rebound, and the listener keeps answering a configuration the settings
+// no longer name. For :53, started once and stopped at exit, that window is
+// unreachable in practice; for DoT it is an operator-driven cycle, reached
+// every time a protocol is toggled or a certificate path changes.
+//
+// NotifyStartedFunc is called from serveTCP/serveUDP after started is set
+// under srv.lock (server.go:388-394, 463-467), so a fired notification is
+// proof that a later ShutdownContext will take the closing path rather than
+// the early return. The done channel covers the other outcome: an
+// ActivateAndServe that fails before it ever starts serving would otherwise
+// leave this waiting forever.
+func serveInBackground(srv *dns.Server, what string) {
+	started := make(chan struct{})
+	srv.NotifyStartedFunc = func() { close(started) }
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if err := srv.ActivateAndServe(); err != nil {
+			slog.Error(what+" server error", "err", err)
+		}
+	}()
+	select {
+	case <-started:
+	case <-done:
+	}
+}
+
+// Shutdown stops every listener this Server started, and reports every
+// failure rather than the first: a socket that would not close is exactly
+// the failure a caller must not discard, and with two of them the second
+// one's reason is as useful as the first's.
+//
+// The socket closes here belong to the "ShutdownContext refused" path only.
+// A refusal means miekg closed nothing at all -- it returns before touching
+// the Listener -- so the socket is this Server's to close, or it stays bound
+// and, worse, keeps serving. On the ordinary path miekg has already closed
+// both, and Close on a closed socket answers net.ErrClosed, which is not a
+// failure to report.
 func (s *Server) Shutdown(ctx context.Context) error {
-	var first error
+	var errs []error
 	for _, srv := range []*dns.Server{s.udp, s.tcp} {
-		if srv != nil {
-			if err := srv.ShutdownContext(ctx); err != nil && first == nil {
-				first = err
-			}
+		if srv == nil {
+			continue
+		}
+		if err := srv.ShutdownContext(ctx); err != nil {
+			errs = append(errs, err)
+			errs = append(errs, closeSocket(s.socketFor(srv))...)
 		}
 	}
-	return first
+	return errors.Join(errs...)
+}
+
+// socketFor is the socket srv was activated on, so a refused shutdown
+// closes the right one rather than both.
+func (s *Server) socketFor(srv *dns.Server) io.Closer {
+	switch srv {
+	case s.udp:
+		if s.pc == nil {
+			return nil
+		}
+		return s.pc
+	case s.tcp:
+		if s.ln == nil {
+			return nil
+		}
+		return s.ln
+	default:
+		return nil
+	}
+}
+
+// closeSocket closes c, reporting anything other than "it was already
+// closed" -- the answer on every path where miekg got there first.
+func closeSocket(c io.Closer) []error {
+	if c == nil {
+		return nil
+	}
+	if err := c.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+		return []error{err}
+	}
+	return nil
 }
 
 func (s *Server) serve(w dns.ResponseWriter, m *dns.Msg) {
@@ -167,6 +266,28 @@ func (s *Server) serve(w dns.ResponseWriter, m *dns.Msg) {
 	// that dropped OPT. Spec-correct behavior per RFC 6891.
 	if m.IsEdns0() != nil && resp.Msg.IsEdns0() == nil {
 		resp.Msg.SetEdns0(1232, false)
+	}
+
+	// RFC 8467 §4.2. Only when the client padded, and only on an encrypted
+	// transport: a plaintext reply gains nothing from padding and costs
+	// bytes.
+	//
+	// The only hard constraint on where this call goes is "before
+	// w.WriteMsg": that is where miekg computes the TSIG MAC, lazily, over
+	// whatever resp.Msg holds at that point (ReplyTSIG below only builds an
+	// unsigned stub). Its position among the response-shaping steps here —
+	// ahead of ReplyTSIG, ahead of FitUDPReply — is conventional, not
+	// forced. In particular, ordering against FitUDPReply has no effect
+	// today: FitUDPReply only runs for a UDP reply, and s.encrypted is only
+	// ever true when WithTLS bound a TLS-wrapped, TCP-only listener with no
+	// UDP socket at all (tls.go, server.go's Start). So s.encrypted and the
+	// isUDP branch below are mutually exclusive for every request this
+	// server handles; padding and a UDP-budget trim never compete for the
+	// same reply.
+	if s.encrypted && hasPadding(m) {
+		if err := Pad(resp.Msg, PaddingBlockResponse); err != nil {
+			slog.Error("padding the reply", "err", err)
+		}
 	}
 
 	// RFC 8945 §5.3: a request that verified gets an answer signed under the

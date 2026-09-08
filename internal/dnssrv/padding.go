@@ -1,13 +1,19 @@
-package upstream
+package dnssrv
 
 import "github.com/miekg/dns"
 
-// paddingBlock is RFC 8467 §4.1's recommended client block size: every
+// PaddingBlockQuery is RFC 8467 §4.1's recommended client block size: every
 // query is rounded up to a multiple of this, so its length says nothing
 // about the name inside it.
-const paddingBlock = 128
+const PaddingBlockQuery = 128
 
-// padQuery pads m to a multiple of block octets using the EDNS(0) Padding
+// PaddingBlockResponse is RFC 8467 §4.2's server profile. A response is
+// padded to a multiple of this only when the query that prompted it carried
+// a Padding option, and only on an encrypted transport — padding a
+// plaintext reply hides nothing and costs bytes.
+const PaddingBlockResponse = 468
+
+// Pad pads m to a multiple of block octets using the EDNS(0) Padding
 // option (RFC 7830, code 12).
 //
 // Only the encrypted exchangers call it. Padding a plaintext query hides
@@ -16,7 +22,7 @@ const paddingBlock = 128
 // Idempotent: an existing padding option is reused and re-sized rather than
 // added to, so a query padded before a failed attempt and retried on a
 // fresh connection is padded once.
-func padQuery(m *dns.Msg, block int) error {
+func Pad(m *dns.Msg, block int) error {
 	opt := m.IsEdns0()
 	if opt == nil {
 		// Padding has nowhere to live without an OPT record. 1232 is the
@@ -51,14 +57,31 @@ func padQuery(m *dns.Msg, block int) error {
 	return nil
 }
 
-// stripPadding removes the Padding option from m's OPT record.
+// hasPadding reports whether m's OPT record carries an EDNS0_PADDING option
+// (RFC 8467 §4.2). The server consults this on the query it just received:
+// padding is a response to a client that asked for it, never volunteered on
+// its own.
+func hasPadding(m *dns.Msg) bool {
+	opt := m.IsEdns0()
+	if opt == nil {
+		return false
+	}
+	for _, o := range opt.Option {
+		if _, ok := o.(*dns.EDNS0_PADDING); ok {
+			return true
+		}
+	}
+	return false
+}
+
+// StripPadding removes the Padding option from m's OPT record.
 //
 // The OPT record itself is kept even when padding was its only option: it
 // also carries the DO bit, the extended rcode bits and the advertised UDP
 // size, and dropping it to save eleven bytes would discard those. Called on
 // every encrypted reply before it is returned, so neither the cache nor the
 // client ever sees padding that meant something only on the TLS hop.
-func stripPadding(m *dns.Msg) {
+func StripPadding(m *dns.Msg) {
 	opt := m.IsEdns0()
 	if opt == nil {
 		return

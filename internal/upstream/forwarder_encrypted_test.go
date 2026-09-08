@@ -8,13 +8,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aloks98/dnsaur/internal/certtest"
 	"github.com/miekg/dns"
 )
 
 // A tls:// entry in the settings reaches the DoT server, end to end through
 // the Forwarder rather than through the exchanger alone.
 func TestForwarderUsesDoT(t *testing.T) {
-	cert, pool := testCertFor(t, dotName)
+	cert, pool := certtest.For(t, dotName)
 	addr, _ := startDoT(t, cert, answerA("10.0.0.9"))
 	f, err := New(Config{Upstreams: []string{"tls://" + addr + "#" + dotName}, Strategy: "failover"})
 	if err != nil {
@@ -75,7 +76,7 @@ func TestNewUpDispatchesOnScheme(t *testing.T) {
 // query failed would pass even if a plaintext attempt had succeeded first
 // and then been discarded; the counter is what makes the test discriminate.
 func TestEncryptedUpstreamNeverFallsBackToPlaintext(t *testing.T) {
-	cert, _ := testCertFor(t, "right.test")
+	cert, _ := certtest.For(t, "right.test")
 	addr, _ := startDoT(t, cert, answerA("10.0.0.1"))
 	host, port, err := net.SplitHostPort(addr)
 	if err != nil {

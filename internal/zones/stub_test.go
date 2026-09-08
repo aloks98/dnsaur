@@ -74,6 +74,34 @@ type stubMasterConfig struct {
 	unsignedReplies bool
 }
 
+// listenBothProtocols binds one loopback port on UDP and TCP both, which is
+// what a DNS server needs and what ListenPacket alone cannot give: the kernel
+// picks a port free in the UDP space, and TCP is a separate space where that
+// same number may already be taken by something else on the machine. Nothing
+// can ask for a port free in both at once, so a collision is retried on a
+// fresh port — rare enough that this converges on the first attempt in
+// practice, and bounded so a machine that really has nothing free says so
+// rather than spinning.
+func listenBothProtocols(t *testing.T) (net.PacketConn, net.Listener) {
+	t.Helper()
+	const attempts = 20
+	for range attempts {
+		pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("listen udp: %v", err)
+		}
+		ln, err := net.Listen("tcp", pc.LocalAddr().String())
+		if err == nil {
+			return pc, ln
+		}
+		if err := pc.Close(); err != nil {
+			t.Fatalf("closing the udp listener after a tcp collision: %v", err)
+		}
+	}
+	t.Fatalf("no loopback port was free on both udp and tcp in %d attempts", attempts)
+	return nil, nil
+}
+
 // startStubMaster serves cfg as zone on one loopback port, on UDP and TCP
 // both, shutting down when the test ends. Both transports, because a DNS
 // client that meets TC=1 has to be able to re-ask over TCP on the same
@@ -153,15 +181,8 @@ func startStubMaster(t *testing.T, zone string, cfg stubMasterConfig) *stubMaste
 	mux := dns.NewServeMux()
 	mux.HandleFunc(".", handle)
 
-	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen udp: %v", err)
-	}
+	pc, ln := listenBothProtocols(t)
 	m.addr = pc.LocalAddr().String()
-	ln, err := net.Listen("tcp", m.addr)
-	if err != nil {
-		t.Fatalf("listen tcp on the udp port: %v", err)
-	}
 	tsig := dnssrv.NewTSIGProvider(cfg.keys)
 	for _, srv := range []*dns.Server{
 		{PacketConn: pc, Handler: mux, TsigProvider: tsig},

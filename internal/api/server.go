@@ -47,10 +47,13 @@ type ZoneRefresher interface {
 }
 
 // ResolverStatus reports state of the running resolver that the dashboard
-// has to show but that is not a setting — today, exactly one thing: whether
-// the forwarder in use is the hardcoded plaintext fallback, installed
-// because the stored `upstreams` value asked for an encrypted transport and
-// would not parse.
+// has to show but that is not a setting. It started (E1) as exactly one
+// fact — whether the forwarder in use is the hardcoded plaintext fallback,
+// installed because the stored `upstreams` value asked for an encrypted
+// transport and would not parse — and that doc comment's "today" was an
+// invitation, not a boundary: it now also carries whether the encrypted
+// listeners actually bound, and whether the certificate they serve is
+// close to expiring.
 //
 // It is not folded into GET /settings on purpose. That response is a flat
 // key -> value map of *settings*, pure enough that handleSettingsGet strips
@@ -65,6 +68,30 @@ type ResolverStatus interface {
 	// UpstreamDowngrade reports whether encrypted upstreams were replaced by
 	// plaintext defaults, and why.
 	UpstreamDowngrade() (active bool, reason string)
+	// Serving reports each encrypted protocol's intent (from settings) and
+	// reality (whether a socket is actually open) separately — DoT and DoH
+	// fail independently (one can bind while the other, on a privileged
+	// port, is refused), so a single aggregated boolean would leave the
+	// operator unable to tell which one is down.
+	Serving() (dot, doh ProtocolStatus)
+	// CertExpiry reports the loaded certificate's NotAfter and whether it
+	// falls within the warning threshold. ok is false when no certificate
+	// has ever loaded successfully — a fresh install with nothing configured
+	// yet, or a configured pair that has never once read cleanly — which is
+	// a different fact from "expires soon" and must not be reported as one.
+	CertExpiry() (notAfter time.Time, expiringSoon, ok bool)
+}
+
+// ProtocolStatus is one encrypted protocol's status as the API reports it.
+// Declared here, not in internal/app, because ResolverStatus is an api
+// interface and internal/app imports this package — an import cycle if the
+// interface referred to a type declared over there. internal/app converts
+// its own unexported protocolState (serve.go) into this on the way out.
+type ProtocolStatus struct {
+	Enabled   bool   `json:"enabled"`
+	Listening bool   `json:"listening"`
+	Addr      string `json:"addr"`
+	Err       string `json:"error,omitempty"`
 }
 
 type Deps struct {

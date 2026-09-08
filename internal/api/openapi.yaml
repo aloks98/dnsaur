@@ -53,6 +53,22 @@ components:
       type: object
       properties:
         error: { type: string }
+    ProtocolStatus:
+      type: object
+      description: >
+        One encrypted protocol's intent and reality, from GET
+        /resolver/status. enabled is what the setting says; listening is
+        whether a socket is actually open right now — they can disagree, and
+        that disagreement is the whole point of reporting both.
+      properties:
+        enabled: { type: boolean }
+        listening: { type: boolean }
+        addr:
+          type: string
+          description: the configured listen address, whether or not the bind succeeded
+        error:
+          type: string
+          description: the bind failure, present only when enabled && !listening
     List:
       type: object
       description: >
@@ -822,6 +838,22 @@ paths:
         page still shows the operator's encrypted value. "reason" carries the
         parse failure. It clears as soon as a later settings apply installs a
         forwarder built from the stored value.
+
+
+        "serving" reports DoT and DoH separately: each carries "enabled" (what
+        serve.{dot,doh}.enabled says) and "listening" (whether a socket is
+        actually open right now). The two are allowed to disagree — a
+        privileged port already taken by something else, or a certificate
+        that stopped being readable, leaves enabled true and listening false
+        — and "error" carries the bind failure in that case.
+
+
+        "certificate" is present only once a certificate has actually loaded
+        successfully; it is absent on a fresh install or while the configured
+        pair has never once read cleanly, which is a different fact from
+        "expires soon" and is never reported as a false warning. When present,
+        "expiring_soon" is true when "not_after" falls within a fixed 14-day
+        warning window — a constant, not a configurable setting.
       responses:
         "200":
           description: OK
@@ -834,9 +866,28 @@ paths:
                   reason:
                     type: string
                     description: why the value would not parse; empty when nothing is wrong
+                  serving:
+                    type: object
+                    properties:
+                      dot: { $ref: "#/components/schemas/ProtocolStatus" }
+                      doh: { $ref: "#/components/schemas/ProtocolStatus" }
+                  certificate:
+                    type: object
+                    description: absent when no certificate has ever loaded successfully
+                    properties:
+                      not_after: { type: string, format: date-time }
+                      expiring_soon:
+                        type: boolean
+                        description: true when not_after falls within the 14-day warning window
                 example:
                   encryption_downgraded: true
                   reason: 'upstream "tls://1.1.1.1:853": missing "#name"'
+                  serving:
+                    dot: { enabled: true, listening: true, addr: "0.0.0.0:853" }
+                    doh: { enabled: true, listening: false, addr: "0.0.0.0:443", error: "listen tcp :443: bind: permission denied" }
+                  certificate:
+                    not_after: "2026-10-01T00:00:00Z"
+                    expiring_soon: false
         "401":
           description: authentication required
           content:
@@ -886,7 +937,11 @@ paths:
         cache.min_ttl, cache.max_ttl, cache.max_entries,
         cache.serve_stale_for (non-negative ints), lists.refresh_hours
         (non-negative int), qlog.retention_days (non-negative int),
-        qlog.privacy (full|anon|none). All other keys are rejected.
+        qlog.privacy (full|anon|none), serve.dot.enabled, serve.doh.enabled
+        ("true" or "false", exactly those two strings), serve.dot.listen,
+        serve.doh.listen ("host:port", host may be empty for all
+        interfaces, port numeric 1-65535), serve.tls.cert, serve.tls.key
+        (an absolute path, or empty to unset). All other keys are rejected.
 
 
         "upstreams" is a comma-separated list of entries, each plain
@@ -900,6 +955,19 @@ paths:
         the list must share one scheme. A value that fails this grammar
         is rejected with 400 and a reason naming the problem, rather than
         being accepted and silently dropped at the next restart.
+
+
+        Setting "serve.dot.enabled" or "serve.doh.enabled" to "true"
+        additionally requires "serve.tls.cert" and "serve.tls.key" to
+        already both be set to an absolute path and to load as a matching
+        keypair (the same check the listener itself makes before
+        binding). The rejection names this explicitly ("set
+        serve.tls.cert and serve.tls.key first") rather than a bare
+        "invalid value", since the fields that make the write valid are
+        not the field being written. Setting either to "false" never has
+        this requirement. Saving "serve.tls.cert" or "serve.tls.key" once
+        both halves are set runs the same pair check, regardless of
+        whether a protocol is currently enabled.
       requestBody:
         required: true
         content:
@@ -922,6 +990,12 @@ paths:
                     - lists.refresh_hours
                     - qlog.retention_days
                     - qlog.privacy
+                    - serve.dot.enabled
+                    - serve.dot.listen
+                    - serve.doh.enabled
+                    - serve.doh.listen
+                    - serve.tls.cert
+                    - serve.tls.key
                 value: { type: string }
       responses:
         "204":

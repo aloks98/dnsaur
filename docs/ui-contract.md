@@ -211,17 +211,62 @@ Server state, not a setting — deliberately not folded into the flat map
 above.
 
 ```json
-{ "encryption_downgraded": false, "reason": "" }
+{
+  "encryption_downgraded": false,
+  "reason": "",
+  "serving": {
+    "dot": { "enabled": true, "listening": true, "addr": "[::]:853" },
+    "doh": { "enabled": true, "listening": true, "addr": "[::]:443" }
+  },
+  "certificate": { "not_after": "2026-11-14T00:00:00Z", "expiring_soon": false }
+}
 ```
 
 `encryption_downgraded` is true when the stored `upstreams` value named
 `tls://` or `https://`, failed to parse, and the server fell back to its
 hardcoded **plaintext** default resolvers; `reason` is the parse failure.
-The settings screen renders a persistent `--warning` strip above the save
-bar while it is true, with `reason` beneath it. It clears server-side as
-soon as a settings apply installs a forwarder built from the stored value,
-so the dashboard polls this every 5s while it is true and not at all
-otherwise.
+It clears server-side as soon as a settings apply installs a forwarder
+built from the stored value.
+
+`serving.dot`/`serving.doh` are intent (`enabled`, from settings) beside
+reality (`listening`, whether a socket is open), plus `error` — omitted
+unless they disagree. A failed bind is retried server-side every 30s.
+`certificate` is **omitted entirely** unless a certificate is actually in
+use: absent when neither protocol is enabled, when no paths are set, and
+when none has ever loaded. That is a different fact from "not expiring
+soon", and conflating them would put an expiry warning on a fresh install.
+
+**Polling.** The dashboard polls this while `somethingIsWrong`
+(`web/src/lib/serving.ts`) — a downgrade, either protocol enabled and not
+listening, or a certificate expiring soon — every 5s, and not at all
+otherwise. One predicate, shared with the shell banners, so "we warn about
+this" and "we keep asking about this" cannot drift.
+
+It also polls every 1s for 5s after **any `serve.*` write**, whatever the
+status currently says. The reconcile that makes such a write real runs
+asynchronously off the settings watcher, so the single refetch that follows
+a save routinely lands before it: without the window, the reality line
+under a freshly ticked checkbox reads `off` until the operator navigates
+away and back.
+
+**A status that will not load is its own state.** Both the reality line and
+the certificate line render "status unavailable" rather than falling back
+to `off` / `No certificate loaded.` — those are positive claims, and a
+listener that is serving perfectly well must not be described as off. This
+covers the transient case before the first response too.
+
+One exception, on the certificate line only: a save-time rejection still
+wins over "Status unavailable." That message came from this form's own
+`PUT`, not from the endpoint that is not answering, so it is known to be
+true even when the status is unknown.
+
+**Multi-key saves are ordered, not fanned out.** `PUT /settings` is one key
+per request and validates each against what is already stored, so the
+settings form dispatches in phases: disables, then `serve.tls.cert`, then
+`serve.tls.key`, then everything else, then enables. The two certificate
+phases hold one key each so the second request is the one that sees a
+complete pair — dispatched together, neither sees both values and a
+mismatched pair stores with a 204.
 
 | Status | Error string |
 |---|---|

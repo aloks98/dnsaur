@@ -105,10 +105,14 @@ func answerA(ip string) dns.HandlerFunc {
 	}
 }
 
-func req(name string) *dnssrv.Request {
+func query(name string) *dns.Msg {
 	m := new(dns.Msg)
 	m.SetQuestion(dns.Fqdn(name), dns.TypeA)
-	return &dnssrv.Request{Msg: m}
+	return m
+}
+
+func req(name string) *dnssrv.Request {
+	return &dnssrv.Request{Msg: query(name)}
 }
 
 func TestForwardSuccessAndCaseRestore(t *testing.T) {

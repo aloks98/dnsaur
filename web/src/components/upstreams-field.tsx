@@ -3,6 +3,7 @@ import { Minus, Plus } from "lucide-react";
 import { Button, cn, Input } from "@e412/rnui-react";
 import {
   buildUpstream,
+  defaultPortFor,
   parseUpstreams,
   type UpstreamErrorCode,
   type UpstreamScheme,
@@ -134,6 +135,54 @@ function hostOf(address: string): string {
   }
   const i = trimmed.lastIndexOf(":");
   return i >= 0 ? trimmed.slice(0, i) : trimmed;
+}
+
+/**
+ * The port an address states, or "" when it states none. Bracket-aware, and
+ * deliberately blind to a bare (unbracketed) IPv6 literal: `::1` has no
+ * port, and reading its last colon as one would invent a port from an
+ * address the operator never gave one to.
+ */
+function portOf(address: string): string {
+  const trimmed = address.trim();
+  if (trimmed.startsWith("[")) {
+    const end = trimmed.indexOf("]");
+    if (end < 0) return "";
+    const rest = trimmed.slice(end + 1);
+    return rest.startsWith(":") ? rest.slice(1) : "";
+  }
+  const i = trimmed.lastIndexOf(":");
+  if (i < 0) return "";
+  // More than one colon and no brackets: a bare IPv6 literal, not a port.
+  if (trimmed.slice(0, i).includes(":")) return "";
+  return trimmed.slice(i + 1);
+}
+
+/**
+ * Rewrites `address`'s port when — and only when — it is `from`'s default
+ * port, moving it to `to`'s.
+ *
+ * DoT and DoH run on different ports, and switching between them used to
+ * carry the address across verbatim, so `1.1.1.1:853` became
+ * `https://1.1.1.1:853/dns-query`. That is not a rejected value: Cloudflare
+ * answers TLS on 853 but never negotiates `h2`, so dnsaur completed the
+ * handshake, sent an HTTP/2 POST, and the far end simply never replied —
+ * every query hung to the 5s upstream timeout and fell back to serve-stale.
+ * Silent, and it looks nothing like a port.
+ *
+ * Only the default moves. An operator who typed `:8853` chose it, and a
+ * port that means something on one encrypted transport can mean the same on
+ * the other. Nothing is cleared either way — "never a silent discard" is
+ * this component's rule, and the addresses are all still valid.
+ */
+function retargetPort(address: string, from: Transport, to: Transport): string {
+  const trimmed = address.trim();
+  const port = portOf(trimmed);
+  if (port === "" || port !== defaultPortFor(schemeFor(from))) return address;
+  // Everything up to and including the ":" — the host is left exactly as
+  // the operator wrote it, brackets and all.
+  const head = trimmed.slice(0, trimmed.length - port.length);
+  return `${head}${defaultPortFor(schemeFor(to))}`;
 }
 
 function isAddressIP(address: string): boolean {
@@ -355,6 +404,11 @@ export function UpstreamsField({
    * can fail: a hostname has no address to carry into a `tls://`/`https://`
    * entry, so if *any* row is a hostname the whole table clears rather than
    * half-convert into something the operator didn't ask for.
+   *
+   * Encrypted -> encrypted keeps everything and moves only a default port
+   * (853 <-> 443) — see retargetPort for what carrying it across verbatim
+   * actually did. buildUpstream already handles the path for both schemes,
+   * so the port is the only thing that leaked.
    */
   function changeTransport(next: Transport) {
     if (next === transport) return;
@@ -367,6 +421,8 @@ export function UpstreamsField({
       const hadNames = rows.some((r) => r.serverName.trim() !== "");
       nextRows = rows.map((r) => ({ id: r.id, address: r.address, serverName: "", path: "" }));
       if (hadNames) nextNote = "Server names dropped.";
+    } else if (wasEncrypted && nowEncrypted) {
+      nextRows = rows.map((r) => ({ ...r, address: retargetPort(r.address, transport, next) }));
     } else if (!wasEncrypted && nowEncrypted) {
       const nonBlank = rows.filter((r) => r.address.trim() !== "");
       const anyHostname = nonBlank.some((r) => !isAddressIP(r.address));
