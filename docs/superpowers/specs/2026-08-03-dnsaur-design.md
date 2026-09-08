@@ -26,6 +26,7 @@ most; proven libraries over from-scratch protocol work).
 | Deployment | Docker-first (distroless, multi-arch amd64+arm64, GHCR) + single static binary (GoReleaser: deb/rpm/tarball, systemd unit, setcap) |
 | Config loading | koanf (file + env) for the bootstrap config — chosen over Viper (dependency weight, implicit merge magic) as the env surface grows. Migrations via goose (pressly/goose v3) as an embedded library: per-dialect `embed.FS` SQL files, applied at startup; standardized over hand-rolled per user decision. |
 | HA | Instance-to-instance config sync, primary/replica, each instance self-contained on its own SQLite. Shared-Postgres and multi-master CRDT models rejected (DB host becomes a SPOF; conflict-resolution complexity not worth it). |
+| DNSSEC | **Deferred (2026-09-08).** Phase 4's zone half shipped (zones milestones A–D); its DNSSEC half did not start. Validation adds little over validating upstreams reached over DoT/DoH (Phase 3, shipped) and adds a failure mode of its own — expired signatures, clock skew before NTP — so it is scheduled with own-recursion, which has no validating upstream to lean on. Signing waits for a hosted zone that needs a DS at its registrar. The Phase 4 RFC targets below stand for when either half is picked up. |
 
 ## Phasing
 

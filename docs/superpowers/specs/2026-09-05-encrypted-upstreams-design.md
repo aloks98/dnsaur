@@ -24,7 +24,8 @@ It is worth being precise about what this does *not* buy. The chosen
 resolver still sees every query — encryption moves trust from "everyone on
 the path" to "the operator of the resolver you picked", it does not remove
 trust. Removing it requires running our own recursion, which is deliberately
-a later release (task #68).
+a later release, scheduled together with DNSSEC validation (decided
+2026-09-08; see the main design spec's decisions table).
 
 ---
 

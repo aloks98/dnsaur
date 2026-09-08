@@ -4,6 +4,7 @@
 **Replaces:** the flat `local_records` model (Pi-hole-style overrides)
 **Scope decision:** full Technitium parity — primary + secondary zones, transfers,
 DNSSEC signing, zone file import/export. Five milestones (A–E), each shippable.
+**A–D shipped; E (DNSSEC signing) was deferred on 2026-09-08 — see §4.**
 
 ---
 
@@ -198,6 +199,13 @@ implementation, and RFC 1995 §2 permits answering it with a full AXFR.
 Online signing: KSK/ZSK generation and storage, DNSKEY/RRSIG/DS, NSEC or NSEC3
 for authenticated denial, scheduled re-signing and key rollover. Largest and
 last; parity with Technitium's DNSSEC menu is the bar.
+
+**Deferred 2026-09-08, not started.** Signing pays off only for a public zone
+with a DS at its registrar, and for a split-horizon internal zone under a
+signed public parent it is actively harmful: a validating client sees bogus.
+It waits for a hosted zone that needs it. Validation on the resolver side is
+deferred with own-recursion for the reasons recorded in the main design
+spec's decisions table.
 
 **Deliberately excluded:** per-zone permissions (single-admin product) and
 page-number pagination (a homelab has single-digit zone counts; the existing

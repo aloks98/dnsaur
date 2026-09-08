@@ -37,7 +37,19 @@ of truth — if it's not listed as shipped, it doesn't work yet.
 | HA config sync (primary/replica) | Planned |
 | DHCP | Planned |
 | Encrypted DNS serving (DoH/DoT for clients of dnsaur) | Shipped |
-| DNSSEC | Planned |
+| DNSSEC (validation and signing) | Deferred — see below |
+
+**DNSSEC is deferred on purpose** (decided 2026-09-08), not merely unbuilt.
+dnsaur forwards to upstreams it reaches over DoT/DoH, and the default ones
+(Cloudflare, Quad9) already validate and refuse bogus answers inside that
+authenticated channel; validating again locally would mostly re-check their
+work while adding the classic way DNS breaks — expired signatures, and
+clock skew on a box with no RTC that needs DNS to reach NTP. Validation is
+scheduled together with own-recursion, where there is no validating upstream
+to lean on. Signing waits for a hosted zone that needs a DS at its
+registrar. Until then a client that sets DO gets whatever signatures the
+upstream returned, subject to the cache: an answer cached for a DO=0 client
+is served without them.
 
 There's no published Docker image yet, but you no longer need to hand-edit
 the database or shell out to curl for everyday admin: a React dashboard

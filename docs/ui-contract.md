@@ -1030,8 +1030,10 @@ comma-separated settings string. Accepted forms: `1.1.1.1`, `1.1.1.1:53`,
 literals bracketed first. Validation is only "non-empty after trimming"; a
 genuinely unusable address is discovered at forwarder-build time.
 
-**Only plain UDP with TCP fallback on truncation is implemented.** No DoT, DoH
-or DoQ anywhere — **TODO**.
+**Transports:** plain UDP with TCP fallback on truncation, `tls://` (DoT) and
+`https://` (DoH) — the address grammar and provider presets are in
+[`configuration.md`](configuration.md). No DoQ, deliberately (E1 spec §"Deliberately
+not implemented").
 
 `upstream.strategy`:
 
@@ -1423,8 +1425,7 @@ typing in an input.
 |---|---|
 | **404 / unknown route** | renders a dedicated not-found screen inside the shell, no group marked in row 2 (`pages/not-found.tsx`) — this table is stale on this point in older captures; `path="*"` no longer redirects |
 | **DHCP** | nothing exists (§3.11) |
-| **Encrypted DNS (DoH/DoT)** | no code |
-| **DNSSEC** | no signing, no validation, no UI. Every other zone type on this row has now shipped and left it: `secondary` in D2–D4 (D2 the transfer client, D3 the AXFR server gated by `allow_transfer`, D4 NOTIFY in both directions — §9.18), and `forwarder` and `stub` in D6 (create/patch, the conditional routing table, the stub's SOA/NS fetch, and both page shapes — §3.8, §2.6). **Reverse zones were never on this list either**: `PTR` is a normal record type, a reverse zone is an ordinary `primary` zone ending in `.arpa`, the RFC 6303 §4 built-ins (`internal/store/builtins.go`'s `BuiltinZones`) are seeded as `type: internal` (read-only, `409` on any write), and an A/AAAA write maintains the matching PTR server-side in the same request |
+| **DNSSEC** | **deferred by decision (2026-09-08), not a gap awaiting work** — no signing, no validation, no UI; validation is scheduled with own-recursion, signing with a hosted zone that needs a DS (README status table, main design spec decisions). Every other zone type on this row has now shipped and left it: `secondary` in D2–D4 (D2 the transfer client, D3 the AXFR server gated by `allow_transfer`, D4 NOTIFY in both directions — §9.18), and `forwarder` and `stub` in D6 (create/patch, the conditional routing table, the stub's SOA/NS fetch, and both page shapes — §3.8, §2.6). **Reverse zones were never on this list either**: `PTR` is a normal record type, a reverse zone is an ordinary `primary` zone ending in `.arpa`, the RFC 6303 §4 built-ins (`internal/store/builtins.go`'s `BuiltinZones`) are seeded as `type: internal` (read-only, `409` on any write), and an A/AAAA write maintains the matching PTR server-side in the same request |
 | **HA / cluster UI** | no code; the spec anticipated a health-strip stub, which does not exist |
 
 The nav contains exactly the nine implemented leaf routes, in four groups

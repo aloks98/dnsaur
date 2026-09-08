@@ -126,7 +126,8 @@ seeing which names this network looks up. **The resolver you chose still
 sees every one of them.** Encryption moves trust from "everyone on the
 path" to "the operator you picked"; it does not remove it. Removing that
 too means dnsaur doing its own recursion instead of forwarding, which is a
-deliberately later release (task #68).
+deliberately later release, scheduled together with DNSSEC validation (see
+the status table in the README).
 
 **Presets.** The dashboard's upstreams editor offers these providers for
 both transports; each round-trips through the same parser as a hand-typed

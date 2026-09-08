@@ -100,9 +100,10 @@ middleware pipeline. Short version: `cmd/dnsaur` is the entry point,
 built independently (`pnpm build`) and embedded into the Go binary via
 `//go:embed` (see `web/embed.go`).
 
-## Specs and plans
+## Specs
 
-Design specs and implementation plans for each phase of work live under
-`docs/superpowers/` (`docs/superpowers/specs/`, `docs/superpowers/plans/`).
-That's where the "why" behind a feature and the step-by-step plan that
-built it are recorded — check there before re-deriving intent from code.
+Design specs for each phase of work live under `docs/superpowers/specs/`.
+That's where the "why" behind a feature is recorded — check there before
+re-deriving intent from code. The step-by-step implementation plans that
+built each milestone were removed once executed; they remain in git
+history before 2026-09-09 if one is ever needed.
