@@ -5,9 +5,20 @@ import (
 	"log/slog"
 	"net/netip"
 	"strings"
+	"time"
 
 	"github.com/miekg/dns"
 )
+
+// PipelineTimeout bounds one ordinary query's trip through the middleware
+// chain, from the listener handing it over to the terminal forwarder's
+// answer coming back.
+//
+// It is the number TransferTimeout and NotifyTimeout are each defined
+// against — both exist because a transfer and a NOTIFY need a deadline of
+// their own rather than this one — and it was a bare literal repeated at
+// every listener while its two siblings were named constants beside it.
+const PipelineTimeout = 5 * time.Second
 
 type Decision string
 

@@ -3,6 +3,7 @@ package dnssrv
 import (
 	"context"
 	"crypto/tls"
+	"fmt"
 	"net"
 	"net/netip"
 	"testing"
@@ -104,6 +105,75 @@ func TestDoTBindsNoUDPSocket(t *testing.T) {
 		t.Fatalf("UDP port %s is occupied, so the TLS server bound a datagram socket it should not have: %v", srv.Addr(), err)
 	}
 	_ = pc.Close()
+}
+
+// A DoT client's connection is meant to be long-lived (RFC 7858 §3.4), and
+// miekg's defaults are not: MaxTCPQueries 128 and an 8-second idle timeout.
+// An Android Private DNS client holds one connection for the life of the
+// network it is on, so both defaults land on it — a full TLS handshake
+// after every 128 queries, and another after every eight-second gap, which
+// is most gaps. DoH already gets three minutes for the same reason
+// (encryptedIdleTimeout); the two encrypted
+// transports should not disagree about how long a connection lives.
+//
+// The query cap is asserted the way it is felt: 130 queries down one
+// connection, ten over miekg's default, so a regression closes the socket
+// under the loop rather than merely reading the wrong number out of a
+// struct field.
+//
+// The idle timeout cannot be asserted the same way. miekg reads
+// srv.IdleTimeout() once when it starts serving a connection and then
+// blocks in a read against it, and there is no seam to move the clock
+// through — proving the default is gone means holding a connection idle for
+// more than eight real seconds, which is more than this suite should spend.
+// So it is pinned at the field miekg reads instead, which is at least the
+// exact value that governs the behaviour rather than a proxy for it.
+func TestDoTHoldsAConnectionOpenForABurst(t *testing.T) {
+	cert, pool := certtest.For(t, "dot.test")
+	srv := NewServer("127.0.0.1:0", echoHandler(), WithTLS(&tls.Config{
+		Certificates: []tls.Certificate{cert},
+		MinVersion:   tls.VersionTLS12,
+	}))
+	if err := srv.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() { _ = srv.Shutdown(context.Background()) })
+
+	if srv.tcp.MaxTCPQueries != -1 {
+		t.Errorf("MaxTCPQueries = %d, want -1 (unlimited); 0 leaves miekg's default of 128", srv.tcp.MaxTCPQueries)
+	}
+	if srv.tcp.IdleTimeout == nil {
+		t.Errorf("IdleTimeout is unset, so miekg's 8-second default governs an idle DoT connection")
+	} else if got := srv.tcp.IdleTimeout(); got != encryptedIdleTimeout {
+		t.Errorf("IdleTimeout() = %v, want %v", got, encryptedIdleTimeout)
+	}
+
+	c := &dns.Client{
+		Net:       "tcp-tls",
+		Timeout:   10 * time.Second,
+		TLSConfig: &tls.Config{ServerName: "dot.test", RootCAs: pool, MinVersion: tls.VersionTLS12},
+	}
+	conn, err := c.Dial(srv.Addr())
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	const queries = 130
+	for i := range queries {
+		m := new(dns.Msg)
+		m.SetQuestion(fmt.Sprintf("q%d.example.com.", i), dns.TypeA)
+		if err := conn.WriteMsg(m); err != nil {
+			t.Fatalf("query %d of %d: write: %v", i+1, queries, err)
+		}
+		r, err := conn.ReadMsg()
+		if err != nil {
+			t.Fatalf("query %d of %d: read: %v -- the server closed the connection mid-burst, which is what miekg's default MaxTCPQueries of 128 does", i+1, queries, err)
+		}
+		if r.Id != m.Id {
+			t.Fatalf("query %d of %d: reply id = %d, want %d", i+1, queries, r.Id, m.Id)
+		}
+	}
 }
 
 // A DoT listener shut down immediately after Start really is gone: the

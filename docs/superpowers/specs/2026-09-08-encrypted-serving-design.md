@@ -350,7 +350,11 @@ is how two copies diverge.
 | RFC | Section | What is implemented |
 |---|---|---|
 | **7858** | §3 | DNS over TLS: port 853, TLS 1.2 minimum, server side |
+| **7858** | §3.4 | Connection reuse: no per-connection query limit, and three minutes idle before a DoT connection is closed |
 | **8484** | §4.1 | DNS over HTTPS: `POST` and `GET`, `application/dns-message` |
+| **8484** | §5.1 | `Cache-Control: max-age=<smallest TTL in the response>`, and `max-age=0` for a response carrying no records |
+| **3225** | §3 | The query's DO bit is copied onto the OPT the server synthesises for the reply |
+| **6891** | §7 | No OPT in a reply to a query that carried none — the reply's own OPT is stripped, not merely left unadded |
 | **7830** | §3 | The EDNS(0) Padding option |
 | **8467** | §4.2 | Response padding to a 468-octet block when the query was padded |
 

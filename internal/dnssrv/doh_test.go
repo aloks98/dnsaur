@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -311,9 +312,41 @@ func TestDoHServerDoesNotAliasCallerNextProtos(t *testing.T) {
 	}
 }
 
+// rejectedBeforeThePipeline is a handler that fails the test if it ever
+// runs. Every case in TestDoHRejectsMalformedRequests is refused ahead of
+// the pipeline, so "the handler was never called" is half of what each of
+// them asserts; the status code or rcode the client sees is the other half.
+// Without it a subtest cannot tell a request the gate refused from one the
+// pipeline forwarded upstream and then happened to answer the same way.
+func rejectedBeforeThePipeline(t *testing.T) Handler {
+	t.Helper()
+	return HandlerFunc(func(_ context.Context, req *Request) (*Response, error) {
+		t.Errorf("the pipeline ran for a request that should have been refused ahead of it: %v", req.Msg)
+		m := new(dns.Msg)
+		m.SetReply(req.Msg)
+		return &Response{Msg: m}, nil
+	})
+}
+
+// dohPostReply POSTs m and returns the DNS message that came back, failing
+// the test unless the exchange was the HTTP 200 a DNS-level refusal is
+// carried inside.
+func dohPostReply(t *testing.T, client *http.Client, addr string, m *dns.Msg) *dns.Msg {
+	t.Helper()
+	code, _, body := dohPost(t, client, addr, packMsg(t, m))
+	if code != http.StatusOK {
+		t.Fatalf("status = %d, want %d (a DNS-level refusal is carried in the message, not the HTTP status)", code, http.StatusOK)
+	}
+	r := new(dns.Msg)
+	if err := r.Unpack(body); err != nil {
+		t.Fatalf("unpacking answer: %v", err)
+	}
+	return r
+}
+
 func TestDoHRejectsMalformedRequests(t *testing.T) {
 	cert, pool := certtest.For(t, "doh.test")
-	srv := startDoHServer(t, echoHandler(), cert)
+	srv := startDoHServer(t, rejectedBeforeThePipeline(t), cert)
 	client := dohHTTPClient(pool, "doh.test", nil)
 
 	t.Run("wrong method", func(t *testing.T) {
@@ -349,6 +382,132 @@ func TestDoHRejectsMalformedRequests(t *testing.T) {
 			t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusBadRequest)
 		}
 	})
+
+	// The rest are the rules miekg's DefaultMsgAcceptFunc applies to every
+	// message arriving on :53, restated on the one transport with no miekg
+	// dns.Server in front of it to apply them. A body that unpacks is not
+	// yet a query: before this gate existed, an UPDATE opcode, a message
+	// with the QR bit set, or a two-question query all entered the pipeline
+	// and were forwarded upstream verbatim.
+	t.Run("message is a response, not a query", func(t *testing.T) {
+		m := new(dns.Msg)
+		m.SetQuestion("example.com.", dns.TypeA)
+		m.Response = true
+		// miekg answers this on :53 with MsgIgnore -- send nothing at all,
+		// so a forged response cannot be bounced off the server as an
+		// amplifier. HTTP has no "say nothing" and needs none: whatever
+		// goes back travels down the client's own connection. 400 says the
+		// same thing in the only vocabulary this transport has.
+		code, _, _ := dohPost(t, client, srv.Addr(), packMsg(t, m))
+		if code != http.StatusBadRequest {
+			t.Errorf("status = %d, want %d", code, http.StatusBadRequest)
+		}
+	})
+
+	t.Run("opcode is not QUERY", func(t *testing.T) {
+		m := new(dns.Msg)
+		m.SetUpdate("example.com.")
+		r := dohPostReply(t, client, srv.Addr(), m)
+		if r.Rcode != dns.RcodeNotImplemented {
+			t.Errorf("rcode = %v, want NOTIMP", dns.RcodeToString[r.Rcode])
+		}
+		if r.Opcode != dns.OpcodeUpdate {
+			t.Errorf("opcode = %v, want the request's own UPDATE echoed back", dns.OpcodeToString[r.Opcode])
+		}
+	})
+
+	t.Run("no question", func(t *testing.T) {
+		m := new(dns.Msg)
+		m.Id = dns.Id()
+		m.RecursionDesired = true
+		r := dohPostReply(t, client, srv.Addr(), m)
+		if r.Rcode != dns.RcodeFormatError {
+			t.Errorf("rcode = %v, want FORMERR", dns.RcodeToString[r.Rcode])
+		}
+	})
+
+	t.Run("two questions", func(t *testing.T) {
+		m := new(dns.Msg)
+		m.Id = dns.Id()
+		m.RecursionDesired = true
+		m.Question = []dns.Question{
+			{Name: "example.com.", Qtype: dns.TypeA, Qclass: dns.ClassINET},
+			{Name: "example.org.", Qtype: dns.TypeA, Qclass: dns.ClassINET},
+		}
+		r := dohPostReply(t, client, srv.Addr(), m)
+		if r.Rcode != dns.RcodeFormatError {
+			t.Errorf("rcode = %v, want FORMERR", dns.RcodeToString[r.Rcode])
+		}
+	})
+
+	// The section caps are what keep miekg's "don't allow dynamic updates,
+	// because then the sections can contain a whole bunch of RRs" true for
+	// a message whose opcode claims QUERY.
+	t.Run("oversized sections", func(t *testing.T) {
+		rr := func(s string) dns.RR {
+			t.Helper()
+			r, err := dns.NewRR(s)
+			if err != nil {
+				t.Fatalf("building %q: %v", s, err)
+			}
+			return r
+		}
+		for _, tc := range []struct {
+			name  string
+			shape func(m *dns.Msg)
+		}{
+			{"two answers", func(m *dns.Msg) {
+				m.Answer = []dns.RR{rr("a.example.com. 300 IN A 1.2.3.4"), rr("b.example.com. 300 IN A 1.2.3.5")}
+			}},
+			{"two authority records", func(m *dns.Msg) {
+				m.Ns = []dns.RR{rr("example.com. 300 IN NS a.example.com."), rr("example.com. 300 IN NS b.example.com.")}
+			}},
+			{"three additional records", func(m *dns.Msg) {
+				m.Extra = []dns.RR{
+					rr("a.example.com. 300 IN A 1.2.3.4"),
+					rr("b.example.com. 300 IN A 1.2.3.5"),
+					rr("c.example.com. 300 IN A 1.2.3.6"),
+				}
+			}},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				m := new(dns.Msg)
+				m.SetQuestion("example.com.", dns.TypeA)
+				tc.shape(m)
+				r := dohPostReply(t, client, srv.Addr(), m)
+				if r.Rcode != dns.RcodeFormatError {
+					t.Errorf("rcode = %v, want FORMERR", dns.RcodeToString[r.Rcode])
+				}
+			})
+		}
+	})
+}
+
+// A NOTIFY still reaches the REFUSED intercept rather than being turned
+// away by the accept gate ahead of it. miekg's DefaultMsgAcceptFunc lets
+// OpcodeNotify through on :53 -- the gate's job is to reject what the
+// server has no answer for at all, and dnsaur has an answer for a NOTIFY on
+// every transport. Narrowing the gate to QUERY alone would answer NOTIMP
+// here and silently change what a secondary sees depending on which
+// transport it used.
+func TestDoHNotifyPassesTheAcceptGate(t *testing.T) {
+	cert, pool := certtest.For(t, "doh.test")
+	srv := startDoHServer(t, rejectedBeforeThePipeline(t), cert)
+	client := dohHTTPClient(pool, "doh.test", nil)
+
+	// RFC 1996 §3.7: a NOTIFY may carry the SOA in its answer section, which
+	// is also why the gate's answer-section cap is one RR and not zero.
+	m := new(dns.Msg).SetNotify("example.com.")
+	soa, err := dns.NewRR("example.com. 300 IN SOA ns.example.com. hostmaster.example.com. 7 3600 600 86400 300")
+	if err != nil {
+		t.Fatalf("building the SOA: %v", err)
+	}
+	m.Answer = []dns.RR{soa}
+
+	r := dohPostReply(t, client, srv.Addr(), m)
+	if r.Rcode != dns.RcodeRefused {
+		t.Errorf("rcode = %v, want REFUSED (the NOTIFY intercept's answer, not the accept gate's NOTIMP)", dns.RcodeToString[r.Rcode])
+	}
 }
 
 // An AXFR arriving over DoH is REFUSED rather than reaching the pipeline.
@@ -405,6 +564,172 @@ func TestDoHRefusesNotify(t *testing.T) {
 	}
 	if r.Rcode != dns.RcodeRefused {
 		t.Errorf("rcode = %v, want REFUSED", dns.RcodeToString[r.Rcode])
+	}
+}
+
+// dohPostHeaders POSTs m and returns the HTTP response headers alongside
+// the DNS message, for assertions about the HTTP envelope rather than the
+// answer inside it.
+func dohPostHeaders(t *testing.T, client *http.Client, addr string, m *dns.Msg) (http.Header, *dns.Msg) {
+	t.Helper()
+	resp, err := client.Post("https://"+addr+dohPath, dohContentType, bytes.NewReader(packMsg(t, m)))
+	if err != nil {
+		t.Fatalf("POST: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("reading body: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	r := new(dns.Msg)
+	if err := r.Unpack(body); err != nil {
+		t.Fatalf("unpacking answer: %v", err)
+	}
+	return resp.Header, r
+}
+
+// RFC 8484 §5.1: a DoH server assigns the response an explicit freshness
+// lifetime, and it may not exceed the smallest TTL the response carries.
+// Without one, every HTTP cache between the client and here is left to
+// guess -- and an answer cached past its TTL is the one failure mode DNS
+// has no way to correct.
+func TestDoHCacheControlFollowsTheSmallestTTL(t *testing.T) {
+	cert, pool := certtest.For(t, "doh.test")
+	client := dohHTTPClient(pool, "doh.test", nil)
+
+	newRR := func(t *testing.T, s string) dns.RR {
+		t.Helper()
+		rr, err := dns.NewRR(s)
+		if err != nil {
+			t.Fatalf("building %q: %v", s, err)
+		}
+		return rr
+	}
+
+	for _, tc := range []struct {
+		name  string
+		edns  bool
+		reply func(t *testing.T, req *dns.Msg) *dns.Msg
+		want  string
+	}{
+		{
+			name: "the smallest TTL in the answer, not the first",
+			reply: func(t *testing.T, req *dns.Msg) *dns.Msg {
+				m := new(dns.Msg)
+				m.SetReply(req)
+				m.Answer = []dns.RR{
+					newRR(t, "example.com. 300 IN A 1.2.3.4"),
+					newRR(t, "example.com. 60 IN A 1.2.3.5"),
+				}
+				return m
+			},
+			want: "max-age=60",
+		},
+		{
+			// RFC 2308: an NXDOMAIN's lifetime is the SOA's, and it rides
+			// in the authority section, so a max-age read from the answer
+			// section alone would be zero for every negative answer.
+			name: "the SOA's negative TTL for an NXDOMAIN",
+			reply: func(t *testing.T, req *dns.Msg) *dns.Msg {
+				m := new(dns.Msg)
+				m.SetRcode(req, dns.RcodeNameError)
+				m.Ns = []dns.RR{newRR(t, "example.com. 120 IN SOA ns.example.com. hostmaster.example.com. 7 3600 600 86400 120")}
+				return m
+			},
+			want: "max-age=120",
+		},
+		{
+			name: "an answer with no records at all holds nothing",
+			reply: func(_ *testing.T, req *dns.Msg) *dns.Msg {
+				m := new(dns.Msg)
+				m.SetRcode(req, dns.RcodeServerFailure)
+				return m
+			},
+			want: "max-age=0",
+		},
+		{
+			// An OPT's TTL field is the extended rcode and the DO bit, not
+			// a lifetime (RFC 6891 §6.1.3). Counting it would answer
+			// max-age=0 for every EDNS query, since those bits are
+			// ordinarily all zero.
+			name: "the OPT's flags are not a TTL",
+			edns: true,
+			reply: func(t *testing.T, req *dns.Msg) *dns.Msg {
+				m := new(dns.Msg)
+				m.SetReply(req)
+				m.Answer = []dns.RR{newRR(t, "example.com. 300 IN A 1.2.3.4")}
+				m.SetEdns0(1232, false)
+				return m
+			},
+			want: "max-age=300",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := startDoHServer(t, HandlerFunc(func(_ context.Context, req *Request) (*Response, error) {
+				return &Response{Msg: tc.reply(t, req.Msg)}, nil
+			}), cert)
+
+			q := new(dns.Msg)
+			q.SetQuestion("example.com.", dns.TypeA)
+			if tc.edns {
+				q.SetEdns0(1232, false)
+			}
+			header, _ := dohPostHeaders(t, client, srv.Addr(), q)
+			if got := header.Get("Cache-Control"); got != tc.want {
+				t.Errorf("Cache-Control = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// The RFC 3225 §3 rule server_test.go's TestSynthesizedOPTCopiesTheDOBit
+// pins on the plain and DoT path, restated on this one for the same reason
+// as TestDoHNonEDNSGetsNoOPTFromACachedReply below.
+func TestDoHSynthesizedOPTCopiesTheDOBit(t *testing.T) {
+	cert, pool := certtest.For(t, "doh.test")
+	srv := startDoHServer(t, noOPTHandler(), cert)
+	client := dohHTTPClient(pool, "doh.test", nil)
+
+	for _, do := range []bool{true, false} {
+		t.Run(fmt.Sprintf("do=%t", do), func(t *testing.T) {
+			q := new(dns.Msg)
+			q.SetQuestion("example.com.", dns.TypeA)
+			q.SetEdns0(4096, do)
+
+			r := dohPostReply(t, client, srv.Addr(), q)
+			opt := r.IsEdns0()
+			if opt == nil {
+				t.Fatal("an EDNS query got no OPT back")
+			}
+			if opt.Do() != do {
+				t.Errorf("reply DO = %t, want the query's own %t", opt.Do(), do)
+			}
+		})
+	}
+}
+
+// The RFC 6891 §7 rule server_test.go's TestNonEDNSGetsNoOPTFromACachedReply
+// pins on the plain and DoT path, restated here because the two paths shape
+// their replies through the same helper and a transport-specific regression
+// would otherwise show up on only one of them.
+func TestDoHNonEDNSGetsNoOPTFromACachedReply(t *testing.T) {
+	cert, pool := certtest.For(t, "doh.test")
+	srv := startDoHServer(t, optCarryingHandler(), cert)
+	client := dohHTTPClient(pool, "doh.test", nil)
+
+	q := new(dns.Msg)
+	q.SetQuestion("example.com.", dns.TypeA)
+	// No EDNS: this client never said it could read an OPT.
+
+	r := dohPostReply(t, client, srv.Addr(), q)
+	if opt := r.IsEdns0(); opt != nil {
+		t.Errorf("a non-EDNS query got an OPT back carrying %v", opt.Option)
+	}
+	if len(r.Answer) != 1 {
+		t.Errorf("answer records = %d, want the answer itself left alone", len(r.Answer))
 	}
 }
 

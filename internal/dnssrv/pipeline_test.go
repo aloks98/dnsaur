@@ -7,6 +7,23 @@ import (
 	"github.com/miekg/dns"
 )
 
+// The three deadlines in this package are defined against each other:
+// PipelineTimeout is what an ordinary query gets, and TransferTimeout and
+// NotifyTimeout exist precisely because a transfer and a NOTIFY need
+// something other than it. Their sibling relation is asserted in
+// notifies_test.go; this is the third side of it, and the thing that
+// notices if the number this package hands every listener stops being a
+// number at all.
+func TestPipelineTimeoutIsTheOrdinaryQuerysDeadline(t *testing.T) {
+	if PipelineTimeout <= 0 {
+		t.Fatalf("PipelineTimeout = %v, want a positive bound", PipelineTimeout)
+	}
+	if PipelineTimeout >= TransferTimeout {
+		t.Errorf("PipelineTimeout = %v, want less than TransferTimeout (%v) -- a transfer needs its own, longer deadline, which is why TransferTimeout exists",
+			PipelineTimeout, TransferTimeout)
+	}
+}
+
 func q(name string, qtype uint16) *Request {
 	m := new(dns.Msg)
 	m.SetQuestion(dns.Fqdn(name), qtype)

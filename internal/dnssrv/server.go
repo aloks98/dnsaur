@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
+	"slices"
 	"time"
 
 	"github.com/miekg/dns"
@@ -68,7 +69,22 @@ func (s *Server) Start() error {
 		s.ln = ln
 		// Net is deliberately unset: ActivateAndServe uses the Listener it
 		// is given, and this one already speaks TLS.
-		s.tcp = &dns.Server{Listener: ln, Handler: dns.HandlerFunc(s.serve), TsigProvider: s.tsig}
+		//
+		// The two overrides are what RFC 7858 §3.4 asks for and miekg's
+		// defaults do not give. A DoT client is expected to hold one
+		// connection open and send everything down it -- Android's Private
+		// DNS keeps one for the life of the network -- and miekg would
+		// close that connection after 128 queries and after eight idle
+		// seconds, charging a full TLS handshake for each. -1 is miekg's
+		// own spelling of "no query limit" (server.go:581-586); 0, the zero
+		// value, is what selects the default of 128.
+		s.tcp = &dns.Server{
+			Listener:      ln,
+			Handler:       dns.HandlerFunc(s.serve),
+			TsigProvider:  s.tsig,
+			IdleTimeout:   func() time.Duration { return encryptedIdleTimeout },
+			MaxTCPQueries: -1,
+		}
 		serveInBackground(s.tcp, "dot")
 		return nil
 	}
@@ -241,7 +257,7 @@ func (s *Server) serve(w dns.ResponseWriter, m *dns.Msg) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), PipelineTimeout)
 	defer cancel()
 	var ip netip.Addr
 	switch a := w.RemoteAddr().(type) {
@@ -256,39 +272,20 @@ func (s *Server) serve(w dns.ResponseWriter, m *dns.Msg) {
 	// computed above, before the branch; see req.RequireTSIG().
 	req.tsig = &tsigState{key: key, err: tsigErr}
 
-	resp, err := s.handler.ServeDNS(ctx, req)
-	if err != nil || resp == nil || resp.Msg == nil {
-		resp = Servfail(req)
-	}
-
-	// RFC 6891: echo EDNS on any OPT-less response to an EDNS query.
-	// Covers locally synthesized responses (SetReply/SetRcode) and upstream responses
-	// that dropped OPT. Spec-correct behavior per RFC 6891.
-	if m.IsEdns0() != nil && resp.Msg.IsEdns0() == nil {
-		resp.Msg.SetEdns0(1232, false)
-	}
-
-	// RFC 8467 §4.2. Only when the client padded, and only on an encrypted
-	// transport: a plaintext reply gains nothing from padding and costs
-	// bytes.
-	//
-	// The only hard constraint on where this call goes is "before
-	// w.WriteMsg": that is where miekg computes the TSIG MAC, lazily, over
-	// whatever resp.Msg holds at that point (ReplyTSIG below only builds an
-	// unsigned stub). Its position among the response-shaping steps here —
-	// ahead of ReplyTSIG, ahead of FitUDPReply — is conventional, not
-	// forced. In particular, ordering against FitUDPReply has no effect
-	// today: FitUDPReply only runs for a UDP reply, and s.encrypted is only
-	// ever true when WithTLS bound a TLS-wrapped, TCP-only listener with no
-	// UDP socket at all (tls.go, server.go's Start). So s.encrypted and the
-	// isUDP branch below are mutually exclusive for every request this
+	// Everything shapeReply does has to happen before w.WriteMsg, and its
+	// padding step is why: that is where miekg computes the TSIG MAC,
+	// lazily, over whatever resp.Msg holds at that point (ReplyTSIG below
+	// only builds an unsigned stub). Where it sits among the steps that
+	// stay here — ahead of ReplyTSIG, ahead of FitUDPReply — is conventional
+	// rather than forced. Ordering against FitUDPReply in particular has no
+	// effect today: FitUDPReply only runs for a UDP reply, and s.encrypted
+	// is only ever true when WithTLS bound a TLS-wrapped, TCP-only listener
+	// with no UDP socket at all (tls.go, Start above). So s.encrypted and
+	// the isUDP branch below are mutually exclusive for every request this
 	// server handles; padding and a UDP-budget trim never compete for the
 	// same reply.
-	if s.encrypted && hasPadding(m) {
-		if err := Pad(resp.Msg, PaddingBlockResponse); err != nil {
-			slog.Error("padding the reply", "err", err)
-		}
-	}
+	resp, err := s.handler.ServeDNS(ctx, req)
+	resp = shapeReply(req, resp, err, s.encrypted)
 
 	// RFC 8945 §5.3: a request that verified gets an answer signed under the
 	// same key. miekg only signs a reply that already carries a TSIG RR
@@ -313,6 +310,60 @@ func (s *Server) serve(w dns.ResponseWriter, m *dns.Msg) {
 	if err := w.WriteMsg(resp.Msg); err != nil {
 		slog.Error("write response error", "err", err)
 	}
+}
+
+// shapeReply turns what the pipeline returned into the message that goes
+// out, applying the rules that are the same whatever carried the query: the
+// SERVFAIL fallback for a handler that failed or returned nothing, the
+// EDNS(0) rules, and RFC 8467 padding.
+//
+// It is one function rather than one per transport because it is one rule
+// set. It was written twice — once in Server.serve, once in
+// DoHServer.handle — and the second copy is precisely where a rule goes
+// missing: the RFC 6891 §7 OPT strip and the RFC 3225 §3 DO copy each had
+// to be added in both places, and a third transport would have made it
+// three.
+//
+// What stays with the callers is what genuinely belongs to them: TSIG
+// signing and the UDP datagram fit in Server.serve, neither of which has
+// any meaning on DoH, and the HTTP framing in DoHServer.handle. encrypted
+// says whether padding hides anything on this transport — false for :53,
+// true for DoT, and always true for DoH, which RFC 8484 runs over HTTPS by
+// construction.
+func shapeReply(req *Request, resp *Response, err error, encrypted bool) *Response {
+	if err != nil || resp == nil || resp.Msg == nil {
+		resp = Servfail(req)
+	}
+
+	// RFC 6891: echo EDNS on any OPT-less reply to an EDNS query, which
+	// covers both a locally synthesized response (SetReply/SetRcode) and an
+	// upstream one that dropped its OPT. The DO bit is the query's own, per
+	// RFC 3225 §3: "The DO bit of the query MUST be copied in the
+	// response." A synthesised OPT that always cleared it told a validating
+	// client the server was not DNSSEC-aware for the answer it had just
+	// asked to be able to validate.
+	//
+	// A query that carried no OPT gets any OPT the reply arrived with taken
+	// off instead, which §7 makes a MUST NOT rather than a courtesy; see
+	// dropOPT.
+	if opt := req.Msg.IsEdns0(); opt != nil {
+		if resp.Msg.IsEdns0() == nil {
+			resp.Msg.SetEdns0(1232, opt.Do())
+		}
+	} else {
+		dropOPT(resp.Msg)
+	}
+
+	// RFC 8467 §4.2. Only when the client padded, and only on an encrypted
+	// transport: a plaintext reply gains nothing from padding and costs
+	// bytes.
+	if encrypted && hasPadding(req.Msg) {
+		if err := Pad(resp.Msg, PaddingBlockResponse); err != nil {
+			slog.Error("padding the reply", "err", err)
+		}
+	}
+
+	return resp
 }
 
 // FitUDPReply trims reply so that what finally goes on the wire fits the
@@ -464,6 +515,34 @@ func fitsIn(reply *dns.Msg, n int) bool {
 // resolvers read as a broken server and downgrade against, which would make the
 // TC unusable for the retry it exists to prompt. A reader who weighs it the
 // other way should know this is a deliberate reading of §5.3, not an omission.
+// dropOPT removes the OPT record from a reply going to a client that sent
+// none. RFC 6891 §7: "If a query message with more than one OPT RR is
+// received, a FORMERR (RCODE=1) MUST be returned" — and, the sentence that
+// matters here, a responder answering a query that carried no OPT "MUST
+// NOT" put one in the response.
+//
+// Adding an OPT only when the reply lacked one was not enough on its own.
+// The cache stores an upstream reply with the OPT it arrived with, so the
+// first EDNS client to populate an entry decided what every later non-EDNS
+// client received for the same name — including whatever options that OPT
+// carried, a cookie minted for someone else among them.
+//
+// An extended rcode goes with the OPT, of necessity: its upper eight bits
+// live in the OPT's TTL and nowhere else, so a reply that keeps one after
+// losing the OPT is not merely lossy — Msg.Pack refuses it outright with
+// ErrExtendedRcode, and the client would get no answer at all. SERVFAIL is
+// the honest downgrade, because the real code is one this client has no way
+// to be told.
+func dropOPT(m *dns.Msg) {
+	m.Extra = slices.DeleteFunc(m.Extra, func(rr dns.RR) bool {
+		_, isOPT := rr.(*dns.OPT)
+		return isOPT
+	})
+	if m.Rcode > 0xF {
+		m.Rcode = dns.RcodeServerFailure
+	}
+}
+
 func ednsOnly(extra []dns.RR) []dns.RR {
 	for _, rr := range extra {
 		if opt, ok := rr.(*dns.OPT); ok {

@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/netip"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -61,7 +62,7 @@ type DoHServer struct {
 // -- checked directly against h2_bundle.go, which consults only ReadTimeout
 // and WriteTimeout (per stream) and IdleTimeout (per connection). On the
 // primary path, the actual backstop against a slow or silent client is
-// dohIdleTimeout below plus HTTP/2's own fixed ten-second client-preface
+// encryptedIdleTimeout below plus HTTP/2's own fixed ten-second client-preface
 // timeout, neither of which this field touches. What ReadHeaderTimeout does
 // still cover is a connection that falls back to HTTP/1.1 -- a client that
 // never negotiates h2 at all -- so it earns its place, just not for the
@@ -81,19 +82,30 @@ const dohReadTimeout = 10 * time.Second
 // dohReadTimeout.
 const dohWriteTimeout = 10 * time.Second
 
-// dohIdleTimeout bounds how long a connection with no request in flight may
-// sit open, and on the HTTP/2 path this -- not dohReadHeaderTimeout -- is
-// the real bound on a client that goes quiet. It is deliberately generous:
-// RFC 8484 connections are meant to be reused for many queries over the
-// lifetime of a resolver's upstream configuration, and a client with query
-// gaps longer than a minute -- a forwarding resolver with bursty traffic, an
-// intermittent stub -- would otherwise pay a fresh TLS handshake per burst,
-// which is exactly the cost negotiating HTTP/2 exists to amortise away.
-// Public DoH resolvers commonly sit in the 180-300s range; three minutes
-// here is still finite, which is all the security rationale (a client that
-// never sends a second query must not hold a connection open forever)
-// actually requires.
-const dohIdleTimeout = 180 * time.Second
+// encryptedIdleTimeout bounds how long a connection with no query in flight
+// may sit open, on both encrypted transports. On the HTTP/2 path this --
+// not dohReadHeaderTimeout -- is the real bound on a client that goes
+// quiet.
+//
+// It is deliberately generous: an encrypted connection is meant to be
+// reused for many queries over the lifetime of a resolver's upstream
+// configuration, and a client with query gaps longer than a minute -- a
+// forwarding resolver with bursty traffic, an intermittent stub, a phone
+// whose screen is off -- would otherwise pay a fresh TLS handshake per
+// burst, which is exactly the cost a persistent connection exists to
+// amortise away. Public DoH resolvers commonly sit in the 180-300s range;
+// three minutes here is still finite, which is all the security rationale
+// (a client that never sends a second query must not hold a connection open
+// forever) actually requires.
+//
+// DoT shares the number rather than picking its own. RFC 7858 §3.4 asks for
+// exactly the same thing -- "clients and servers SHOULD support connection
+// reuse" and a server "SHOULD NOT" close an idle connection eagerly -- and
+// two encrypted transports that disagreed about how long a connection lives
+// would be a difference with no reason behind it. miekg's own default is
+// eight seconds (Server.getReadTimeout's idle sibling), which is shorter
+// than the gap between two glances at a phone.
+const encryptedIdleTimeout = 180 * time.Second
 
 // NewDoHServer builds a DoH server that dispatches every query to h. tlsCfg
 // must already carry a certificate — either Certificates or GetCertificate —
@@ -137,7 +149,7 @@ func NewDoHServer(addr string, h Handler, tlsCfg *tls.Config) *DoHServer {
 		ReadHeaderTimeout: dohReadHeaderTimeout,
 		ReadTimeout:       dohReadTimeout,
 		WriteTimeout:      dohWriteTimeout,
-		IdleTimeout:       dohIdleTimeout,
+		IdleTimeout:       encryptedIdleTimeout,
 	}
 	return s
 }
@@ -179,6 +191,16 @@ func (s *DoHServer) handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if reply, ok := acceptQuery(m); !ok {
+		if reply == nil {
+			// The one case with nothing to say back; see acceptQuery.
+			http.Error(w, "message is a response, not a query", http.StatusBadRequest)
+			return
+		}
+		s.write(w, reply)
+		return
+	}
+
 	// A transfer or a NOTIFY has no meaning here: both are answered by
 	// Server.serve through a dns.ResponseWriter that streams, which does not
 	// exist on this path, and RFC 8484 does not contemplate AXFR at all.
@@ -193,7 +215,7 @@ func (s *DoHServer) handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(r.Context(), PipelineTimeout)
 	defer cancel()
 
 	req := &Request{Msg: m, ClientIP: clientAddr(r)}
@@ -203,33 +225,80 @@ func (s *DoHServer) handle(w http.ResponseWriter, r *http.Request) {
 	// unexamined message as "checked and fine". See tsig.go's tsigState.
 	req.tsig = unverifiedTSIG()
 
+	// The SERVFAIL fallback, the EDNS(0) rules and RFC 8467 padding are the
+	// same here as on :53 and DoT, and are applied by the same code so they
+	// cannot drift apart; see shapeReply. The transport is always encrypted
+	// — RFC 8484 runs over HTTPS by construction — so padding is never
+	// suppressed the way it is for a plaintext reply, and there is no TSIG
+	// on this path (see unverifiedTSIG) to order it against.
 	resp, err := s.handler.ServeDNS(ctx, req)
-	if err != nil || resp == nil || resp.Msg == nil {
-		resp = Servfail(req)
-	}
-
-	// RFC 6891: echo EDNS on any OPT-less response to an EDNS query, the same
-	// rule Server.serve applies to plain, DoT and (implicitly, since it
-	// shares this handler) transfer/notify-free traffic.
-	if m.IsEdns0() != nil && resp.Msg.IsEdns0() == nil {
-		resp.Msg.SetEdns0(1232, false)
-	}
-
-	// RFC 8467 §4.2. Only when the client padded: DoH is encrypted by
-	// construction (RFC 8484 runs over HTTPS), so there is no plaintext
-	// case to guard against here the way Server.serve must. There is also
-	// no TSIG on this path (see unverifiedTSIG) to worry about ordering
-	// against.
-	if hasPadding(m) {
-		if err := Pad(resp.Msg, PaddingBlockResponse); err != nil {
-			slog.Error("padding the reply", "err", err)
-		}
-	}
+	resp = shapeReply(req, resp, err, true)
 
 	// RFC 8484 §4.1 unlike E1's client-side exchanger: a server does not
 	// rewrite the message ID here. SetReply/SetRcode already copied it from
 	// the request, and it is echoed back exactly as it arrived.
 	s.write(w, resp.Msg)
+}
+
+// acceptQuery decides whether m is a message this server will answer at
+// all, and reports the reply to send instead when it is not.
+//
+// It exists because DoH is the one transport with no miekg dns.Server in
+// front of it. On :53 and on DoT, every message passes
+// dns.DefaultMsgAcceptFunc before Server.serve is ever called (miekg's
+// server.go:639), and the checks below are that function's, rule for rule.
+// Without them a body that merely unpacks was treated as a query: an UPDATE
+// opcode, a message with the QR bit set, or a query with two questions all
+// entered the pipeline and were forwarded upstream verbatim.
+//
+// The three returns are miekg's three actions:
+//
+//   - (nil, true) — accept, and the caller goes on to the pipeline.
+//   - (reply, false) — refuse with reply. MsgReject becomes FORMERR and
+//     MsgRejectNotImplemented becomes NOTIMP, exactly as on :53.
+//   - (nil, false) — MsgIgnore: on :53 miekg answers a message with the QR
+//     bit set by sending nothing at all, because any reply to a forged
+//     "response" can be used to amplify. HTTP has no way to say nothing and
+//     needs none — whatever goes back travels down the client's own
+//     connection — so the caller renders this as an HTTP error instead.
+//
+// OpcodeNotify is accepted here rather than refused, which looks like a gap
+// and is not: miekg accepts it too, and dnsaur has its own answer for a
+// NOTIFY on this transport (handle's REFUSED intercept, immediately after
+// this call). Rejecting it here would make a secondary's NOTIFY answer
+// NOTIMP over DoH and REFUSED over :53 — a difference in what a peer sees
+// that depends only on which transport it picked.
+func acceptQuery(m *dns.Msg) (*dns.Msg, bool) {
+	if m.Response {
+		return nil, false
+	}
+
+	// A dynamic update is refused by opcode rather than by its contents:
+	// once the opcode says UPDATE the sections carry prerequisites and
+	// records rather than a question, and nothing downstream reads them
+	// that way.
+	if m.Opcode != dns.OpcodeQuery && m.Opcode != dns.OpcodeNotify {
+		reply := new(dns.Msg)
+		reply.SetRcode(m, dns.RcodeNotImplemented)
+		return reply, false
+	}
+
+	// The section caps are miekg's, and each one has a protocol behind it:
+	// RFC 1996 §3.7 lets a NOTIFY carry the SOA in its answer section, RFC
+	// 1995 §3 lets an IXFR request carry one SOA in its authority section,
+	// and two additional records covers an OPT beside a TSIG. Anything
+	// beyond that is not a question with its trimmings.
+	if len(m.Question) != 1 || len(m.Answer) > 1 || len(m.Ns) > 1 || len(m.Extra) > 2 {
+		reply := new(dns.Msg)
+		reply.SetRcode(m, dns.RcodeFormatError)
+		// SetReply copies the request's opcode, and for a FORMERR that has
+		// to be forced back to QUERY the way miekg does it: the reply
+		// carries none of the sections the other opcode's counts describe.
+		reply.Opcode = dns.OpcodeQuery
+		return reply, false
+	}
+
+	return nil, true
 }
 
 // write packs m and sends it with the content type RFC 8484 §6 requires.
@@ -240,9 +309,47 @@ func (s *DoHServer) write(w http.ResponseWriter, m *dns.Msg) {
 		return
 	}
 	w.Header().Set("Content-Type", dohContentType)
+	w.Header().Set("Cache-Control", "max-age="+strconv.FormatUint(uint64(maxAge(m)), 10))
 	if _, err := w.Write(wire); err != nil {
 		slog.Error("doh write response error", "err", err)
 	}
+}
+
+// maxAge is the freshness lifetime RFC 8484 §5.1 asks a DoH server to put
+// on its response: "the DNS API server SHOULD assign an explicit HTTP
+// freshness lifetime", and that lifetime is bounded by the smallest TTL the
+// message carries. Without one, every HTTP cache between here and the
+// client is left to guess, and an answer cached past its TTL is the failure
+// DNS has no way to correct after the fact.
+//
+// Every section counts, not only the answer. A NODATA or an NXDOMAIN says
+// how long it holds on the SOA in the authority section (RFC 2308), and
+// reading the answer section alone would call every negative answer
+// uncacheable. A message with no records at all — a SERVFAIL, a REFUSED, an
+// empty NOERROR — gets zero, which is the honest lifetime for a response
+// that makes no claim about how long it stands.
+//
+// The OPT is skipped, because its TTL field is not a TTL: it carries the
+// extended rcode and the DO bit (RFC 6891 §6.1.3), which for a well-formed
+// reply are ordinarily all zero. Counting it would answer max-age=0 for
+// every EDNS query — which is to say nearly all of them.
+func maxAge(m *dns.Msg) uint32 {
+	var smallest uint32
+	found := false
+	for _, section := range [][]dns.RR{m.Answer, m.Ns, m.Extra} {
+		for _, rr := range section {
+			if _, isOPT := rr.(*dns.OPT); isOPT {
+				continue
+			}
+			if ttl := rr.Header().Ttl; !found || ttl < smallest {
+				smallest, found = ttl, true
+			}
+		}
+	}
+	if !found {
+		return 0
+	}
+	return smallest
 }
 
 // readQuery extracts the wire-format message from r under RFC 8484 §4.1's

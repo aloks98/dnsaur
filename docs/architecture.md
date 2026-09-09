@@ -98,9 +98,86 @@ shaping an answer that the cache — keyed on `(qname, qtype)` and nothing
 else — would then serve to every other client.
 
 A message that does not carry **exactly one** question is answered
-`FORMERR` and never forwarded. On :53 the library's accept function already
-refuses any other QDCOUNT, but a header claiming one question with no body
-after it unpacks to a message with none, and DoH has no equivalent gate.
+`FORMERR` and never forwarded. Both transports refuse any other QDCOUNT
+before the pipeline is entered — the library's accept function on :53, and
+its restatement below on DoH — but a header claiming one question with no
+body after it unpacks to a message with none, which neither gate catches.
+
+## Reply shaping
+
+Whatever the pipeline returns is not yet what goes on the wire. Every
+transport applies the same rules to it before writing, through one
+`shapeReply` (`internal/dnssrv/server.go`) rather than a copy per
+transport — the copy is where a rule goes missing, and both of the EDNS
+rules below had to be added twice before it existed:
+
+- **EDNS follows the client, not the answer.** A query that carried an OPT
+  gets one back, synthesised at a 1232-octet advertised size if the reply
+  came without one. A query that carried none gets its reply's OPT
+  *removed* — RFC 6891 §7 makes that a MUST NOT, and only removal satisfies
+  it, because the cache stores an upstream reply with the OPT it arrived
+  with. Without the strip, the first EDNS client to populate an entry
+  decided what every later non-EDNS client saw for that name, cookie and
+  all. An extended rcode is downgraded to `SERVFAIL` when its OPT goes,
+  since its upper bits have nowhere else to live.
+- **The DO bit is copied from the query**, RFC 3225 §3. A synthesised OPT
+  that always cleared it told a validating client the server was not
+  DNSSEC-aware for the answer it had just asked to be able to validate.
+- **A handler that failed, returned nothing, or returned no message
+  becomes `SERVFAIL`.**
+- **RFC 8467 padding, on the encrypted transports only** — and only when
+  the query itself was padded. Padding a plaintext reply hides nothing and
+  costs bytes.
+
+What is *not* shared stays with the transport that owns it: TSIG signing
+and the UDP datagram fit (see Zone transfers below for why the order of
+those two is load-bearing) belong to the `:53`/DoT server, HTTP framing to
+the DoH one.
+
+## Encrypted serving (DoT and DoH)
+
+DNS-over-TLS (RFC 7858) and DNS-over-HTTPS (RFC 8484) are additional
+listeners into the same pipeline, not a second resolver. DoT is
+`internal/dnssrv`'s ordinary `Server` bound to a TLS listener — TCP only,
+with no UDP sibling — so everything above the socket, the TSIG provider and
+the AXFR/NOTIFY intercepts included, is the plaintext path unchanged. DoH
+is its own `DoHServer`: an `http.Server` serving `/dns-query`, because an
+HTTP request/response pair is not a `dns.ResponseWriter` and there is no
+miekg `dns.Server` on that path at all.
+
+That last difference is the one with teeth. On `:53` and on DoT, miekg
+applies `DefaultMsgAcceptFunc` to every message before dnsaur ever sees it.
+DoH has to apply the same rules itself, and does (`acceptQuery` in
+`doh.go`) — a body that merely unpacks is not yet a query:
+
+- a message with the QR bit set is refused with `400`. On `:53` miekg
+  answers one by sending nothing at all, so it cannot be used to amplify;
+  HTTP has no way to say nothing, and needs none.
+- an opcode other than `QUERY` or `NOTIFY` answers `NOTIMP`.
+- anything but exactly one question answers `FORMERR`, as does more than
+  one answer record, more than one authority record, or more than two
+  additional records.
+
+A DoH response also carries `Cache-Control: max-age=<smallest TTL in the
+message>` (RFC 8484 §5.1), counting the authority section so a negative
+answer gets the SOA's lifetime rather than none, and skipping the OPT,
+whose TTL field holds flags rather than a lifetime. A response with no
+records — `SERVFAIL`, `REFUSED`, an empty `NOERROR` — gets `max-age=0`.
+
+Both encrypted listeners keep a connection open for **three minutes idle
+and any number of queries**. An encrypted connection exists to be reused —
+RFC 7858 §3.4 for DoT, HTTP/2 for DoH — and the alternative is a full TLS
+handshake per burst for a client like Android's Private DNS, which holds
+one connection for the life of the network it is on. miekg's `dns.Server`
+defaults (128 queries, eight seconds idle) are the ones being overridden,
+and they are not a defence worth keeping here: the listener's network is
+the boundary, and the timeout is still finite.
+
+`NOTIFY` passes that gate on every transport, exactly as it does on `:53`,
+and a `NOTIFY` or an `AXFR`/`IXFR` arriving over DoH is then answered
+`REFUSED` — neither has a meaning on a transport that cannot stream, and
+letting either into the pipeline is how a NOTIFY once reached the forwarder
+and was sent upstream.
 
 ## Zone transfers (AXFR out)
 
