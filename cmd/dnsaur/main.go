@@ -31,14 +31,20 @@ func main() {
 }
 
 func run(ctx context.Context) error {
-	cfgPath := flag.String("config", "dnsaur.yaml", "path to bootstrap config")
+	cfgPath := flag.String("config", config.DefaultPath, "path to bootstrap config")
 	flag.Parse()
 	cfg, err := config.Load(*cfgPath)
 	if err != nil {
 		return err
 	}
+	// config.Load parses the level with this same call and refuses anything
+	// it cannot read, so this cannot fail — but the error is returned rather
+	// than discarded, because discarding it here is what made a misspelled
+	// log_level silently INFO.
 	var lvl slog.Level
-	_ = lvl.UnmarshalText([]byte(cfg.LogLevel))
+	if err := lvl.UnmarshalText([]byte(cfg.LogLevel)); err != nil {
+		return err
+	}
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: lvl})))
 	slog.Info("dnsaur starting", "version", Version)
 

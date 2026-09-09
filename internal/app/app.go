@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
@@ -194,6 +195,12 @@ type App struct {
 	cancel    context.CancelFunc
 	ready     chan struct{}
 	wg        sync.WaitGroup
+	// badSettings is the last failure each settings key was warned about,
+	// keyed by key — see warnUnusableSetting. sync.Map rather than a guarded
+	// map because it is written from getInt, which applySettings and the
+	// pruner's retention closure both reach from different goroutines, and
+	// its zero value is already usable.
+	badSettings sync.Map
 }
 
 func New(ctx context.Context, cfg *config.Config, version string) (*App, error) {
@@ -316,12 +323,50 @@ func (a *App) getSetting(ctx context.Context, key string) string {
 	return v
 }
 
+// settingValue is getSetting for the keys where "the store could not answer"
+// and "the key is unset" have to stay apart. Settings().Get already
+// distinguishes them — a missing key is ("", false, nil), not an error — and
+// this carries that distinction out to the caller instead of flattening both
+// into "".
+//
+// The flattening is not a cosmetic loss: a value of "" is how blocking.mode
+// means null-ip and qlog.privacy means full, so a database blip read as ""
+// silently undoes a configured nxdomain, and starts writing whole client IPs
+// into the query log for an install configured to anonymise them.
+// readServingSettings (serve.go) refuses the same collapse for the serving
+// keys; this is the same rule for the two keys applySettings applies itself.
+func (a *App) settingValue(ctx context.Context, key string) (string, error) {
+	v, _, err := a.st.Settings().Get(ctx, key)
+	if err != nil {
+		return "", fmt.Errorf("reading %s: %w", key, err)
+	}
+	return v, nil
+}
+
 func (a *App) getInt(ctx context.Context, key string, fallback int64) int64 {
 	v, err := a.st.Settings().GetInt(ctx, key)
 	if err != nil {
+		a.warnUnusableSetting(key, fallback, err)
 		return fallback
 	}
+	a.badSettings.Delete(key)
 	return v
+}
+
+// warnUnusableSetting reports an integer setting that could not be used, once
+// per distinct failure per key.
+//
+// The rate limit is what makes the log worth reading: applySettings runs on
+// every settings write, and a row holding "ninety" would otherwise repeat its
+// warning on each one — which is a large part of why this was silent to begin
+// with. Remembering the last failure per key keeps the first occurrence and
+// any change to it, and drops the repeats; a key that reads successfully
+// forgets, so a value that breaks again is reported again.
+func (a *App) warnUnusableSetting(key string, fallback int64, err error) {
+	if prev, had := a.badSettings.Swap(key, err.Error()); had && prev == err.Error() {
+		return
+	}
+	slog.Warn("unusable setting, falling back to the default", "key", key, "default", fallback, "err", err)
 }
 
 // buildForwarder wraps upstream.New with the same defaulted timeout/strategy
@@ -528,8 +573,11 @@ func (a *App) applySettings(ctx context.Context) {
 	// that return before it.
 	defer a.reconcileServing(ctx)
 
-	mode := a.getSetting(ctx, "blocking.mode")
-	a.engine.SetBlocking(mode, uint32(a.getInt(ctx, "blocking.ttl", 30)))
+	if mode, err := a.settingValue(ctx, "blocking.mode"); err != nil {
+		slog.Warn("keeping the blocking mode already in force", "err", err)
+	} else {
+		a.engine.SetBlocking(mode, uint32(a.getInt(ctx, "blocking.ttl", 30)))
+	}
 	if err := a.registry.Reload(ctx); err != nil {
 		slog.Error("client reload failed", "err", err)
 	}
@@ -537,7 +585,11 @@ func (a *App) applySettings(ctx context.Context) {
 		slog.Error("zones reload failed", "err", err)
 	}
 	if a.logger != nil {
-		a.logger.SetPrivacy(a.getSetting(ctx, "qlog.privacy"))
+		if privacy, err := a.settingValue(ctx, "qlog.privacy"); err != nil {
+			slog.Warn("keeping the query-log privacy mode already in force", "err", err)
+		} else {
+			a.logger.SetPrivacy(privacy)
+		}
 	}
 
 	rawUpstreams := a.getSetting(ctx, "upstreams")
@@ -745,7 +797,11 @@ func (a *App) Start(ctx context.Context) error {
 		}
 	}()
 
-	pruner := qlog.NewPruner(a.st.QueryLog(), func() int64 { return a.getInt(ctx, "qlog.retention_days", 90) })
+	// runCtx, not ctx: the closure outlives Start and is called on every
+	// prune, so it has to read under the context that ends when the app
+	// stops rather than under the caller's, which in cmd/dnsaur is cancelled
+	// by SIGTERM and would make the last prune read nothing.
+	pruner := qlog.NewPruner(a.st.QueryLog(), func() int64 { return a.getInt(runCtx, "qlog.retention_days", 90) })
 	rollups := stats.NewRunner(a.st.Stats(), a.st.Settings(), time.Minute)
 	refreshEvery := time.Duration(a.getInt(ctx, "lists.refresh_hours", 24)) * time.Hour
 	changes := a.st.Settings().Changes()

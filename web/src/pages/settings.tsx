@@ -181,6 +181,22 @@ const nonNegIntSchema = z
     if (!Number.isSafeInteger(n)) return fail("Too large.");
   });
 
+/** Mirrors editableSettings' positiveInt(...), which is nonNegInt with zero
+ * refused. Only lists.refresh_hours uses it: the interval becomes a ticker,
+ * and 0 is not a slower schedule but one that cannot be built. Saying so in
+ * the form saves a round trip to the same rejection. */
+const positiveIntSchema = z
+  .string()
+  .trim()
+  .superRefine((value, ctx) => {
+    const fail = (message: string) => ctx.addIssue({ code: "custom", message });
+    if (!value) return fail("Required.");
+    if (!/^[+-]?\d+$/.test(value)) return fail("Numbers only — no units or separators.");
+    const n = Number(value);
+    if (n < 1) return fail("Must be 1 or more.");
+    if (!Number.isSafeInteger(n)) return fail("Too large.");
+  });
+
 /** Mirrors editableSettings' `boolean`: exactly "true" or "false", not
  * anything strconv.ParseBool would also accept. In practice the only
  * writer is protocols-field.tsx's checkbox, which never emits anything
@@ -402,7 +418,7 @@ const SETTING_GROUPS: SettingGroup[] = [
         label: "Refresh interval (hours)",
         description: "How often blocklists and allowlists are re-downloaded and recompiled.",
         restartRequired: true,
-        schema: nonNegIntSchema,
+        schema: positiveIntSchema,
       },
     ],
   },

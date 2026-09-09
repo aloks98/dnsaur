@@ -467,3 +467,32 @@ func TestRefreshAllSerializesConcurrentCalls(t *testing.T) {
 		t.Fatalf("RefreshAll calls overlapped: max concurrent in-flight fetches = %d, want 1", got)
 	}
 }
+
+// Run's interval comes from lists.refresh_hours, and it runs in a background
+// goroutine with nothing to recover it: time.NewTicker(0) panicking there
+// took the whole process down at every start, over and over, until the row
+// was hand-edited. A non-positive interval has to mean "no periodic refresh"
+// and nothing more.
+func TestRunWithANonPositiveIntervalDoesNotPanic(t *testing.T) {
+	for _, every := range []time.Duration{0, -time.Hour} {
+		t.Run(every.String(), func(t *testing.T) {
+			fs := &fakeFilterStore{}
+			cs := &fakeClientStore{groups: []store.Group{{ID: 1, Name: "default", Enabled: true}}}
+			ref := NewRefresher(fs, cs, NewEngine(), t.TempDir())
+
+			ctx, cancel := context.WithCancel(context.Background())
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				ref.Run(ctx, every)
+			}()
+
+			cancel()
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+				t.Fatal("Run did not return when its context was cancelled")
+			}
+		})
+	}
+}

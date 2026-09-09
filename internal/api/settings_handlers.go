@@ -29,7 +29,7 @@ var editableSettings = map[string]func(string) error{
 	"cache.max_ttl":         nonNegInt,
 	"cache.max_entries":     nonNegInt,
 	"cache.serve_stale_for": nonNegInt,
-	"lists.refresh_hours":   nonNegInt,
+	"lists.refresh_hours":   positiveInt,
 	"qlog.retention_days":   nonNegInt,
 	"qlog.privacy":          oneOf("full", "anon", "none"),
 	"serve.dot.enabled":     boolean,
@@ -60,6 +60,19 @@ func nonNegInt(v string) error {
 	n, err := strconv.ParseInt(v, 10, 64)
 	if err != nil || n < 0 {
 		return errors.New("must be a whole number, zero or more")
+	}
+	return nil
+}
+
+// positiveInt is nonNegInt with zero refused, for lists.refresh_hours: it is
+// the only integer setting that becomes a tick interval, and 0 is not a
+// slower schedule but an interval time.NewTicker refuses to build. The key is
+// restart-required, so a stored 0 does not fail the write that made it — it
+// fails the next start, which is why this end has to refuse it.
+func positiveInt(v string) error {
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil || n < 1 {
+		return errors.New("must be a whole number, one or more")
 	}
 	return nil
 }

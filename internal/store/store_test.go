@@ -256,3 +256,43 @@ func TestLocalRecords(t *testing.T) {
 		}
 	})
 }
+
+// The pragmas are a query string, so a DSN that already carries one has to
+// be extended rather than restarted: "file:x.db?mode=ro" + "?_pragma=..." is
+// not a URI any driver reads back the way it was meant.
+func TestSQLiteDSNKeepsAnExistingQuery(t *testing.T) {
+	const pragmas = "_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)"
+	for _, tc := range []struct {
+		name, dsn, want string
+	}{
+		{"plain path", "/var/lib/dnsaur/dnsaur.db", "/var/lib/dnsaur/dnsaur.db?" + pragmas},
+		{"uri with a query", "file:dnsaur.db?mode=ro", "file:dnsaur.db?mode=ro&" + pragmas},
+		{"uri with an empty query", "file:dnsaur.db?", "file:dnsaur.db?&" + pragmas},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := sqliteDSN(tc.dsn); got != tc.want {
+				t.Errorf("sqliteDSN(%q) = %q, want %q", tc.dsn, got, tc.want)
+			}
+		})
+	}
+}
+
+// The pragmas have to survive the join, not merely be separated correctly: a
+// URI DSN that lost foreign_keys(1) would drop every cascade the schema
+// relies on, silently.
+func TestSQLiteDSNAppliesPragmasToAURIWithAQuery(t *testing.T) {
+	dsn := "file:" + filepath.Join(t.TempDir(), "t.db") + "?_txlock=immediate"
+	s, err := Open(context.Background(), "sqlite", dsn)
+	if err != nil {
+		t.Fatalf("Open(%q): %v", dsn, err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	var fk int
+	if err := s.(*sqlStore).db.QueryRowContext(context.Background(), "PRAGMA foreign_keys").Scan(&fk); err != nil {
+		t.Fatal(err)
+	}
+	if fk != 1 {
+		t.Error("foreign_keys is off: the pragmas did not survive being appended to a DSN that already had a query")
+	}
+}

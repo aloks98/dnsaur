@@ -618,7 +618,12 @@ everything else is expendable before it.
 - A failed blocklist refresh keeps serving the previous compiled list and
   retries with backoff instead of going unfiltered or falling over.
 - Bad configuration is validated and rejected at write time; the running
-  config is always the last-known-good one.
+  config is always the last-known-good one. The bootstrap config is the one
+  place that refuses to start instead: no listen address, or a `-config`
+  path that isn't there, does not give a degraded resolver but a silent
+  one, and a process that comes up answering nothing is worse than a
+  process that says why it didn't (see
+  [`docs/configuration.md`](configuration.md#what-startup-refuses)).
 - Pipeline panics are recovered per-query (`SERVFAIL` + logged) so one
   poisoned query can't take the whole server down.
 
@@ -626,7 +631,11 @@ This shows up concretely in `internal/app`'s settings reload logic: if a new
 upstream configuration fails to build, it keeps the previous working
 forwarder rather than replacing it with something broken, falling back
 through progressively safer defaults only if no forwarder has ever been
-installed.
+installed. The same rule governs the settings a reload applies directly: a
+read that *fails* is not a value, so the blocking mode and the query-log
+privacy mode already in force are kept, rather than letting a database blip
+read as "the operator asked for the default" and quietly start logging whole
+client IPs on an install configured to anonymise them.
 
 That last rung has one consequence worth stating out loud: **the hardcoded
 defaults are plaintext.** If the stored `upstreams` value asked for

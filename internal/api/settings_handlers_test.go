@@ -49,6 +49,37 @@ func TestSettingsGetPut(t *testing.T) {
 	}
 }
 
+// lists.refresh_hours is the one interval that becomes a time.Ticker, and 0
+// panics one. The setting is restart-required, so a stored 0 does not fail
+// the write that made it — it fails the next start, and the one after that,
+// until someone edits the row by hand. This is the end of it that can still
+// say no.
+func TestRefreshHoursRejectsZero(t *testing.T) {
+	srv, s, _ := testServer(t)
+	cookie := login(t, srv, s)
+	h := srv.Handler()
+
+	w := doReq(t, h, "PUT", "/api/v1/settings", `{"key":"lists.refresh_hours","value":"0"}`, cookie)
+	if w.Code != 400 {
+		t.Fatalf("lists.refresh_hours=0 accepted: %d %s", w.Code, w.Body.String())
+	}
+	if want := "invalid value for lists.refresh_hours: must be a whole number, one or more"; !strings.Contains(w.Body.String(), want) {
+		t.Errorf("rejection = %s, want it to contain %q", w.Body.String(), want)
+	}
+	if v, ok, _ := s.Settings().Get(t.Context(), "lists.refresh_hours"); ok && v == "0" {
+		t.Error("the rejected value was stored anyway")
+	}
+
+	if w := doReq(t, h, "PUT", "/api/v1/settings", `{"key":"lists.refresh_hours","value":"1"}`, cookie); w.Code != 204 {
+		t.Fatalf("lists.refresh_hours=1 rejected: %d %s", w.Code, w.Body.String())
+	}
+	// The other integer keys still accept 0 — none of them ticks, and 0 is a
+	// meaningful value for every one of them.
+	if w := doReq(t, h, "PUT", "/api/v1/settings", `{"key":"qlog.retention_days","value":"0"}`, cookie); w.Code != 204 {
+		t.Fatalf("qlog.retention_days=0 rejected: %d %s", w.Code, w.Body.String())
+	}
+}
+
 func TestBlockingPauseResume(t *testing.T) {
 	srv, s, _ := testServer(t)
 	srv.deps.Engine = filter.NewEngine()

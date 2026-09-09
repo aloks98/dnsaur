@@ -119,7 +119,10 @@ Full parameter/response detail lives in `internal/api/openapi.yaml`
   while a protocol is still enabled is rejected for the same reason, from
   the other direction. `serve.dot.listen`/`serve.doh.listen` take
   `host:port` with the port in 1-65535 — port 0 is refused, since it binds
-  whatever is free and reports an address no client was ever told. **One
+  whatever is free and reports an address no client was ever told. The
+  integer keys take zero and up, except `lists.refresh_hours`, which takes
+  1 and up: it becomes the refresh timer's interval, and `0` is not a
+  slower schedule but one no timer can be built from. **One
   key per call is not incidental**: each write is validated against the
   values already stored, so a client changing several dependent keys has to
   order them — certificate paths before the `enabled` flags that check

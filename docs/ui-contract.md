@@ -1108,12 +1108,14 @@ Full editable allowlist. Values are always strings on the wire.
 | `cache.max_ttl` | `86400` | int ≥ 0 | **restart** (stored `0` → 24h) |
 | `cache.max_entries` | `10000` | int ≥ 0 | **restart** (stored `0` → 10000) |
 | `cache.serve_stale_for` | `86400` | int ≥ 0 | **restart** (stored `0` → 24h) |
-| `lists.refresh_hours` | `24` | int ≥ 0 | **restart** for the cadence — but any settings change triggers one immediate refresh |
+| `lists.refresh_hours` | `24` | int ≥ 1 | **restart** for the cadence — but any settings change triggers one immediate refresh |
 | `qlog.retention_days` | `90` | int ≥ 0 | **hot, delayed** — re-read per prune run, so it lands on the next 24h tick |
 | `qlog.privacy` | `full` | `full` \| `anon` \| `none` | **hot**, read per query |
 
-No upper bound on any integer key. `blocking.mode` treats **anything ≠
-`nxdomain`** as null-ip.
+No upper bound on any integer key. `lists.refresh_hours` is the only one
+with a lower bound above zero: it becomes a tick interval, and `0` is
+rejected with `invalid value for lists.refresh_hours: must be a whole number,
+one or more`. `blocking.mode` treats **anything ≠ `nxdomain`** as null-ip.
 
 Non-editable keys that exist but are stripped from `GET /settings`:
 `instance.id`, `stats.watermark`.

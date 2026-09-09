@@ -323,7 +323,22 @@ func (r *Refresher) RefreshAll(ctx context.Context) error {
 	return nil
 }
 
+// Run re-downloads and recompiles every enabled list on a fixed cadence,
+// until ctx ends.
+//
+// A non-positive interval means no cadence at all, not a crash:
+// time.NewTicker panics on one, and internal/app calls this in a background
+// goroutine with nothing to recover it, so a stored lists.refresh_hours of 0
+// used to take the process down at every start. Lists still compile on
+// demand — the initial load, every settings change and every manual refresh
+// call RefreshAll directly — so "no periodic download" is a configuration
+// the server can honestly serve, and it says so once rather than silently.
 func (r *Refresher) Run(ctx context.Context, every time.Duration) {
+	if every <= 0 {
+		slog.Warn("periodic blocklist refresh disabled: the configured interval is not positive", "every", every)
+		<-ctx.Done()
+		return
+	}
 	t := time.NewTicker(every)
 	defer t.Stop()
 	for {

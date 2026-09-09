@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,6 +14,12 @@ import (
 	"github.com/knadh/koanf/v2"
 )
 
+// DefaultPath is the bootstrap file Load reads when -config names nothing
+// else. It is the one path allowed to be absent: running with no config file
+// at all is a supported setup, while a path the operator typed and that is
+// not there is a typo.
+const DefaultPath = "dnsaur.yaml"
+
 type Config struct {
 	DNSListen  []string `yaml:"dns_listen"`
 	HTTPListen string   `yaml:"http_listen"`
@@ -22,6 +29,34 @@ type Config struct {
 		Driver string `yaml:"driver"`
 		DSN    string `yaml:"dsn"`
 	} `yaml:"storage"`
+}
+
+// listenAddrs reads dns_listen from every shape it can arrive in and
+// normalises the lot.
+//
+// A scalar (`dns_listen: ":53"`) is the natural thing to write for a single
+// address, and koanf's Strings answers a scalar with nothing at all — which
+// bound no DNS listener and left the server running, answering no queries,
+// with an empty address in the startup log as the only trace. It is read
+// here as the one-element list it plainly means.
+//
+// Entries are trimmed and blanks dropped because every one of them is handed
+// to net.Listen verbatim: " :5353" from a spaced-out env list, or "" from a
+// trailing comma, is not an address. An empty result is a real error, raised
+// by the caller rather than here, so "no addresses" and "the addresses given
+// were all blank" fail the same way.
+func listenAddrs(k *koanf.Koanf) []string {
+	raw := k.Strings("dns_listen")
+	if s, ok := k.Get("dns_listen").(string); ok {
+		raw = []string{s}
+	}
+	out := make([]string, 0, len(raw))
+	for _, a := range raw {
+		if a = strings.TrimSpace(a); a != "" {
+			out = append(out, a)
+		}
+	}
+	return out
 }
 
 func Load(path string) (*Config, error) {
@@ -41,12 +76,17 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("load defaults: %w", err)
 	}
 
-	// Load YAML file if it exists
-	if _, err := os.Stat(path); err == nil {
+	// Load the YAML file. Absence is only tolerable for DefaultPath: a path
+	// the operator named and that is not there is a typo, and starting on
+	// defaults leaves it running with none of the configuration they wrote
+	// and nothing saying so.
+	switch _, err := os.Stat(path); {
+	case err == nil:
 		if err := k.Load(file.Provider(path), yaml.Parser()); err != nil {
 			return nil, fmt.Errorf("parse %s: %w", path, err)
 		}
-	} else if !errors.Is(err, os.ErrNotExist) {
+	case errors.Is(err, os.ErrNotExist) && path == DefaultPath:
+	default:
 		return nil, err
 	}
 
@@ -67,7 +107,9 @@ func Load(path string) (*Config, error) {
 		}
 	}
 
-	// Handle DNSAUR_DNS_LISTEN specially (comma-separated list)
+	// Handle DNSAUR_DNS_LISTEN specially (comma-separated list). The entries
+	// are trimmed by listenAddrs below, along with the file's, so the two
+	// ways of writing the same list produce the same value.
 	if v := os.Getenv("DNSAUR_DNS_LISTEN"); v != "" {
 		if err := k.Set("dns_listen", strings.Split(v, ",")); err != nil {
 			return nil, fmt.Errorf("set dns_listen: %w", err)
@@ -76,7 +118,7 @@ func Load(path string) (*Config, error) {
 
 	// Build Config struct from koanf
 	c := &Config{
-		DNSListen:  k.Strings("dns_listen"),
+		DNSListen:  listenAddrs(k),
 		HTTPListen: k.String("http_listen"),
 		DataDir:    k.String("data_dir"),
 		LogLevel:   k.String("log_level"),
@@ -85,6 +127,17 @@ func Load(path string) (*Config, error) {
 	c.Storage.DSN = k.String("storage.dsn")
 
 	// Validation
+	if len(c.DNSListen) == 0 {
+		return nil, fmt.Errorf("dns_listen must name at least one address")
+	}
+	// Parsed with the same call cmd/dnsaur uses to configure the handler, so
+	// a value that loads here is a value that will set the level there. It
+	// used to be parsed only there, with the error discarded, which made
+	// every misspelling silently INFO.
+	var lvl slog.Level
+	if err := lvl.UnmarshalText([]byte(c.LogLevel)); err != nil {
+		return nil, fmt.Errorf("unknown log_level %q: must be one of debug, info, warn, error", c.LogLevel)
+	}
 	if c.Storage.Driver != "sqlite" && c.Storage.Driver != "postgres" {
 		return nil, fmt.Errorf("unknown storage driver %q", c.Storage.Driver)
 	}

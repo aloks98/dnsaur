@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 	_ "modernc.org/sqlite"
@@ -282,12 +283,28 @@ type TokenStore interface {
 	SetExpiry(ctx context.Context, id, ts int64) error
 }
 
+// sqliteDSN adds the pragmas every connection needs, as another parameter
+// on the DSN's query rather than as a second query.
+//
+// storage.dsn is operator-supplied and may already be a URI carrying one
+// ("file:dnsaur.db?mode=ro"); appending "?_pragma=..." to that produced two
+// "?" in one DSN, which the driver reads as one parameter with a "?" in its
+// value — so the first pragma was mangled and the rest of them, foreign_keys
+// among them, never applied.
+func sqliteDSN(dsn string) string {
+	sep := "?"
+	if strings.Contains(dsn, "?") {
+		sep = "&"
+	}
+	return dsn + sep + "_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)"
+}
+
 func Open(ctx context.Context, driver, dsn string) (Store, error) {
 	var drvName string
 	switch driver {
 	case "sqlite":
 		drvName = "sqlite"
-		dsn = dsn + "?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)"
+		dsn = sqliteDSN(dsn)
 	case "postgres":
 		drvName = "pgx"
 	default:

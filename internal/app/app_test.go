@@ -1202,6 +1202,93 @@ func watchLogs(t *testing.T, msg string) *logWatcher {
 	return h
 }
 
+// logCounter is logWatcher for the cases where how *many* times a line was
+// written is the property, not whether it was.
+type logCounter struct {
+	msg string
+	mu  sync.Mutex
+	n   int
+}
+
+func (h *logCounter) Enabled(context.Context, slog.Level) bool { return true }
+
+func (h *logCounter) Handle(_ context.Context, r slog.Record) error {
+	if strings.Contains(r.Message, h.msg) {
+		h.mu.Lock()
+		h.n++
+		h.mu.Unlock()
+	}
+	return nil
+}
+
+func (h *logCounter) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *logCounter) WithGroup(string) slog.Handler      { return h }
+
+func (h *logCounter) count() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.n
+}
+
+func countLogs(t *testing.T, msg string) *logCounter {
+	t.Helper()
+	h := &logCounter{msg: msg}
+	prev := slog.Default()
+	slog.SetDefault(slog.New(h))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	return h
+}
+
+// A settings value that is not a number falls back to the built-in default,
+// which is the right answer — and used to be given with nothing said, so a
+// hand-edited qlog.retention_days of "ninety" silently meant 90 days and a
+// key never seeded meant its default forever.
+//
+// Saying so has to survive applySettings running on every settings write:
+// one line per bad value, not one per pass. Built with New rather than
+// newTestApp so the only reads counted are this test's.
+func TestUnusableIntSettingIsWarnedOncePerValue(t *testing.T) {
+	ctx := context.Background()
+	a, err := New(ctx, testConfig(t.TempDir()), "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = a.Store().Close() })
+	counter := countLogs(t, "unusable setting")
+
+	read := func() {
+		t.Helper()
+		if got := a.getInt(ctx, "qlog.retention_days", 90); got != 90 {
+			t.Fatalf("getInt returned %d for an unusable value, want the fallback 90", got)
+		}
+	}
+
+	setInternal(t, a, "qlog.retention_days", "ninety")
+	read()
+	read()
+	read()
+	if got := counter.count(); got != 1 {
+		t.Errorf("one bad value warned %d times, want 1 — a reload loop would fill the log", got)
+	}
+
+	setInternal(t, a, "qlog.retention_days", "ninety-one")
+	read()
+	if got := counter.count(); got != 2 {
+		t.Errorf("a different bad value warned %d times in total, want 2", got)
+	}
+
+	// A key that reads cleanly is forgotten, so breaking it again is news.
+	setInternal(t, a, "qlog.retention_days", "30")
+	if got := a.getInt(ctx, "qlog.retention_days", 90); got != 30 {
+		t.Fatalf("getInt = %d, want the stored 30", got)
+	}
+	setInternal(t, a, "qlog.retention_days", "ninety-one")
+	read()
+	if got := counter.count(); got != 3 {
+		t.Errorf("a value that broke, was fixed and broke again warned %d times in total, want 3", got)
+	}
+}
+
 // An inbound NOTIFY replies first and works afterwards (RFC 1996 §4.7), so
 // the work runs in a goroutine of its own under a context the request's
 // cancellation cannot reach. That goroutine used to be tracked by nothing:
@@ -1355,4 +1442,57 @@ func TestApplySettingsDoesNotCallAPlaintextFallbackADowngrade(t *testing.T) {
 	if active, reason := a.UpstreamDowngrade(); active {
 		t.Errorf("a plaintext value that would not parse was reported as an encryption downgrade: %q", reason)
 	}
+}
+
+// applySettings re-reads blocking.mode and qlog.privacy on every settings
+// change, and a store that cannot answer must not read as "the operator
+// chose the default". Collapsed, a transient database error turned a
+// configured nxdomain into null-ip and a configured anon into full — logging
+// whole client IPs until some later apply happened to succeed.
+// TestServingSettingsReadFailureLeavesListenersUntouched pins the same rule
+// for the serving keys; this is the other half of applySettings.
+//
+// Asserted through the running server rather than off the engine's fields:
+// the setting only matters as the answer a client gets and the row the query
+// log keeps.
+func TestSettingsReadFailureLeavesBlockingModeAndPrivacyUntouched(t *testing.T) {
+	ctx := context.Background()
+	pub := mockDNS(t, answerA("5.6.7.8"))
+	a := newTestApp(t, withUpstreams(pub),
+		withSetting("blocking.mode", "nxdomain"), withSetting("qlog.privacy", "anon"))
+
+	if _, err := a.Store().Filters().AddRule(ctx, store.Rule{
+		GroupID: 1, Action: "block", Pattern: "ads.example.com",
+	}); err != nil {
+		t.Fatalf("AddRule: %v", err)
+	}
+	if err := a.refresher.RefreshAll(ctx); err != nil {
+		t.Fatalf("RefreshAll: %v", err)
+	}
+	a.applySettings(ctx)
+
+	entries, unsubscribe := a.logger.Subscribe()
+	defer unsubscribe()
+
+	check := func(when string) {
+		t.Helper()
+		if r := askAppMsg(t, a, "ads.example.com"); r.Rcode != dns.RcodeNameError {
+			t.Errorf("%s: blocked query answered %s, want NXDOMAIN", when, dns.RcodeToString[r.Rcode])
+		}
+		select {
+		case e := <-entries:
+			if e.ClientIP != "127.0.0.0" {
+				t.Errorf("%s: query log kept client IP %q, want it anonymised to 127.0.0.0", when, e.ClientIP)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("%s: the query was never logged", when)
+		}
+	}
+	check("before the failed read")
+
+	failed, cancel := context.WithCancel(ctx)
+	cancel() // every store read under this context now returns an error
+	a.applySettings(failed)
+
+	check("after the failed read")
 }

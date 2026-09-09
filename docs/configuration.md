@@ -19,10 +19,10 @@ over built-in defaults, then overridden by environment variables.
 
 | YAML field | Env var | Default | Meaning |
 |---|---|---|---|
-| `dns_listen` | `DNSAUR_DNS_LISTEN` (comma-separated) | `[":53"]` | Addresses the DNS engine listens on (UDP+TCP) |
+| `dns_listen` | `DNSAUR_DNS_LISTEN` (comma-separated) | `[":53"]` | Addresses the DNS engine listens on (UDP+TCP). A list, or a plain string for a single address (`dns_listen: ":53"`); at least one address is required |
 | `http_listen` | `DNSAUR_HTTP_LISTEN` | `:8080` | Address the REST API *and* the web dashboard listen on — both are served by the same HTTP server (the dashboard is a static SPA embedded into the binary; the API answers under `/api/v1`, everything else falls through to the dashboard, see [`docs/architecture.md`](architecture.md)) |
 | `data_dir` | `DNSAUR_DATA_DIR` | `./data` | Directory for the SQLite DB file and cached blocklist downloads |
-| `log_level` | `DNSAUR_LOG_LEVEL` | `info` | slog level (`debug`, `info`, `warn`, `error`) |
+| `log_level` | `DNSAUR_LOG_LEVEL` | `info` | slog level: `debug`, `info`, `warn` or `error`. Anything else is refused at startup |
 | `storage.driver` | `DNSAUR_STORAGE_DRIVER` | `sqlite` | `sqlite` or `postgres` |
 | `storage.dsn` | `DNSAUR_STORAGE_DSN` | `<data_dir>/dnsaur.db` (sqlite) | Data source name; **required** when `storage.driver` is `postgres` |
 
@@ -42,6 +42,32 @@ Env vars always win over the file, and the file always wins over built-in
 defaults. All bootstrap fields have a `DNSAUR_*` override; there is no
 env-only field that can't also be set in YAML.
 
+`DNSAUR_DNS_LISTEN` is split on commas, with surrounding whitespace trimmed
+and empty entries dropped, so `":53, :5353"` and `":53,:5353,"` both mean
+the same two addresses. A list written in YAML is normalised identically:
+the same addresses written either way produce the same value.
+
+### What startup refuses
+
+Bootstrap config is checked before anything binds, and a value that cannot
+be honoured stops the process with a message rather than being replaced by
+a default — this is the one layer where "keep going" would mean running a
+server that answers nothing (see
+[`docs/architecture.md`](architecture.md#dns-must-not-die)):
+
+- **A config file that isn't there**, when `-config` named it. Only the
+  default path (`dnsaur.yaml`) is allowed to be absent, since running with
+  no config file at all is a supported setup. `-config /etc/dnsaur/dnsuar.yaml`
+  is a typo, and starting on defaults hid it behind a server that came up
+  answering none of the configured names.
+- **A config file that doesn't parse**, or that can't be read.
+- **An empty `dns_listen`** — `[]`, `""`, or an env value that trims to
+  nothing. There is no DNS server without an address to serve it on.
+- **An unknown `log_level`.** `verbose` used to be silently `info`, so an
+  operator who asked for debug output got none and nothing said why.
+- **An unknown `storage.driver`**, and a `postgres` driver with no
+  `storage.dsn`.
+
 ## Database-managed settings
 
 These are seeded into the `settings` table the first time dnsaur starts
@@ -60,7 +86,7 @@ the DB, bumps a config version, and live components reload automatically —
 | `cache.max_ttl` **†** | `86400` | Maximum TTL (seconds) clamp on cached responses |
 | `cache.max_entries` **†** | `10000` | Maximum number of entries held in the in-memory cache |
 | `cache.serve_stale_for` **†** | `86400` | How long (seconds) a stale cache entry may still be served if upstream is down. It never applies across a routing change: adding, removing or retargeting a `forwarder` or `stub` zone drops what the cache held beneath that suffix, so a claimed suffix cannot be served an answer the default upstreams produced |
-| `lists.refresh_hours` **†** | `24` | How often blocklists/allowlists are re-downloaded and recompiled |
+| `lists.refresh_hours` **†** | `24` | How often blocklists/allowlists are re-downloaded and recompiled. **Minimum 1** — `0` is an interval no timer can be built from, and `PUT /settings` refuses it. A `0` already in the database (or one written before this check existed) turns the periodic refresh off with a warning in the log instead of taking the process down; lists still recompile on every settings change and on the manual refresh |
 | `qlog.retention_days` | `90` | How long query log rows are kept before the pruner deletes them |
 | `qlog.privacy` | `full` | Query log privacy mode: `full`, anonymized client IPs, or `none` (no per-query logging) |
 | `serve.dot.enabled` | `false` | Serve DNS-over-TLS (RFC 7858) to clients on `serve.dot.listen`. Enabling requires `serve.tls.cert`/`serve.tls.key` to already name a certificate that loads — see Encrypted serving below |
