@@ -29,6 +29,12 @@ they are what a user will see — **the string only**, with no RFC citation or
 other commentary appended, which §2.6's record conflicts are the place that
 most often gets written down wrong.
 
+A body that is *not* the envelope never comes from dnsaur — it comes from
+whatever sits in front of it, which answers its own 502/413/504 page. The
+client falls back to `HTTP <status>` for those (`web/src/api/client.ts`):
+`Response.statusText` is empty over HTTP/2, so trusting it left such a failure
+with an empty message and the UI showing an empty toast.
+
 *Citations in this section name functions, not line numbers* — four of them
 pointed about a hundred lines off by D6, because a line number is a fact
 about a file's history rather than about its behaviour. The rest of the
@@ -1332,6 +1338,12 @@ no `onMutate` and no `setQueryData` in the whole client.
 Settings saves are per-key via `Promise.allSettled`, so a partial failure keeps
 the failed fields dirty with the admin's typed value intact.
 
+The `upstreams` editor hands the form whatever the rows currently spell, valid
+or not, so a rejected row blocks Save through the field's own schema (the same
+`ParseUpstreams` grammar). It used to withhold a rejected value, which left the
+form holding the last valid one — an edit that looked applied, was silently
+discarded on save, and lost its row error on the resync.
+
 ---
 
 ## 7. Loading / empty / error states
@@ -1343,6 +1355,11 @@ The client distinguishes two error cases, and the distinction is load-bearing:
   content** (`Couldn't refresh {what}` / "Showing what last loaded
   successfully." / `Try again`). A blipped background poll never wipes good
   data.
+
+The chrome's blocking cell obeys the same rule without a banner: `Status
+unavailable` is only for a `GET /blocking` that has never answered. A failed
+poll keeps the last state it read — countdown included — and keeps `Resume`
+greyed out if that state says there is nothing to resume.
 
 | Screen | Pending | Empty | First load failed | Background refetch failed |
 |---|---|---|---|---|
@@ -1369,11 +1386,19 @@ until the first SSE row arrives.
 | State | Renders |
 |---|---|
 | `me` pending | full-page spinner |
+| `me` failed with **anything but 401** | `Can't reach dnsaur` banner with a manual `Retry` |
 | `me` 401 + setup pending | full-page spinner |
 | `me` 401 + setup **also failed** | `Can't reach dnsaur` banner with a manual `Retry` |
 | `me` 401 + `setup_required: true` | Setup wizard |
 | `me` 401 + `setup_required: false` | Login |
 | `me` success | app shell |
+
+**Only a 401 means "signed out".** `me` is retried once, after 500ms, on
+anything else (5xx, a fetch `TypeError`) and a still-failing non-401 is an
+unreachable server, not an absent session — a restart mid-load must not walk an
+operator with a valid cookie to a login form. `Retry` on the banner invalidates
+`me` as well as refetching `setup`, so recovery does not depend on signing in
+again.
 
 A **mid-session 401** from any query revalidates `me` once (re-entrancy
 guarded); if it now fails, all non-auth cached data is dropped and the gate
@@ -1403,16 +1428,32 @@ changes.
 
 Everything else is fetch-on-mount with a 10s stale time and no window-focus
 refetch; `me` is a further exception, refetching on focus only once it has
-succeeded.
+succeeded, and retrying once (500ms) on any failure that is not a 401.
 
 **SSE client behaviour** — backoff doubles 1s → 30s; after **6** consecutive
-failures with no successful open it gives up and shows `Live tail disconnected`
-with a manual Reconnect. Arrivals batch at 100ms; the ring buffer holds **500
-rows**, newest first, and is never cleared when the stream stops.
+failures it gives up and shows `Live tail disconnected` with a manual
+Reconnect, and invalidates `me` on the way out so an expired session reaches
+the auth gate instead of a dead button. A connection counts as working — and
+so resets the failure count and the backoff — only once it has **delivered a
+message or stayed open 5s**: EventSource reports a 401 as an error *after* the
+stream opened, so "it opened" alone would reset the backoff on every attempt
+and the retries would never run out. Arrivals batch at 100ms; the ring buffer
+holds **500 rows**, newest first, and is never cleared when the stream stops.
+Pausing the tail is per-visit: the flag is cleared when the query log unmounts,
+because the buffer it governs is per-mount and the seed only runs while
+unpaused.
 
 **Keyboard** — exactly one shortcut: ⌘K / Ctrl+K toggles the command palette.
 It is registered on `window` with no target filtering, so it also fires while
-typing in an input.
+typing in an input. The hint in the search cell reads `⌘K` on Apple platforms
+and `Ctrl+K` everywhere else; the listener accepts either modifier on both.
+
+**Theme** — `dnsaur.theme` in `localStorage` (`light`/`dark`) overrides
+`prefers-color-scheme`, and with nothing stored the app follows the OS live.
+`public/theme-boot.js` applies the same rule from `<head>`, before the module
+bundle, so a dark install does not paint light first. It is a file rather than
+an inline script because the served CSP is `script-src 'self'` with no
+`'unsafe-inline'` (`internal/api/static.go`), which would block one silently.
 
 ---
 

@@ -12,18 +12,16 @@ import {
 } from "lucide-react";
 
 /**
- * The dashboard. Named because two other places need to recognise it: the
- * chrome hangs that screen's own cells off it (components/top-nav.tsx), and
- * the shell drops its page padding for it (components/app-shell.tsx) — the
- * dashboard is a full-bleed grid of hairline-separated bands, and a padded
- * <main> would leave every one of those rules floating in a 24px gutter.
+ * The dashboard. Named because the chrome hangs that screen's own cells off
+ * it (components/top-nav.tsx): the stats window selector belongs to this
+ * route and to no other.
  */
 export const DASHBOARD_PATH = "/";
 
 /**
- * The query log. Recognised for the same two reasons the dashboard is: the
- * chrome hangs that screen's own cells off it (components/top-nav.tsx), and
- * the shell drops its page padding for it (components/app-shell.tsx).
+ * The query log. Recognised for the same reason the dashboard is: the chrome
+ * hangs that screen's own cells off it (components/top-nav.tsx) — the tail's
+ * readout and its LIVE/PAUSE toggle.
  */
 export const QUERY_LOG_PATH = "/queries";
 

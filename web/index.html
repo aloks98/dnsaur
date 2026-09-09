@@ -5,6 +5,11 @@
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>dnsaur</title>
+    <!-- Blocking, and before the module bundle below (which is deferred), so
+         the theme is on the <html> element for the first paint rather than
+         after it — a dark install used to flash light for as long as the
+         bundle took to load. See public/theme-boot.js. -->
+    <script src="/theme-boot.js"></script>
   </head>
   <body>
     <div id="root"></div>

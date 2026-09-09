@@ -92,6 +92,16 @@ describe("parseACL", () => {
     });
   });
 
+  // netip.ParsePrefix refuses a leading zero in the prefix length for the
+  // same octal-ambiguity reason netip.ParseAddr refuses one in an octet, so
+  // accepting it here would only mean the field passing a value the server
+  // 400s.
+  test("a leading zero in the prefix length is rejected, as it is in an octet", () => {
+    expect(parseACL("10.0.0.0/08").ok).toBe(false);
+    expect(parseACL("10.0.0.0/024").ok).toBe(false);
+    expect(parseACL("10.0.0.0/0").ok).toBe(true);
+  });
+
   test("a value that is neither an address nor a key is rejected", () => {
     const result = parseACL("not-an-ip");
     expect(result.ok).toBe(false);

@@ -42,6 +42,18 @@ while keeping the history already recorded.
 A live tail of queries as they're answered, streamed over SSE, plus search and
 filters over what's already stored.
 
+The screen opens with the most recent 100 queries from storage, so a busy
+resolver doesn't start on an empty table, and keeps the last 500 rows in view.
+
+**Pause** holds the stream: what's on screen stays, and nothing new is added
+until you resume. It's a hold, not a saved view — leaving the screen resumes
+it, so coming back always shows a running tail.
+
+If the stream drops, it reconnects on a widening delay and gives up after about
+half a minute, offering **Reconnect**. Giving up also re-checks your session,
+since an expired one looks exactly like a dead connection from here: if it has
+expired you get the login screen rather than a button that can't work.
+
 How much lands here is set by `qlog.privacy`, and how long it stays is set by
 `qlog.retention_days` — a background pruner deletes rows older than the cutoff.
 Setting retention to `0` prunes everything on the next pass.
@@ -723,6 +735,16 @@ of the same answer.
 ---
 
 ## Account & security
+
+### When the server can't be reached
+
+`Can't reach dnsaur` replaces the whole screen when the API doesn't answer —
+including while it's restarting, which is not the same thing as being signed
+out. **Retry** re-asks both the session and the setup state, so a server that
+has come back drops you where you were, with the session you already had.
+
+The login screen only appears when the server answers and says the session is
+gone.
 
 ### Password
 

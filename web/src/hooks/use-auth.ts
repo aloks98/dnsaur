@@ -12,6 +12,21 @@ export function isSessionData(queryKey: readonly unknown[]): boolean {
   return queryKey[0] !== authKeys.me[0] && queryKey[0] !== authKeys.setup[0];
 }
 
+/**
+ * A 401 — the only failure that actually means "this session is not signed
+ * in". Every other one (a 5xx, a fetch TypeError because the server is
+ * restarting) says nothing about the cookie, and the difference is what the
+ * auth gate branches on: see app.tsx.
+ */
+export function isUnauthorized(error: unknown): boolean {
+  return error instanceof ApiError && error.status === 401;
+}
+
+// One retry, soon. A server being restarted answers (or refuses) for a
+// second or two, which is long enough to lose the race against a page load
+// and short enough that waiting once costs nothing.
+const ME_RETRY_DELAY_MS = 500;
+
 /** The signed-in user, plus everything the UI derives from them. */
 export interface Me extends MeResponse {
   /** Two-letter avatar initials. */
@@ -36,7 +51,11 @@ export function useMe() {
     // happens to draw an avatar — derived once here so every call site
     // (sidebar footer today, anything else later) agrees on them.
     select: withDerived,
-    retry: false,
+    // A 401 is an answer and is never retried; anything else is the server
+    // failing to answer, and retrying once keeps a restart from reading as
+    // a dead session. App's gate tells the two apart the same way.
+    retry: (failureCount, error) => failureCount < 1 && !isUnauthorized(error),
+    retryDelay: ME_RETRY_DELAY_MS,
     // The one query that opts back into focus revalidation (the client-wide
     // default is off): coming back to a tab that has been open for days is
     // exactly when the session is most likely to have expired, and the auth
@@ -96,7 +115,7 @@ export function useLogin() {
  * the one failure that isn't one, without re-deriving the rule.
  */
 export function isAlreadyLoggedOut(error: unknown): boolean {
-  return error instanceof ApiError && error.status === 401;
+  return isUnauthorized(error);
 }
 
 // A hard reload, not qc.clear()/invalidateQueries(authKeys.me) — this page

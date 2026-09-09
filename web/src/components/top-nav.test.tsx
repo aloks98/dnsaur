@@ -254,18 +254,29 @@ test("the search cell opens the command palette", async () => {
 
 // The shortcut is a key, so it's a <kbd> — rnui's Kbd, not two more
 // characters of label text. The word stays in the accessible name even
-// where the viewport hides it, so the cell never announces as just "⌘K".
-test("the search cell names itself and shows the shortcut as a Kbd", async () => {
+// where the viewport hides it, so the cell never announces as just the key.
+//
+// The glyph follows the platform: the listener has always accepted both
+// modifiers (command-palette.tsx), while the hint claimed ⌘ on machines that
+// have no such key.
+test("the search cell names itself and shows the platform's shortcut as a Kbd", async () => {
   renderTopNav();
 
   const search = screen.getByRole("button", { name: /search/i });
-  expect(search).toHaveAccessibleName("search ⌘K");
+  expect(search).toHaveAccessibleName("search Ctrl+K");
 
   const kbd = search.querySelector("kbd");
   expect(kbd).not.toBeNull();
-  expect(kbd).toHaveTextContent("⌘K");
+  expect(kbd).toHaveTextContent("Ctrl+K");
   // The old cell spelled the affordance out in the label instead.
   expect(search.textContent).not.toMatch(/\//);
+});
+
+test("the search cell shows ⌘K on an Apple platform", async () => {
+  vi.spyOn(navigator, "platform", "get").mockReturnValue("MacIntel");
+  renderTopNav();
+
+  expect(screen.getByRole("button", { name: /search/i })).toHaveAccessibleName("search ⌘K");
 });
 
 test("the System menu carries Settings, Account, the signed-in user, theme and log out", async () => {

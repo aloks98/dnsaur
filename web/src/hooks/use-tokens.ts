@@ -40,6 +40,11 @@ export function useCreateToken() {
   return useMutation({
     mutationFn: (v: CreateTokenInput) => api.post<CreateTokenResult>("/tokens", v),
     onSuccess: () => qc.invalidateQueries({ queryKey: tokenKeys.all }),
+    // Drop the result the moment the dialog that shows it goes away, rather
+    // than leaving the plaintext token readable through the mutation cache
+    // for the default five minutes — the same treatment use-totp.ts gives
+    // the TOTP secret, and for the same reason.
+    gcTime: 0,
   });
 }
 

@@ -312,9 +312,17 @@ export interface TopEntry {
 
 export interface ApiToken {
   id: number;
+  user_id: number;
+  /** `"api"` on everything `GET /tokens` returns — session rows are filtered
+   * out server-side (internal/api/tokens_handlers.go). Mirrored because
+   * store.AuthToken sends it and this file is that struct's counterpart. */
+  kind: string;
   name: string;
   scope: "read" | "write";
   created_at: number;
+  /** Unix ms, `0` for never — which is every API token today; only sessions
+   * are minted with an expiry. */
+  expires_at: number;
   last_used: number;
 }
 

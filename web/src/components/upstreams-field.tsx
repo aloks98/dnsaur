@@ -8,6 +8,7 @@ import {
   type UpstreamErrorCode,
   type UpstreamScheme,
 } from "../lib/upstreams";
+import { splitHostPortOptional } from "../lib/hostport";
 import { isValidIPv4, isValidIPv6 } from "../lib/schemas";
 import { WarningStrip } from "./warning-strip";
 
@@ -20,8 +21,9 @@ import { WarningStrip } from "./warning-strip";
  * server still stores and validates exactly that string, via
  * internal/upstream/addr.go's grammar, mirrored here by parseUpstreams). This
  * component's whole job is presenting that string as a transport choice plus
- * a table of address/name pairs, and never handing back a string
- * `parseUpstreams` would reject — see `emit` below.
+ * a table of address/name pairs, and saying which row is wrong when one is —
+ * while still handing the form what the rows currently spell, so the field's
+ * schema is what decides whether Save may proceed. See `emit` below.
  */
 
 type Transport = "plain" | "tls" | "https";
@@ -123,39 +125,23 @@ const PRESET_LABELS: Record<PresetName, string> = {
 
 /**
  * The host portion of an address that may carry a `host:port` or
- * `[ipv6]:port` suffix — just enough to ask "does this look like an IP",
- * not a full parse. upstreams.ts owns the real grammar; this is only used to
+ * `[ipv6]:port` suffix — just enough to ask "does this look like an IP", not
+ * a full parse. upstreams.ts owns the real grammar; this is only used to
  * decide, when leaving Plain, whether an address can carry over as-is.
  */
 function hostOf(address: string): string {
-  const trimmed = address.trim();
-  if (trimmed.startsWith("[")) {
-    const end = trimmed.indexOf("]");
-    return end >= 0 ? trimmed.slice(1, end) : trimmed;
-  }
-  const i = trimmed.lastIndexOf(":");
-  return i >= 0 ? trimmed.slice(0, i) : trimmed;
+  return splitHostPortOptional(address.trim()).host;
 }
 
 /**
- * The port an address states, or "" when it states none. Bracket-aware, and
- * deliberately blind to a bare (unbracketed) IPv6 literal: `::1` has no
- * port, and reading its last colon as one would invent a port from an
- * address the operator never gave one to.
+ * The port an address states, or "" when it states none — including for a
+ * bare (unbracketed) IPv6 literal, which states none: `::1` is an address,
+ * and reading its last group as a port would invent one the operator never
+ * gave. See lib/hostport.ts, which is where that rule now lives for every
+ * field that needs it.
  */
 function portOf(address: string): string {
-  const trimmed = address.trim();
-  if (trimmed.startsWith("[")) {
-    const end = trimmed.indexOf("]");
-    if (end < 0) return "";
-    const rest = trimmed.slice(end + 1);
-    return rest.startsWith(":") ? rest.slice(1) : "";
-  }
-  const i = trimmed.lastIndexOf(":");
-  if (i < 0) return "";
-  // More than one colon and no brackets: a bare IPv6 literal, not a port.
-  if (trimmed.slice(0, i).includes(":")) return "";
-  return trimmed.slice(i + 1);
+  return splitHostPortOptional(address.trim()).port;
 }
 
 /**
@@ -305,9 +291,16 @@ export function UpstreamsField({
   }, [value]);
 
   /**
-   * Builds the wire string from `nextRows` under `nextTransport`, and either
-   * hands it to `onChange` or — if `parseUpstreams` would reject it — leaves
-   * `onChange` uncalled and records which row said why.
+   * Builds the wire string from `nextRows` under `nextTransport`, hands it to
+   * `onChange`, and — if `parseUpstreams` would reject it — also records
+   * which row said why.
+   *
+   * The rejected string goes out too, rather than being withheld. Withholding
+   * it left the form's value at the last *valid* string while the screen
+   * showed the invalid one: saving then persisted the pre-edit list, the row
+   * error disappeared on the resync, and nothing anywhere said the edit had
+   * been dropped. The form's own schema is the same parseUpstreams (see
+   * pages/settings.tsx), so emitting it is what blocks Save.
    *
    * A row whose Address is still blank is dropped rather than validated: an
    * empty new row (from "+ Add resolver") is not yet an entry, the same way
@@ -332,27 +325,24 @@ export function UpstreamsField({
       .filter((e): e is { index: number; entry: string } => e !== null);
     const joined = built.map((e) => e.entry).join(",");
 
-    if (joined === "") {
+    const parsed = joined === "" ? null : parseUpstreams(joined);
+    if (parsed === null || parsed.ok) {
       setRowError(null);
-      lastEmitted.current = joined;
-      onChange(joined);
-      return;
+    } else {
+      const failed = built.find((e) => e.entry === parsed.error.entry);
+      setRowError({
+        index: failed ? failed.index : nextRows.length - 1,
+        message: ROW_ERROR_MESSAGES[parsed.error.code] ?? parsed.error.message,
+        target: errorTarget(parsed.error.code),
+      });
     }
 
-    const parsed = parseUpstreams(joined);
-    if (parsed.ok) {
-      setRowError(null);
-      lastEmitted.current = joined;
-      onChange(joined);
-      return;
-    }
-
-    const failed = built.find((e) => e.entry === parsed.error.entry);
-    setRowError({
-      index: failed ? failed.index : nextRows.length - 1,
-      message: ROW_ERROR_MESSAGES[parsed.error.code] ?? parsed.error.message,
-      target: errorTarget(parsed.error.code),
-    });
+    // Recorded even for a rejected value, so the resync effect above still
+    // recognises the next `value` as our own and leaves the table alone —
+    // re-deriving from a string parseUpstreams refuses collapses it to a
+    // single Plain row holding the raw text.
+    lastEmitted.current = joined;
+    onChange(joined);
   }
 
   function updateRow(index: number, patch: Partial<Row>) {

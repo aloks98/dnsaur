@@ -24,6 +24,7 @@
  */
 
 import { canonicalDomainName, isValidACLKeyName, parseAddress } from "./acl";
+import { splitHostPort } from "./hostport";
 
 const NOTIFY_KEY_PREFIX = "key:";
 /** notifyto.go's own default — `zones.DefaultPrimaryPort`, the port any
@@ -121,6 +122,10 @@ function parseNotifyTarget(field: string): TargetResult {
     return { ok: false, error: `notify target "${field}": needs a host before the key` };
   }
 
+  // `net.SplitHostPort` never returns anything but a `*net.AddrError`, and
+  // `parseNotifyTarget` catches every one of those the same way — the whole
+  // field becomes the host, with no port. That includes the two legal
+  // no-port shapes: a bare host with no colon, and a bare IPv6 literal.
   const split = splitHostPort(hostPart);
   const host = split ? split.host : hostPart;
   const portStr = split ? split.port : "";
@@ -147,47 +152,6 @@ function indexOfSpaceOrTab(s: string): number {
     if (s[i] === " " || s[i] === "\t") return i;
   }
   return -1;
-}
-
-/**
- * A minimal port of `net.SplitHostPort`, covering the bracketed-IPv6 case
- * it accepts plus the two "legal" no-port shapes `parseNotifyTarget`'s own
- * comment names: a bare host with no colon, and a bare IPv6 literal with
- * none.
- *
- * `net.SplitHostPort` never returns anything but a `*net.AddrError`, and
- * `parseNotifyTarget` catches every one of those the same way — the whole
- * field becomes the host, with no port. So there is no distinguished error
- * to port here either: any shape this function does not recognise comes
- * back `null`, and the caller treats that exactly like a recognised
- * no-port host.
- */
-function splitHostPort(hostport: string): { host: string; port: string } | null {
-  const lastColon = hostport.lastIndexOf(":");
-  if (lastColon === -1) return null;
-
-  if (hostport[0] === "[") {
-    const end = hostport.indexOf("]");
-    if (end === -1) return null;
-    if (end + 1 === hostport.length) return null; // "[fd00::2]" — no port
-    if (end + 1 !== lastColon) return null; // ']' not immediately followed by the last ':'
-    if (hostport.slice(1).includes("[")) return null;
-    if (hostport.slice(end + 1).includes("]")) return null;
-    return { host: hostport.slice(1, end), port: hostport.slice(lastColon + 1) };
-  }
-
-  const host = hostport.slice(0, lastColon);
-  if (host.includes(":")) return null; // a bare IPv6 literal, unbracketed
-  // Go checks the *whole* string for a stray '[' or ']' here (j and k are
-  // both 0 in this branch — only the bracket branch above moves them), not
-  // just the host or port half. Checking only `port` for ']' (an earlier
-  // version of this function did) let "abc]:1234" through as
-  // {host: "abc]", port: "1234"} — a shape net.SplitHostPort actually
-  // refuses ("unexpected ']' in address"), which is exactly the kind of
-  // too-lax drift this file's own top comment warns about.
-  if (hostport.includes("[") || hostport.includes("]")) return null;
-  const port = hostport.slice(lastColon + 1);
-  return { host, port };
 }
 
 /**

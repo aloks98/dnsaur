@@ -93,7 +93,10 @@ export function PauseControl({ groupId = 0, variant = "button" }: PauseControlPr
     buttonTone,
     chromeTone,
   } = triggerView(status, isPaused, remainingMs);
-  const stateKnown = status.isSuccess;
+  // Having read the state once is what counts, not whether the *latest* poll
+  // succeeded: a 30s poll that blips must not un-grey Resume under a pause
+  // this control already knows about.
+  const stateKnown = status.data !== undefined;
 
   function onPause(minutes: number) {
     pauseBlocking.mutate(
@@ -217,7 +220,11 @@ function triggerView(
       // Unfilled: there is nothing to be confident about yet.
       chromeTone: "text-muted-foreground hover:bg-accent/60",
     };
-  if (status.isError)
+  // Only when there is nothing to show. A failed *refetch* still has the
+  // last good `paused_until`, and replacing a live countdown with a
+  // destructive "Status unavailable" over one missed poll is the failure
+  // mode the data layer's rule exists to prevent (web/README.md).
+  if (status.isError && status.data === undefined)
     return {
       icon: CircleAlert,
       label: "Status unavailable",

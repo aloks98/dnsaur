@@ -15,7 +15,11 @@ served by `internal/api` alongside the REST API.
   Router for client routing
 - [oxlint](https://oxc.rs/docs/guide/usage/linter.html) + `oxfmt` for
   lint/format (not eslint/prettier), [Vitest](https://vitest.dev) +
-  Testing Library for tests
+  Testing Library for tests. `.oxlintrc.json` runs the `correctness`
+  category plus three rules named explicitly — `no-console` and both
+  `react-hooks` rules — so a category reshuffle can't quietly turn the
+  stale-closure check off, and the `eslint-disable` comments in the tree
+  suppress rules that are actually on.
 
 ## Prerequisites
 
@@ -96,6 +100,13 @@ So, by layer:
   dropped.
 
 ## Build + embed
+
+`index.html` loads one classic script before the bundle:
+`public/theme-boot.js`, which puts the stored (or OS-preferred) theme on
+`<html>` so a dark install doesn't paint light first. It is a file rather
+than an inline block because the served CSP is `script-src 'self'` with no
+`'unsafe-inline'` — an inline script would work in `pnpm dev` and be
+silently blocked in the real binary.
 
 `pnpm build` produces `web/dist/`, which `web/embed.go` embeds via
 `//go:embed all:dist` and exposes as `web.Dist() fs.FS`. The Go binary

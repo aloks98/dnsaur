@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { expect, test, vi } from "vitest";
 import { fireEvent, render, screen, within } from "@testing-library/react";
 import { parseUpstreams } from "../lib/upstreams";
@@ -84,7 +85,14 @@ test("choosing the Cloudflare preset under DNS-over-HTTPS shows one row with the
 // The artboard demonstrates the invalid state with a bare hostname
 // ("cloudflare-dns.com") typed into the first row's Address under Custom —
 // this reproduces exactly that.
-test("typing a hostname into Address under DNS-over-TLS shows the fix-it message and never calls onChange", () => {
+//
+// The edit is still emitted, and that is the point: withholding it left the
+// form holding the last *valid* string, so saving from this screen wrote the
+// pre-edit list, the row error vanished on the resync, and nothing said a
+// word. What goes out is the raw entry the field built, which the settings
+// form's schema (the same parseUpstreams) rejects — so Save is blocked
+// instead.
+test("typing a hostname into Address under DNS-over-TLS shows the fix-it message and emits a value the schema rejects", () => {
   const onChange = vi.fn<(next: string) => void>();
   render(<UpstreamsField value="" onChange={onChange} />);
 
@@ -102,7 +110,53 @@ test("typing a hostname into Address under DNS-over-TLS shows the fix-it message
     screen.getByText("Needs an address, not a name. Put the name in Server name."),
   ).toBeInTheDocument();
   expect(screen.getByLabelText("Address")).toHaveAttribute("aria-invalid", "true");
-  expect(onChange).not.toHaveBeenCalled();
+
+  expect(onChange).toHaveBeenCalled();
+  const emitted = onChange.mock.calls.at(-1)?.[0] as string;
+  expect(emitted).toContain("cloudflare-dns.com");
+  expect(parseUpstreams(emitted).ok).toBe(false);
+});
+
+// A rejected row must not be forgotten on the next keystroke either: the
+// value the form holds has to keep tracking the field, or a second edit that
+// happens to parse would save on top of a row still showing an error.
+test("correcting a rejected row emits again and clears the row error", () => {
+  const onChange = vi.fn<(next: string) => void>();
+  function Harness() {
+    const [value, setValue] = useState("");
+    return (
+      <UpstreamsField
+        value={value}
+        onChange={(next) => {
+          onChange(next);
+          setValue(next);
+        }}
+      />
+    );
+  }
+  render(<Harness />);
+
+  fireEvent.click(screen.getByRole("radio", { name: /^tls/i }));
+  fireEvent.change(screen.getByLabelText("Address"), { target: { value: "dns.google" } });
+  const rejected = onChange.mock.calls.at(-1)?.[0] as string;
+  expect(rejected).toContain("dns.google");
+  expect(parseUpstreams(rejected).ok).toBe(false);
+
+  // The rows survive the invalid value round-tripping back in as `value` —
+  // re-deriving from it would collapse the table to one Plain row.
+  fireEvent.change(screen.getByLabelText("Server name"), { target: { value: "dns.google" } });
+  fireEvent.change(screen.getByLabelText("Address"), { target: { value: "8.8.8.8:853" } });
+
+  expect(screen.getByRole("radio", { name: /^tls/i })).toBeChecked();
+  expect(
+    screen.queryByText("Needs an address, not a name. Put the name in Server name."),
+  ).not.toBeInTheDocument();
+  const emitted = onChange.mock.calls.at(-1)?.[0] as string;
+  const parsed = parseUpstreams(emitted);
+  if (!parsed.ok) throw new Error(`emitted value was rejected: ${parsed.error.message}`);
+  expect(parsed.entries).toEqual([
+    expect.objectContaining({ scheme: "tls", addr: "8.8.8.8:853", verifyName: "dns.google" }),
+  ]);
 });
 
 test("switching DNS-over-TLS to Plain keeps the addresses and drops the server names", () => {
@@ -208,7 +262,7 @@ test("typing a bare % into Server name is rejected in-row rather than thrown", (
 
   expect(screen.getByLabelText("Server name")).toHaveValue("100%");
   expect(screen.getByLabelText("Address")).toHaveAttribute("aria-invalid", "true");
-  expect(onChange).not.toHaveBeenCalled();
+  expect(parseUpstreams(onChange.mock.calls.at(-1)?.[0] as string).ok).toBe(false);
 });
 
 // The render path, which is the worse half: deriveState runs in a useState

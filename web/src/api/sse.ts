@@ -8,9 +8,18 @@ const MAX_BACKOFF_MS = 30_000;
 // EventSource.onerror carries no status code, so a 401 (expired session) is
 // indistinguishable from a network blip — retrying forever would leave a
 // dead session spinning "Reconnecting…" until the tab is closed. After this
-// many consecutive failures with no successful open in between, give up and
-// report a terminal state the UI can offer an explicit retry from.
+// many consecutive failures with no *working* stream in between (see
+// STABLE_OPEN_MS), give up and report a terminal state the UI can offer an
+// explicit retry from.
 const MAX_CONSECUTIVE_FAILURES = 6;
+// How long an open connection has to hold before it counts as a working
+// stream. A 401 on the tail endpoint reaches EventSource as an ordinary
+// error *after* the connection opened, so "it opened" on its own is not
+// evidence of anything: treating it as evidence reset the backoff on every
+// attempt, which turned that loop into a flat 1s retry that never gave up.
+// A delivered row is the other, better proof — a quiet resolver just may
+// not have one to send.
+const STABLE_OPEN_MS = 5_000;
 
 /**
  * Subscribes to the live query-log tail: `GET /api/v1/queries/tail`, a
@@ -42,20 +51,35 @@ export function subscribeQueries(
 
   let source: EventSource | null = null;
   let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
+  let stableTimer: ReturnType<typeof setTimeout> | undefined;
   let backoffMs = INITIAL_BACKOFF_MS;
   let failures = 0;
   let unsubscribed = false;
+
+  /** This connection did something a broken one can't. */
+  function markHealthy() {
+    backoffMs = INITIAL_BACKOFF_MS;
+    failures = 0;
+  }
+
+  function cancelStableTimer() {
+    if (stableTimer !== undefined) {
+      clearTimeout(stableTimer);
+      stableTimer = undefined;
+    }
+  }
 
   function connect() {
     source = new EventSource(TAIL_PATH);
 
     source.onopen = () => {
-      backoffMs = INITIAL_BACKOFF_MS;
-      failures = 0;
+      cancelStableTimer();
+      stableTimer = setTimeout(markHealthy, STABLE_OPEN_MS);
       onState("open");
     };
 
     source.onmessage = (event: MessageEvent<string>) => {
+      markHealthy();
       try {
         onEntry(JSON.parse(event.data) as QueryEntry);
       } catch {
@@ -66,6 +90,7 @@ export function subscribeQueries(
     source.onerror = () => {
       source?.close();
       source = null;
+      cancelStableTimer();
       if (unsubscribed) return;
       failures += 1;
       if (failures >= MAX_CONSECUTIVE_FAILURES) {
@@ -85,6 +110,7 @@ export function subscribeQueries(
   return () => {
     unsubscribed = true;
     if (reconnectTimer !== undefined) clearTimeout(reconnectTimer);
+    cancelStableTimer();
     source?.close();
     onState("closed");
   };

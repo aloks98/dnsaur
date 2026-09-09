@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useInfiniteQuery } from "@tanstack/react-query";
+import { useInfiniteQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "../api/client";
 import { subscribeQueries, type SseState } from "../api/sse";
+import { authKeys } from "./use-auth";
 import type { QueryEntry } from "../api/types";
 
 /** Exported because the query log's footer states both numbers to the user
@@ -147,6 +148,7 @@ function queryIdentity(e: QueryEntry): string {
  * already on screen.
  */
 export function useLiveTail(enabled: boolean): LiveTailResult {
+  const qc = useQueryClient();
   const [entries, setEntries] = useState<QueryEntry[]>([]);
   const [state, setState] = useState<SseState>(enabled ? "reconnecting" : "closed");
   // Bumped by reconnect() to re-run the effect (and so reopen the stream)
@@ -212,6 +214,22 @@ export function useLiveTail(enabled: boolean): LiveTailResult {
     });
   }, [enabled, seed]);
 
+  /**
+   * A stream that has given up is the one state worth asking a question
+   * about. EventSource reports a 401 as an ordinary error, so an expired
+   * session is indistinguishable from a blip until the retries are spent —
+   * and then the likeliest explanation is a session that no longer exists.
+   * Revalidating `me` lets the auth gate answer that, instead of leaving a
+   * dead "Reconnect" button as the only thing on offer.
+   */
+  const handleState = useCallback(
+    (next: SseState) => {
+      setState(next);
+      if (next === "failed") void qc.invalidateQueries({ queryKey: authKeys.me, exact: true });
+    },
+    [qc],
+  );
+
   useEffect(() => {
     if (!enabled) {
       setState("closed");
@@ -220,7 +238,7 @@ export function useLiveTail(enabled: boolean): LiveTailResult {
     const unsubscribe = subscribeQueries((entry) => {
       pending.current.push(entry);
       flushTimer.current ??= setTimeout(flush, FLUSH_INTERVAL_MS);
-    }, setState);
+    }, handleState);
 
     return () => {
       unsubscribe();
@@ -230,7 +248,7 @@ export function useLiveTail(enabled: boolean): LiveTailResult {
       }
       flush();
     };
-  }, [enabled, attempt, flush]);
+  }, [enabled, attempt, flush, handleState]);
 
   const reconnect = useCallback(() => setAttempt((n) => n + 1), []);
 

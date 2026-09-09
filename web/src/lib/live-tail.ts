@@ -103,9 +103,19 @@ export function setLiveTailReport(next: Omit<TailStatus, "paused">): void {
   emit();
 }
 
-/** Reset to defaults when the query log unmounts, so the chrome on another
- * screen never reports a stream that is no longer running. */
+/**
+ * Reset to defaults when the query log unmounts, so the chrome on another
+ * screen never reports a stream that is no longer running.
+ *
+ * `paused` goes with it. It is a momentary hold on a stream, not a view of
+ * the data (see the module comment) — and it is the one piece of this store
+ * that outlives the page, while the ring buffer it governs does not. Left
+ * set, coming back to the query log rendered an empty table labelled
+ * "Paused": no history, because the seed only runs while enabled, and no
+ * stream to fill it.
+ */
 export function resetLiveTailReport(): void {
+  setLiveTailPaused(false);
   setLiveTailReport({ filtered: false, streamState: "closed", reconnect: () => {} });
 }
 

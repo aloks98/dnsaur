@@ -16,9 +16,14 @@ export class ApiError extends Error {
  * the status line when there isn't. The raw text is kept on the ApiError
  * regardless: some endpoints put more than the summary in the body — a
  * rejected zone-file import carries an `errors` array alongside `error` — and
- * `.body` is the only place a caller can still reach it. */
+ * `.body` is the only place a caller can still reach it.
+ *
+ * `statusText` is empty over HTTP/2, which dropped the reason phrase, so it
+ * cannot be the last resort: a reverse proxy answering its own HTML 502
+ * otherwise produced an ApiError with an empty message — an empty toast, and
+ * `[""]` out of the zone import's error list. */
 function apiError(res: Response, text: string): ApiError {
-  let msg = res.statusText;
+  let msg = res.statusText || `HTTP ${res.status}`;
   try {
     const j = text ? JSON.parse(text) : null;
     if (j && typeof j.error === "string") msg = j.error;

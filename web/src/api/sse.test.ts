@@ -95,6 +95,90 @@ test("reconnects with capped backoff after an error", () => {
   unsubscribe();
 });
 
+// A dead session answers the tail endpoint with a 401, which EventSource
+// reports as an ordinary error — so the stream opens and immediately fails,
+// over and over. Resetting the backoff on `onopen` alone made that loop
+// reconnect at a flat 1s forever and never reach the terminal state.
+test("a stream that opens and then fails at once keeps backing off", () => {
+  const onState = vi.fn<(state: SseState) => void>();
+  const unsubscribe = subscribeQueries(() => {}, onState);
+
+  FakeEventSource.instances[0]?.emitOpen();
+  FakeEventSource.instances[0]?.emitError();
+  vi.advanceTimersByTime(1_000);
+  expect(FakeEventSource.instances).toHaveLength(2);
+
+  // Second attempt: opens, then dies before it has delivered anything or
+  // stayed up long enough to count as healthy.
+  FakeEventSource.instances[1]?.emitOpen();
+  FakeEventSource.instances[1]?.emitError();
+  vi.advanceTimersByTime(1_000);
+  expect(FakeEventSource.instances).toHaveLength(2); // 2s now, not 1s again
+
+  vi.advanceTimersByTime(1_000);
+  expect(FakeEventSource.instances).toHaveLength(3);
+
+  unsubscribe();
+});
+
+test("giving up after six consecutive failures reports failed and schedules nothing further", () => {
+  const onState = vi.fn<(state: SseState) => void>();
+  const unsubscribe = subscribeQueries(() => {}, onState);
+
+  // 1s, 2s, 4s, 8s, 16s — five reconnects, and the sixth failure is the one
+  // that gives up. MAX_CONSECUTIVE_FAILURES is 6.
+  for (const backoff of [1_000, 2_000, 4_000, 8_000, 16_000]) {
+    FakeEventSource.instances.at(-1)?.emitError();
+    expect(onState).toHaveBeenLastCalledWith("reconnecting");
+    vi.advanceTimersByTime(backoff);
+  }
+  expect(FakeEventSource.instances).toHaveLength(6);
+
+  FakeEventSource.instances.at(-1)?.emitError();
+  expect(onState).toHaveBeenLastCalledWith("failed");
+
+  vi.advanceTimersByTime(120_000);
+  expect(FakeEventSource.instances).toHaveLength(6);
+
+  unsubscribe();
+});
+
+test("a delivered message counts the stream as healthy and resets the backoff", () => {
+  const unsubscribe = subscribeQueries(() => {}, vi.fn<(state: SseState) => void>());
+
+  FakeEventSource.instances[0]?.emitError();
+  vi.advanceTimersByTime(1_000);
+  expect(FakeEventSource.instances).toHaveLength(2);
+
+  FakeEventSource.instances[1]?.emitOpen();
+  FakeEventSource.instances[1]?.emit(sampleEntry);
+  FakeEventSource.instances[1]?.emitError();
+
+  // Back to the initial delay, because this stream actually worked.
+  vi.advanceTimersByTime(1_000);
+  expect(FakeEventSource.instances).toHaveLength(3);
+
+  unsubscribe();
+});
+
+test("a stream that stays open counts as healthy even if it never delivers a row", () => {
+  const unsubscribe = subscribeQueries(() => {}, vi.fn<(state: SseState) => void>());
+
+  FakeEventSource.instances[0]?.emitError();
+  vi.advanceTimersByTime(1_000);
+
+  // A quiet resolver publishes nothing for minutes at a time; an open
+  // connection is the only evidence available, so it counts once it holds.
+  FakeEventSource.instances[1]?.emitOpen();
+  vi.advanceTimersByTime(5_000);
+  FakeEventSource.instances[1]?.emitError();
+
+  vi.advanceTimersByTime(1_000);
+  expect(FakeEventSource.instances).toHaveLength(3);
+
+  unsubscribe();
+});
+
 test("unsubscribing before a scheduled reconnect fires cancels it", () => {
   const onState = vi.fn<(state: SseState) => void>();
   const unsubscribe = subscribeQueries(() => {}, onState);

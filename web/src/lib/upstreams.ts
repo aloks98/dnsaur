@@ -17,6 +17,8 @@
  * never by catching a constructor throw.
  */
 
+import { joinHostPort, splitHostPortOptional } from "./hostport";
+
 export type UpstreamScheme = "udp" | "tls" | "https";
 
 export interface Upstream {
@@ -57,15 +59,6 @@ function fail(entry: string, code: UpstreamErrorCode, message: string): Upstream
 }
 
 /**
- * Brackets a host that contains a colon (an IPv6 literal) before joining it
- * with a port — the equivalent of Go's net.JoinHostPort, and the other half
- * of stripping the brackets off one going in (see `bareHost`).
- */
-function joinHostPort(host: string, port: string): string {
-  return host.includes(":") ? `[${host}]:${port}` : `${host}:${port}`;
-}
-
-/**
  * The bracket-free form of a host, whether or not it arrived bracketed.
  *
  * Go's `url.URL.Hostname()` always strips an IPv6 literal's brackets, and
@@ -79,27 +72,6 @@ function joinHostPort(host: string, port: string): string {
  */
 function bareHost(hostname: string): string {
   return hostname.startsWith("[") && hostname.endsWith("]") ? hostname.slice(1, -1) : hostname;
-}
-
-/**
- * Splits a hostport that may be missing its port, understanding the
- * bracketed [ipv6]:port form the way net.SplitHostPort does but tolerating
- * an absent port — mirrors addr.go's splitHostPort. Used only for the
- * hand-rolled port check on tls:// and https:// entries, before the URL
- * parser ever sees the entry.
- */
-function splitHostPort(hostport: string): { host: string; port: string } {
-  if (hostport.startsWith("[")) {
-    const end = hostport.indexOf("]");
-    if (end < 0) return { host: hostport, port: "" }; // malformed; the caller's host/IP check rejects it
-    const host = hostport.slice(1, end);
-    const rest = hostport.slice(end + 1);
-    const port = rest.startsWith(":") ? rest.slice(1) : "";
-    return { host, port };
-  }
-  const i = hostport.lastIndexOf(":");
-  if (i >= 0) return { host: hostport.slice(0, i), port: hostport.slice(i + 1) };
-  return { host: hostport, port: "" };
 }
 
 /** Digits only, 1-65535 — the same rule addr.go's checkEncryptedPort and
@@ -138,7 +110,7 @@ function checkEncryptedAuthority(raw: string): UpstreamError | null {
       `"${authority}" is an IPv6 address and needs brackets here: write [${authority}]`,
     );
   }
-  const { port } = splitHostPort(authority);
+  const { port } = splitHostPortOptional(authority);
   if (port === "") return null; // no port stated: the scheme's default applies
   if (!isValidPort(port)) return fail(raw, "bad_addr", `"${port}" is not a port number`);
   return null;

@@ -28,6 +28,7 @@ import {
 } from "../lib/nav";
 import { useLists } from "../hooks/use-filters";
 import { useLiveTailStatus } from "../lib/live-tail";
+import { paletteShortcut } from "../lib/platform";
 import { parseWindow, WINDOW_PARAM, WINDOWS } from "../lib/stats-window";
 import { DnsaurLogo } from "./dnsaur-logo";
 import { PauseControl } from "./pause-control";
@@ -134,11 +135,13 @@ export function TopNav({ onOpenCommandPalette }: TopNavProps) {
             <span className="max-lg:sr-only">search</span>
             {/* A real space rather than flex `gap`: name computation
                 concatenates inline children without inserting one, so a gap
-                would leave this cell announcing as "search⌘K". */}{" "}
-            {/* rnui's Kbd rather than a bare "⌘K": a keyboard shortcut is a
+                would leave this cell announcing as "searchCtrl+K". */}{" "}
+            {/* rnui's Kbd rather than a bare string: a keyboard shortcut is a
                 <kbd>, and the component is what makes it look like a key
-                instead of two more characters of label. */}
-            <Kbd>⌘K</Kbd>
+                instead of two more characters of label. The glyph follows the
+                platform — the listener takes either modifier, but this names
+                one, and naming ⌘ on a keyboard that has no ⌘ is just wrong. */}
+            <Kbd>{paletteShortcut()}</Kbd>
           </button>
           {/* Global blocking (group 0). Still the same control — state
               readout and pause/resume menu in one — now the filled cell the

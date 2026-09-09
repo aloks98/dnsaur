@@ -60,9 +60,13 @@ function mockTokens(tokens: ApiToken[]) {
 function sampleToken(overrides: Partial<ApiToken> = {}): ApiToken {
   return {
     id: 1,
+    user_id: 1,
+    kind: "api",
     name: "Home Assistant",
     scope: "read",
     created_at: Date.now() - 5 * 24 * 60 * 60 * 1000,
+    // Every API token is non-expiring; only sessions carry an expiry.
+    expires_at: 0,
     last_used: 0,
     ...overrides,
   };

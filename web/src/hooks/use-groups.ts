@@ -35,7 +35,7 @@ export function useAddGroup() {
       void qc.invalidateQueries({ queryKey: groupKeys.all });
       // The new group may have taken list assignments with it, so the
       // per-group list queries the Groups tab reads are now stale too.
-      void qc.invalidateQueries({ queryKey: ["filters", "groups"] });
+      void qc.invalidateQueries({ queryKey: filterKeys.groups });
     },
   });
 }

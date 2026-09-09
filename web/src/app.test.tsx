@@ -219,6 +219,71 @@ test("a crash on an unauthenticated screen is caught, not left as a blank page",
   expect(await screen.findByText(/something went wrong/i)).toBeInTheDocument();
 });
 
+// The failure mode this pins: `me` retried nothing and any error at all was
+// read as "not signed in", so a server restart mid-load walked an operator
+// with a perfectly valid session cookie to the login form — where signing in
+// again is the one thing that cannot work while the server is down.
+test("a 503 on auth/me shows the unreachable banner, never the login form", async () => {
+  server.use(
+    http.get("/api/v1/auth/me", () =>
+      HttpResponse.json({ error: "storage unavailable" }, { status: 503 }),
+    ),
+    // Setup answers fine — only `me` is failing, which is exactly the case
+    // that used to fall through to Login.
+    http.get("/api/v1/setup", () => HttpResponse.json({ setup_required: false })),
+  );
+  renderWithProviders(<App />);
+
+  await waitFor(() => expect(screen.getByText(/can't reach/i)).toBeInTheDocument(), {
+    timeout: 3000,
+  });
+  expect(screen.queryByLabelText(/password/i)).not.toBeInTheDocument();
+});
+
+test("Retry on the unreachable banner re-asks auth/me, not just setup", async () => {
+  const user = userEvent.setup();
+  let meCalls = 0;
+  let down = true;
+  server.use(
+    http.get("/api/v1/auth/me", () => {
+      meCalls += 1;
+      return down
+        ? HttpResponse.json({ error: "storage unavailable" }, { status: 503 })
+        : HttpResponse.json({ id: 1, username: "admin", totp_enabled: false });
+    }),
+    http.get("/api/v1/setup", () =>
+      down
+        ? HttpResponse.json({ error: "storage unavailable" }, { status: 503 })
+        : HttpResponse.json({ setup_required: false }),
+    ),
+  );
+  renderWithProviders(<App />);
+
+  await waitFor(() => expect(screen.getByText(/can't reach/i)).toBeInTheDocument(), {
+    timeout: 3000,
+  });
+  const callsWhileDown = meCalls;
+
+  down = false;
+  await user.click(screen.getByRole("button", { name: /retry/i }));
+
+  // The session was valid all along, so re-asking `me` is what puts the
+  // operator back in the shell. Retrying `setup` alone left them at Login.
+  expect(await screen.findByRole("link", { name: "Query Log" })).toBeInTheDocument();
+  expect(meCalls).toBeGreaterThan(callsWhileDown);
+});
+
+test("a 401 on auth/me still goes to login, not the unreachable banner", async () => {
+  server.use(
+    http.get("/api/v1/auth/me", () => unauthorized()),
+    http.get("/api/v1/setup", () => HttpResponse.json({ setup_required: false })),
+  );
+  renderWithProviders(<App />);
+
+  expect(await screen.findByLabelText(/password/i)).toBeInTheDocument();
+  expect(screen.queryByText(/can't reach/i)).not.toBeInTheDocument();
+});
+
 test("api unreachable (both auth/me and setup fail) shows the unreachable banner, not the shell or login", async () => {
   server.use(
     http.get("/api/v1/auth/me", () => HttpResponse.json({ error: "unreachable" }, { status: 500 })),

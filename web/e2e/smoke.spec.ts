@@ -72,10 +72,13 @@ test("first-run setup, login, create a zone and add a record, dark mode persists
   await page.getByRole("button", { name: "Log in" }).click();
   await expect(page.getByRole("heading", { name: "Dashboard" })).toBeVisible();
 
-  // --- the row-1 search cell opens the ⌘K palette -----------------------
-  // The shortcut is a real <kbd>, not two more characters of label.
+  // --- the row-1 search cell opens the command palette ------------------
+  // The shortcut is a real <kbd>, not two more characters of label, and it
+  // names the modifier this platform actually has — the browser runs on the
+  // same machine as this test, so `process.platform` is the same reading
+  // `lib/platform.ts` makes from `navigator`.
   const search = topNav.getByRole("button", { name: /search/i });
-  await expect(search.locator("kbd")).toHaveText("⌘K");
+  await expect(search.locator("kbd")).toHaveText(process.platform === "darwin" ? "⌘K" : "Ctrl+K");
   await search.click();
   await expect(page.getByPlaceholder("Jump to a page…")).toBeVisible();
   await page.keyboard.press("Escape");
@@ -239,6 +242,18 @@ test("first-run setup, login, create a zone and add a record, dark mode persists
     topNav.getByRole("navigation", { name: "Zones" }).getByRole("link", { name: "Zones" }),
   ).toHaveAttribute("aria-current", "page");
   await expect(page.locator("html")).toHaveClass(/dark/);
+  // ...and it is on the element before the bundle runs, not after: with the
+  // app's own scripts blocked, the only thing left that can set the class is
+  // the boot script in <head> (public/theme-boot.js). This is the half no
+  // component test can see — the CSP that would silently block an inline
+  // script only exists in the real binary.
+  await page.route("**/assets/*.js", (route) => route.abort());
+  await page.reload({ waitUntil: "commit" });
+  await expect(page.locator("html")).toHaveClass(/dark/);
+  await page.unroute("**/assets/*.js");
+  await page.reload();
+  await expect(page.locator("html")).toHaveClass(/dark/);
+
   await expect(row).toBeVisible(); // the record survived the reload too
   // …and so did the allow transfer — read back from the server, not the tab,
   // and shown in read mode (the default on a fresh load) rather than the

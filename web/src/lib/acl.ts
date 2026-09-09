@@ -189,7 +189,10 @@ function parseCIDR(s: string): (AddressResult & { prefixLen: number }) | null {
   if (slash === -1) return null;
   const addrPart = s.slice(0, slash);
   const lenPart = s.slice(slash + 1);
+  // A leading zero is refused here for the same reason parseIPv4 refuses one
+  // in an octet: netip.ParsePrefix rejects "/08" rather than reading it as 8.
   if (!/^\d{1,3}$/.test(lenPart)) return null;
+  if (lenPart.length > 1 && lenPart[0] === "0") return null;
   const prefixLen = Number(lenPart);
   const addr = parseAddress(addrPart);
   if (!addr) return null;

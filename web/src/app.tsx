@@ -1,9 +1,10 @@
 import { Navigate, Route, Routes } from "react-router";
+import { useQueryClient } from "@tanstack/react-query";
 import { Spinner, Toaster, TooltipProvider } from "@e412/rnui-react";
 import { AppShell } from "./components/app-shell";
 import { ApiUnreachableBanner } from "./components/api-unreachable-banner";
 import { ErrorBoundary } from "./components/error-boundary";
-import { useMe, useSetupState } from "./hooks/use-auth";
+import { authKeys, isUnauthorized, useMe, useSetupState } from "./hooks/use-auth";
 import { useTheme } from "./lib/theme";
 import { TOOLTIP_DELAY_MS } from "./lib/tooltip";
 import { Account } from "./pages/account";
@@ -30,26 +31,37 @@ function FullPageSpinner() {
 }
 
 /**
- * Rendered once useMe() has failed (no active session). Distinguishes a
- * real "please sign in" state from "the API is unreachable" by consulting
- * useSetupState() — both auth/me and setup fail together when the backend
- * itself can't be reached at all.
+ * Rendered once useMe() has failed. Distinguishes a real "please sign in"
+ * state from "the API is unreachable" two ways: `me` failing with anything
+ * but a 401 is itself an unreachable server (a 401 is the only answer that
+ * says the session is gone), and a 401 whose `setup` fetch also fails is a
+ * backend that can't be reached at all.
+ *
+ * Retry re-asks both. Refetching `setup` alone left the operator wherever
+ * that answer put them — the login form, with a session cookie that was
+ * valid the whole time.
  */
-function UnauthenticatedGate() {
+function UnauthenticatedGate({ apiUnreachable }: { apiUnreachable: boolean }) {
+  const qc = useQueryClient();
   const setupState = useSetupState();
 
-  if (setupState.isPending) {
-    return <FullPageSpinner />;
+  function retry() {
+    void qc.invalidateQueries({ queryKey: authKeys.me, exact: true });
+    void setupState.refetch();
   }
 
-  if (setupState.isError) {
+  if (apiUnreachable || setupState.isError) {
     return (
       <main className="flex min-h-screen items-center justify-center bg-background p-6">
         <div className="w-full max-w-md">
-          <ApiUnreachableBanner onRetry={() => setupState.refetch()} />
+          <ApiUnreachableBanner onRetry={retry} />
         </div>
       </main>
     );
+  }
+
+  if (setupState.isPending) {
+    return <FullPageSpinner />;
   }
 
   return setupState.data.setup_required ? <Setup /> : <Login />;
@@ -76,7 +88,7 @@ export function App() {
         {me.isPending ? (
           <FullPageSpinner />
         ) : me.isError ? (
-          <UnauthenticatedGate />
+          <UnauthenticatedGate apiUnreachable={!isUnauthorized(me.error)} />
         ) : (
           <Routes>
             <Route element={<AppShell />}>
