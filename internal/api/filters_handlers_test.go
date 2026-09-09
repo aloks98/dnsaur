@@ -112,6 +112,91 @@ func TestRules(t *testing.T) {
 	}
 }
 
+// TestRulePatternValidation: a literal rule stored verbatim can be a pattern
+// no query will ever carry — `*.doubleclick.net` becomes a label `*`, `||x^`
+// a label with punctuation in it — and nothing anywhere said so. Accepted
+// shapes are normalised to what the trie matches; the rest are 400s that
+// name what a pattern may be.
+func TestRulePatternValidation(t *testing.T) {
+	srv, s, _ := testServer(t)
+	cookie := login(t, srv, s)
+	h := srv.Handler()
+	gid, _ := s.Clients().AddGroup(t.Context(), "patterns")
+	path := fmt.Sprintf("/api/v1/groups/%d/rules", gid)
+
+	for _, bad := range []string{"||doubleclick.net^", "not a domain", "ads.*.example.com", "*", "a..b"} {
+		body, _ := json.Marshal(map[string]any{"action": "block", "pattern": bad})
+		w := doReq(t, h, "POST", path, string(body), cookie)
+		if w.Code != 400 {
+			t.Errorf("pattern %q accepted: %d %s", bad, w.Code, w.Body.String())
+		}
+		if !strings.Contains(w.Body.String(), "example.com") {
+			t.Errorf("pattern %q rejected without saying what is accepted: %s", bad, w.Body.String())
+		}
+	}
+
+	// Accepted, and stored in the form the matcher actually uses.
+	for _, tc := range []struct{ in, want string }{
+		{"*.doubleclick.net", "doubleclick.net"},
+		{"Ads.Example.COM.", "ads.example.com"},
+		{"localhost", "localhost"},
+	} {
+		body, _ := json.Marshal(map[string]any{"action": "block", "pattern": tc.in})
+		if w := doReq(t, h, "POST", path, string(body), cookie); w.Code != 201 {
+			t.Fatalf("pattern %q rejected: %d %s", tc.in, w.Code, w.Body.String())
+		}
+	}
+	w := doReq(t, h, "GET", path, "", cookie)
+	var rs []store.Rule
+	_ = json.Unmarshal(w.Body.Bytes(), &rs)
+	got := map[string]bool{}
+	for _, r := range rs {
+		got[r.Pattern] = true
+	}
+	for _, want := range []string{"doubleclick.net", "ads.example.com", "localhost"} {
+		if !got[want] {
+			t.Errorf("stored patterns %v, want %q among them", got, want)
+		}
+	}
+
+	// A regex is a regex: it is not a domain and must not be normalised.
+	body, _ := json.Marshal(map[string]any{"action": "block", "pattern": `^ads[0-9]+\.`, "is_regex": true})
+	if w := doReq(t, h, "POST", path, string(body), cookie); w.Code != 201 {
+		t.Fatalf("regex rule rejected: %d %s", w.Code, w.Body.String())
+	}
+}
+
+// TestRuleWritesRecompileWithoutDownloading is the split: a rule save
+// rebuilds the ruleset from what is already on disk. Fused with the
+// download, one unreachable list URL made this request wait out the fetch
+// timeout while every other write queued behind it.
+func TestRuleWritesRecompileWithoutDownloading(t *testing.T) {
+	srv, s, rl := testServer(t)
+	cookie := login(t, srv, s)
+	h := srv.Handler()
+	gid, _ := s.Clients().AddGroup(t.Context(), "norefetch")
+
+	w := doReq(t, h, "POST", fmt.Sprintf("/api/v1/groups/%d/rules", gid), `{"action":"block","pattern":"ads.example.com"}`, cookie)
+	if w.Code != 201 {
+		t.Fatalf("create rule: %d %s", w.Code, w.Body.String())
+	}
+	var created map[string]int64
+	_ = json.Unmarshal(w.Body.Bytes(), &created)
+	if w := doReq(t, h, "DELETE", fmt.Sprintf("/api/v1/filters/rules/%d", created["id"]), "", cookie); w.Code != 204 {
+		t.Fatalf("delete rule: %d", w.Code)
+	}
+	if w := doReq(t, h, "PUT", fmt.Sprintf("/api/v1/groups/%d/lists", gid), `{"list_ids":[]}`, cookie); w.Code != 204 {
+		t.Fatalf("assign lists: %d", w.Code)
+	}
+
+	if got := rl.recompileCount(); got != 3 {
+		t.Fatalf("recompiles = %d, want 3 (rule create, rule delete, assignment)", got)
+	}
+	if _, _, downloads := rl.counts(); downloads != 0 {
+		t.Fatalf("%d list downloads triggered by rule/assignment writes, want none", downloads)
+	}
+}
+
 // A list assigned to no group filters nothing: a group's ruleset is compiled
 // only from its assigned lists (internal/filter/refresh.go's ListsForGroup).
 // Subscribing to a blocklist and having it block zero queries — while the UI

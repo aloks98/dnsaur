@@ -27,7 +27,12 @@ var openapiDoc []byte
 type Reloader interface {
 	ReloadClients(ctx context.Context) error
 	ReloadZones(ctx context.Context) error
+	// RefreshFilters downloads every enabled list and then compiles.
+	// RecompileFilters only compiles, from the copies already on disk —
+	// which is what a rule, list or assignment write needs, and the reason
+	// such a write no longer waits on the network.
 	RefreshFilters(ctx context.Context) error
+	RecompileFilters(ctx context.Context) error
 	// NotifyZones wakes the outbound NOTIFY pass. See zones.Notifier.Wake:
 	// it is promptness, never correctness, so a handler that forgets this
 	// call only delays delivery by one tick rather than losing it.

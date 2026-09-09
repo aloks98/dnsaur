@@ -68,6 +68,11 @@ type Response struct {
 	Upstream string
 	RuleID   int64
 	ListID   int64
+	// Matched is the rule pattern or list entry that fired, for a blocked
+	// response. The ids alone say which row decided, not what in it
+	// matched, which is the one thing "why was this blocked?" needs — an
+	// entry inside a million-line list is not findable from its list id.
+	Matched string
 }
 
 type Handler interface {

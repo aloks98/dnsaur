@@ -4,9 +4,9 @@ import (
 	"context"
 	"log/slog"
 	"net/http"
-	"net/netip"
 	"strconv"
 
+	"github.com/aloks98/dnsaur/internal/clients"
 	"github.com/aloks98/dnsaur/internal/store"
 )
 
@@ -190,13 +190,11 @@ func (s *Server) handleClientsList(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, cs)
 }
 
-func validMatcher(m string) bool {
-	if _, err := netip.ParseAddr(m); err == nil {
-		return true
-	}
-	_, err := netip.ParsePrefix(m)
-	return err == nil
-}
+// badMatcher is what both write paths answer with. It names the interface
+// zone because that is the one rejection whose cause isn't obvious from
+// looking at the value: `fe80::1%eth0` is a perfectly good address that the
+// request side can never produce (see clients.NormalizeMatcher).
+const badMatcher = "matcher must be an IP or CIDR without an interface zone, and group_id set"
 
 // missingGroupMsg is the answer to a client write whose group_id names no
 // group. clients.group_id is a foreign key, and this one is named in the
@@ -210,10 +208,16 @@ func (s *Server) handleClientCreate(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if !validMatcher(body.Matcher) || body.GroupID <= 0 {
-		errJSON(w, http.StatusBadRequest, "matcher must be an IP or CIDR and group_id set")
+	if body.GroupID <= 0 {
+		errJSON(w, http.StatusBadRequest, badMatcher)
 		return
 	}
+	m, ok := clients.NormalizeMatcher(body.Matcher)
+	if !ok {
+		errJSON(w, http.StatusBadRequest, badMatcher)
+		return
+	}
+	body.Matcher = m
 	id, err := s.deps.Store.Clients().AddClient(r.Context(), body)
 	if err != nil {
 		storeErrDupRef(w, err, "another client already matches "+body.Matcher, missingGroupMsg)
@@ -233,10 +237,16 @@ func (s *Server) handleClientPut(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if !validMatcher(body.Matcher) || body.GroupID <= 0 {
-		errJSON(w, http.StatusBadRequest, "matcher must be an IP or CIDR and group_id set")
+	if body.GroupID <= 0 {
+		errJSON(w, http.StatusBadRequest, badMatcher)
 		return
 	}
+	m, ok := clients.NormalizeMatcher(body.Matcher)
+	if !ok {
+		errJSON(w, http.StatusBadRequest, badMatcher)
+		return
+	}
+	body.Matcher = m
 	body.ID = id
 	if err := s.deps.Store.Clients().UpdateClient(r.Context(), body); err != nil {
 		storeErrDupRef(w, err, "another client already matches "+body.Matcher, missingGroupMsg)

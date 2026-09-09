@@ -194,6 +194,7 @@ func (l *Logger) Middleware() dnssrv.Middleware {
 			} else {
 				e.Decision = string(resp.Decision)
 				e.RuleID, e.ListID, e.Upstream = resp.RuleID, resp.ListID, resp.Upstream
+				e.Matched = resp.Matched
 				if resp.Msg != nil {
 					e.RCode = dns.RcodeToString[resp.Msg.Rcode]
 				}

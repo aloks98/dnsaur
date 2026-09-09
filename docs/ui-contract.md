@@ -988,11 +988,30 @@ different states rather than one.
 
 Parser accepts hosts-style (`0.0.0.0 domain`, `127.0.0.1 domain`, `:: domain`),
 ABP-subset (`||domain^`, `@@||domain^`), bare domains, and **`*.domain`
-wildcards** (hagezi's `wildcard/*` files); `#`/`!` comments are stripped. ABP
-rules containing `/ ^ $ * |` after the prefix are still skipped. Domains are
-lowercased, ≤253 chars, labels ≤63, charset `a-z 0-9 - _` — **no IDN/punycode
-handling**. `kind=allow` uses the file's allow entries **plus** its block
-entries, so a plain domain list works as an allowlist.
+wildcards** (hagezi's `wildcard/*` files); `#`/`!` comments are stripped, and a
+leading UTF-8 BOM no longer swallows the first line. ABP rules containing
+`/ ^ $ * |` after the prefix are still skipped. Domains are lowercased, ≤253
+chars, labels ≤63, charset `a-z 0-9 - _`, with **Unicode converted to punycode**
+(`пример.рф` → `xn--e1afmkfd.xn--p1ai`) since that is the form a qname arrives
+in. A line over 1 MiB is counted as skipped and parsing continues, rather than
+failing the whole list. `kind=allow` uses the file's allow entries **plus** its
+block entries, so a plain domain list works as an allowlist.
+
+**A block list's `@@||` exceptions are honoured, scoped to that list.** They
+compile into a companion set consulted before the list's block set, so a list
+that blocks `||example.com^` and exempts `@@||cdn.example.com^` does not block
+`cdn.example.com` (or anything below it) — while another block list naming it
+still does, and a block *rule* still wins. They are not promoted into the
+allow-list tier.
+
+**Downloading and compiling are separate.** Only `POST /filters/lists`,
+`PATCH /filters/lists/{id}` with `enabled: true`, `POST /filters/refresh` and
+the `lists.refresh_hours` ticker fetch; every other rule/list/assignment write
+recompiles from the on-disk copies and returns without touching the network,
+and startup compiles from them before the DNS listeners bind. A fetch is
+capped at **64 MiB** and refuses any address that is not public (loopback,
+link-local, private, unspecified) on the URL *and* on every redirect — both
+show up as `last_status: "failed"` with the reason in `last_error`.
 
 **`*.domain` is stored as `domain`.** The matcher (`DomainSet.Match`) walks
 whole labels from the TLD inward and hits on any stored ancestor, so
@@ -1022,19 +1041,28 @@ creation; only `name` and `enabled` are mutable.
 | `id` | int64 | |
 | `group_id` | int64 | from the **path**; a rule always belongs to exactly one group — there are no global rules |
 | `action` | string | `allow` \| `block` |
-| `pattern` | string | non-empty |
+| `pattern` | string | non-empty; a literal pattern is **stored normalised**, not verbatim |
 | `is_regex` | bool | default false |
 
 - **Regex rules**: ≤512 **bytes**, must compile with RE2, matched **unanchored**
-  against the lowercased qname.
-- **Literal rules**: **no length cap and no domain-shape validation at all.**
-  Inserted into a label trie, so they match the domain *and every subdomain*, on
-  whole-label boundaries.
+  against the lowercased qname. Stored exactly as sent.
+- **Literal rules**: validated through the same path a list entry takes, plus
+  single labels (`localhost`) and minus the "must contain a dot" rule. Sent
+  value is lowercased, its trailing dot and leading `*.` removed, and Unicode
+  converted to punycode; what `GET` returns is that normalised form. Anything
+  that is not a domain — `||x^`, `ads.*.example.com`, `*` — is
+  `400 pattern must be a domain like example.com, *.example.com or localhost`
+  rather than a stored rule that matches nothing. There is still no length cap
+  beyond the 253-byte domain limit. Inserted into a label trie, so a rule
+  matches the domain *and every subdomain*, on whole-label boundaries.
 - Evaluation order: literal allow → regex allow → literal block → regex block →
   allowlists → blocklists. First match wins.
-- The matched pattern is computed per query and **discarded** — only `rule_id`
-  and `list_id` reach the log, which is why the UI's "why?" drawer has to
-  re-resolve them and can only say *"Matched rule #N, which isn't available
+- The matched pattern is computed per query and now reaches the pipeline
+  response and the in-memory log entry (`dnssrv.Response.Matched`,
+  `store.QueryLogEntry.Matched`), but there is **no `query_log` column for it
+  yet**, so it is `json:"-"` and does not appear on any endpoint. A stored row
+  still carries only `rule_id`/`list_id`, which is why the UI's "why?" drawer
+  re-resolves them and can only say *"Matched rule #N, which isn't available
   right now"* if it was deleted.
 
 **TODO** — no update endpoint; rules are create/delete only.
@@ -1045,20 +1073,28 @@ creation; only `name` and `enabled` are mutable.
 |---|---|---|
 | `id` | int64 | accepted in POST bodies but ignored |
 | `name` | string | **not validated, may be empty** |
-| `matcher` | string | exact IP **or** CIDR; **DB-unique** |
+| `matcher` | string | exact IP **or** CIDR; **DB-unique**; **stored canonically**, not as sent |
 | `group_id` | int64 | must be `> 0`; **not checked against an existing group** — a bad id fails the FK and returns 503 |
 
 Matching: exact-IP map first, then CIDR list **longest-prefix-first**.
 IPv4-mapped IPv6 is unmapped on both sides, so `::ffff:192.0.2.1` matches the
 plain IPv4 client. No match → `group_id 1`, hardcoded
-(`internal/clients/registry.go:74`).
+(`internal/clients/registry.go`).
 
-> **IPv6 zone ids are accepted but can never match.** `fe80::1%eth0` passes
-> validation and stores fine (verified: 201), but the request-side address is
-> built with `netip.AddrFromSlice`, which never carries a zone (the UDP and
-> TCP arms of `Server.serve`'s `RemoteAddr` switch,
-> `internal/dnssrv/server.go`). A zoned matcher is therefore dead
-> config. A zoned *CIDR* is correctly rejected at 400.
+**Canonicalisation on write** (`clients.NormalizeMatcher`, applied by both
+`POST` and `PUT`, and again when the registry loads older rows): a CIDR is
+masked (`10.0.0.1/24` → `10.0.0.0/24`) and an IPv4-mapped form is unmapped
+(`::ffff:10.0.0.0/120` → `10.0.0.0/24`, `::ffff:192.0.2.5` → `192.0.2.5`), so
+`GET` returns the spelling that will actually be compared. A mapped prefix
+shorter than `/96` is not a v4 range and is rejected.
+
+> **IPv6 zone ids are now rejected**, both as an address and as a prefix:
+> `fe80::1%eth0` returns `400 matcher must be an IP or CIDR without an
+> interface zone, and group_id set`. The request-side address is built with
+> `netip.AddrFromSlice`, which never carries a zone (the UDP and TCP arms of
+> `Server.serve`'s `RemoteAddr` switch, `internal/dnssrv/server.go`), so such
+> a matcher could only ever be dead config. A stored row that predates this
+> is skipped at load with a `WARN` naming the client id, rather than silently.
 
 ### 3.5 Group
 

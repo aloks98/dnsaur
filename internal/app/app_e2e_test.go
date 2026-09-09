@@ -71,6 +71,7 @@ func TestEndToEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	allowLoopbackLists(t, a)
 	if err := a.Start(ctx); err != nil {
 		t.Fatal(err)
 	}

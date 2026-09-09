@@ -38,10 +38,13 @@ terminal upstream forwarder. Each stage can answer the query outright
    the client registry. Unknown IPs fall into the default group.
 4. **filter** — checks the qname against the client's group blocklists,
    allowlists, and regex rules. A block returns a configured response
-   (null IP or NXDOMAIN) and is tagged `blocked` in the log. Rules are
+   (null IP or NXDOMAIN) and is tagged `blocked` in the log, carrying the
+   rule id, the list id and the entry that actually matched. Rules are
    evaluated before lists and allow before block — see
    [`dashboard.md`](dashboard.md#the-order-that-matters) for the full
-   six-stage precedence.
+   six-stage precedence. Compiled rulesets and the pause map are immutable
+   values behind `atomic.Pointer`, so a refresh or a pause never makes a
+   query wait on a lock.
 5. **zones** — answers authoritatively for the suffixes this server holds,
    before the cache or any upstream is consulted, and tags the result
    `authoritative` in the query log. This is a zone cut, not a set of
@@ -781,8 +784,44 @@ Planned, not yet present: `internal/dhcp` (Phase 2), `internal/sync`
   enough for the query log's own buffered writes to time out and be
   discarded.
 - The DNS cache and the compiled filter trie are memory-only — never
-  persisted to the DB. Downloaded blocklist files are cached on disk so a
+  persisted to the DB. Downloaded blocklist files are cached on disk
+  (`<data_dir>/lists/<id>.txt`, with the server's `ETag` beside it) so a
   restart doesn't force a re-download.
+
+## Blocklists: compiling is not downloading
+
+`internal/filter`'s refresher has two entry points, and which one a caller
+takes is the difference between a request that answers immediately and one
+that waits on the internet.
+
+- **Compile** (`Recompile`) reads the stored rules and the cached list files
+  and swaps in a new set of compiled rulesets. No network, no list state
+  written — nothing was attempted, so there is nothing to report. Every API
+  write to a rule, a list or an assignment takes this path, which is why a
+  rule save answers in milliseconds even with an unreachable list
+  subscribed, and why "add a rule, see it blocked" is immediate.
+- **Download** (`RefreshAll`) fetches every enabled list into the cache,
+  records what each attempt produced (`ok`/`stale`/`failed`/`empty` — see
+  [`ui-contract.md`](ui-contract.md#refresh-outcome-last_status)) and then
+  compiles. It runs on the `lists.refresh_hours` ticker, on
+  `POST /filters/refresh`, when a list is created or re-enabled, and once in
+  the background at startup.
+
+`App.Start` compiles synchronously **before** it binds any listener. The
+first download can take as long as the slowest subscribed URL — with the WAN
+down, the full fetch timeout per list — and the alternative is a window
+where the resolver answers, unfiltered, with usable copies sitting on disk.
+
+Two bounds apply to a download, both because the body is admin-named but
+server-fetched:
+
+- 64 MiB per list, enforced with an `io.LimitReader`; an overflow is a
+  failed fetch, not a full data directory.
+- The connection is refused unless the address dialled is a public one. The
+  check sits in the transport's dialer rather than on the URL, so it sees
+  the address after DNS resolution and applies to every redirect hop: a
+  subscription pointed (or redirected) at `169.254.169.254`, at loopback, or
+  at a neighbour on the LAN cannot make the fetcher a confused deputy.
 
 ## "DNS must not die"
 
@@ -796,7 +835,9 @@ everything else is expendable before it.
   log buffer drops oldest entries with a surfaced warning rather than
   blocking.
 - A failed blocklist refresh keeps serving the previous compiled list and
-  retries with backoff instead of going unfiltered or falling over.
+  retries with backoff instead of going unfiltered or falling over, and a
+  restart compiles the cached copies before it binds a listener rather than
+  serving unfiltered until the first download finishes.
 - Bad configuration is validated and rejected at write time; the running
   config is always the last-known-good one. The bootstrap config is the one
   place that refuses to start instead: no listen address, or a `-config`

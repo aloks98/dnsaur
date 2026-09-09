@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"strconv"
 
+	"github.com/aloks98/dnsaur/internal/filter"
 	"github.com/aloks98/dnsaur/internal/store"
 )
 
@@ -25,13 +26,33 @@ func (s *Server) filtersRoutes() {
 	s.route("POST /api/v1/filters/refresh", s.requireAuth(s.handleRefresh))
 }
 
-// refreshFilters runs with a context stripped of cancellation: the write
-// already committed, so a client disconnecting mid-request must not abort
-// the refresh.
+// refreshFilters rebuilds the compiled rulesets after a write. It
+// recompiles from the list copies already on disk and never downloads: a
+// rule, list or assignment write changes what is compiled, not what has been
+// fetched, and fusing the two made every such request wait out the fetch
+// timeout of the slowest subscribed URL — with the rest of the writes queued
+// behind it. Downloading stays on the ticker, POST /filters/refresh and
+// list creation.
+//
+// It runs with a context stripped of cancellation: the write already
+// committed, so a client disconnecting mid-request must not abort the
+// recompile.
 func (s *Server) refreshFilters(r *http.Request) {
-	if err := s.deps.Reloader.RefreshFilters(context.WithoutCancel(r.Context())); err != nil {
-		slog.Error("filter refresh after api write failed", "err", err)
+	if err := s.deps.Reloader.RecompileFilters(context.WithoutCancel(r.Context())); err != nil {
+		slog.Error("filter recompile after api write failed", "err", err)
 	}
+}
+
+// downloadLists kicks off a full network refresh in the background, for the
+// two writes that mean "go and fetch": subscribing to a list, and asking for
+// a refresh. A client disconnect must not cancel it, hence WithoutCancel.
+func (s *Server) downloadLists(r *http.Request) {
+	ctx := context.WithoutCancel(r.Context())
+	go func() {
+		if err := s.deps.Reloader.RefreshFilters(ctx); err != nil {
+			slog.Error("filter refresh failed", "err", err)
+		}
+	}()
 }
 
 func (s *Server) handleListsGet(w http.ResponseWriter, r *http.Request) {
@@ -96,16 +117,11 @@ func (s *Server) handleListCreate(w http.ResponseWriter, r *http.Request) {
 			slog.Error("assigning new list to group failed", "list", id, "group", g.ID, "err", err)
 		}
 	}
-	// Unlike the other list/rule mutations (cheap metadata ops refreshed
-	// synchronously), adding a list triggers a full network refresh of
-	// every list. Do that in the background so the request doesn't block
-	// on it, mirroring handleRefresh; a client disconnect must not cancel
-	// it either, hence WithoutCancel.
-	go func() {
-		if err := s.deps.Reloader.RefreshFilters(context.WithoutCancel(r.Context())); err != nil {
-			slog.Error("filter refresh after list create failed", "err", err)
-		}
-	}()
+	// Unlike the other list/rule mutations (recompiles from the on-disk
+	// copies), a list nobody has fetched yet has nothing to compile, so
+	// this one really does download — in the background, so the request
+	// doesn't block on it.
+	s.downloadLists(r)
 	writeJSON(w, http.StatusCreated, map[string]int64{"id": id})
 }
 
@@ -154,6 +170,13 @@ func (s *Server) handleListPatch(w http.ResponseWriter, r *http.Request) {
 		if err := s.deps.Store.Filters().SetListEnabled(r.Context(), id, *body.Enabled); err != nil {
 			storeErr(w, err)
 			return
+		}
+		if *body.Enabled {
+			// Re-enabling compiles from the cached copy immediately; the
+			// download is for the case where there isn't one yet (a list
+			// added while the WAN was down), so it isn't stuck off until
+			// the next tick.
+			s.downloadLists(r)
 		}
 	}
 	s.refreshFilters(r)
@@ -284,6 +307,7 @@ func (s *Server) handleRuleCreate(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusBadRequest, "action allow|block and pattern required")
 		return
 	}
+	pattern := body.Pattern
 	if body.IsRegex {
 		if len(body.Pattern) > 512 {
 			errJSON(w, http.StatusBadRequest, "regex pattern too long (max 512)")
@@ -293,12 +317,23 @@ func (s *Server) handleRuleCreate(w http.ResponseWriter, r *http.Request) {
 			errJSON(w, http.StatusBadRequest, "invalid regex: "+err.Error())
 			return
 		}
+	} else {
+		// Through the same normalisation a list entry gets. Stored
+		// verbatim, a Pi-hole-style `*.doubleclick.net` or an ABP `||x^`
+		// becomes a label no query can carry: a rule that matches nothing,
+		// reports nothing, and looks exactly like one that works.
+		norm, ok := filter.RulePattern(body.Pattern)
+		if !ok {
+			errJSON(w, http.StatusBadRequest, "pattern must be a domain like example.com, *.example.com or localhost")
+			return
+		}
+		pattern = norm
 	}
 	// storeErr, not storeErrDupRef: rules.group_id is a foreign key and the
 	// group it names came from the path, so a violation means the resource
 	// this URL addresses does not exist — 404, which is what storeErr
 	// answers for ErrReference with no field to name.
-	id, err := s.deps.Store.Filters().AddRule(r.Context(), store.Rule{GroupID: gid, Action: body.Action, Pattern: body.Pattern, IsRegex: body.IsRegex})
+	id, err := s.deps.Store.Filters().AddRule(r.Context(), store.Rule{GroupID: gid, Action: body.Action, Pattern: pattern, IsRegex: body.IsRegex})
 	if err != nil {
 		storeErr(w, err)
 		return
@@ -322,10 +357,6 @@ func (s *Server) handleRuleDelete(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleRefresh(w http.ResponseWriter, r *http.Request) {
-	go func() {
-		if err := s.deps.Reloader.RefreshFilters(context.WithoutCancel(r.Context())); err != nil {
-			slog.Error("manual filter refresh failed", "err", err)
-		}
-	}()
+	s.downloadLists(r)
 	writeJSON(w, http.StatusAccepted, map[string]string{"status": "refreshing"})
 }

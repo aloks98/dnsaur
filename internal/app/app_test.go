@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -13,6 +15,7 @@ import (
 
 	"github.com/aloks98/dnsaur/internal/config"
 	"github.com/aloks98/dnsaur/internal/dnssrv"
+	"github.com/aloks98/dnsaur/internal/filter"
 	"github.com/aloks98/dnsaur/internal/store"
 	"github.com/miekg/dns"
 )
@@ -110,6 +113,78 @@ func mockDNSCounting(t *testing.T, hits *atomic.Int64, h dns.HandlerFunc) string
 }
 
 // answerA answers every query with one A record holding ip.
+// TestStartFiltersFromTheListCacheBeforeServing is the restart case: the
+// listeners used to bind before the first ruleset existed, so a reboot
+// served the whole LAN unfiltered until every list had been downloaded — or
+// had timed out, which with the WAN down is the full fetch timeout per list,
+// while perfectly good copies sat in the data dir. Nothing here waits for
+// the background download (there is nothing at the list's URL to download);
+// the query is made the moment Start returns.
+func TestStartFiltersFromTheListCacheBeforeServing(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "lists"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &config.Config{DNSListen: []string{"127.0.0.1:0"}, HTTPListen: "127.0.0.1:0", DataDir: dir, LogLevel: "error"}
+	cfg.Storage.Driver = "sqlite"
+	cfg.Storage.DSN = dir + "/t.db"
+	a, err := New(ctx, cfg, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := a.Store()
+	if err := s.Settings().SetInternal(ctx, "blocking.mode", "nxdomain"); err != nil {
+		t.Fatal(err)
+	}
+	// TEST-NET-1, port 9: nothing answers, so the background download cannot
+	// be what makes this pass.
+	lid, err := s.Filters().AddList(ctx, store.List{URL: "http://192.0.2.1:9/hosts", Kind: "block", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Filters().AssignList(ctx, 1, lid); err != nil {
+		t.Fatal(err)
+	}
+	cache := filepath.Join(dir, "lists", fmt.Sprintf("%d.txt", lid))
+	if err := os.WriteFile(cache, []byte("0.0.0.0 ads.example.com\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := a.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = a.Shutdown(context.Background()) }()
+
+	if got := digRcodeQuiet(a.DNSAddr(), "ads.example.com"); got != dns.RcodeNameError {
+		t.Fatalf("rcode %s at the moment the listener came up, want NXDOMAIN from the cached list",
+			dns.RcodeToString[got])
+	}
+}
+
+// allowLoopbackLists rebuilds the app's list refresher so it will fetch from
+// an httptest server. The real one refuses every non-public address,
+// loopback included, because a list URL is admin-supplied and fetched by the
+// server itself (filter.AllowLoopbackTargets). Tests that serve a blocklist
+// locally have to opt in; production never does.
+func allowLoopbackLists(t *testing.T, a *App) {
+	t.Helper()
+	a.refresher = filter.NewRefresher(a.st.Filters(), a.st.Clients(), a.engine, a.cfg.DataDir,
+		filter.AllowLoopbackTargets())
+}
+
+func digRcodeQuiet(addr, name string) int {
+	c := new(dns.Client)
+	m := new(dns.Msg)
+	m.SetQuestion(dns.Fqdn(name), dns.TypeA)
+	r, _, err := c.Exchange(m, addr)
+	if err != nil {
+		return -1
+	}
+	return r.Rcode
+}
+
 func answerA(ip string) dns.HandlerFunc {
 	return func(w dns.ResponseWriter, m *dns.Msg) {
 		r := new(dns.Msg)

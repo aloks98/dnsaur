@@ -19,6 +19,10 @@ type CompiledList struct {
 	ID   int64
 	Kind string // block | allow
 	Set  *DomainSet
+	// Except holds a block list's own `@@||` exceptions, nil when it has
+	// none. It excuses this list and no other: a domain one list's author
+	// exempted is still blocked by the next list that names it.
+	Except *DomainSet
 }
 
 type regexRule struct {
@@ -93,6 +97,11 @@ func (rs *Ruleset) Evaluate(qname string) Verdict {
 	for _, l := range rs.lists {
 		if l.Kind != "block" {
 			continue
+		}
+		if l.Except != nil {
+			if _, ok := l.Except.Match(qname); ok {
+				continue
+			}
 		}
 		if m, ok := l.Set.Match(qname); ok {
 			return Verdict{Action: "block", ListID: l.ID, Matched: m}

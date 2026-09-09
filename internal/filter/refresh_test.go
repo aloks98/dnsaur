@@ -4,6 +4,8 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -149,7 +151,7 @@ func TestRefreshDownloadsCompilesAndKeepsOldOnFailure(t *testing.T) {
 	fs := &fakeFilterStore{lists: []store.List{{ID: 1, URL: srv.URL, Kind: "block", Enabled: true}}}
 	cs := &fakeClientStore{groups: []store.Group{{ID: 1, Name: "default", Enabled: true}}}
 	eng := NewEngine()
-	ref := NewRefresher(fs, cs, eng, t.TempDir())
+	ref := NewRefresher(fs, cs, eng, t.TempDir(), AllowLoopbackTargets())
 
 	if err := ref.RefreshAll(context.Background()); err != nil {
 		t.Fatal(err)
@@ -184,7 +186,7 @@ func TestRefreshPartialDownloadFallsBackToCache(t *testing.T) {
 	fs := &fakeFilterStore{lists: []store.List{{ID: 2, URL: srv.URL, Kind: "block", Enabled: true}}}
 	cs := &fakeClientStore{groups: []store.Group{{ID: 1, Name: "default", Enabled: true}}}
 	eng := NewEngine()
-	ref := NewRefresher(fs, cs, eng, t.TempDir())
+	ref := NewRefresher(fs, cs, eng, t.TempDir(), AllowLoopbackTargets())
 
 	// First RefreshAll: healthy server, list is cached
 	if err := ref.RefreshAll(context.Background()); err != nil {
@@ -219,7 +221,7 @@ func TestRefreshRecordsFailedWhenNothingIsServed(t *testing.T) {
 
 	fs := &fakeFilterStore{lists: []store.List{{ID: 7, URL: srv.URL, Kind: "block", Enabled: true}}}
 	cs := &fakeClientStore{groups: []store.Group{{ID: 1, Name: "default", Enabled: true}}}
-	ref := NewRefresher(fs, cs, NewEngine(), t.TempDir())
+	ref := NewRefresher(fs, cs, NewEngine(), t.TempDir(), AllowLoopbackTargets())
 
 	if err := ref.RefreshAll(context.Background()); err != nil {
 		t.Fatal(err)
@@ -261,7 +263,7 @@ func TestRefreshRecordsStaleWhenCacheStillServes(t *testing.T) {
 	fs := &fakeFilterStore{lists: []store.List{{ID: 8, URL: srv.URL, Kind: "block", Enabled: true}}}
 	cs := &fakeClientStore{groups: []store.Group{{ID: 1, Name: "default", Enabled: true}}}
 	eng := NewEngine()
-	ref := NewRefresher(fs, cs, eng, t.TempDir())
+	ref := NewRefresher(fs, cs, eng, t.TempDir(), AllowLoopbackTargets())
 
 	if err := ref.RefreshAll(context.Background()); err != nil {
 		t.Fatal(err)
@@ -310,7 +312,7 @@ func TestRefreshRecordsEmptyWhenParsedButUseless(t *testing.T) {
 
 	fs := &fakeFilterStore{lists: []store.List{{ID: 9, URL: srv.URL, Kind: "block", Enabled: true}}}
 	cs := &fakeClientStore{groups: []store.Group{{ID: 1, Name: "default", Enabled: true}}}
-	ref := NewRefresher(fs, cs, NewEngine(), t.TempDir())
+	ref := NewRefresher(fs, cs, NewEngine(), t.TempDir(), AllowLoopbackTargets())
 
 	if err := ref.RefreshAll(context.Background()); err != nil {
 		t.Fatal(err)
@@ -349,7 +351,7 @@ func TestRefreshClearsErrorOnRecovery(t *testing.T) {
 
 	fs := &fakeFilterStore{lists: []store.List{{ID: 10, URL: srv.URL, Kind: "block", Enabled: true}}}
 	cs := &fakeClientStore{groups: []store.Group{{ID: 1, Name: "default", Enabled: true}}}
-	ref := NewRefresher(fs, cs, NewEngine(), t.TempDir())
+	ref := NewRefresher(fs, cs, NewEngine(), t.TempDir(), AllowLoopbackTargets())
 
 	if err := ref.RefreshAll(context.Background()); err != nil {
 		t.Fatal(err)
@@ -379,7 +381,7 @@ func TestRefreshReasonNamesTransportError(t *testing.T) {
 		{ID: 11, URL: "http://127.0.0.1:1/never-listening", Kind: "block", Enabled: true},
 	}}
 	cs := &fakeClientStore{groups: []store.Group{{ID: 1, Name: "default", Enabled: true}}}
-	ref := NewRefresher(fs, cs, NewEngine(), t.TempDir())
+	ref := NewRefresher(fs, cs, NewEngine(), t.TempDir(), AllowLoopbackTargets())
 
 	if err := ref.RefreshAll(context.Background()); err != nil {
 		t.Fatal(err)
@@ -452,7 +454,7 @@ func TestRefreshAllSerializesConcurrentCalls(t *testing.T) {
 	fs := &fakeFilterStore{lists: []store.List{{ID: 1, URL: srv.URL, Kind: "block", Enabled: true}}}
 	cs := &fakeClientStore{groups: []store.Group{{ID: 1, Name: "default", Enabled: true}}}
 	eng := NewEngine()
-	ref := NewRefresher(fs, cs, eng, t.TempDir())
+	ref := NewRefresher(fs, cs, eng, t.TempDir(), AllowLoopbackTargets())
 
 	var wg sync.WaitGroup
 	for i := 0; i < 5; i++ {
@@ -497,5 +499,302 @@ func TestRunWithANonPositiveIntervalDoesNotPanic(t *testing.T) {
 				t.Fatal("Run did not return when its context was cancelled")
 			}
 		})
+	}
+}
+
+// countingList serves a fixed blocklist and counts the requests it answers,
+// so a test can assert that a code path did not touch the network.
+func countingList(t *testing.T, body string) (string, *atomic.Int64) {
+	t.Helper()
+	hits := &atomic.Int64{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		_, _ = w.Write([]byte(body))
+	}))
+	t.Cleanup(srv.Close)
+	return srv.URL, hits
+}
+
+// TestRecompileDoesNotDownload is the split every API write depends on:
+// adding a rule recompiles from what is already on disk, so one unreachable
+// list URL can no longer make a rule save wait out the fetch timeout.
+func TestRecompileDoesNotDownload(t *testing.T) {
+	url, hits := countingList(t, "0.0.0.0 ads.example.com\n")
+	fs := &fakeFilterStore{lists: []store.List{{ID: 1, URL: url, Kind: "block", Enabled: true}}}
+	cs := &fakeClientStore{groups: []store.Group{{ID: 1, Name: "default", Enabled: true}}}
+	eng := NewEngine()
+	ref := NewRefresher(fs, cs, eng, t.TempDir(), AllowLoopbackTargets())
+
+	if err := ref.RefreshAll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := hits.Load(); got != 1 {
+		t.Fatalf("download made %d requests, want 1", got)
+	}
+	if err := ref.Recompile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := hits.Load(); got != 1 {
+		t.Fatalf("Recompile made %d requests, want none", got-1)
+	}
+	if v := (*eng.groups.Load())[1].Evaluate("ads.example.com"); v.Action != "block" {
+		t.Fatalf("recompile lost the cached list: %+v", v)
+	}
+}
+
+// TestRecompileServesCachedCopyWithoutTheNetwork is the restart case: the
+// cached copy on disk has to be compiled and enforcing before anything is
+// downloaded, so a reboot with the WAN down does not leave the LAN
+// unfiltered for as long as the fetch timeout takes.
+func TestRecompileServesCachedCopyWithoutTheNetwork(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "lists"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "lists", "3.txt"), []byte("0.0.0.0 ads.example.com\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fs := &fakeFilterStore{lists: []store.List{
+		{ID: 3, URL: "http://192.0.2.1:9/never-answers", Kind: "block", Enabled: true},
+	}}
+	cs := &fakeClientStore{groups: []store.Group{{ID: 1, Name: "default", Enabled: true}}}
+	eng := NewEngine()
+	ref := NewRefresher(fs, cs, eng, dir)
+
+	if err := ref.Recompile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if v := (*eng.groups.Load())[1].Evaluate("ads.example.com"); v.Action != "block" {
+		t.Fatalf("cached copy not compiled: %+v", v)
+	}
+}
+
+// TestRecompileSkipsDisabledListsAndGroups: compiling from cache applies the
+// same enabled checks the download path does, or disabling a list would keep
+// enforcing it until the next download.
+func TestRecompileSkipsDisabledListsAndGroups(t *testing.T) {
+	url, _ := countingList(t, "0.0.0.0 ads.example.com\n")
+	fs := &fakeFilterStore{lists: []store.List{{ID: 1, URL: url, Kind: "block", Enabled: true}}}
+	cs := &fakeClientStore{groups: []store.Group{
+		{ID: 1, Name: "default", Enabled: true},
+		{ID: 2, Name: "off", Enabled: false},
+	}}
+	eng := NewEngine()
+	ref := NewRefresher(fs, cs, eng, t.TempDir(), AllowLoopbackTargets())
+	if err := ref.RefreshAll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := (*eng.groups.Load())[2]; ok {
+		t.Fatal("disabled group got a compiled ruleset")
+	}
+
+	fs.lists[0].Enabled = false
+	if err := ref.Recompile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if v := (*eng.groups.Load())[1].Evaluate("ads.example.com"); v.Action == "block" {
+		t.Fatalf("disabled list still enforcing: %+v", v)
+	}
+}
+
+// TestFetchSendsETagAndHandles304 covers the conditional-request round trip:
+// a second refresh offers the stored ETag, and the 304 means "the cached
+// copy is current", not a failure.
+func TestFetchSendsETagAndHandles304(t *testing.T) {
+	var conditional atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("If-None-Match") == `"v1"` {
+			conditional.Add(1)
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		w.Header().Set("ETag", `"v1"`)
+		_, _ = w.Write([]byte("0.0.0.0 ads.example.com\n"))
+	}))
+	defer srv.Close()
+
+	fs := &fakeFilterStore{lists: []store.List{{ID: 4, URL: srv.URL, Kind: "block", Enabled: true}}}
+	cs := &fakeClientStore{groups: []store.Group{{ID: 1, Name: "default", Enabled: true}}}
+	eng := NewEngine()
+	ref := NewRefresher(fs, cs, eng, t.TempDir(), AllowLoopbackTargets())
+
+	if err := ref.RefreshAll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := ref.RefreshAll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if conditional.Load() != 1 {
+		t.Fatalf("If-None-Match sent %d times, want 1", conditional.Load())
+	}
+	got := fs.stateOf(4)
+	if got.status != store.ListStatusOK || got.lastError != "" {
+		t.Fatalf("304 recorded as %+v, want ok with no error", got)
+	}
+	if v := (*eng.groups.Load())[1].Evaluate("ads.example.com"); v.Action != "block" {
+		t.Fatalf("304 lost the list: %+v", v)
+	}
+}
+
+// TestFetchRecoversFromAStaleETag is the permanent-failure bug: the cache
+// file goes missing while its .etag survives (a half-cleared data dir), so
+// every refresh asked conditionally, got a 304, and failed on the cache it
+// no longer had — forever. The etag must not be offered without the copy it
+// describes.
+func TestFetchRecoversFromAStaleETag(t *testing.T) {
+	var conditional atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("If-None-Match") != "" {
+			conditional.Add(1)
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		w.Header().Set("ETag", `"v1"`)
+		_, _ = w.Write([]byte("0.0.0.0 ads.example.com\n"))
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	fs := &fakeFilterStore{lists: []store.List{{ID: 5, URL: srv.URL, Kind: "block", Enabled: true}}}
+	cs := &fakeClientStore{groups: []store.Group{{ID: 1, Name: "default", Enabled: true}}}
+	eng := NewEngine()
+	ref := NewRefresher(fs, cs, eng, dir, AllowLoopbackTargets())
+
+	if err := ref.RefreshAll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(dir, "lists", "5.txt")); err != nil {
+		t.Fatal(err)
+	}
+	if err := ref.RefreshAll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if conditional.Load() != 0 {
+		t.Fatalf("If-None-Match offered %d times with no cache file to back it", conditional.Load())
+	}
+	got := fs.stateOf(5)
+	if got.status != store.ListStatusOK {
+		t.Fatalf("status = %q (%q), want %q — the list must recover", got.status, got.lastError, store.ListStatusOK)
+	}
+	if v := (*eng.groups.Load())[1].Evaluate("ads.example.com"); v.Action != "block" {
+		t.Fatalf("list did not recover: %+v", v)
+	}
+}
+
+// TestFetchRefetchesWhen304HasNoReadableCache covers the other half: a
+// server that answers 304 to an unconditional request. The etag is dropped
+// and the list is fetched once more rather than failing "cache unreadable"
+// every 24h.
+func TestFetchRefetchesWhen304HasNoReadableCache(t *testing.T) {
+	var first atomic.Bool
+	first.Store(true)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if first.Swap(false) {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		_, _ = w.Write([]byte("0.0.0.0 ads.example.com\n"))
+	}))
+	defer srv.Close()
+
+	fs := &fakeFilterStore{lists: []store.List{{ID: 6, URL: srv.URL, Kind: "block", Enabled: true}}}
+	cs := &fakeClientStore{groups: []store.Group{{ID: 1, Name: "default", Enabled: true}}}
+	eng := NewEngine()
+	ref := NewRefresher(fs, cs, eng, t.TempDir(), AllowLoopbackTargets())
+
+	if err := ref.RefreshAll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := fs.stateOf(6); got.status != store.ListStatusOK {
+		t.Fatalf("status = %q (%q), want the re-fetch to succeed", got.status, got.lastError)
+	}
+	if v := (*eng.groups.Load())[1].Evaluate("ads.example.com"); v.Action != "block" {
+		t.Fatalf("re-fetch did not compile: %+v", v)
+	}
+}
+
+// TestFetchCapsTheBodySize: a list body is written straight into the data
+// dir, so an oversized (or endless) one has to be a failed fetch rather than
+// a full disk followed by a trie built from it.
+func TestFetchCapsTheBodySize(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		line := []byte("0.0.0.0 ads.example.com\n")
+		for written := 0; written <= maxListBytes; written += len(line) {
+			if _, err := w.Write(line); err != nil {
+				return
+			}
+		}
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	fs := &fakeFilterStore{lists: []store.List{{ID: 12, URL: srv.URL, Kind: "block", Enabled: true}}}
+	cs := &fakeClientStore{groups: []store.Group{{ID: 1, Name: "default", Enabled: true}}}
+	ref := NewRefresher(fs, cs, NewEngine(), dir, AllowLoopbackTargets())
+
+	if err := ref.RefreshAll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	got := fs.stateOf(12)
+	if got.status != store.ListStatusFailed {
+		t.Fatalf("status = %q (%q), want %q", got.status, got.lastError, store.ListStatusFailed)
+	}
+	if !strings.Contains(got.lastError, "too large") {
+		t.Fatalf("lastError = %q, want it to name the size limit", got.lastError)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "lists", "12.txt")); !os.IsNotExist(err) {
+		t.Fatalf("oversized body was kept on disk: %v", err)
+	}
+}
+
+// TestFetchRefusesPrivateTargets: list URLs are admin-supplied but fetched
+// by the server itself, so one aimed at the host's own loopback, a
+// link-local metadata endpoint or a neighbour on the LAN has to be refused
+// rather than turning dnsaur into a confused deputy.
+func TestFetchRefusesPrivateTargets(t *testing.T) {
+	for _, tc := range []struct{ name, url string }{
+		{"loopback", "http://127.0.0.1:8080/admin"},
+		{"loopback_v6", "http://[::1]:8080/admin"},
+		{"link_local_metadata", "http://169.254.169.254/latest/meta-data/"},
+		{"rfc1918", "http://10.0.0.1/hosts"},
+		{"unique_local_v6", "http://[fd00::1]/hosts"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fs := &fakeFilterStore{lists: []store.List{{ID: 13, URL: tc.url, Kind: "block", Enabled: true}}}
+			cs := &fakeClientStore{groups: []store.Group{{ID: 1, Name: "default", Enabled: true}}}
+			ref := NewRefresher(fs, cs, NewEngine(), t.TempDir())
+			if err := ref.RefreshAll(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			got := fs.stateOf(13)
+			if got.status != store.ListStatusFailed {
+				t.Fatalf("status = %q, want %q", got.status, store.ListStatusFailed)
+			}
+			if !strings.Contains(got.lastError, "not a public address") {
+				t.Fatalf("lastError = %q, want it to name the refusal", got.lastError)
+			}
+		})
+	}
+}
+
+// TestFetchRefusesAPrivateRedirect: the check has to survive the hop, since
+// the URL an admin sees is not necessarily the address that gets dialled.
+// The first hop is loopback, which this refresher allows (see
+// AllowLoopbackTargets); the second is the cloud metadata address, which
+// nothing allows.
+func TestFetchRefusesAPrivateRedirect(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "http://169.254.169.254/latest/meta-data/", http.StatusFound)
+	}))
+	defer srv.Close()
+
+	fs := &fakeFilterStore{lists: []store.List{{ID: 14, URL: srv.URL, Kind: "block", Enabled: true}}}
+	cs := &fakeClientStore{groups: []store.Group{{ID: 1, Name: "default", Enabled: true}}}
+	ref := NewRefresher(fs, cs, NewEngine(), t.TempDir(), AllowLoopbackTargets())
+	if err := ref.RefreshAll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := fs.stateOf(14); !strings.Contains(got.lastError, "not a public address") {
+		t.Fatalf("lastError = %q, want the redirect target refused", got.lastError)
 	}
 }

@@ -85,6 +85,99 @@ func TestPauseDisablesBlocking(t *testing.T) {
 	}
 }
 
+// TestPausePerGroup: a pause on one group leaves every other group
+// filtering. Only the global pause (id 0) is meant to stop everyone.
+func TestPausePerGroup(t *testing.T) {
+	e := engineWith(t, "null-ip")
+	e.SetGroups(map[int64]*Ruleset{
+		1: Compile(nil, []CompiledList{compiledList(10, "block", "ads.example")}),
+		2: Compile(nil, []CompiledList{compiledList(10, "block", "ads.example")}),
+	})
+	h := e.Middleware()(passthrough(t))
+
+	e.Pause(1, time.Minute)
+	if resp, _ := h.ServeDNS(context.Background(), testReq("ads.example", dns.TypeA, 1)); resp.Decision != dnssrv.DecisionForwarded {
+		t.Fatalf("paused group still blocked: %+v", resp)
+	}
+	if resp, _ := h.ServeDNS(context.Background(), testReq("ads.example", dns.TypeA, 2)); resp.Decision != dnssrv.DecisionBlocked {
+		t.Fatalf("group 2 stopped blocking because group 1 is paused: %+v", resp)
+	}
+}
+
+// TestPausedUntilTakesTheLater is the documented rule: a global pause and a
+// group pause can both be in effect, and whichever ends later wins — in both
+// directions, so neither can cut the other short.
+func TestPausedUntilTakesTheLater(t *testing.T) {
+	e := NewEngine()
+	e.Pause(0, time.Minute)
+	e.Pause(7, time.Hour)
+	if until := e.PausedUntil(7); time.Until(until) < 30*time.Minute {
+		t.Fatalf("PausedUntil(7) = %v, want the longer group pause", until)
+	}
+
+	e = NewEngine()
+	e.Pause(0, time.Hour)
+	e.Pause(7, time.Minute)
+	if until := e.PausedUntil(7); time.Until(until) < 30*time.Minute {
+		t.Fatalf("PausedUntil(7) = %v, want the longer global pause", until)
+	}
+	// And the shorter group pause must not resume the group early.
+	h := e.Middleware()(passthrough(t))
+	e.SetGroups(map[int64]*Ruleset{7: Compile(nil, []CompiledList{compiledList(10, "block", "ads.example")})})
+	if resp, _ := h.ServeDNS(context.Background(), testReq("ads.example", dns.TypeA, 7)); resp.Decision != dnssrv.DecisionForwarded {
+		t.Fatalf("global pause not honoured for a group with its own shorter one: %+v", resp)
+	}
+}
+
+// TestBlockNullIPPerQType: null-ip is an answer shaped like the question. An
+// AAAA gets ::, and a type with no null address (TXT, MX…) gets an empty
+// NOERROR — still recorded as blocked, and never forwarded, which is the
+// point.
+func TestBlockNullIPPerQType(t *testing.T) {
+	e := engineWith(t, "null-ip")
+	h := e.Middleware()(passthrough(t))
+
+	resp, err := h.ServeDNS(context.Background(), testReq("ads.example", dns.TypeAAAA, 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Decision != dnssrv.DecisionBlocked {
+		t.Fatalf("AAAA not blocked: %+v", resp)
+	}
+	aaaa, ok := resp.Msg.Answer[0].(*dns.AAAA)
+	if !ok || aaaa.AAAA.String() != "::" || aaaa.Hdr.Ttl != 30 {
+		t.Fatalf("answer %v", resp.Msg.Answer)
+	}
+
+	for _, qt := range []uint16{dns.TypeTXT, dns.TypeMX, dns.TypeHTTPS} {
+		resp, err := h.ServeDNS(context.Background(), testReq("ads.example", qt, 1))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if resp.Decision != dnssrv.DecisionBlocked {
+			t.Fatalf("%s forwarded instead of blocked: %+v", dns.TypeToString[qt], resp)
+		}
+		if len(resp.Msg.Answer) != 0 || resp.Msg.Rcode != dns.RcodeSuccess {
+			t.Fatalf("%s answer = %v rcode = %d, want empty NOERROR", dns.TypeToString[qt], resp.Msg.Answer, resp.Msg.Rcode)
+		}
+	}
+}
+
+// TestBlockedResponseCarriesTheMatch: the ids say which rule or list
+// decided, not what in it matched, and inside a million-entry list that is
+// the only part anyone can act on.
+func TestBlockedResponseCarriesTheMatch(t *testing.T) {
+	e := engineWith(t, "null-ip")
+	h := e.Middleware()(passthrough(t))
+	resp, err := h.ServeDNS(context.Background(), testReq("x.ads.example", dns.TypeA, 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Matched != "ads.example" {
+		t.Fatalf("Matched = %q, want the list entry that fired", resp.Matched)
+	}
+}
+
 func TestUnknownGroupPassesThrough(t *testing.T) {
 	e := engineWith(t, "null-ip")
 	h := e.Middleware()(passthrough(t))

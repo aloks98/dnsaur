@@ -748,6 +748,17 @@ func (a *App) Start(ctx context.Context) error {
 		cancel()
 	}
 
+	// Compile before binding, from the list copies already on disk and the
+	// stored rules. The initial download below can take as long as the
+	// slowest subscribed URL — a reboot with the WAN down spends the full
+	// fetch timeout per list — and until it finished, every listener was
+	// already answering, unfiltered, with usable copies sitting in the data
+	// dir. This costs a few milliseconds of disk and parse; a failure is not
+	// a reason to refuse to resolve.
+	if err := a.refresher.Recompile(ctx); err != nil {
+		slog.Error("compiling filters from the list cache at startup failed", "err", err)
+	}
+
 	for _, addr := range a.cfg.DNSListen {
 		// The key store, not a snapshot of it: a key created through the API
 		// is live on the next signed message rather than the next restart.
@@ -913,8 +924,9 @@ func (a *App) ReloadZones(ctx context.Context) error {
 	return nil
 }
 
-func (a *App) RefreshFilters(ctx context.Context) error { return a.refresher.RefreshAll(ctx) }
-func (a *App) NotifyZones()                             { a.notifier.Wake() }
+func (a *App) RefreshFilters(ctx context.Context) error   { return a.refresher.RefreshAll(ctx) }
+func (a *App) RecompileFilters(ctx context.Context) error { return a.refresher.Recompile(ctx) }
+func (a *App) NotifyZones()                               { a.notifier.Wake() }
 
 func (a *App) Shutdown(ctx context.Context) error {
 	if a.apiCancel != nil {

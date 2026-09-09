@@ -24,8 +24,8 @@ import (
 // uniformity and because a future async reload there would silently start
 // racing otherwise.
 type fakeReloader struct {
-	mu                                  sync.Mutex
-	clients, records, filters, notifies int
+	mu                                              sync.Mutex
+	clients, records, filters, recompiles, notifies int
 }
 
 func (f *fakeReloader) ReloadClients(ctx context.Context) error {
@@ -45,6 +45,19 @@ func (f *fakeReloader) RefreshFilters(ctx context.Context) error {
 	defer f.mu.Unlock()
 	f.filters++
 	return nil
+}
+
+func (f *fakeReloader) RecompileFilters(ctx context.Context) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.recompiles++
+	return nil
+}
+
+func (f *fakeReloader) recompileCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.recompiles
 }
 
 func (f *fakeReloader) NotifyZones() {

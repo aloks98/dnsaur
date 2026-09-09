@@ -203,7 +203,12 @@ Full parameter/response detail lives in `internal/api/openapi.yaml`
   (rename/enable/disable), `DELETE /groups/{id}`,
   `GET /groups/{id}/lists` and `PUT /groups/{id}/lists` (assign filter
   lists to a group), `GET /groups/{id}/rules` and `POST /groups/{id}/rules`
-  (per-group allow/block rules, literal or regex pattern).
+  (per-group allow/block rules, literal or regex pattern). A literal
+  pattern must be a domain (`example.com`, `*.example.com`, or a single
+  label like `localhost`) and is stored normalised — lowercased, trailing
+  dot and leading `*.` removed, Unicode converted to punycode. Anything
+  else is `400 pattern must be a domain like example.com, *.example.com or
+  localhost`.
   Every `list_ids` entry must name a list that exists — one that doesn't is
   a `400` naming the id, on create and on `PUT` alike, and creates nothing.
   **`PUT /groups/{id}/lists` is one transaction**: a bad id leaves the
@@ -214,16 +219,23 @@ Full parameter/response detail lives in `internal/api/openapi.yaml`
   included — `GET /groups/999/lists` is `404`, not `200 []`.
 - **Clients** — `GET /clients`, `POST /clients`, `PUT /clients/{id}`,
   `DELETE /clients/{id}` — each client is an IP or CIDR `matcher` bound to
-  a `group_id`. A `group_id` naming no group is `400 group_id does not name
-  an existing group`; the same reference from the *path* (`POST
-  /groups/{id}/rules`) is a `404` instead, since there the missing row is
-  the resource the URL addressed.
+  a `group_id`. The matcher is stored canonically: CIDRs are masked,
+  IPv4-mapped IPv6 is unmapped. An interface zone (`fe80::1%eth0`) is
+  `400`, because the request side never carries one. A `group_id` naming no
+  group is `400 group_id does not name an existing group`; the same
+  reference from the *path* (`POST /groups/{id}/rules`) is a `404` instead,
+  since there the missing row is the resource the URL addressed.
 - **Filters** — `GET /filters/lists`, `POST /filters/lists` (subscribe a
-  block/allow list URL; refreshes synchronously before responding),
+  block/allow list URL; downloads in the background after responding),
   `PATCH /filters/lists/{id}` (enable/disable),
   `DELETE /filters/lists/{id}`, `DELETE /filters/rules/{id}` (delete a
   per-group rule), `POST /filters/refresh` (`202`, kicks off an
   asynchronous refresh of all lists).
+  Every other rule/list/assignment write **recompiles from the copies
+  already on disk and does not download**, so none of them wait on the
+  network. A list whose URL resolves to a loopback, link-local or private
+  address is refused at fetch time and reads back `last_status: "failed"`;
+  the same goes for a body over 64 MiB.
 - **Zones** — `GET /zones`, `POST /zones`, `GET /zones/{id}`,
   `PATCH /zones/{id}`, `DELETE /zones/{id}` (cascades its records).
   `PATCH` is conditional on the zone not having changed since it was read:

@@ -102,6 +102,13 @@ list — an allow rule wins, and keeps winning after the list refreshes.
 an allow list beats a block list. So the way to carve an exception out of a
 blocklist is an allow entry, not a narrower blocklist.
 
+**A blocklist's own exceptions apply to that list only.** A block list may
+carry `@@||name^` lines — the list author's carve-outs from their own
+entries. Those are honoured at stage 6: a name a list exempts is not blocked
+*by that list*. It is not promoted to a global allow, so another blocklist
+that names it still blocks it, and a block rule of yours still wins. If you
+want a name allowed everywhere, use an allow rule.
+
 If nothing matches, the query is forwarded normally.
 
 ### Lists
@@ -111,7 +118,25 @@ and compiled into a domain set; the entry count shown is what actually
 compiled, not the line count of the file.
 
 Lists refresh on a timer set by `lists.refresh_hours` — **changing that
-interval needs a restart** (see [Settings](#settings)).
+interval needs a restart** (see [Settings](#settings)). Downloading and
+compiling are separate: editing a rule, a list or an assignment recompiles
+from the copies already on disk and answers immediately, while **Refresh
+now**, adding a list, enabling one and the timer are what actually fetch. A
+restart compiles from those copies before it starts answering queries, so the
+network is filtered from the first query rather than from the end of the
+first download.
+
+Two limits apply to a fetch, and a list that hits either is reported
+`failed` with the reason on its row:
+
+- **64 MiB per list.** The body is written into the data directory and then
+  turned into a domain set, so an endless response is refused rather than
+  filling the disk.
+- **Public addresses only.** A list URL is yours to choose but the server is
+  what fetches it, from inside your network — so a URL (or a redirect) that
+  resolves to loopback, a link-local address such as `169.254.169.254`, or a
+  private range like `10.0.0.0/8` is refused. Host list files on something
+  reachable from the internet; there is no local-file source.
 
 A list only applies to a group it's assigned to. That assignment is on the
 [Groups & clients](#groups--clients) screen, not here.
@@ -127,10 +152,19 @@ Your own entries, which beat every list. Four kinds, matching the stages above:
 allow or block, exact/wildcard or regex.
 
 Exact and wildcard patterns are matched case-insensitively against the
-normalized name, and a pattern covers its subdomains. Regex rules are Go
-regular expressions matched against the whole name; **an invalid pattern is
-skipped with a warning at compile time rather than failing the whole ruleset**,
-so a rule that silently does nothing is usually a regex that didn't compile.
+normalized name, and a pattern covers its subdomains. A pattern has to be a
+domain — `example.com`, `*.example.com` (stored as `example.com`, which
+already covers the subdomains) or a single label like `localhost`. Anything
+else is refused at 400: `||example.com^`, `ads.*.example.com` and a bare `*`
+are patterns no query can ever carry, so storing them would create a rule
+that silently matches nothing. Unicode names are converted to punycode, since
+that is the form a query arrives in.
+
+Regex rules are Go regular expressions matched **unanchored** against the
+lowercased name — a rule `ads` matches `roads.example` too, so anchor with
+`^`/`$` when you mean the whole name. **An invalid pattern is skipped with a
+warning at compile time rather than failing the whole ruleset**, so a rule
+that silently does nothing is usually a regex that didn't compile.
 
 Go syntax is what counts, including the parts your browser's own regex engine
 has no equivalent for — inline flags like `(?i)ads` and the `(?P<name>…)`
@@ -147,6 +181,13 @@ Matching, when a query arrives:
 2. Otherwise the **most specific CIDR** that contains the address wins
    (`/32` before `/24` before `/16`).
 3. If nothing matches, the client falls into the **default** group.
+
+A matcher is stored in the one spelling that matching uses: a CIDR is masked
+(`10.0.0.1/24` is saved as `10.0.0.0/24`) and an IPv4-mapped IPv6 form is
+unmapped (`::ffff:192.168.1.0/120` becomes `192.168.1.0/24`), so what the row
+shows is what will be compared. An address carrying an interface zone
+(`fe80::1%eth0`) is refused: the request side never carries one, so such a
+matcher could only ever match nothing.
 
 That default is why a fresh install filters everything on the network without
 you listing a single device — you only add clients to treat some devices

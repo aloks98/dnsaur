@@ -92,6 +92,71 @@ func TestClientsCRUDAndValidation(t *testing.T) {
 	}
 }
 
+// TestClientMatcherCanonicalisation: three matcher shapes were accepted and
+// then never matched anything — an unmasked prefix, a v4-mapped one, and an
+// address carrying an interface zone the request side can never produce.
+// The first two are stored in the spelling the lookup uses; the third has no
+// such spelling and is refused.
+func TestClientMatcherCanonicalisation(t *testing.T) {
+	srv, s, _ := testServer(t)
+	cookie := login(t, srv, s)
+	h := srv.Handler()
+	_, _ = s.Clients().AddGroup(t.Context(), "default")
+
+	for _, tc := range []struct{ in, want string }{
+		{"10.0.0.1/24", "10.0.0.0/24"},
+		{"::ffff:192.168.1.0/120", "192.168.1.0/24"},
+		{"::ffff:192.0.2.5", "192.0.2.5"},
+		{"2001:db8::1/64", "2001:db8::/64"},
+	} {
+		body := fmt.Sprintf(`{"name":"c","matcher":%q,"group_id":1}`, tc.in)
+		w := doReq(t, h, "POST", "/api/v1/clients", body, cookie)
+		if w.Code != 201 {
+			t.Fatalf("matcher %q rejected: %d %s", tc.in, w.Code, w.Body.String())
+		}
+		var created map[string]int64
+		_ = json.Unmarshal(w.Body.Bytes(), &created)
+
+		w = doReq(t, h, "GET", "/api/v1/clients", "", cookie)
+		var cs []store.Client
+		_ = json.Unmarshal(w.Body.Bytes(), &cs)
+		var got string
+		for _, c := range cs {
+			if c.ID == created["id"] {
+				got = c.Matcher
+			}
+		}
+		if got != tc.want {
+			t.Errorf("matcher %q stored as %q, want %q", tc.in, got, tc.want)
+		}
+		if w := doReq(t, h, "DELETE", fmt.Sprintf("/api/v1/clients/%d", created["id"]), "", cookie); w.Code != 204 {
+			t.Fatalf("cleanup delete: %d", w.Code)
+		}
+	}
+
+	for _, bad := range []string{"fe80::1%eth0", "fe80::1%25eth0", "::ffff:10.0.0.0/64", "not-an-ip"} {
+		body := fmt.Sprintf(`{"name":"c","matcher":%q,"group_id":1}`, bad)
+		if w := doReq(t, h, "POST", "/api/v1/clients", body, cookie); w.Code != 400 {
+			t.Errorf("matcher %q accepted: %d %s", bad, w.Code, w.Body.String())
+		}
+	}
+
+	// PUT normalises the same way, or the row could be edited back into a
+	// shape that never matches.
+	w := doReq(t, h, "POST", "/api/v1/clients", `{"name":"c","matcher":"10.1.0.0/16","group_id":1}`, cookie)
+	var created map[string]int64
+	_ = json.Unmarshal(w.Body.Bytes(), &created)
+	if w := doReq(t, h, "PUT", fmt.Sprintf("/api/v1/clients/%d", created["id"]), `{"name":"c","matcher":"10.2.3.4/16","group_id":1}`, cookie); w.Code != 204 {
+		t.Fatalf("update: %d %s", w.Code, w.Body.String())
+	}
+	w = doReq(t, h, "GET", "/api/v1/clients", "", cookie)
+	var cs []store.Client
+	_ = json.Unmarshal(w.Body.Bytes(), &cs)
+	if len(cs) != 1 || cs[0].Matcher != "10.2.0.0/16" {
+		t.Fatalf("clients after update: %+v", cs)
+	}
+}
+
 // POST /groups accepts the two fields the UI's add row now sets. Both are
 // optional, and their defaults are the ones that keep a new group useful:
 // enabled, carrying every list. An explicitly empty list_ids is the one way

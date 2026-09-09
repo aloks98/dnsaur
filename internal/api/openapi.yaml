@@ -1471,7 +1471,13 @@ paths:
                 action: { type: string, enum: [allow, block] }
                 pattern:
                   type: string
-                  description: literal domain, or a regex when is_regex is true (max 512 chars)
+                  description: >
+                    A regex when is_regex is true (max 512 chars, RE2,
+                    matched unanchored), otherwise a domain: example.com,
+                    *.example.com, or a single label such as localhost.
+                    A literal pattern is stored normalised — lowercased,
+                    trailing dot and leading "*." removed, Unicode
+                    converted to punycode.
                 is_regex: { type: boolean, default: false }
       responses:
         "201":
@@ -1485,7 +1491,8 @@ paths:
         "400":
           description: >
             invalid json; bad id; action allow|block and pattern required;
-            regex pattern too long (max 512); or invalid regex
+            regex pattern too long (max 512); invalid regex; or "pattern
+            must be a domain like example.com, *.example.com or localhost"
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -1523,7 +1530,7 @@ paths:
                   properties:
                     id: { type: integer, format: int64 }
                     name: { type: string }
-                    matcher: { type: string, description: IP address or CIDR }
+                    matcher: { type: string, description: IP address or CIDR, stored canonically }
                     group_id: { type: integer, format: int64 }
         "401":
           description: authentication required
@@ -1547,7 +1554,13 @@ paths:
               required: [matcher, group_id]
               properties:
                 name: { type: string }
-                matcher: { type: string, description: IP address or CIDR }
+                matcher:
+                  type: string
+                  description: >
+                    IP address or CIDR, without an interface zone. Stored
+                    canonically: a CIDR is masked (10.0.0.1/24 -> 10.0.0.0/24)
+                    and IPv4-mapped IPv6 is unmapped (::ffff:192.168.1.0/120
+                    -> 192.168.1.0/24).
                 group_id: { type: integer, format: int64 }
       responses:
         "201":
@@ -1560,8 +1573,9 @@ paths:
                   id: { type: integer, format: int64 }
         "400":
           description: >
-            invalid json; matcher must be an IP or CIDR and group_id set;
-            or `group_id does not name an existing group`
+            invalid json; matcher must be an IP or CIDR without an interface
+            zone, and group_id set; or `group_id does not name an existing
+            group`
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -1603,15 +1617,22 @@ paths:
               required: [matcher, group_id]
               properties:
                 name: { type: string }
-                matcher: { type: string, description: IP address or CIDR }
+                matcher:
+                  type: string
+                  description: >
+                    IP address or CIDR, without an interface zone. Stored
+                    canonically: a CIDR is masked (10.0.0.1/24 -> 10.0.0.0/24)
+                    and IPv4-mapped IPv6 is unmapped (::ffff:192.168.1.0/120
+                    -> 192.168.1.0/24).
                 group_id: { type: integer, format: int64 }
       responses:
         "204":
           description: No Content
         "400":
           description: >
-            bad id; invalid json; matcher must be an IP or CIDR and
-            group_id set; or `group_id does not name an existing group`
+            bad id; invalid json; matcher must be an IP or CIDR without an
+            interface zone, and group_id set; or `group_id does not name an
+            existing group`
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -1694,10 +1715,17 @@ paths:
       tags: [Filters]
       summary: Add a filter list
       description: >
-        Adding a list refreshes filters asynchronously after the response
-        (the same as POST /filters/refresh): the list row is created and
-        its id returned immediately, and the potentially slow full-network
-        refresh runs in the background.
+        Adding a list downloads asynchronously after the response (the same
+        as POST /filters/refresh): the list row is created and its id
+        returned immediately, and the potentially slow full-network refresh
+        runs in the background. Every other rule/list/assignment write only
+        recompiles from the copies already on disk, and never downloads.
+
+
+        A fetch is capped at 64 MiB and refuses any address that is not
+        public — loopback, link-local and private ranges included, on the
+        original URL and on every redirect. A list refused this way reads
+        back with last_status "failed" and the reason in last_error.
 
 
         The new list is also assigned to every existing group. A group's
