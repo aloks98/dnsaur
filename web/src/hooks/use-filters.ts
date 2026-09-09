@@ -132,10 +132,15 @@ export function useRefreshFilters() {
 // Rules for a single group. Used by the "why?" drawer (query log) to
 // resolve a QueryEntry's rule_id, and by the Filtering page's Rules tab
 // (Task 10).
-export function useRules(groupId: number) {
+// `enabled` for the query log, which only needs a group's rules once a row
+// is selected — the same escape hatch useQuerySearch offers, and for the
+// same reason: a screen that fetches a ruleset it has no use for pays for it
+// on every mount.
+export function useRules(groupId: number, options?: { enabled?: boolean }) {
   return useQuery({
     queryKey: filterKeys.rules(groupId),
     queryFn: () => api.get<Rule[]>(`/groups/${groupId}/rules`),
+    enabled: options?.enabled ?? true,
   });
 }
 

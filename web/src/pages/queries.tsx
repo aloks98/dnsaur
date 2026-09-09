@@ -38,6 +38,7 @@ import type { Client, List, QueryEntry, Rule } from "../api/types";
 import { StaleDataAlert } from "../components/stale-data-alert";
 import { useClients } from "../hooks/use-clients";
 import { useGroups } from "../hooks/use-groups";
+import { useSettings } from "../hooks/use-settings";
 import { useAddRule, useRules, useLists } from "../hooks/use-filters";
 import {
   DEFAULT_SEARCH_LIMIT,
@@ -47,15 +48,15 @@ import {
   type QuerySearchFilter,
 } from "../hooks/use-queries";
 import { useLiveTailPaused, usePublishLiveTailStatus } from "../lib/live-tail";
-import { durationLabel, rowKey } from "../lib/query-rows";
+import {
+  clockTime,
+  DEFAULT_GROUP_ID,
+  decisionTone,
+  durationLabel,
+  namesByKey,
+  rowKey,
+} from "../lib/query-rows";
 import { parseUpstreams } from "../lib/upstreams";
-
-// The group a query is attributed to when its client matched no client entry
-// at all — internal/clients/registry.go's Lookup falls back to
-// ClientInfo{GroupID: 1} (with a zero ID) for those, so the query log must
-// use the same fallback or its rules would land somewhere the resolver never
-// consults for that client.
-const DEFAULT_GROUP_ID = 1;
 
 /** Dense row: `py-1.5` twice plus a `text-xs` line box plus the hairline. Only
  * an estimate — the virtualizer measures for real once a row is mounted. */
@@ -142,36 +143,13 @@ function clientGroupMap(clients: Client[] | undefined): Map<number, number> {
  * never equals any single `client_ip`. Rows whose `client_id` is 0, or names
  * a client deleted since the query was logged, are simply absent from the
  * map — the column renders UNKNOWN for those rather than inventing a name.
+ * So is a client whose name is empty: see namesByKey.
  */
 function clientNameMap(clients: Client[] | undefined): Map<number, string> {
-  return new Map((clients ?? []).map((c) => [c.id, c.name]));
+  return namesByKey(clients, (c) => c.id);
 }
 
 // --- decisions ---------------------------------------------------------------
-
-/**
- * Per-decision tint for the *table*. The resolver's decision vocabulary is in
- * internal/dnssrv/pipeline.go; this is the design's flat, text-only reading
- * of it — no badges, no icons, because a column of a thousand tinted pills is
- * the loudest thing on a page whose whole point is scanning a thousand rows.
- * The one badge on this screen is the inspector's chip, below.
- *
- * There is no `allowed` entry, here or in the filter below, on purpose:
- * there is no such decision in the Go enum at all. An allow rule only
- * *skips* blocking, so the row is logged with whatever the downstream
- * stage produced. Offering it as a filter advertised a query that always
- * returns zero rows.
- */
-const DECISION_TONE: Record<string, string> = {
-  blocked: "text-destructive",
-  // A failed resolve is a broken query, not a policy decision — but on a
-  // one-line readout it needs the same "look at me" weight as a block.
-  error: "text-destructive",
-  stale: "text-warn",
-  cached: "text-muted-foreground",
-  forwarded: "text-foreground",
-  authoritative: "text-primary",
-};
 
 /**
  * The inspector chip's tone, as an rnui Badge variant.
@@ -191,7 +169,14 @@ const DECISION_BADGE: Record<string, NonNullable<BadgeProps["variant"]>> = {
   forwarded: "outline",
 };
 
-/** The decisions the resolver actually writes — the filter's whole vocabulary. */
+/**
+ * The decisions the resolver actually writes — the filter's whole
+ * vocabulary. There is no `allowed` in it, on purpose: there is no such
+ * decision in the Go enum (see lib/query-rows.ts's tone map). An allow rule
+ * only *skips* blocking, so the row is logged with whatever the downstream
+ * stage produced, and offering it advertised a query that always returns
+ * zero rows.
+ */
 const DECISIONS = ["blocked", "forwarded", "cached", "stale", "authoritative", "error"];
 
 /**
@@ -205,22 +190,8 @@ const DECISIONS = ["blocked", "forwarded", "cached", "stale", "authoritative", "
  */
 const QUERY_TYPES = ["A", "AAAA", "HTTPS", "PTR", "TXT"];
 
-function decisionTone(decision: string): string {
-  return DECISION_TONE[decision] ?? "text-muted-foreground";
-}
-
 function decisionBadge(decision: string): NonNullable<BadgeProps["variant"]> {
   return DECISION_BADGE[decision] ?? "outline";
-}
-
-// --- formatting --------------------------------------------------------------
-
-function clockTime(atMs: number): string {
-  return new Date(atMs).toLocaleTimeString([], {
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-  });
 }
 
 // --- shared chrome -----------------------------------------------------------
@@ -418,12 +389,14 @@ function FilterSelect({
   value,
   onChange,
   className,
+  disabled = false,
   children,
 }: {
   label: string;
   value: string;
   onChange: (value: string) => void;
   className?: string;
+  disabled?: boolean;
   children: ReactNode;
 }) {
   return (
@@ -432,6 +405,7 @@ function FilterSelect({
       <NativeSelect
         size="sm"
         value={value}
+        disabled={disabled}
         onChange={(event) => onChange(event.target.value)}
         className={cn("text-xs", className)}
       >
@@ -457,12 +431,16 @@ interface ClientOption {
 const FilterBar = memo(function FilterBar({
   value,
   clients,
+  clientIpsMasked,
   resetToken,
   onChange,
   onTimeRange,
 }: {
   value: FilterState;
   clients: ClientOption[];
+  /** `qlog.privacy` is not `full`, so a stored `client_ip` is masked or
+   * absent and can never equal a client's exact-IP matcher. */
+  clientIpsMasked: boolean;
   /** Bumped when the filters are cleared, so the DateSelector — which keeps
    * its own selection internally — is remounted empty rather than left
    * showing a range the page is no longer filtering on. */
@@ -535,18 +513,31 @@ const FilterBar = memo(function FilterBar({
         ))}
       </FilterSelect>
 
+      {/* `client` is an exact match on the stored `client_ip`
+          (ui-contract §2.7), and `qlog.privacy=anon` masks the last octet on
+          the way in (internal/qlog/qlog.go's anonymize) while `none` records
+          nothing at all. Under either, every option here names an address
+          the log cannot hold — so the control says what is true instead of
+          offering a query that always returns nothing. */}
       <FilterSelect
         label="Client"
         value={value.client}
         onChange={(client) => onChange({ client })}
         className="max-w-56"
+        disabled={clientIpsMasked}
       >
-        <NativeSelectOption value="">Any client IP</NativeSelectOption>
-        {clients.map((client) => (
-          <NativeSelectOption key={client.ip} value={client.ip}>
-            {client.ip} {client.name}
-          </NativeSelectOption>
-        ))}
+        {clientIpsMasked ? (
+          <NativeSelectOption value="">Client IPs masked</NativeSelectOption>
+        ) : (
+          <>
+            <NativeSelectOption value="">Any client IP</NativeSelectOption>
+            {clients.map((client) => (
+              <NativeSelectOption key={client.ip} value={client.ip}>
+                {client.ip} {client.name}
+              </NativeSelectOption>
+            ))}
+          </>
+        )}
       </FilterSelect>
 
       {/* The two `datetime-local` boxes this replaced were ~170px each and
@@ -641,6 +632,10 @@ const QUERY_COLUMNS: ColumnDef<QueryEntry>[] = [
     meta: { headerClassName: "px-4", cellClassName: "px-4" },
     cell: ({ row, table }) => {
       const entry = row.original;
+      // `q_name` is "" when the query carried no question (ui-contract
+      // §3.1). An empty cell reads as a rendering fault, and an empty
+      // accessible name ("Why was  forwarded?") is worse than none.
+      const named = entry.q_name !== "";
       return (
         // A real button, not just a click handler on the row: selecting a
         // row is what opens the inspector, and that has to be reachable
@@ -648,7 +643,11 @@ const QUERY_COLUMNS: ColumnDef<QueryEntry>[] = [
         // as a convenience on top of this rather than instead of it.
         <button
           type="button"
-          aria-label={`Why was ${entry.q_name} ${entry.decision}?`}
+          aria-label={
+            named
+              ? `Why was ${entry.q_name} ${entry.decision}?`
+              : `Why was an unnamed query ${entry.decision}?`
+          }
           title={entry.q_name}
           onClick={() => tableMeta(table).onSelect(entry)}
           className={cn(
@@ -656,7 +655,7 @@ const QUERY_COLUMNS: ColumnDef<QueryEntry>[] = [
             "outline-none focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-ring",
           )}
         >
-          {entry.q_name}
+          {named ? entry.q_name : UNKNOWN}
         </button>
       );
     },
@@ -960,6 +959,12 @@ function ActionStrip({
 }) {
   const action = entry.decision === "blocked" ? "allow" : "block";
   const done = status === "blocked" || status === "allowed";
+  // A rule needs a pattern, and a row with no question has none: the POST
+  // would carry `pattern: ""` and come back 400, after the button had
+  // already promised to write it.
+  const unnamed = entry.q_name === "";
+  const held = disabled || unnamed;
+  const heldReason = unnamed ? "This query carried no name to write a rule for" : disabledReason;
 
   return (
     <div className="flex flex-wrap items-center gap-3 border-t border-border px-4 py-3">
@@ -971,11 +976,11 @@ function ActionStrip({
         <Button
           type="button"
           size="sm"
-          disabled={status === "pending" || disabled}
+          disabled={status === "pending" || held}
           // Still visible while unavailable, just visibly inert and carrying
           // the reason — silently having no affordance is how "why can't I
           // block from here?" starts.
-          title={disabled ? disabledReason : undefined}
+          title={held ? heldReason : undefined}
           onClick={() => onQuickRule(action, entry)}
         >
           {action === "allow" ? "Allow domain" : "Block domain"}
@@ -1251,13 +1256,24 @@ export function QueryLog() {
     [clients.data],
   );
 
+  // Only an explicit non-`full` value closes the filter. An unread or failed
+  // settings request leaves it open: a filter that returns nothing is a
+  // smaller harm than a control taken away for a reason that wasn't checked.
+  const privacy = useSettings().data?.["qlog.privacy"];
+  const clientIpsMasked = privacy !== undefined && privacy !== "full";
+
   const groups = useGroups();
   const groupName = useMemo(
     () => groups.data?.find((g) => g.id === selectedGroupId)?.name,
     [groups.data, selectedGroupId],
   );
 
-  const rules = useRules(selectedGroupId ?? DEFAULT_GROUP_ID);
+  // Only once a row is selected: with nothing selected there is no group to
+  // ask about, and falling back to group 1 fetched a ruleset the page had no
+  // use for on every mount.
+  const rules = useRules(selectedGroupId ?? DEFAULT_GROUP_ID, {
+    enabled: selectedGroupId !== null,
+  });
   const lists = useLists();
   const rulesById = useMemo(() => new Map((rules.data ?? []).map((r) => [r.id, r])), [rules.data]);
   const listsById = useMemo(() => new Map((lists.data ?? []).map((l) => [l.id, l])), [lists.data]);
@@ -1433,7 +1449,7 @@ export function QueryLog() {
 
   let emptyMessage: ReactNode;
   if (filtered && paged.isError) {
-    emptyMessage = "Couldn't load queries. Try adjusting the filters, or reload the page.";
+    emptyMessage = "Couldn't load queries.";
   } else if (filtered) {
     emptyMessage = "No queries match these filters.";
   } else if (paused) {
@@ -1456,6 +1472,7 @@ export function QueryLog() {
         <FilterBar
           value={filters}
           clients={clientOptions}
+          clientIpsMasked={clientIpsMasked}
           resetToken={resetToken}
           onChange={patchFilters}
           onTimeRange={applyTimeRange}

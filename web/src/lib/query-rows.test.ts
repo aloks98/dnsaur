@@ -1,6 +1,6 @@
 import { describe, expect, test } from "vitest";
 import type { QueryEntry } from "../api/types";
-import { durationLabel, rowKey } from "./query-rows";
+import { decisionTone, durationLabel, namesByKey, rowKey } from "./query-rows";
 
 function entry(over: Partial<QueryEntry> = {}): QueryEntry {
   return {
@@ -52,5 +52,41 @@ describe("durationLabel", () => {
 
   test("renders real measurements verbatim", () => {
     expect(durationLabel(24)).toBe("24");
+  });
+});
+
+describe("namesByKey", () => {
+  // A client's name is not validated and may be empty (ui-contract §3.4).
+  // An empty string in the map is a hit, so every `?? UNKNOWN` fallback at
+  // the call site stops firing and the cell renders blank.
+  test("leaves a client with an empty name out of the map", () => {
+    const map = namesByKey(
+      [
+        { id: 1, name: "Laptop" },
+        { id: 2, name: "" },
+      ],
+      (c) => c.id,
+    );
+    expect(map.get(1)).toBe("Laptop");
+    expect(map.has(2)).toBe(false);
+  });
+
+  test("takes no clients at all", () => {
+    expect(namesByKey(undefined, (c: { id: number; name: string }) => c.id).size).toBe(0);
+  });
+});
+
+describe("decisionTone", () => {
+  // The vocabulary is the resolver's (internal/dnssrv/pipeline.go), and
+  // there is no `allowed` in it — a decision this map has never heard of
+  // must still render, in the neutral tone.
+  test("tones every decision the resolver writes, and falls back for the rest", () => {
+    expect(decisionTone("blocked")).toBe("text-destructive");
+    expect(decisionTone("error")).toBe("text-destructive");
+    expect(decisionTone("stale")).toBe("text-warn");
+    expect(decisionTone("cached")).toBe("text-muted-foreground");
+    expect(decisionTone("forwarded")).toBe("text-foreground");
+    expect(decisionTone("authoritative")).toBe("text-primary");
+    expect(decisionTone("teleported")).toBe("text-muted-foreground");
   });
 });

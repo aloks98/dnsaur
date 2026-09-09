@@ -340,9 +340,9 @@ test("errors and authoritative answers get their own band, and the three still t
 
   // 10 forwarded + 2 cached + 2 stale = 14 served; 5 blocked; 3 error + 2
   // authoritative = 5 other. 14 + 5 + 5 = 24, the total the strip reports.
-  expect(await screen.findByText(`${SERVED}: 0,14`)).toBeInTheDocument();
-  expect(screen.getByText(`${BLOCKED}: 0,5`)).toBeInTheDocument();
-  expect(screen.getByText(`${OTHER}: 0,5`)).toBeInTheDocument();
+  expect(await screen.findByText(`${SERVED}: 14`)).toBeInTheDocument();
+  expect(screen.getByText(`${BLOCKED}: 5`)).toBeInTheDocument();
+  expect(screen.getByText(`${OTHER}: 5`)).toBeInTheDocument();
   expect(screen.getByRole("figure", { name: /24 queries/ })).toBeInTheDocument();
 });
 
@@ -361,8 +361,8 @@ test("a decision the page has never heard of still lands in a band", async () =>
 
   renderWithProviders(<Dashboard />, { route: "/?window=1h" });
 
-  expect(await screen.findByText(`${OTHER}: 0,7`)).toBeInTheDocument();
-  expect(screen.getByText(`${SERVED}: 0,4`)).toBeInTheDocument();
+  expect(await screen.findByText(`${OTHER}: 7`)).toBeInTheDocument();
+  expect(screen.getByText(`${SERVED}: 4`)).toBeInTheDocument();
 });
 
 // /stats/timeline emits a row only for hours that had traffic and never
@@ -388,6 +388,61 @@ test("hours with no traffic are synthesised as zeroes so the axis stays continuo
   expect(seriesEl(SERVED).textContent).toBe(`${SERVED}: 4,0,0,8`);
   expect(seriesEl(BLOCKED).textContent).toBe(`${BLOCKED}: 1,0,0,2`);
   expect(chart().getAttribute("data-buckets")).toBe("4");
+});
+
+/** The category labels the page handed the chart, off the merged option. */
+function categories(): string[] {
+  return chartOption<{ xAxis: { data: string[] } }>().xAxis.data;
+}
+
+// `from` is a raw unix second (`now - hours`) compared against hour-aligned
+// bucket starts, so the server drops the partially covered oldest hour whole
+// (ui-contract §4). An axis that starts at `floor(now − hours)` therefore
+// always opens on an hour the API cannot report — a fabricated zero at the
+// left edge of every window.
+test("the axis starts at the oldest hour the server can actually report", async () => {
+  server.use(
+    http.get("/api/v1/stats/timeline", () =>
+      HttpResponse.json([{ bucket: hourStart(0), decisions: { forwarded: 9 } }]),
+    ),
+  );
+
+  renderWithProviders(<Dashboard />, { route: "/?window=24h" });
+  await screen.findByTestId("timeline-chart");
+
+  // 24 hours the server can answer for, not 25 with a phantom at the front.
+  expect(chart().getAttribute("data-buckets")).toBe("24");
+});
+
+// 7d is 168 hourly bars. A date-only label gives all 24 of a day's bars the
+// same category, so neither the axis nor ECharts' own tooltip can say which
+// hour a bar is.
+test("a multi-day window labels each bar with its hour, not just its date", async () => {
+  server.use(
+    http.get("/api/v1/stats/timeline", () =>
+      HttpResponse.json([
+        { bucket: hourStart(0), decisions: { forwarded: 9 } },
+        { bucket: hourStart(1), decisions: { forwarded: 4 } },
+      ]),
+    ),
+  );
+
+  renderWithProviders(<Dashboard />, { route: "/?window=7d" });
+  await screen.findByTestId("timeline-chart");
+
+  const labels = categories();
+  expect(labels).toHaveLength(168);
+  expect(new Set(labels).size).toBe(168);
+});
+
+test("a same-day window keeps the clock-only label", async () => {
+  renderWithProviders(<Dashboard />, { route: "/?window=24h" });
+  await screen.findByTestId("timeline-chart");
+
+  // No date component — 24 bars never span more than two days, and the
+  // window selector above already says which.
+  const month = new Date(hourStart(0) * 1000).toLocaleDateString([], { month: "short" });
+  for (const label of categories()) expect(label).not.toContain(month);
 });
 
 test("the header names the real granularity, admits the lag, and legends all three bands", async () => {
@@ -625,6 +680,41 @@ test("HOSTNAME resolves through the client registry, and shows an em dash when i
   expect(within(liveRow("unknown.example")).getAllByText("192.168.11.63")).toHaveLength(1);
 });
 
+// A client's name is not validated server-side and may be empty
+// (ui-contract §3.4 — the Add-client form allows it too). An empty string in
+// the lookup map is a hit, so `?? EM_DASH` never fires and the cell renders
+// blank, which reads as a broken table rather than as "no name".
+test("a client with no name still renders an em dash, not an empty cell", async () => {
+  server.use(
+    http.get("/api/v1/clients", () =>
+      HttpResponse.json([{ id: 7, name: "", matcher: "192.168.1.10", group_id: 1 }]),
+    ),
+  );
+
+  renderWithProviders(<Dashboard />);
+  const source = await firstSource();
+  await emitAll(source, [
+    entry({ id: 0, q_name: "nameless.example", client_ip: "192.168.1.10", client_id: 7 }),
+  ]);
+
+  expect(within(liveRow("nameless.example")).getByText("—")).toBeInTheDocument();
+});
+
+// The rail labels a top client by its registry name where one exists; an
+// empty name is not one, and the address it really was beats a blank row.
+test("a top client with no name falls back to its address", async () => {
+  server.use(
+    http.get("/api/v1/clients", () =>
+      HttpResponse.json([{ id: 1, name: "", matcher: "192.168.1.10", group_id: 1 }]),
+    ),
+  );
+
+  renderWithProviders(<Dashboard />);
+
+  const rail = await screen.findByRole("region", { name: "Top client IPs" });
+  expect(await within(rail).findByText("192.168.1.10")).toBeInTheDocument();
+});
+
 // The decision vocabulary is the resolver's (internal/dnssrv/pipeline.go).
 // There is no `allowed` — no such decision exists — so nothing here may
 // invent one.
@@ -660,7 +750,8 @@ test("the rate readout stays absent until it has watched long enough to mean it"
   const source = await firstSource();
   act(() => source.emitOpen());
   act(() => {
-    for (let i = 1; i <= 20; i += 1) source.emit(entry({ id: i, q_name: `h${i}.example` }));
+    // id 0, the shape every row on the stream actually has.
+    for (let i = 1; i <= 20; i += 1) source.emit(entry({ id: 0, q_name: `h${i}.example` }));
   });
   // Past two ticks of the rate timer, so "nothing yet" is the warm-up
   // holding it back and not merely a timer that hasn't fired.
@@ -676,6 +767,82 @@ test("the rate readout stays absent until it has watched long enough to mean it"
 
   // 20 arrivals over the ~11.5s observed so far.
   expect(screen.getByText(/q\/s/i)).toBeInTheDocument();
+});
+
+/** The number the readout is currently claiming, as a number. */
+function arrivalRate(): number {
+  return Number.parseFloat(screen.getByText(/q\/s/i).textContent ?? "");
+}
+
+// Every row on the stream carries `id: 0` — internal/qlog/qlog.go publishes
+// the entry to the SSE hub before the batched insert assigns a primary key
+// (ui-contract §3.1). Detecting "new" rows by id therefore counted the first
+// batch and nothing ever again: `0 <= lastSeenId` for every row after it, so
+// the readout sat at 0.0 q/s under real traffic.
+test("arrivals are counted by identity, so a second batch of id-0 rows still registers", async () => {
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+
+  renderWithProviders(<Dashboard />);
+  const source = await firstSource();
+  act(() => source.emitOpen());
+  act(() => {
+    for (let i = 1; i <= 5; i += 1) source.emit(entry({ id: 0, q_name: `first${i}.example` }));
+  });
+  // Two advances, not one: the first closes the tail's 100ms coalescing
+  // window so the batch is actually observed, the second lets the rate
+  // timer tick with it recorded — and takes the readout past its warm-up.
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(500);
+  });
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(11_000);
+  });
+  expect(arrivalRate()).toBeGreaterThan(0);
+
+  // Past the 30s rate window, so the first batch has aged out and the
+  // readout is measuring nothing but what comes next.
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(40_000);
+  });
+  expect(arrivalRate()).toBe(0);
+
+  act(() => {
+    for (let i = 1; i <= 15; i += 1) source.emit(entry({ id: 0, q_name: `second${i}.example` }));
+  });
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(500);
+  });
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(2_000);
+  });
+
+  expect(arrivalRate()).toBeGreaterThan(0);
+});
+
+// The tail is seeded once from GET /queries so the panel isn't empty on a
+// busy instance. Those rows are history that arrived in one lump, not
+// traffic measured over the window — counting them would open every
+// dashboard on a fabricated burst.
+test("the seeded page of history is not counted as arrivals", async () => {
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  server.use(
+    http.get("/api/v1/queries", () =>
+      HttpResponse.json(
+        Array.from({ length: 60 }, (_, i) => entry({ id: i + 1, q_name: `seed${i}.example` })),
+      ),
+    ),
+  );
+
+  renderWithProviders(<Dashboard />);
+  const source = await firstSource();
+  act(() => source.emitOpen());
+  await waitFor(() => expect(screen.queryByText("seed0.example")).toBeInTheDocument());
+
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(11_000);
+  });
+
+  expect(arrivalRate()).toBe(0);
 });
 
 // --- 5. the right rail -------------------------------------------------------
@@ -832,6 +999,34 @@ test("a top-blocked row reveals Allow and posts the rule", async () => {
   await waitFor(() => expect(body).toEqual({ action: "allow", pattern: "ads.tracker.example" }));
   expect(await within(row).findByText("Allowed")).toBeInTheDocument();
   expect(successSpy).toHaveBeenCalledWith("Allowed ads.tracker.example");
+});
+
+// The status map is keyed by domain, so every cell showing that domain
+// confirms the same write — but each cell used to label the confirmation
+// from *its own* action, and the two disagree. Blocking a forwarded live row
+// left the Top-blocked row for the same domain reading "Allowed".
+test("the confirmation names the action that was taken, wherever the domain appears", async () => {
+  const user = userEvent.setup();
+  server.use(
+    http.post("/api/v1/groups/1/rules", () => HttpResponse.json({ id: 1 }, { status: 201 })),
+  );
+
+  renderWithProviders(<Dashboard />);
+  const source = await firstSource();
+  // The same domain the Top-blocked rail already lists, arriving forwarded.
+  // Emitted by hand rather than through emitAll, which waits on a text
+  // match the rail would satisfy on its own.
+  act(() => source.emitOpen());
+  act(() => source.emit(entry({ id: 0, q_name: "ads.tracker.example" })));
+
+  const live = screen.getByRole("region", { name: "Live queries" });
+  const row = (await within(live).findByText("ads.tracker.example")).closest("tr")!;
+  await user.click(within(row).getByRole("button", { name: "Block" }));
+
+  expect(await within(row).findByText("Blocked")).toBeInTheDocument();
+  const rail = screen.getByRole("region", { name: "Top blocked" });
+  expect(within(rail).getByText("Blocked")).toBeInTheDocument();
+  expect(within(rail).queryByText("Allowed")).not.toBeInTheDocument();
 });
 
 test("a failed quick action says so and leaves the action available", async () => {
