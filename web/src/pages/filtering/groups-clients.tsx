@@ -7,24 +7,10 @@ import { z } from "zod";
 import {
   Alert,
   AlertDescription,
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
   AlertTitle,
   Badge,
   Button,
   cn,
-  Dialog,
-  DialogClose,
-  DialogContent,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
   DropdownMenu,
   DropdownMenuCheckboxItem,
   DropdownMenuContent,
@@ -37,7 +23,6 @@ import {
   FormControl,
   FormField,
   FormItem,
-  FormLabel,
   FormMessage,
   Input,
   NativeSelect,
@@ -65,12 +50,8 @@ import {
 import { PauseControl } from "../../components/pause-control";
 import { StaleDataAlert } from "../../components/stale-data-alert";
 import { isValidIPv4, isValidIPv6, requiredText } from "../../lib/schemas";
-
-// The seeded, structural group — the server refuses to delete it
-// (internal/store/crud.go's DeleteGroup treats id 1 specially), so its row
-// disables the delete control up front instead of letting the click round
-// trip to a 409.
-const DEFAULT_GROUP_ID = 1;
+import { DEFAULT_GROUP_ID } from "../../lib/query-rows";
+import { ConfirmDeleteDialog, RenameDialog } from "../dialogs";
 
 function friendlyDeleteError(err: unknown, fallback: string): string {
   if (err instanceof ApiError && err.status === 409) return fallback;
@@ -128,9 +109,9 @@ function ClientMatchingPopover() {
 
 const nameSchema = requiredText("Name is required");
 
-/** Rename only ever changes the name. */
+/** Rename only ever changes the name, and a group's is required and unique
+ * (ui-contract §3.5) — unlike a list's, where blank has a meaning. */
 const groupNameSchema = z.object({ name: nameSchema });
-type GroupNameValues = z.infer<typeof groupNameSchema>;
 
 /**
  * Everything the add row owns, in one place.
@@ -285,63 +266,30 @@ function AddGroupRow({ allLists, onClose }: { allLists: List[]; onClose: () => v
 
 function RenameGroupDialog({ group, onClose }: { group: Group | null; onClose: () => void }) {
   const renameGroup = useRenameGroup();
-  const form = useForm<GroupNameValues>({
-    resolver: zodResolver(groupNameSchema),
-    defaultValues: { name: group?.name ?? "" },
-  });
-
-  if (!group) return null;
-
-  function onSubmit(values: GroupNameValues) {
-    if (!group) return;
-    renameGroup.mutate(
-      { id: group.id, name: values.name.trim() },
-      {
-        onSuccess: () => {
-          toast.success("Group renamed");
-          onClose();
-        },
-        onError: (err) =>
-          toast.error(err instanceof ApiError ? err.message : "Couldn't rename the group"),
-      },
-    );
-  }
 
   return (
-    <Dialog open onOpenChange={(next) => !next && onClose()}>
-      <DialogContent>
-        <DialogHeader>
-          <DialogTitle>Rename this group</DialogTitle>
-        </DialogHeader>
-        <Form {...form}>
-          <form
-            className="flex flex-col gap-4"
-            onSubmit={(e) => void form.handleSubmit(onSubmit)(e)}
-            noValidate
-          >
-            <FormField
-              control={form.control}
-              name="name"
-              render={({ field }) => (
-                <FormItem>
-                  <FormLabel>Name</FormLabel>
-                  <FormControl>
-                    <Input {...field} autoComplete="off" />
-                  </FormControl>
-                  <FormMessage />
-                </FormItem>
-              )}
-            />
-            <DialogFooter>
-              <DialogClose render={<Button type="button" variant="outline" />}>Cancel</DialogClose>
-              <Button type="submit" disabled={renameGroup.isPending}>
-                {renameGroup.isPending ? "Saving…" : "Save"}
-              </Button>
-            </DialogFooter>
-          </form>
-        </Form>
-      </DialogContent>
-    </Dialog>
+    <RenameDialog
+      targetId={group?.id ?? null}
+      title="Rename this group"
+      initialName={group?.name ?? ""}
+      schema={groupNameSchema}
+      isPending={renameGroup.isPending}
+      onClose={onClose}
+      onSubmit={(name) => {
+        if (!group) return;
+        renameGroup.mutate(
+          { id: group.id, name },
+          {
+            onSuccess: () => {
+              toast.success("Group renamed");
+              onClose();
+            },
+            onError: (err) =>
+              toast.error(err instanceof ApiError ? err.message : "Couldn't rename the group"),
+          },
+        );
+      }}
+    />
   );
 }
 
@@ -425,7 +373,13 @@ function GroupListsCell({ group, allLists }: { group: Group; allLists: List[] })
             <DropdownMenuCheckboxItem
               key={list.id}
               checked={assignedIds.has(list.id)}
-              disabled={setGroupLists.isPending || !groupLists.data}
+              // `isFetching` as well as `isPending`: the next set is derived
+              // from this query's data, which is stale from the moment a
+              // write lands until its refetch does. The mutation happens to
+              // stay pending across that window today (its onSuccess returns
+              // the invalidation's promise), but the set this control writes
+              // must be safe on its own terms, not on the hook's.
+              disabled={setGroupLists.isPending || groupLists.isFetching || !groupLists.data}
               onCheckedChange={(checked) => onToggle(list.id, checked)}
             >
               {/* The name, not the URL: a column of 90-character
@@ -459,6 +413,10 @@ function GroupRow({
   const deleteGroup = useDeleteGroup();
   const [deleteOpen, setDeleteOpen] = useState(false);
   const isDefault = group.id === DEFAULT_GROUP_ID;
+  // The server refuses the delete while any client still points at the group
+  // (internal/store/crud.go's DeleteGroup returns ErrInUse → 409), so the
+  // row says so up front instead of offering a confirm that can only fail.
+  const inUse = clientCount > 0;
 
   return (
     <div
@@ -532,7 +490,7 @@ function GroupRow({
             type="button"
             size="icon-sm"
             variant="ghost"
-            disabled={isDefault}
+            disabled={isDefault || inUse}
             aria-label={`Delete ${group.name}`}
             onClick={() => setDeleteOpen(true)}
           >
@@ -547,46 +505,46 @@ function GroupRow({
         </p>
       )}
 
+      {!isDefault && inUse && (
+        <p className="px-4 pb-2.5 pl-8 text-xs text-muted-foreground">
+          Move its {clientCount} {clientCount === 1 ? "client" : "clients"} first to delete it.
+        </p>
+      )}
+
       {!group.enabled && (
         <p className="flex items-center gap-2 px-4 pb-2.5 pl-8 text-xs text-destructive-foreground">
           <span className="font-mono font-semibold tracking-widest uppercase">Not filtering</span>
+          {/* The default group governs every device that matched no client
+              row (internal/clients/registry.go's Lookup), so counting only
+              the clients pinned to it under-reports what has stopped being
+              filtered — usually as "its 0 clients". */}
           <span className="text-pretty">
-            Nothing is blocked for its {clientCount} {clientCount === 1 ? "client" : "clients"}.
+            {isDefault
+              ? "Nothing is blocked for any device not pinned to another group."
+              : `Nothing is blocked for its ${clientCount} ${clientCount === 1 ? "client" : "clients"}.`}
           </span>
         </p>
       )}
 
-      <AlertDialog open={deleteOpen} onOpenChange={setDeleteOpen}>
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>Delete {group.name}?</AlertDialogTitle>
-            <AlertDialogDescription>
-              Its clients fall back to the default group.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction
-              className="bg-destructive text-destructive-solid-foreground hover:bg-destructive/90"
-              disabled={deleteGroup.isPending}
-              onClick={() =>
-                deleteGroup.mutate(group.id, {
-                  onSuccess: () => {
-                    toast.success(`${group.name} deleted`);
-                    setDeleteOpen(false);
-                  },
-                  onError: (err) =>
-                    toast.error(
-                      friendlyDeleteError(err, `Can't delete ${group.name} — it's still in use`),
-                    ),
-                })
-              }
-            >
-              {deleteGroup.isPending ? "Deleting…" : "Delete"}
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+      <ConfirmDeleteDialog
+        open={deleteOpen}
+        onOpenChange={setDeleteOpen}
+        title={`Delete ${group.name}?`}
+        description="Its rules and list assignments go with it."
+        isPending={deleteGroup.isPending}
+        onConfirm={() =>
+          deleteGroup.mutate(group.id, {
+            onSuccess: () => {
+              toast.success(`${group.name} deleted`);
+              setDeleteOpen(false);
+            },
+            onError: (err) =>
+              toast.error(
+                friendlyDeleteError(err, `Can't delete ${group.name} — it's still in use`),
+              ),
+          })
+        }
+      />
     </div>
   );
 }
@@ -686,7 +644,7 @@ function AddClientRow({
                   <Input
                     {...field}
                     aria-label="Client name"
-                    placeholder="Alok's laptop — optional"
+                    placeholder="Living room TV — optional"
                     autoComplete="off"
                   />
                 </FormControl>
@@ -755,10 +713,10 @@ function AddClientRow({
   );
 }
 
-const GROUP_BADGE: Record<string, NonNullable<BadgeProps["variant"]>> = {};
-
+/** The default group is the one every unpinned device lands in, so its badge
+ * is the quiet one; a deliberate assignment is the thing worth seeing. */
 function groupBadgeVariant(groupId: number): NonNullable<BadgeProps["variant"]> {
-  return GROUP_BADGE[groupId] ?? (groupId === DEFAULT_GROUP_ID ? "secondary" : "primary-light");
+  return groupId === DEFAULT_GROUP_ID ? "secondary" : "primary-light";
 }
 
 // --- page -----------------------------------------------------------------
@@ -902,7 +860,12 @@ export function GroupsClientsTab() {
   }
 
   return (
-    <div className="flex h-full min-h-0 flex-col">
+    // Both grids are fixed-pixel column templates (~680px of them), and the
+    // shell around this is h-screen/overflow-hidden — so on a narrow
+    // viewport the right-hand columns were clipped with no way to reach
+    // them. The header rows and the rows themselves have to scroll together,
+    // which is why this sits on the column rather than on each body.
+    <div data-slot="h-scroll" className="flex h-full min-h-0 flex-col overflow-x-auto">
       {(groups.isError && groups.data !== undefined) ||
       (clients.isError && clients.data !== undefined) ? (
         <div className="shrink-0 border-b border-border p-3">
@@ -1003,44 +966,31 @@ export function GroupsClientsTab() {
 
       <RenameGroupDialog group={renameTarget} onClose={() => setRenameTarget(null)} />
 
-      <AlertDialog
+      <ConfirmDeleteDialog
         open={deleteTarget !== null}
         onOpenChange={(open) => !open && setDeleteTarget(null)}
-      >
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>Delete this client?</AlertDialogTitle>
-            <AlertDialogDescription>
-              {deleteTarget && (
-                <>
-                  <code className="font-mono">{deleteTarget.matcher}</code> falls back to the
-                  default group.
-                </>
-              )}
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction
-              className="bg-destructive text-destructive-solid-foreground hover:bg-destructive/90"
-              disabled={deleteClient.isPending}
-              onClick={() => {
-                if (!deleteTarget) return;
-                const target = deleteTarget;
-                deleteClient.mutate(target.id, {
-                  onSuccess: () => {
-                    toast.success("Client deleted");
-                    setDeleteTarget(null);
-                  },
-                  onError: () => toast.error(`Couldn't delete ${target.matcher}`),
-                });
-              }}
-            >
-              {deleteClient.isPending ? "Deleting…" : "Delete"}
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+        title="Delete this client?"
+        description={
+          deleteTarget && (
+            <>
+              <code className="font-mono">{deleteTarget.matcher}</code> falls back to the default
+              group.
+            </>
+          )
+        }
+        isPending={deleteClient.isPending}
+        onConfirm={() => {
+          if (!deleteTarget) return;
+          const target = deleteTarget;
+          deleteClient.mutate(target.id, {
+            onSuccess: () => {
+              toast.success("Client deleted");
+              setDeleteTarget(null);
+            },
+            onError: () => toast.error(`Couldn't delete ${target.matcher}`),
+          });
+        }}
+      />
     </div>
   );
 }

@@ -20,7 +20,11 @@ async function fillCredentials(
 
 afterEach(() => vi.restoreAllMocks());
 
-test("bad credentials show an inline error, a toast, and keep the user on the credentials step", async () => {
+// One rejection, one message, in one place. The inline banner is the one
+// that stays on screen next to the field being corrected; a toast saying the
+// same thing in different words ("Invalid username or password." over
+// "Username or password is wrong.") reads as two separate failures.
+test("bad credentials show one inline error and keep the user on the credentials step", async () => {
   const user = userEvent.setup();
   server.use(
     http.post("/api/v1/auth/login", () =>
@@ -37,7 +41,7 @@ test("bad credentials show an inline error, a toast, and keep the user on the cr
   expect(screen.getByLabelText(/^username$/i)).toBeInTheDocument();
   // Password is cleared after a bad-credentials failure.
   expect(screen.getByLabelText(/^password$/i)).toHaveValue("");
-  expect(errorSpy).toHaveBeenCalledWith("Invalid username or password.");
+  expect(errorSpy).not.toHaveBeenCalled();
 });
 
 test("successful login resolves the mutation and the auth gate swaps from login to the app shell", async () => {
@@ -132,7 +136,7 @@ test("TOTP: a rejected code (401) keeps the user on the code step with the passw
   // Still on the code step, not bounced back to credentials.
   expect(screen.getByLabelText(/6-digit code/i)).toBeInTheDocument();
   expect(screen.queryByLabelText(/^password$/i)).not.toBeInTheDocument();
-  expect(errorSpy).toHaveBeenCalledWith("Invalid verification code — try again.");
+  expect(errorSpy).not.toHaveBeenCalled();
 
   // And the password survived: retrying the code re-sends it, so the user
   // never has to retype anything but the code itself.
@@ -162,5 +166,5 @@ test("409 (no admin account yet) surfaces a message pointing at first-run setup"
   expect(await screen.findByText(/no admin account yet/i)).toBeInTheDocument();
   expect(screen.getByText(/hasn't been set up yet/i)).toBeInTheDocument();
   expect(screen.getByRole("button", { name: /go to setup/i })).toBeInTheDocument();
-  expect(errorSpy).toHaveBeenCalledWith("This dnsaur instance hasn't been set up yet.");
+  expect(errorSpy).not.toHaveBeenCalled();
 });

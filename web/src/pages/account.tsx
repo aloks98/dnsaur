@@ -19,14 +19,6 @@ import * as QRCode from "qrcode";
 import {
   Alert,
   AlertDescription,
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
   AlertTitle,
   Badge,
   Button,
@@ -65,6 +57,7 @@ import { useTotpConfirm, useTotpDisable, useTotpStart } from "../hooks/use-totp"
 import { relativeTime } from "../lib/format";
 import { requiredText, totpCodeSchema } from "../lib/schemas";
 import { StaleDataAlert } from "../components/stale-data-alert";
+import { ConfirmDeleteDialog } from "./dialogs";
 
 // --- shared: copyable secret/token block ------------------------------
 
@@ -334,8 +327,8 @@ function TotpDisableDialog({
         <DialogHeader>
           <DialogTitle>Disable two-factor authentication</DialogTitle>
           <DialogDescription>
-            Enter a current code from your authenticator app to confirm. Your account will only need
-            a password to sign in afterward.
+            Enter a current code from your authenticator app. Signing in will need only a password
+            afterward.
           </DialogDescription>
         </DialogHeader>
         <Form {...form}>
@@ -839,9 +832,22 @@ function TokensCard() {
             <Button
               type="button"
               size="sm"
+              // The same guard the query log's Copy row JSON uses. Optional
+              // chaining alone would `await undefined` and then toast a
+              // success for a copy that never happened — and the clipboard
+              // API is absent outside a secure context, which is exactly
+              // where a homelab instance reached over plain HTTP lives. A
+              // false "Token copied" here costs the token: the next press is
+              // "I've saved it".
               onClick={() => {
-                void navigator.clipboard?.writeText(revealResult.token);
-                toast.success("Token copied");
+                if (!navigator.clipboard) {
+                  toast.error("Couldn't copy — this browser won't allow clipboard access here");
+                  return;
+                }
+                navigator.clipboard.writeText(revealResult.token).then(
+                  () => toast.success("Token copied"),
+                  () => toast.error("Couldn't copy the token"),
+                );
               }}
             >
               <Copy />
@@ -912,34 +918,23 @@ function TokensCard() {
         {body}
       </div>
 
-      <AlertDialog
+      <ConfirmDeleteDialog
         open={revokeTarget !== null}
         onOpenChange={(open) => !open && setRevokeTarget(null)}
-      >
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>Revoke this token?</AlertDialogTitle>
-            <AlertDialogDescription>
-              {revokeTarget && (
-                <>
-                  <code className="font-mono break-all text-foreground">{revokeTarget.name}</code>{" "}
-                  will stop working immediately. Anything using it will need a new token.
-                </>
-              )}
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction
-              className="bg-destructive text-destructive-solid-foreground hover:bg-destructive/90"
-              onClick={onConfirmRevoke}
-              disabled={revokeToken.isPending}
-            >
-              {revokeToken.isPending ? "Revoking…" : "Revoke"}
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+        title="Revoke this token?"
+        description={
+          revokeTarget && (
+            <>
+              <code className="font-mono break-all text-foreground">{revokeTarget.name}</code> stops
+              working immediately. Anything using it needs a new token.
+            </>
+          )
+        }
+        confirmLabel="Revoke"
+        pendingLabel="Revoking…"
+        isPending={revokeToken.isPending}
+        onConfirm={onConfirmRevoke}
+      />
     </Section>
   );
 }
@@ -971,7 +966,11 @@ export function Account() {
   const me = useMe();
 
   return (
-    <div className="flex h-full min-h-0 flex-col">
+    // The Section band and TOKEN_GRID are both fixed-pixel column templates,
+    // and the shell around this is h-screen/overflow-hidden
+    // (components/app-shell.tsx) — so a narrow viewport clipped the Revoke
+    // column with nothing to scroll.
+    <div data-slot="h-scroll" className="flex h-full min-h-0 flex-col overflow-x-auto">
       {me.isPending && <AccountSkeleton />}
 
       {me.isError && me.data === undefined && (

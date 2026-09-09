@@ -501,6 +501,57 @@ test("hostname resolves through client_id, and says nothing rather than guessing
   expect(within(rowFor("anon.example.com")).getByText("—")).toBeInTheDocument();
 });
 
+// A client's name is not validated server-side and may be empty
+// (ui-contract §3.4), and the Add-client form allows it. An empty string in
+// the lookup map is a hit, so the `?? UNKNOWN` fallback never fires and the
+// cell renders blank — which reads as a broken table, not as "no name".
+test("a client with an empty name leaves the hostname unknown, not blank", async () => {
+  server.use(
+    http.get("/api/v1/clients", () =>
+      HttpResponse.json([{ id: 7, name: "", matcher: "192.168.1.42", group_id: 1 }]),
+    ),
+  );
+
+  renderQueryLog();
+  const source = await firstSource();
+  act(() => source.emitOpen());
+  act(() =>
+    source.emit(entry({ q_name: "nameless.example.com", client_id: 7, client_ip: "192.168.1.42" })),
+  );
+
+  await screen.findByText("nameless.example.com");
+  expect(within(rowFor("nameless.example.com")).getByText("—")).toBeInTheDocument();
+});
+
+// `q_name` is `""` when the query carried no question (ui-contract §3.1).
+// The domain cell rendered an empty button — "Why was  forwarded?" — and the
+// quick rule posted an empty pattern, which the server answers 400 to after
+// the UI has already promised to block it.
+test("a row with no question name says so and offers no rule to write", async () => {
+  const user = userEvent.setup();
+  let posted = false;
+  server.use(
+    http.post("/api/v1/groups/:id/rules", () => {
+      posted = true;
+      return HttpResponse.json({ id: 1 }, { status: 201 });
+    }),
+  );
+
+  renderQueryLog();
+  const source = await firstSource();
+  act(() => source.emitOpen());
+  act(() => source.emit(entry({ q_name: "", decision: "error", r_code: "SERVFAIL" })));
+
+  const cell = await screen.findByRole("button", { name: /why was an unnamed query/i });
+  expect(cell).toHaveTextContent("—");
+
+  await user.click(cell);
+  const action = within(inspector()).getByRole("button", { name: /block domain/i });
+  expect(action).toBeDisabled();
+  await user.click(action);
+  expect(posted).toBe(false);
+});
+
 // duration_ms is time.Duration.Milliseconds() — truncated whole
 // milliseconds — so a sub-millisecond cache hit is logged as 0. Rendering
 // that as "0" claims an instantaneous resolve that nothing measured.
@@ -822,6 +873,52 @@ test("the client filter lists exact-IP clients as '<ip> <name>' and filters on t
   selectFilter(/client/i, "192.168.1.42");
   await waitFor(() => expect(urls.at(-1) ?? "").toContain("client=192.168.1.42"));
   expect(await screen.findByText("tablet.example")).toBeInTheDocument();
+});
+
+// `qlog.privacy=anon` masks the last octet on the way in
+// (internal/qlog/qlog.go's anonymize), so a stored `client_ip` never equals
+// any client's exact-IP matcher and `client=` can only ever return nothing.
+// Offering the filter anyway advertises a query that cannot match.
+test("the client filter is closed and says why when client IPs are masked", async () => {
+  server.use(
+    http.get("/api/v1/settings", () => HttpResponse.json({ "qlog.privacy": "anon" })),
+    http.get("/api/v1/clients", () =>
+      HttpResponse.json([{ id: 7, name: "kids-ipad", matcher: "192.168.1.42", group_id: 1 }]),
+    ),
+  );
+
+  renderQueryLog();
+  await firstSource();
+
+  const select = screen.getByRole("combobox", { name: /client/i });
+  await waitFor(() => expect(select).toBeDisabled());
+  expect(
+    within(select)
+      .getAllByRole("option")
+      .map((o) => o.textContent),
+  ).toEqual(["Client IPs masked"]);
+});
+
+test("the client filter stays open on the default privacy setting", async () => {
+  server.use(
+    http.get("/api/v1/settings", () => HttpResponse.json({ "qlog.privacy": "full" })),
+    http.get("/api/v1/clients", () =>
+      HttpResponse.json([{ id: 7, name: "kids-ipad", matcher: "192.168.1.42", group_id: 1 }]),
+    ),
+  );
+
+  renderQueryLog();
+  await firstSource();
+
+  const select = screen.getByRole("combobox", { name: /client/i });
+  await waitFor(() =>
+    expect(
+      within(select)
+        .getAllByRole("option")
+        .map((o) => o.textContent),
+    ).toEqual(["Any client IP", "192.168.1.42 kids-ipad"]),
+  );
+  expect(select).toBeEnabled();
 });
 
 // --- the time range ----------------------------------------------------------
@@ -1344,6 +1441,35 @@ test("selecting a row explains the decision and shows the raw record", async () 
   expect(duration).toHaveTextContent("0 under 1 ms, truncated");
   // rule_id 5 matched, so it carries no "nothing matched" annotation.
   expect(within(rail).getByText("rule_id").nextElementSibling).toHaveTextContent(/^5$/);
+});
+
+// The rules query exists to explain a *selected* row, and which group's
+// rules to ask for is a property of that row. With nothing selected the page
+// fell back to group 1 and fetched a ruleset it had no use for, on a screen
+// that opens on every page load.
+test("no ruleset is fetched until a row is selected", async () => {
+  const asked: string[] = [];
+  server.use(
+    http.get("/api/v1/groups/:id/rules", ({ request }) => {
+      asked.push(request.url);
+      return HttpResponse.json([]);
+    }),
+  );
+
+  const { queryClient } = renderQueryLog();
+  const source = await firstSource();
+  act(() => source.emitOpen());
+  act(() => source.emit(entry({ q_name: "quiet.example" })));
+  await screen.findByText("quiet.example");
+  // Let every query the page did start settle, so "nothing asked" can't
+  // merely mean "the request hasn't gone out yet".
+  await waitFor(() => expect(queryClient.isFetching()).toBe(0));
+
+  expect(asked).toEqual([]);
+
+  const user = userEvent.setup();
+  await selectRow(user, "quiet.example");
+  await waitFor(() => expect(asked).toHaveLength(1));
 });
 
 // A rule can be deleted between the query being logged and the row being

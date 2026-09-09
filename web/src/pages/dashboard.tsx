@@ -25,19 +25,33 @@ import { useGroups } from "../hooks/use-groups";
 import { useClients } from "../hooks/use-clients";
 import { LIVE_TAIL_CAP, useLiveTail } from "../hooks/use-queries";
 import { useStatsOverview, useStatsTimeline, useStatsTop } from "../hooks/use-stats";
-import { durationLabel, rowKey } from "../lib/query-rows";
+import {
+  clockTime,
+  DEFAULT_GROUP_ID,
+  decisionTone,
+  durationLabel,
+  namesByKey,
+  rowKey,
+} from "../lib/query-rows";
 import { hoursFor, parseWindow, WINDOW_PARAM, windowPhrase } from "../lib/stats-window";
 import { useTheme, type Theme } from "../lib/theme";
 import { StaleDataAlert } from "../components/stale-data-alert";
 
-// The group every quick rule targets unless the user picks another one.
-// Group 1 is the structural default (see hooks/use-groups.ts) and the group
-// unmatched clients resolve to (internal/clients/registry.go).
-const DEFAULT_GROUP_ID = 1;
-
 /** Rows of live tail the panel shows. The hook keeps 500; this is what
  * fits the split without turning the page into a second query log. */
 const LIVE_ROWS = 12;
+
+/**
+ * One quick rule in flight, or written.
+ *
+ * The action is stored rather than read off the cell that renders it: the
+ * map is keyed by domain, and the same domain can appear in the live table
+ * (offering Block) and the Top-blocked rail (offering Allow) at once.
+ */
+interface RuleStatus {
+  state: "pending" | "done";
+  action: "allow" | "block";
+}
 
 /** Sizes of the two right-rail panels, per the design. */
 const TOP_BLOCKED_N = 6;
@@ -54,40 +68,6 @@ const EM_DASH = "—";
 function pct(numerator: number, denominator: number): string {
   if (denominator <= 0) return EM_DASH;
   return `${Math.round((numerator / denominator) * 100)}%`;
-}
-
-function clockTime(atMs: number): string {
-  return new Date(atMs).toLocaleTimeString([], {
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-  });
-}
-
-/**
- * Per-decision tint, shared by the live rows.
- *
- * The six-way decision vocabulary is the resolver's (see
- * internal/dnssrv/pipeline.go); this is the design's flat, text-only reading
- * of it, not the query log's badge-and-icon treatment — twelve badges in a
- * 340px-adjacent column would be the loudest thing on the page.
- *
- * There is no `allowed` entry on purpose: there is no such decision in the
- * Go enum, so a row can't carry it.
- */
-const DECISION_TONE: Record<string, string> = {
-  blocked: "text-destructive",
-  // A failed resolve is a broken query, not a policy decision — but on a
-  // one-line readout it needs the same "look at me" weight as a block.
-  error: "text-destructive",
-  stale: "text-warn",
-  cached: "text-muted-foreground",
-  forwarded: "text-foreground",
-  authoritative: "text-primary",
-};
-
-function decisionTone(decision: string): string {
-  return DECISION_TONE[decision] ?? "text-muted-foreground";
 }
 
 /**
@@ -358,12 +338,19 @@ const HOUR_SEC = 3600;
  * trips on data the API can actually return. */
 const MAX_BUCKETS = 24 * 8 + 1;
 
+/**
+ * The x-axis category for one hourly bucket.
+ *
+ * Every bucket is an hour, whatever the window — so a multi-day window
+ * needs the date *and* the hour. Date-only gave all 24 of a day's bars the
+ * same category, which ECharts' tooltip reads verbatim: 24 bars all
+ * captioned "Sep 3", with no way to tell which hour was the spike.
+ */
 function bucketLabel(bucketSec: number, hours: number): string {
   const date = new Date(bucketSec * 1000);
-  if (hours <= 24) {
-    return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-  }
-  return date.toLocaleDateString([], { month: "short", day: "numeric" });
+  const clock = date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  if (hours <= 24) return clock;
+  return `${date.toLocaleDateString([], { month: "short", day: "numeric" })} ${clock}`;
 }
 
 /**
@@ -418,7 +405,12 @@ function timelineSeries(buckets: TimelineBucket[], hours: number) {
 
   const nowSec = Math.floor(Date.now() / 1000);
   const lastHour = Math.floor(nowSec / HOUR_SEC) * HOUR_SEC;
-  const firstHour = Math.floor((nowSec - hours * HOUR_SEC) / HOUR_SEC) * HOUR_SEC;
+  // The hour *after* the one `now - hours` falls in. `from` is a raw unix
+  // second compared against hour-aligned bucket starts, so the server drops
+  // the partially covered oldest hour whole (ui-contract §4): starting the
+  // axis at that hour put a zero the API can never fill at the left edge of
+  // every window.
+  const firstHour = Math.floor((nowSec - hours * HOUR_SEC) / HOUR_SEC) * HOUR_SEC + HOUR_SEC;
 
   // The axis spans the requested window *and* every bucket the API actually
   // handed over — dropping a returned bucket to keep a tidy axis would be
@@ -650,10 +642,7 @@ function QueryVolume({
     // claims dnsaur was up and quiet, which on a fresh instance is a guess.
     body = (
       <div className="flex h-full items-center justify-center font-sans">
-        <p className="text-sm text-muted-foreground">
-          No query activity yet. Once dnsaur answers queries in this window, what it forwarded,
-          cached, blocked and answered locally shows up here.
-        </p>
+        <p className="text-sm text-muted-foreground">No query activity yet.</p>
       </div>
     );
   } else {
@@ -716,21 +705,31 @@ const RATE_TICK_MS = 1_000;
  */
 function useArrivalRate(entries: QueryEntry[]): number | undefined {
   const observedFrom = useRef(Date.now());
-  const lastSeenId = useRef<number | undefined>(undefined);
+  // Object identity, not `entry.id`: every row on the stream carries id 0
+  // (ui-contract §3.1 — qlog publishes to the SSE hub before the batched
+  // insert assigns a primary key), so "ids above the last one counted"
+  // matched nothing after the first batch and the readout sat at 0.0 q/s
+  // under real traffic. Each SSE message is its own JSON.parse result, so
+  // identity is unique and the set costs nothing once the ring drops a row.
+  const counted = useRef(new WeakSet<QueryEntry>());
   const arrivals = useRef<{ at: number; n: number }[]>([]);
   const [rate, setRate] = useState<number | undefined>(undefined);
 
   useEffect(() => {
     // `entries` is newest-first and only ever grows at the front, so the run
-    // of ids above the last one we counted is exactly what's new. Length
-    // can't be used: it saturates at the buffer cap.
+    // of uncounted rows there is exactly what arrived. Length can't be used:
+    // it saturates at the buffer cap.
     let added = 0;
     for (const entry of entries) {
-      if (lastSeenId.current !== undefined && entry.id <= lastSeenId.current) break;
-      added += 1;
+      if (counted.current.has(entry)) break;
+      counted.current.add(entry);
+      // The one page of history the tail is seeded with (useLiveTail's
+      // LIVE_TAIL_SEED) comes from the database and carries a real id. It
+      // landed in one lump and was never measured over this window, so
+      // counting it would open every dashboard on a burst that never
+      // happened.
+      if (entry.id === 0) added += 1;
     }
-    const newest = entries[0];
-    if (newest !== undefined) lastSeenId.current = newest.id;
     if (added > 0) arrivals.current.push({ at: Date.now(), n: added });
   }, [entries]);
 
@@ -765,7 +764,7 @@ function LiveQueries({
   quickRuleDisabledReason,
 }: {
   quickRule: (action: "allow" | "block", pattern: string) => void;
-  ruleStatus: Record<string, "pending" | "done">;
+  ruleStatus: Record<string, RuleStatus>;
   quickRuleDisabled: boolean;
   quickRuleDisabledReason: string;
 }) {
@@ -920,16 +919,22 @@ function QuickRuleAction({
 }: {
   pattern: string;
   action: "allow" | "block";
-  status?: "pending" | "done";
+  status?: RuleStatus;
   disabled: boolean;
   disabledReason: string;
   onAction: (action: "allow" | "block", pattern: string) => void;
 }) {
   // Confirmation is never hover-gated: the user needs to see that it worked.
-  if (status === "done") {
+  //
+  // It names the action the *rule* carries, not this cell's own: the status
+  // map is keyed by domain, and a domain can be on screen twice offering
+  // opposite actions — a forwarded live row (Block) and the Top-blocked row
+  // for the same name (Allow). Labelling from the cell made blocking the
+  // first one report "Allowed" on the second.
+  if (status?.state === "done") {
     return (
       <span className="shrink-0 text-xs tracking-widest text-primary uppercase">
-        {action === "block" ? "Blocked" : "Allowed"}
+        {status.action === "block" ? "Blocked" : "Allowed"}
       </span>
     );
   }
@@ -937,7 +942,7 @@ function QuickRuleAction({
   return (
     <button
       type="button"
-      disabled={status === "pending" || disabled}
+      disabled={status?.state === "pending" || disabled}
       title={disabled ? disabledReason : undefined}
       onClick={() => onAction(action, pattern)}
       className={cn(
@@ -1138,21 +1143,19 @@ function RailBody({
  */
 function useClientHostnames(): Map<number, string> {
   const clients = useClients();
-  return useMemo(
-    () => new Map((clients.data ?? []).map((client) => [client.id, client.name])),
-    [clients.data],
-  );
+  return useMemo(() => namesByKey(clients.data, (client) => client.id), [clients.data]);
 }
 
 function useClientNames(): Map<string, string> {
   const clients = useClients();
-  return useMemo(() => {
-    const byIp = new Map<string, string>();
-    for (const client of clients.data ?? []) {
-      if (!client.matcher.includes("/")) byIp.set(client.matcher, client.name);
-    }
-    return byIp;
-  }, [clients.data]);
+  return useMemo(
+    () =>
+      namesByKey(
+        clients.data?.filter((client) => !client.matcher.includes("/")),
+        (client) => client.matcher,
+      ),
+    [clients.data],
+  );
 }
 
 // --- quick-rule group selector ----------------------------------------------
@@ -1223,18 +1226,18 @@ export function Dashboard() {
     : "Loading groups…";
 
   const addRule = useAddRule();
-  const [ruleStatus, setRuleStatus] = useState<Record<string, "pending" | "done">>({});
+  const [ruleStatus, setRuleStatus] = useState<Record<string, RuleStatus>>({});
 
   function quickRule(action: "allow" | "block", pattern: string) {
     // Named in the toast only when there was a choice — on a single-group
     // instance "in default" is noise, not information.
     const scope = availableGroups.length > 1 && selectedGroup ? ` in ${selectedGroup.name}` : "";
-    setRuleStatus((s) => ({ ...s, [pattern]: "pending" }));
+    setRuleStatus((s) => ({ ...s, [pattern]: { state: "pending", action } }));
     addRule.mutate(
       { groupId: effectiveGroupId, action, pattern },
       {
         onSuccess: () => {
-          setRuleStatus((s) => ({ ...s, [pattern]: "done" }));
+          setRuleStatus((s) => ({ ...s, [pattern]: { state: "done", action } }));
           toast.success(
             action === "block" ? `Blocked ${pattern}${scope}` : `Allowed ${pattern}${scope}`,
           );

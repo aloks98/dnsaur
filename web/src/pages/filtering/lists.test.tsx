@@ -208,12 +208,13 @@ test("deleting a list asks for confirmation, then DELETEs /filters/lists/{id}", 
   await waitFor(() => expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument());
 });
 
-test("an empty list says what lists are for, with the toolbar's Add still there", async () => {
+test("an empty list states it, with the toolbar's Add still there", async () => {
   server.use(http.get("/api/v1/filters/lists", () => HttpResponse.json([])));
 
   renderWithProviders(<ListsTab />);
 
-  expect(await screen.findByText(/no lists subscribed yet/i)).toBeInTheDocument();
+  // The string ui-contract §7 documents, verbatim.
+  expect(await screen.findByText("No filter lists yet.")).toBeInTheDocument();
   // Add lives in the toolbar at all times now, so there is exactly one of
   // it — an empty state with its own duplicate button would be two.
   expect(screen.getAllByRole("button", { name: /^add list$/i })).toHaveLength(1);
@@ -435,4 +436,48 @@ test("renaming PATCHes the name, and blank resets to the derived default", async
   await user.click(within(dialog).getByRole("button", { name: /^save$/i }));
 
   await waitFor(() => expect(bodies).toEqual([{ name: "" }, { name: "Kids blocklist" }]));
+});
+
+// The dialog is mounted unconditionally, so `useForm` captured its defaults
+// once and never again: text typed for one list survived Cancel and was
+// still sitting there the next time the dialog opened — on a different list,
+// under a placeholder naming that other list's current name.
+test("a cancelled rename leaves nothing behind for the next list", async () => {
+  const user = userEvent.setup();
+  server.use(
+    http.get("/api/v1/filters/lists", () =>
+      HttpResponse.json([
+        list({ id: 1, name: "First list", url: "https://example.com/one" }),
+        list({ id: 2, name: "Second list", url: "https://example.com/two" }),
+      ]),
+    ),
+  );
+
+  renderWithProviders(<ListsTab />);
+
+  await user.click(await screen.findByRole("button", { name: /rename first list/i }));
+  let dialog = await screen.findByRole("dialog");
+  await user.type(within(dialog).getByLabelText(/^name$/i), "half-typed");
+  await user.click(within(dialog).getByRole("button", { name: /^cancel$/i }));
+  await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+
+  await user.click(screen.getByRole("button", { name: /rename second list/i }));
+  dialog = await screen.findByRole("dialog");
+  // Blank, because blank is what "keep the current name" looks like here —
+  // and never the other list's half-typed replacement.
+  expect(within(dialog).getByLabelText(/^name$/i)).toHaveValue("");
+  expect(within(dialog).getByLabelText(/^name$/i)).toHaveAttribute("placeholder", "Second list");
+});
+
+// The grid is a fixed-pixel column template inside a shell that is
+// h-screen/overflow-hidden (components/app-shell.tsx), so on a phone the
+// Status and Actions columns were clipped with no way to reach them.
+test("the fixed-width grid sits in a horizontal scroll container", async () => {
+  renderWithProviders(<ListsTab />);
+  await screen.findByText("example.com hosts");
+
+  const scroller = document.querySelector('[data-slot="h-scroll"]');
+  expect(scroller).not.toBeNull();
+  expect(scroller!.className).toContain("overflow-x-auto");
+  expect(scroller!.contains(screen.getByText("example.com hosts"))).toBe(true);
 });

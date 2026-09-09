@@ -113,6 +113,37 @@ test("a disabled group says nothing is being filtered for its clients", async ()
   expect(screen.getByText(/nothing is blocked for its 2 clients/i)).toBeInTheDocument();
 });
 
+// The default group governs every device not pinned somewhere else
+// (internal/clients/registry.go's Lookup), so counting only the clients
+// pinned *to* it reported "its 0 clients" for the group that was, at that
+// moment, filtering nothing for the whole network.
+test("a disabled default group counts unpinned devices, not just its own clients", async () => {
+  mockAll({ groups: [group({ id: 1, name: "default", enabled: false })] });
+
+  renderWithProviders(<GroupsClientsTab />);
+  await waitFor(() => expect(groupRows()).toHaveLength(1));
+
+  expect(screen.getByText(/not filtering/i)).toBeInTheDocument();
+  expect(screen.getByText(/not pinned to another group/i)).toBeInTheDocument();
+  expect(screen.queryByText(/its 0 clients/i)).not.toBeInTheDocument();
+});
+
+// The two grids are ~680px of fixed-pixel columns inside a shell that is
+// h-screen/overflow-hidden (components/app-shell.tsx), so on a phone the
+// Blocking and Actions columns were clipped and unreachable — no scrollbar,
+// no way to pan.
+test("the fixed-width grids sit in a horizontal scroll container", async () => {
+  mockAll({ groups: [group({ id: 1, name: "default" })] });
+
+  renderWithProviders(<GroupsClientsTab />);
+  await waitFor(() => expect(groupRows()).toHaveLength(1));
+
+  const scroller = document.querySelector('[data-slot="h-scroll"]');
+  expect(scroller).not.toBeNull();
+  expect(scroller!.className).toContain("overflow-x-auto");
+  expect(scroller!.contains(groupRows()[0]!)).toBe(true);
+});
+
 test("toggling a group's switch PATCHes /groups/{id}", async () => {
   const user = userEvent.setup();
   let body: unknown;
@@ -210,6 +241,63 @@ test("renaming a group PATCHes /groups/{id}", async () => {
   await waitFor(() => expect(body).toEqual({ name: "Children" }));
 });
 
+// The dialog is mounted unconditionally, so `useForm` captured its defaults
+// once — at mount, with no target. The field therefore opened empty on the
+// first rename and, from then on, held whatever had last been typed: rename
+// "Kids" to "Children" and "Office" opened on "Children".
+test("rename opens on the target's own name, and never on the previous target's", async () => {
+  const user = userEvent.setup();
+  mockAll({ groups: [group({ id: 2, name: "Kids" }), group({ id: 3, name: "Office" })] });
+  server.use(http.patch("/api/v1/groups/:id", () => new HttpResponse(null, { status: 204 })));
+
+  renderWithProviders(<GroupsClientsTab />);
+  await waitFor(() => expect(groupRows()).toHaveLength(2));
+
+  await user.click(screen.getByRole("button", { name: /rename kids/i }));
+  let dialog = await screen.findByRole("dialog");
+  expect(within(dialog).getByLabelText(/^name$/i)).toHaveValue("Kids");
+
+  await user.clear(within(dialog).getByLabelText(/^name$/i));
+  await user.type(within(dialog).getByLabelText(/^name$/i), "Children");
+  await user.click(within(dialog).getByRole("button", { name: /^save$/i }));
+  await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+
+  await user.click(screen.getByRole("button", { name: /rename office/i }));
+  dialog = await screen.findByRole("dialog");
+  expect(within(dialog).getByLabelText(/^name$/i)).toHaveValue("Office");
+});
+
+// The server refuses `DELETE /groups/{id}` with 409 while any client points
+// at the group (internal/store/crud.go's DeleteGroup), so a dialog promising
+// the clients would fall back to the default group was describing something
+// that cannot happen.
+test("a group with clients can't be deleted, and says to move them first", async () => {
+  mockAll({
+    groups: [group({ id: 2, name: "Kids" })],
+    clients: [client({ id: 1, group_id: 2 }), client({ id: 2, matcher: "10.0.0.2", group_id: 2 })],
+  });
+
+  renderWithProviders(<GroupsClientsTab />);
+  await waitFor(() => expect(groupRows()).toHaveLength(1));
+
+  expect(screen.getByRole("button", { name: /delete kids/i })).toBeDisabled();
+  expect(screen.getByText(/move its 2 clients first/i)).toBeInTheDocument();
+});
+
+test("a group with no clients still deletes, and the dialog says what goes with it", async () => {
+  const user = userEvent.setup();
+  mockAll({ groups: [group({ id: 2, name: "Kids" })] });
+  server.use(http.delete("/api/v1/groups/2", () => new HttpResponse(null, { status: 204 })));
+
+  renderWithProviders(<GroupsClientsTab />);
+  await waitFor(() => expect(groupRows()).toHaveLength(1));
+
+  await user.click(screen.getByRole("button", { name: /delete kids/i }));
+  const confirm = await screen.findByRole("alertdialog");
+  expect(confirm).toHaveTextContent(/rules and list assignments/i);
+  expect(confirm).not.toHaveTextContent(/fall back to the default group/i);
+});
+
 test("deleting a non-default group asks for confirmation, then DELETEs it", async () => {
   const user = userEvent.setup();
   let deleted = false;
@@ -279,6 +367,72 @@ test("toggling a list PUTs the whole assigned set, not just the one clicked", as
 
   // Both ids, because A was already assigned and must survive adding B.
   await waitFor(() => expect(body).toEqual({ list_ids: [1, 2] }));
+});
+
+// The next set is computed from `groupLists.data`, which is stale between a
+// successful PUT and the refetch it triggers. Ticking a second list inside
+// that window would PUT the *old* set plus the new one and silently drop
+// what was just written, so nothing may be clickable until the read lands.
+test("no list can be toggled while the post-write refetch is still in flight", async () => {
+  const bodies: { list_ids: number[] }[] = [];
+  let releaseRefetch: (() => void) | undefined;
+  server.use(
+    http.get("/api/v1/groups", () => HttpResponse.json([group({ id: 1, name: "default" })])),
+    http.get("/api/v1/clients", () => HttpResponse.json([])),
+    http.get("/api/v1/filters/lists", () =>
+      HttpResponse.json([
+        list({ id: 1, name: "A" }),
+        list({ id: 2, name: "B" }),
+        list({ id: 3, name: "C" }),
+      ]),
+    ),
+    http.get("/api/v1/groups/:id/lists", async () => {
+      // Every read after the first write is held open, so the second click
+      // lands inside exactly the window the bug lived in.
+      if (bodies.length > 0) {
+        await new Promise<void>((resolve) => {
+          releaseRefetch = resolve;
+        });
+      }
+      return HttpResponse.json([list({ id: 2, name: "B" })]);
+    }),
+    http.put("/api/v1/groups/1/lists", async ({ request }) => {
+      bodies.push((await request.json()) as { list_ids: number[] });
+      return new HttpResponse(null, { status: 204 });
+    }),
+  );
+
+  renderWithProviders(<GroupsClientsTab />);
+
+  // fireEvent, not userEvent: base-ui's Menu re-closes on userEvent's full
+  // pointerdown→click sequence under jsdom (no geometry to hit-test).
+  fireEvent.click(await screen.findByRole("button", { name: /lists \(1\)/i }));
+  fireEvent.click(await screen.findByRole("menuitemcheckbox", { name: "A" }));
+  await waitFor(() => expect(bodies).toEqual([{ list_ids: [2, 1] }]));
+  // The write has fully settled — so nothing below is merely the write's own
+  // pending state holding the control shut — and the refetch it triggered is
+  // held open by the handler above.
+  // Held shut for the whole read, not merely for the write: the cached set
+  // still says [B], so a click here would send [B, C].
+  await waitFor(() =>
+    expect(screen.getByRole("menuitemcheckbox", { name: "C" })).toHaveAttribute(
+      "aria-disabled",
+      "true",
+    ),
+  );
+  fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "C" }));
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  // Never [B, C] — A was written a moment ago and must not vanish again.
+  expect(bodies.filter((b) => !b.list_ids.includes(1))).toEqual([]);
+
+  // And the control comes back once the read lands.
+  releaseRefetch?.();
+  await waitFor(() =>
+    expect(screen.getByRole("menuitemcheckbox", { name: "C" })).not.toHaveAttribute(
+      "aria-disabled",
+      "true",
+    ),
+  );
 });
 
 // The bug this screen shipped with. The toggle computes the next set from

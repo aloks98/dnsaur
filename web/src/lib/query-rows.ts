@@ -50,3 +50,73 @@ export function rowKey(entry: QueryEntry): string {
 export function durationLabel(ms: number): string {
   return ms > 0 ? String(ms) : "<1";
 }
+
+/**
+ * The group a rule is written into when nothing else names one.
+ *
+ * Id 1 is structural: the server seeds it, refuses to delete it
+ * (internal/store/crud.go's DeleteGroup) and resolves every client that
+ * matched no client row to it (internal/clients/registry.go's Lookup). Five
+ * screens needed the same constant, and five copies of a number that has to
+ * agree with two Go files is four too many.
+ */
+export const DEFAULT_GROUP_ID = 1;
+
+/**
+ * Per-decision tint, shared by the dashboard's live feed and the query
+ * log's table.
+ *
+ * The six-way decision vocabulary is the resolver's (see
+ * internal/dnssrv/pipeline.go); this is the flat, text-only reading of it —
+ * no badges, no icons, because a column of a thousand tinted pills is the
+ * loudest thing on a page whose whole point is scanning a thousand rows.
+ *
+ * There is no `allowed` entry on purpose: there is no such decision in the
+ * Go enum, so a row can't carry one. Both screens render the same enum, so
+ * one map tracks it rather than two that have to be kept in step.
+ */
+const DECISION_TONE: Record<string, string> = {
+  blocked: "text-destructive",
+  // A failed resolve is a broken query, not a policy decision — but on a
+  // one-line readout it needs the same "look at me" weight as a block.
+  error: "text-destructive",
+  stale: "text-warn",
+  cached: "text-muted-foreground",
+  forwarded: "text-foreground",
+  authoritative: "text-primary",
+};
+
+export function decisionTone(decision: string): string {
+  return DECISION_TONE[decision] ?? "text-muted-foreground";
+}
+
+/** `at` is unix ms; both screens print the wall clock and nothing else —
+ * the date is the window's job, not a row's. */
+export function clockTime(atMs: number): string {
+  return new Date(atMs).toLocaleTimeString([], {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+}
+
+/**
+ * `client_id` (or an exact-IP matcher) → the client's name, for whichever
+ * column is showing a hostname.
+ *
+ * Names are **not validated server-side and may be empty** (ui-contract
+ * §3.4 — the Add-client form allows it too). An empty name in the map makes
+ * every `?? UNKNOWN` fallback at the call site fire on a value that exists,
+ * so the cell renders blank instead of the em dash or the address the page
+ * promised. Skipping the empty ones is what keeps that fallback reachable.
+ */
+export function namesByKey<T extends { name: string }, K>(
+  clients: readonly T[] | undefined,
+  key: (client: T) => K,
+): Map<K, string> {
+  const byKey = new Map<K, string>();
+  for (const client of clients ?? []) {
+    if (client.name !== "") byKey.set(key(client), client.name);
+  }
+  return byKey;
+}

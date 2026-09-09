@@ -361,6 +361,25 @@ test("lists created but not attached are reported as applied to nothing", async 
   expect(creates).toBe(DEFAULT_CHOSEN);
 });
 
+// The done screen claimed "Upstreams 1.1.1.1, 1.0.0.1 and 9.9.9.9, racing"
+// as a fact, but `upstreams` is a setting a bootstrap config can already
+// have changed (docs/configuration.md) — and the wizard never reads it. A
+// first-run screen that names the wrong resolvers is worse than one that
+// names none.
+test("the done screen doesn't invent the upstreams it was never told", async () => {
+  const user = userEvent.setup();
+  mockAccountCreation();
+
+  renderWithProviders(<Setup />);
+  await fillAccountForm(user);
+  await onListsStep();
+  await user.click(screen.getByRole("button", { name: /skip for now/i }));
+
+  expect(await screen.findByText(/resolver is answering/i)).toBeInTheDocument();
+  expect(screen.queryByText(/1\.1\.1\.1/)).not.toBeInTheDocument();
+  expect(screen.queryByText(/9\.9\.9\.9/)).not.toBeInTheDocument();
+});
+
 test("the done screen names the address to point a router at", async () => {
   const user = userEvent.setup();
   mockAccountCreation();

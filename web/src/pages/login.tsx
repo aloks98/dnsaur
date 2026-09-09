@@ -157,6 +157,11 @@ export function Login() {
       },
       {
         onSuccess: () => toast.success("Logged in"),
+        // Rejections are said once, inline, and nowhere else. Every branch
+        // below used to raise a toast as well, in different words from the
+        // banner it sat above — "Invalid username or password." over
+        // "Username or password is wrong." reads as two failures, and the
+        // toast is gone by the time the retry is typed.
         onError: (err) => {
           if (err instanceof ApiError && err.status === 428) {
             form.resetField("totpCode");
@@ -176,13 +181,13 @@ export function Login() {
             const message = "That code didn't match.";
             setFormError({ setupRequired: false, message });
             form.resetField("totpCode");
-            toast.error("Invalid verification code — try again.");
             return;
           }
           if (err instanceof ApiError && err.status === 409) {
-            const message = "This dnsaur instance hasn't been set up yet.";
-            setFormError({ setupRequired: true, message });
-            toast.error(message);
+            setFormError({
+              setupRequired: true,
+              message: "This dnsaur instance hasn't been set up yet.",
+            });
             return;
           }
           const message =
@@ -194,7 +199,6 @@ export function Login() {
           setFormError({ setupRequired: false, message });
           form.resetField("password");
           setStep("credentials");
-          toast.error("Invalid username or password.");
           form.setFocus("password");
         },
       },

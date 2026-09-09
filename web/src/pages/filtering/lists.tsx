@@ -7,14 +7,6 @@ import { z } from "zod";
 import {
   Alert,
   AlertDescription,
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
   AlertTitle,
   Badge,
   Button,
@@ -54,6 +46,7 @@ import {
 import { relativeTime } from "../../lib/format";
 import { deriveListName } from "../../lib/list-name";
 import { StaleDataAlert } from "../../components/stale-data-alert";
+import { ConfirmDeleteDialog, RenameDialog } from "../dialogs";
 
 /** Block/allow, as a colour pair rather than words in a sentence. */
 const KIND_VARIANT: Record<List["kind"], NonNullable<BadgeProps["variant"]>> = {
@@ -107,14 +100,14 @@ function statusDetail(list: List): string {
     case "stale":
       return `Refresh failed — still enforcing the copy from ${relativeTime(list.last_refreshed)}. Last tried ${relativeTime(list.last_attempt)}: ${list.last_error}`;
     case "failed":
-      return `Download failed — ${list.last_error}. No usable copy, so this list is blocking nothing.`;
+      return `Download failed — ${list.last_error}. Blocking nothing.`;
     case "empty":
       // last_error carries *why* the parser produced nothing, which is the
       // only actionable part — without it this says "no entries" twice and
       // sends the admin looking at their network, which is not the problem.
-      return `No usable entries — ${list.last_error}. The download itself worked, so this is a format problem, not a network one; the list is blocking nothing.`;
+      return `No usable entries — ${list.last_error}. Blocking nothing.`;
     default:
-      return "Added but not yet fetched. 0 entries is expected until the first refresh lands.";
+      return "Added but not yet fetched.";
   }
 }
 
@@ -156,10 +149,11 @@ const addListSchema = z.object({
 type AddListValues = z.infer<typeof addListSchema>;
 const ADD_LIST_DEFAULTS: AddListValues = { url: "", kind: "block", name: "" };
 
+/** Blank is a legitimate submission — the server reads it as "go back to the
+ * URL-derived default" — so the field is never required. */
 const renameListSchema = z.object({
   name: z.string().trim().max(120, "Name is too long (max 120)"),
 });
-type RenameListValues = z.infer<typeof renameListSchema>;
 
 function AddListDialog() {
   const [open, setOpen] = useState(false);
@@ -264,9 +258,7 @@ function AddListDialog() {
                       <NativeSelectOption value="allow">Allow</NativeSelectOption>
                     </NativeSelect>
                   </FormControl>
-                  <FormDescription>
-                    Allow lists are checked before block lists, so an allow entry always wins.
-                  </FormDescription>
+                  <FormDescription>Allow lists are checked before block lists.</FormDescription>
                 </FormItem>
               )}
             />
@@ -290,68 +282,37 @@ function AddListDialog() {
  */
 function RenameListDialog({ list, onClose }: { list: List | null; onClose: () => void }) {
   const renameList = useRenameList();
-  const form = useForm<RenameListValues>({
-    resolver: zodResolver(renameListSchema),
-    defaultValues: { name: "" },
-  });
-
-  if (!list) return null;
-
-  function onSubmit(values: RenameListValues) {
-    if (!list) return;
-    const target = list;
-    renameList.mutate(
-      { id: target.id, name: values.name.trim() },
-      {
-        onSuccess: () => {
-          toast.success("List renamed");
-          onClose();
-        },
-        onError: (err) =>
-          toast.error(err instanceof ApiError ? err.message : `Couldn't rename ${target.name}`),
-      },
-    );
-  }
 
   return (
-    <Dialog open onOpenChange={(next) => !next && onClose()}>
-      <DialogContent>
-        <DialogHeader>
-          <DialogTitle>Rename this list</DialogTitle>
-          <DialogDescription>
-            Used everywhere dnsaur would otherwise print the raw URL.
-          </DialogDescription>
-        </DialogHeader>
-        <Form {...form}>
-          <form
-            className="flex flex-col gap-4"
-            onSubmit={(e) => void form.handleSubmit(onSubmit)(e)}
-            noValidate
-          >
-            <FormField
-              control={form.control}
-              name="name"
-              render={({ field }) => (
-                <FormItem>
-                  <FormLabel>Name</FormLabel>
-                  <FormControl>
-                    <Input {...field} placeholder={list.name} autoComplete="off" />
-                  </FormControl>
-                  <FormDescription>Blank goes back to {deriveListName(list.url)}.</FormDescription>
-                  <FormMessage />
-                </FormItem>
-              )}
-            />
-            <DialogFooter>
-              <DialogClose render={<Button type="button" variant="outline" />}>Cancel</DialogClose>
-              <Button type="submit" disabled={renameList.isPending}>
-                {renameList.isPending ? "Saving…" : "Save"}
-              </Button>
-            </DialogFooter>
-          </form>
-        </Form>
-      </DialogContent>
-    </Dialog>
+    <RenameDialog
+      targetId={list?.id ?? null}
+      title="Rename this list"
+      description="Used everywhere dnsaur would otherwise print the raw URL."
+      // Blank, not the current name: blank is what the server reads as "go
+      // back to the URL-derived default", so the field has to be able to
+      // mean it. The placeholder carries the current name instead.
+      initialName=""
+      placeholder={list?.name}
+      hint={list && `Blank goes back to ${deriveListName(list.url)}.`}
+      schema={renameListSchema}
+      isPending={renameList.isPending}
+      onClose={onClose}
+      onSubmit={(name) => {
+        if (!list) return;
+        const target = list;
+        renameList.mutate(
+          { id: target.id, name },
+          {
+            onSuccess: () => {
+              toast.success("List renamed");
+              onClose();
+            },
+            onError: (err) =>
+              toast.error(err instanceof ApiError ? err.message : `Couldn't rename ${target.name}`),
+          },
+        );
+      }}
+    />
   );
 }
 
@@ -442,12 +403,7 @@ export function ListsTab() {
       </div>
     );
   } else if (all.length === 0) {
-    body = (
-      <p className="p-6 text-center text-sm text-muted-foreground">
-        No lists subscribed yet. Add a blocklist or allowlist URL and dnsaur will fetch it and keep
-        it refreshed.
-      </p>
-    );
+    body = <p className="p-6 text-center text-sm text-muted-foreground">No filter lists yet.</p>;
   } else if (shown.length === 0) {
     body = (
       <p className="p-6 text-center text-sm text-muted-foreground">
@@ -551,7 +507,12 @@ export function ListsTab() {
   }
 
   return (
-    <div className="flex h-full min-h-0 flex-col">
+    // GRID is a fixed-pixel column template inside a shell that is
+    // h-screen/overflow-hidden (components/app-shell.tsx), so a narrow
+    // viewport clipped the Status and Actions columns with nothing to
+    // scroll. On the column, not on the body, so the header row and the
+    // rows below it move together.
+    <div data-slot="h-scroll" className="flex h-full min-h-0 flex-col overflow-x-auto">
       <div className="flex shrink-0 flex-wrap items-center gap-3 border-b border-border px-4 py-2.5">
         <Input
           value={search}
@@ -674,35 +635,22 @@ export function ListsTab() {
 
       <RenameListDialog list={renameTarget} onClose={() => setRenameTarget(null)} />
 
-      <AlertDialog
+      <ConfirmDeleteDialog
         open={deleteTarget !== null}
         onOpenChange={(open) => !open && setDeleteTarget(null)}
-      >
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>Delete this list?</AlertDialogTitle>
-            <AlertDialogDescription>
-              {deleteTarget && (
-                <>
-                  <span className="font-medium text-foreground">{deleteTarget.name}</span> (
-                  <code className="font-mono break-all">{deleteTarget.url}</code>) will stop being
-                  fetched, and its entries will no longer be enforced.
-                </>
-              )}
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction
-              className="bg-destructive text-destructive-solid-foreground hover:bg-destructive/90"
-              onClick={onConfirmDelete}
-              disabled={deleteList.isPending}
-            >
-              {deleteList.isPending ? "Deleting…" : "Delete"}
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+        title="Delete this list?"
+        description={
+          deleteTarget && (
+            <>
+              <span className="font-medium text-foreground">{deleteTarget.name}</span> (
+              <code className="font-mono break-all">{deleteTarget.url}</code>) stops being fetched,
+              and its entries stop being enforced.
+            </>
+          )
+        }
+        isPending={deleteList.isPending}
+        onConfirm={onConfirmDelete}
+      />
     </div>
   );
 }

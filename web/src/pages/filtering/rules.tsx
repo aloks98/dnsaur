@@ -7,14 +7,6 @@ import { z } from "zod";
 import {
   Alert,
   AlertDescription,
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
   AlertTitle,
   Badge,
   Button,
@@ -39,6 +31,8 @@ import type { Rule } from "../../api/types";
 import { useAddRule, useDeleteRule, useRules } from "../../hooks/use-filters";
 import { useGroups } from "../../hooks/use-groups";
 import { StaleDataAlert } from "../../components/stale-data-alert";
+import { DEFAULT_GROUP_ID } from "../../lib/query-rows";
+import { ConfirmDeleteDialog } from "../dialogs";
 
 // The server compiles a regex rule's pattern with Go's regexp package (see
 // internal/api/filters_handlers.go's handleRuleCreate); `new RegExp` isn't a
@@ -47,10 +41,26 @@ import { StaleDataAlert } from "../../components/stale-data-alert";
 // cap mirrors that same handler's own length check exactly.
 const MAX_REGEX_PATTERN_LENGTH = 512;
 
-// The default group (id 1, seeded and undeletable — see use-groups.ts) is a
-// safe first selection: it always exists, so the select never opens on an
-// empty choice while groups are still loading.
-const DEFAULT_GROUP_ID = 1;
+/**
+ * The pattern rewritten into V8's spelling of the constructs Go's regexp has
+ * and V8 does not — used only to let `new RegExp` judge the *syntax*. What
+ * gets sent is always the pattern as typed.
+ *
+ * Two of them, both verified against both engines: inline flag settings
+ * (`(?i)ads`, `(?is)^ads.*`), which V8 has no equivalent for at all, and
+ * `(?P<name>…)`, which V8 spells `(?<name>…)`. Without this the check
+ * rejected patterns the resolver compiles happily — the exact failure
+ * lib/schemas.ts warns against, since a false reject silently blocks a
+ * legitimate value while a false accept costs one 400 toast.
+ *
+ * `(?i:…)` needs nothing: V8 has modifier groups.
+ */
+function inV8Spelling(pattern: string): string {
+  return pattern
+    .replaceAll(/\(\?[imsU-]+\)/g, "")
+    .replaceAll(/\(\?[imsU-]+:/g, "(?:")
+    .replaceAll("(?P<", "(?<");
+}
 
 /** Same red/green thread as the Lists tab's block/allow badges — an action
  * reads the same way wherever it appears, even though this is a distinct
@@ -144,7 +154,7 @@ const addRuleSchema = z
     }
     try {
       // eslint-disable-next-line no-new -- constructed only to validate syntax
-      new RegExp(pattern);
+      new RegExp(inV8Spelling(pattern));
     } catch (err) {
       fail(`Invalid regular expression: ${err instanceof Error ? err.message : "syntax error"}`);
     }
@@ -446,7 +456,11 @@ export function RulesTab() {
   }
 
   return (
-    <div className="flex h-full min-h-0 flex-col">
+    // GRID and FORM_GRID are fixed-pixel column templates, and the shell
+    // around this is h-screen/overflow-hidden (components/app-shell.tsx) —
+    // so a narrow viewport clipped the right-hand columns with nothing to
+    // scroll. On the column, so the header and the rows move together.
+    <div data-slot="h-scroll" className="flex h-full min-h-0 flex-col overflow-x-auto">
       <div className="flex shrink-0 flex-wrap items-center gap-3 border-b border-border px-4 py-2.5">
         <div className="flex items-center gap-1.5">
           <span className="font-mono text-xs tracking-widest text-muted-foreground uppercase">
@@ -526,37 +540,22 @@ export function RulesTab() {
 
       <div className="min-h-0 flex-1 overflow-y-auto">{body}</div>
 
-      <AlertDialog
+      <ConfirmDeleteDialog
         open={deleteTarget !== null}
         onOpenChange={(open) => !open && setDeleteTarget(null)}
-      >
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>Delete this rule?</AlertDialogTitle>
-            <AlertDialogDescription>
-              {deleteTarget && (
-                <>
-                  The {deleteTarget.action} rule for{" "}
-                  <code className="font-mono break-all text-foreground">
-                    {deleteTarget.pattern}
-                  </code>{" "}
-                  will stop applying to {groupName}.
-                </>
-              )}
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction
-              className="bg-destructive text-destructive-solid-foreground hover:bg-destructive/90"
-              onClick={onConfirmDelete}
-              disabled={deleteRule.isPending}
-            >
-              {deleteRule.isPending ? "Deleting…" : "Delete"}
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+        title="Delete this rule?"
+        description={
+          deleteTarget && (
+            <>
+              The {deleteTarget.action} rule for{" "}
+              <code className="font-mono break-all text-foreground">{deleteTarget.pattern}</code>{" "}
+              stops applying to {groupName}.
+            </>
+          )
+        }
+        isPending={deleteRule.isPending}
+        onConfirm={onConfirmDelete}
+      />
     </div>
   );
 }

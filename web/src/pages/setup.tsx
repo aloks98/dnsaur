@@ -27,8 +27,10 @@ import type { List } from "../api/types";
 import { AuthLayout } from "../components/auth-layout";
 import { authKeys, useSetup, useSetupSignIn } from "../hooks/use-auth";
 import { useAddList, useAssignGroupLists } from "../hooks/use-filters";
+import { DEFAULT_GROUP_ID } from "../lib/query-rows";
 
-const STARTER_GROUP_ID = 1;
+/** The starter lists go to the group every unpinned device resolves in. */
+const STARTER_GROUP_ID = DEFAULT_GROUP_ID;
 
 /**
  * Every URL here is fetched on first run, so a dead one is the worst
@@ -571,8 +573,7 @@ export function Setup() {
                     {outcome.failed.length > 0
                       ? `${outcome.failed.join(", ")} couldn't be added.`
                       : "The lists were created but couldn't be applied to the default group, so they are filtering nothing."}{" "}
-                    Everything else is in place and dnsaur is already resolving. You can retry or
-                    remove them from Filtering → Lists.
+                    Everything else is in place. Fix them in Filtering → Lists.
                   </AlertDescription>
                 </Alert>
               )}
@@ -600,10 +601,15 @@ export function Setup() {
                     }
                   />
                 )}
+                {/* Deliberately unnamed: `upstreams` is a setting, and a
+                    bootstrap config can already have changed it before this
+                    screen renders (docs/configuration.md). The wizard never
+                    reads it, so naming three resolvers here was a guess
+                    printed as a fact. */}
                 <DoneCheck
                   ok
                   label="Resolver is answering"
-                  detail="Upstreams 1.1.1.1, 1.0.0.1 and 9.9.9.9, racing for the first reply."
+                  detail="Forwarding to the upstreams in Settings."
                 />
               </div>
 
