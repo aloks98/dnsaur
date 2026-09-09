@@ -30,7 +30,9 @@ terminal upstream forwarder. Each stage can answer the query outright
    qtype, decision, upstream, latency, rcode) to a buffered async channel.
    Logging never blocks resolution.
 2. **recovery** — recovers panics from any inner stage into a `SERVFAIL`
-   response instead of crashing the server. One bad query never takes down
+   response instead of crashing the server. It covers the goroutine the
+   query arrived on, so a stage that spawns its own — the forwarder's
+   `race` — has to contain its panics itself. One bad query never takes down
    the resolver.
 3. **client-id** — maps the requester IP to a known client (name, group) via
    the client registry. Unknown IPs fall into the default group.
@@ -78,6 +80,27 @@ terminal upstream forwarder. Each stage can answer the query outright
 Stages implement a small `Handler`/`Middleware` Go interface
 (`internal/dnssrv`), so each one is unit-testable in isolation and new
 stages are purely additive — no rewiring of existing ones.
+
+### The query that goes upstream is dnsaur's, not the client's
+
+The forwarder does not relay the message it was handed. It reads the
+client's question and builds a new query around it: that one question, RD
+set, a message ID minted here, and an OPT record of dnsaur's own —
+1232-octet UDP size, carrying the DO bit copied from the client and no
+other option. The reply is given the client's ID back before it leaves the
+pipeline, and its question keeps the client's exact spelling.
+
+Nothing else the client sent travels. A TSIG-signed ordinary query (a
+secondary refreshing an apex this server does not hold) loses its signature
+rather than being sent to a resolver that shares no key with the peer;
+EDNS Client Subnet, cookies and NSID stay on this network rather than
+shaping an answer that the cache — keyed on `(qname, qtype)` and nothing
+else — would then serve to every other client.
+
+A message that does not carry **exactly one** question is answered
+`FORMERR` and never forwarded. On :53 the library's accept function already
+refuses any other QDCOUNT, but a header claiming one question with no body
+after it unpacks to a message with none, and DoH has no equivalent gate.
 
 ## Zone transfers (AXFR out)
 

@@ -47,6 +47,15 @@ func newDoHExchanger(u Upstream, timeout time.Duration, roots *x509.CertPool) *d
 		url: "https://" + host + u.Path,
 		client: &http.Client{
 			Timeout: timeout,
+			// RFC 8484 gives a redirect no meaning for a DNS query, and
+			// following one destroys the query: net/http reissues a 301, 302
+			// or 303 as a bodiless GET, so the wire-format message in the
+			// POST body is dropped and the upstream answers 400 to a request
+			// carrying no question at all — with nothing in the error saying
+			// a redirect ever happened. Exchange reports the 3xx itself.
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
 			Transport: &http.Transport{
 				ForceAttemptHTTP2:   true,
 				MaxIdleConnsPerHost: maxIdleConns,
@@ -97,6 +106,12 @@ func (e *dohExchanger) Exchange(ctx context.Context, m *dns.Msg) (*dns.Msg, erro
 		// an upstream answering 500 with a gigabyte of HTML is not something
 		// to read in full.
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, dns.MaxMsgSize))
+		if loc := resp.Header.Get("Location"); loc != "" && resp.StatusCode/100 == 3 {
+			// CheckRedirect stopped here deliberately, so the status alone
+			// would say nothing an operator could act on. Where the upstream
+			// pointed is the whole diagnosis.
+			return nil, fmt.Errorf("doh %s: %s, not followed, to %q", e.url, resp.Status, loc)
+		}
 		return nil, fmt.Errorf("doh %s: %s", e.url, resp.Status)
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, dns.MaxMsgSize))

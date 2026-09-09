@@ -1,12 +1,15 @@
 package upstream
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"log/slog"
 	"maps"
 	"net"
 	"runtime"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -321,6 +324,132 @@ func TestMarkResultPenalizesFailingUpstreamEwma(t *testing.T) {
 	u.markResult(true, 5*time.Millisecond, time.Now(), timeoutMicro)
 	if got := u.ewmaMicro.Load(); got >= timeoutMicro {
 		t.Fatalf("expected ewma to move back down after a fast success, got %d (timeout=%d)", got, timeoutMicro)
+	}
+}
+
+// Both edges of the backoff reach the log.
+//
+// Fifteen seconds of every query going to the second-choice resolver is
+// what gets reported as "DNS was weird for a moment"; until this, nothing
+// anywhere said an upstream had been dropped, or picked back up.
+func TestTheBackoffIsLogged(t *testing.T) {
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	u := newUp(Upstream{Scheme: SchemePlain, Addr: "127.0.0.1:1", Canonical: "127.0.0.1:1"}, time.Second)
+	now := time.Now()
+	for range 3 {
+		u.markResult(false, 0, now, time.Second.Microseconds())
+	}
+	if got := buf.String(); !strings.Contains(got, "upstream marked down") ||
+		!strings.Contains(got, "127.0.0.1:1") || !strings.Contains(got, "until=") {
+		t.Errorf("the backoff was not logged with its address and window: %q", got)
+	}
+	buf.Reset()
+
+	u.markResult(true, time.Millisecond, now, time.Second.Microseconds())
+	if got := buf.String(); !strings.Contains(got, "upstream recovered") {
+		t.Errorf("coming back was not logged: %q", got)
+	}
+}
+
+// What moves an upstream's health counters, and what must not.
+//
+// A SERVFAIL that arrived as a well-formed reply is the upstream doing its
+// job: the transport worked, the resolver had an answer to give and the
+// answer was "I could not resolve this". Counting it as a transport failure
+// marks a correct resolver down after three DNSSEC-invalid names, and then
+// its replacement, until every upstream is "down" for names that will never
+// resolve anywhere. The RFC 9520 failure cache above already stops the retry
+// storm; the health counters must stay out of it.
+func TestAWellFormedServfailIsNotATransportFailure(t *testing.T) {
+	addr := mockUpstream(t, func(w dns.ResponseWriter, m *dns.Msg) {
+		r := new(dns.Msg)
+		r.SetRcode(m, dns.RcodeServerFailure)
+		_ = w.WriteMsg(r)
+	})
+	f, err := New(Config{Upstreams: []string{addr}, Strategy: "failover", Timeout: 500 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = f.Close() })
+
+	h := f.Handler()
+	// Distinct names: one name three times would be answered by the failure
+	// cache after the first, and the upstream would never be asked again.
+	for i := range 3 {
+		if _, err := h.ServeDNS(context.Background(), req(fmt.Sprintf("sf%d.test", i))); err == nil {
+			t.Fatalf("query %d: a SERVFAIL-only upstream produced an answer", i)
+		}
+	}
+
+	u := f.def[0]
+	if got := u.downUntil.Load(); got != 0 {
+		t.Errorf("downUntil = %d after three SERVFAIL replies, want 0: the upstream was marked down", got)
+	}
+	if got := u.fails.Load(); got != 0 {
+		t.Errorf("fails = %d after three SERVFAIL replies, want 0", got)
+	}
+	if got, ceiling := u.ewmaMicro.Load(), f.timeout.Microseconds(); got >= ceiling {
+		t.Errorf("ewma = %d micros, clamped to the %d micros timeout: a replying upstream was penalised", got, ceiling)
+	}
+}
+
+// An upstream that was never asked cannot have failed.
+//
+// The pipeline deadline is a hard five seconds shared by every attempt, so
+// under failover a slow first upstream can spend all of it; the next attempt
+// then fails instantly with the context error, before a single byte is
+// dialed. Recording that as the second upstream's failure marks the healthy
+// one down after three such queries.
+func TestACancelledContextDoesNotMarkAnUpstream(t *testing.T) {
+	addr := mockUpstream(t, answerA("5.6.7.8"))
+	f, err := New(Config{Upstreams: []string{addr}, Strategy: "failover", Timeout: 500 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = f.Close() })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := f.Handler().ServeDNS(ctx, req("cancelled.test")); err == nil {
+		t.Fatal("a cancelled context produced an answer")
+	}
+
+	u := f.def[0]
+	if got := u.fails.Load(); got != 0 {
+		t.Errorf("fails = %d, want 0: an upstream that was never asked was blamed", got)
+	}
+	if got := u.ewmaMicro.Load(); got != 0 {
+		t.Errorf("ewma = %d micros, want 0: an upstream that was never asked was penalised", got)
+	}
+	if got := u.downUntil.Load(); got != 0 {
+		t.Errorf("downUntil = %d, want 0", got)
+	}
+}
+
+// Every candidate being down is not a reason to refuse: the backoff exists
+// to prefer a working upstream, and with none to prefer, asking a down one
+// is the only way the outage can ever be observed to have ended. Pins
+// Handler's "healthy = candidates" fallback, and with it the recovery a
+// success by a down upstream records.
+func TestAllUpstreamsDownAreStillTried(t *testing.T) {
+	addr := mockUpstream(t, answerA("5.6.7.8"))
+	f, err := New(Config{Upstreams: []string{addr}, Strategy: "failover", Timeout: 500 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = f.Close() })
+	f.def[0].downUntil.Store(time.Now().Add(time.Minute).UnixNano())
+
+	resp, err := f.Handler().ServeDNS(context.Background(), req("alldown.test"))
+	if err != nil || resp == nil || resp.Upstream != addr {
+		t.Fatalf("a down-but-only upstream was not tried: resp=%+v err=%v", resp, err)
+	}
+	if got := f.def[0].downUntil.Load(); got != 0 {
+		t.Errorf("downUntil = %d after a success, want it cleared", got)
 	}
 }
 

@@ -5,6 +5,8 @@ import (
 	"crypto/tls"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -161,5 +163,45 @@ func TestDoHKeepsAPercentEncodedPath(t *testing.T) {
 	}
 	if got := rec.rawPath.Load(); got != "/a%2Fb" {
 		t.Errorf("the server was asked for %v, want %q", got, "/a%2Fb")
+	}
+}
+
+// A redirect is an error, not a detour.
+//
+// net/http follows a 301/302/303 by reissuing the request as a bodiless GET,
+// so the wire-format query in the POST body is dropped and the upstream
+// answers 400 to a request carrying no question — an error that says "400
+// Bad Request" and nothing about why. RFC 8484 gives a redirect no meaning
+// for a DNS query, so it is reported as itself, naming where it pointed.
+func TestDoHDoesNotFollowARedirect(t *testing.T) {
+	cert, pool := certtest.For(t, dohName)
+	var requests atomic.Int64
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		if r.Method == http.MethodPost {
+			http.Redirect(w, r, "/elsewhere", http.StatusFound)
+			return
+		}
+		// What the upstream makes of the bodiless GET a followed redirect
+		// turns the query into.
+		http.Error(w, "no dns message", http.StatusBadRequest)
+	}))
+	srv.TLS = &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}
+	srv.EnableHTTP2 = true
+	srv.StartTLS()
+	t.Cleanup(srv.Close)
+
+	e := newDoHExchanger(dohUpstream(srv.Listener.Addr().String()), 5*time.Second, pool)
+	t.Cleanup(func() { _ = e.Close() })
+
+	_, err := e.Exchange(context.Background(), query("example.com"))
+	if err == nil {
+		t.Fatal("Exchange succeeded against a redirect")
+	}
+	if !strings.Contains(err.Error(), "/elsewhere") {
+		t.Errorf("the error does not name where the upstream pointed: %v", err)
+	}
+	if got := requests.Load(); got != 1 {
+		t.Errorf("the server saw %d requests, want 1: the redirect was followed", got)
 	}
 }

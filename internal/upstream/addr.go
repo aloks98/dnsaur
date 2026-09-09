@@ -120,7 +120,7 @@ func parseEntry(raw string) (Upstream, error) {
 	// hand, by both languages, before either one's URL parser gets a vote.
 	// Only tls:// and https:// get this check -- see parsePlainEntry.
 	if scheme := strings.ToLower(raw[:strings.Index(raw, "://")]); scheme == string(SchemeDoT) || scheme == string(SchemeDoH) {
-		if perr := checkEncryptedPort(raw); perr != nil {
+		if perr := checkEncryptedAuthority(raw); perr != nil {
 			return Upstream{}, perr
 		}
 	}
@@ -184,18 +184,30 @@ func parsePlainEntry(raw, hostPort string) (Upstream, error) {
 	return Upstream{Scheme: SchemePlain, Addr: addr, Canonical: addr}, nil
 }
 
-// checkEncryptedPort validates the port of a tls:// or https:// entry by
-// hand, independent of url.Parse: literal digits, in range 1-65535. It runs
-// before url.Parse is even called, so a malformed port such as ":domain" is
+// checkEncryptedAuthority validates the authority of a tls:// or https://
+// entry by hand, independent of url.Parse: an unbracketed IPv6 literal
+// first, then the port -- literal digits, in range 1-65535. It runs before
+// url.Parse is even called, so a malformed port such as ":domain" is
 // rejected as bad_addr by a rule this package owns, rather than by whichever
 // inputs Go's net/url happens to error on -- see the comment in parseEntry.
-func checkEncryptedPort(raw string) *ParseError {
+//
+// The IPv6 case has to be caught here for a second reason: nothing after
+// url.Parse can still tell it apart. Everything from the last colon on is
+// read as the port, so tls://2606:4700:4700::1111 arrives with the host
+// "2606:4700:4700:" and the operator is told that their address is a name.
+func checkEncryptedAuthority(raw string) *ParseError {
 	authority := raw[strings.Index(raw, "://")+3:]
 	if i := strings.IndexAny(authority, "/?#"); i >= 0 {
 		authority = authority[:i]
 	}
 	if i := strings.LastIndexByte(authority, '@'); i >= 0 {
 		authority = authority[i+1:] // drop userinfo; bad_url handles it later
+	}
+	// Two or more colons with no bracket in front of them: an IPv6 literal
+	// written bare. One colon is host:port, which is the ordinary case.
+	if strings.Count(authority, ":") >= 2 && !strings.HasPrefix(authority, "[") {
+		return failf(raw, "bad_addr",
+			"%q is an IPv6 address and needs brackets here: write [%s]", authority, authority)
 	}
 	_, port := splitHostPort(authority)
 	if port == "" {

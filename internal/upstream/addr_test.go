@@ -99,6 +99,33 @@ func TestParseUpstreamsLists(t *testing.T) {
 	}
 }
 
+// The fixture pins the code; this pins the one thing the code cannot say.
+//
+// An unbracketed IPv6 literal in an encrypted entry used to be diagnosed as
+// a hostname: url.Parse reads everything after the last colon as the port,
+// so "tls://2606:4700:4700::1111" arrives as host "2606:4700:4700:" and the
+// operator is told their address "is a name". The whole fix is the wording,
+// so the wording is what is asserted.
+func TestUnbracketedIPv6SaysToBracketIt(t *testing.T) {
+	for _, raw := range []string{
+		"tls://2606:4700:4700::1111#cloudflare-dns.com",
+		"https://2606:4700:4700::1111/dns-query#cloudflare-dns.com",
+	} {
+		t.Run(raw, func(t *testing.T) {
+			_, err := ParseUpstreams(raw)
+			if err == nil {
+				t.Fatal("accepted an unbracketed IPv6 address")
+			}
+			if !strings.Contains(err.Error(), "[2606:4700:4700::1111]") {
+				t.Errorf("the message does not show the bracketed form: %v", err)
+			}
+			if strings.Contains(err.Error(), "is a name") {
+				t.Errorf("an IPv6 address was diagnosed as a hostname: %v", err)
+			}
+		})
+	}
+}
+
 // Canonical is the identity *up is reused by, so parsing it again has to
 // produce the same upstream — otherwise two spellings of one server would
 // keep separate health records after a settings round trip.

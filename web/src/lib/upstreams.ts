@@ -111,17 +111,33 @@ function isValidPort(port: string): boolean {
 }
 
 /**
- * Validates the port of a tls:// or https:// entry by hand, independent of
- * the URL parser: literal digits, in range 1-65535. Mirrors addr.go's
- * checkEncryptedPort, which runs before url.Parse (here, before `new URL`)
- * is even called, so a malformed port such as ":domain" is rejected as
- * bad_addr by a rule this module owns rather than by whichever inputs the
- * URL parser happens to reject — see the module comment.
+ * Validates the authority of a tls:// or https:// entry by hand, independent
+ * of the URL parser: an unbracketed IPv6 literal first, then the port —
+ * literal digits, in range 1-65535. Mirrors addr.go's
+ * checkEncryptedAuthority, which runs before url.Parse (here, before
+ * `new URL`) is even called, so a malformed port such as ":domain" is
+ * rejected as bad_addr by a rule this module owns rather than by whichever
+ * inputs the URL parser happens to reject — see the module comment.
+ *
+ * The IPv6 case is here for that same reason and one more: the two parsers
+ * fail on it in different places. Go reads everything from the last colon on
+ * as a port and reports the host "2606:4700:4700:" as a name, while `new
+ * URL` throws outright — so left to the parsers, one says host_not_ip and
+ * the other bad_url, and neither says the useful thing.
  */
-function checkEncryptedPort(raw: string): UpstreamError | null {
+function checkEncryptedAuthority(raw: string): UpstreamError | null {
   let authority = rawAuthority(raw);
   const at = authority.lastIndexOf("@");
   if (at >= 0) authority = authority.slice(at + 1); // drop userinfo; bad_url handles it later
+  // Two or more colons with no bracket in front of them: an IPv6 literal
+  // written bare. One colon is host:port, which is the ordinary case.
+  if ((authority.match(/:/g)?.length ?? 0) >= 2 && !authority.startsWith("[")) {
+    return fail(
+      raw,
+      "bad_addr",
+      `"${authority}" is an IPv6 address and needs brackets here: write [${authority}]`,
+    );
+  }
   const { port } = splitHostPort(authority);
   if (port === "") return null; // no port stated: the scheme's default applies
   if (!isValidPort(port)) return fail(raw, "bad_addr", `"${port}" is not a port number`);
@@ -349,8 +365,8 @@ function parseEntry(raw: string): ParseResult {
   // this check; see parsePlainEntry for the bare/udp:// path.
   const schemeToken = raw.slice(0, raw.indexOf("://")).toLowerCase();
   if (schemeToken === "tls" || schemeToken === "https") {
-    const portErr = checkEncryptedPort(raw);
-    if (portErr) return { ok: false, error: portErr };
+    const authorityErr = checkEncryptedAuthority(raw);
+    if (authorityErr) return { ok: false, error: authorityErr };
   }
 
   // Userinfo is rejected by presence, not content, for every scheme — see

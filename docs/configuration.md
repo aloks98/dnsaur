@@ -124,13 +124,16 @@ An `upstreams` entry may add a scheme and, for the encrypted schemes, a
 udp://1.1.1.1:53                               plain, scheme written explicitly
 tls://1.1.1.1:853#cloudflare-dns.com           DoT, port defaults to 853
 https://1.1.1.1/dns-query#cloudflare-dns.com   DoH, port 443, path defaults to /dns-query
+tls://[2606:4700:4700::1111]#cloudflare-dns.com  DoT over IPv6; the brackets are required
 ```
 
 The parser (`internal/upstream/addr.go`, mirrored for the dashboard by
 `web/src/lib/upstreams.ts` against the shared fixture
 `internal/upstream/testdata/grammar.json`) rejects, each with a reason: a
-`tls://` or `https://` host that isn't an IP literal; `tls://` or `https://`
-without `#name`; `#name` on a plain entry; and a list that mixes schemes.
+`tls://` or `https://` host that isn't an IP literal; an IPv6 address
+written without brackets, where the reason shows the bracketed form to
+write instead; `tls://` or `https://` without `#name`; `#name` on a plain
+entry; and a list that mixes schemes.
 This rejection now happens at save time — `PUT /api/v1/settings` returns
 400 with the reason — where it was previously accepted and silently
 dropped the next time dnsaur restarted.

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sort"
 	"strings"
 	"sync"
@@ -57,17 +58,29 @@ func (u *up) healthy(now time.Time) bool { return now.UnixNano() >= u.downUntil.
 // upstream can't keep winning "fastest" sorts on a stale/cold-start ewma
 // of 0. Genuinely-new upstreams (ewma 0, zero failures so far) still sort
 // first and get probed once — that's intended, not a bug.
+//
+// Both edges of the backoff are logged, because until they were, fifteen
+// seconds of every query going to the second-choice resolver looked from
+// outside like "DNS was weird for a moment" with nothing anywhere saying
+// what happened. A success clears downUntil rather than waiting the window
+// out: it can only be reached through Handler's all-down fallback, and an
+// upstream that has just answered is not down.
 func (u *up) markResult(ok bool, latency time.Duration, now time.Time, timeoutMicro int64) {
 	if ok {
 		u.fails.Store(0)
+		if u.downUntil.Swap(0) != 0 {
+			slog.Info("upstream recovered", "addr", u.addr)
+		}
 		old := u.ewmaMicro.Load()
 		u.ewmaMicro.Store((old*7 + latency.Microseconds()) / 8)
 		return
 	}
 	u.ewmaMicro.Store(max(u.ewmaMicro.Load(), timeoutMicro))
 	if u.fails.Add(1) >= 3 {
-		u.downUntil.Store(now.Add(15 * time.Second).UnixNano())
+		until := now.Add(15 * time.Second)
+		u.downUntil.Store(until.UnixNano())
 		u.fails.Store(0)
+		slog.Warn("upstream marked down", "addr", u.addr, "until", until)
 	}
 }
 
@@ -155,17 +168,74 @@ func New(cfg Config) (*Forwarder, error) {
 //
 // The copy is made here because the exchanger is free to mutate what it is
 // given — plainExchanger scrambles the question's case, the encrypted ones
-// add padding and rewrite the ID — and req.Msg belongs to the caller, who
-// may still be racing this exchange against another upstream.
+// add padding and rewrite the ID — and m is shared by every upstream this
+// query is raced or failed over across.
 func (f *Forwarder) exchange(ctx context.Context, m *dns.Msg, u *up) (*dns.Msg, error) {
+	// An upstream that was never asked has said nothing about its health.
+	// The pipeline deadline is a single budget shared by every attempt, so
+	// one slow upstream can hand the next a context that is already done:
+	// that attempt fails before the dial, and charging it to the upstream
+	// marks a healthy resolver down after three such queries.
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	start := f.now()
 	r, err := u.ex.Exchange(ctx, m.Copy())
 	ok := err == nil && r != nil
-	f.markLatency(u, ok && r.Rcode != dns.RcodeServerFailure, start)
+	// Only the transport outcome. A well-formed SERVFAIL is the upstream
+	// working — it reached an answer, and the answer was that it could not
+	// resolve the name — so counting it here marks a correct resolver down
+	// for names (a DNSSEC-invalid delegation, say) that will not resolve
+	// anywhere, and the next resolver down after it. The failure cache in
+	// Handler is what keeps a SERVFAIL from being re-asked (RFC 9520).
+	f.markLatency(u, ok, start)
 	if !ok {
 		return nil, err
 	}
 	return r, nil
+}
+
+// upstreamQuery is the message that actually leaves dnsaur: the client's
+// question, and nothing else the client sent.
+//
+// Forwarding a copy of the client's message was the root of three separate
+// failures. A TSIG-signed ordinary query — what a BIND secondary sends to
+// refresh an apex this server does not hold — carried its TSIG RR upstream,
+// where miekg's client refuses to send a signed message it has no secret
+// for and fails before a byte goes out; three of those and an upstream that
+// was never reached is marked down for every client. A client's EDNS
+// options went with it, so an ECS-tailored or cookie-bearing answer was
+// cached under (qname, qtype) and served to the whole LAN. And whatever
+// shape the header happened to have became something every exchanger had to
+// survive.
+//
+// The OPT is dnsaur's own: 1232 octets, the size the response path
+// advertises everywhere else, carrying the DO bit and nothing more. DO is
+// copied rather than asserted — a client that asked for DNSSEC records
+// still gets its RRSIGs, and one that did not is not made to pay for them.
+//
+// The ID is fresh because the client's is not a secret; Handler puts the
+// client's back on the reply, which is the ID every layer above matches on.
+func upstreamQuery(q dns.Question, do bool) *dns.Msg {
+	m := new(dns.Msg)
+	m.Id = dns.Id()
+	m.RecursionDesired = true
+	m.Question = []dns.Question{q}
+	m.SetEdns0(1232, do)
+	return m
+}
+
+// formerr answers a message dnsaur cannot make sense of.
+//
+// FORMERR rather than dnssrv.Servfail because the fault is in the message,
+// not in the resolution: it is the rcode miekg's own accept function
+// answers for a bad QDCOUNT one layer down (see dnssrv/transfers_test.go's
+// two-question AXFR), and SERVFAIL would invite a retry that can only
+// produce the same answer.
+func formerr(req *dnssrv.Request) *dnssrv.Response {
+	m := new(dns.Msg)
+	m.SetRcode(req.Msg, dns.RcodeFormatError)
+	return &dnssrv.Response{Msg: m, Decision: dnssrv.DecisionError}
 }
 
 func (f *Forwarder) markLatency(u *up, ok bool, start time.Time) {
@@ -341,6 +411,15 @@ func (f *Forwarder) condTableLoad() *condTable { return f.cond.Load() }
 
 func (f *Forwarder) Handler() dnssrv.Handler {
 	return dnssrv.HandlerFunc(func(ctx context.Context, req *dnssrv.Request) (*dnssrv.Response, error) {
+		// Exactly one question, or nothing leaves this server. A header
+		// claiming QDCOUNT 1 with no body after it unpacks to a message with
+		// no Question at all and arrives here with every stage above having
+		// fallen through on an empty name, and the DoH entry point has no
+		// equivalent of miekg's accept function, so QDCOUNT 0 or 2 reaches
+		// here that way too. Everything below assumes Question[0] exists.
+		if len(req.Msg.Question) != 1 {
+			return formerr(req), nil
+		}
 		k := failKey{req.QName(), req.QType()}
 		f.fmu.Lock()
 		until, failed := f.failCache[k]
@@ -362,12 +441,17 @@ func (f *Forwarder) Handler() dnssrv.Handler {
 		if len(healthy) == 0 {
 			healthy = candidates // all down: try anyway rather than refusing
 		}
+		var do bool
+		if opt := req.Msg.IsEdns0(); opt != nil {
+			do = opt.Do()
+		}
+		out := upstreamQuery(req.Msg.Question[0], do)
 		var r *dns.Msg
 		var lastErr error
 		var winner *up
 		switch f.strategy {
 		case "race":
-			r, winner, lastErr = f.race(ctx, req.Msg, healthy)
+			r, winner, lastErr = f.race(ctx, out, healthy)
 		default: // failover, fastest
 			ordered := healthy
 			if f.strategy == "fastest" {
@@ -377,7 +461,7 @@ func (f *Forwarder) Handler() dnssrv.Handler {
 				})
 			}
 			for _, u := range ordered {
-				if r, lastErr = f.exchange(ctx, req.Msg, u); lastErr == nil && r.Rcode != dns.RcodeServerFailure {
+				if r, lastErr = f.exchange(ctx, out, u); lastErr == nil && r.Rcode != dns.RcodeServerFailure {
 					winner = u
 					break
 				}
@@ -401,6 +485,10 @@ func (f *Forwarder) Handler() dnssrv.Handler {
 			}
 			return nil, lastErr
 		}
+		// The reply came back wearing the ID upstreamQuery minted. Every
+		// layer above — the cache's rewrite, the server's TSIG and UDP
+		// shaping, the client itself — matches on the client's.
+		r.Id = req.Msg.Id
 		return &dnssrv.Response{Msg: r, Decision: dnssrv.DecisionForwarded, Upstream: winner.addr}, nil
 	})
 }
@@ -425,6 +513,17 @@ func (f *Forwarder) race(ctx context.Context, m *dns.Msg, ups []*up) (*dns.Msg, 
 	ch := make(chan result, len(ups))
 	for _, u := range ups {
 		go func(u *up) {
+			// dnssrv.Recover wraps the handler's own goroutine, and this is
+			// not it: a panic below the transport seam has nothing between
+			// it and the runtime, and takes the whole server down rather
+			// than one query. Reported as a failure of this attempt, so the
+			// other upstreams still decide the query.
+			defer func() {
+				if p := recover(); p != nil {
+					slog.Error("panic in upstream exchange", "addr", u.addr, "panic", p)
+					ch <- result{nil, u, fmt.Errorf("upstream %s: panic: %v", u.addr, p)}
+				}
+			}()
 			r, err := f.exchange(ctx, m, u)
 			ch <- result{r, u, err}
 		}(u)

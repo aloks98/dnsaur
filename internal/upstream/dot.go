@@ -18,10 +18,14 @@ const (
 	// per upstream and a handful of upstreams, the worst case is a few
 	// descriptors held until the next query.
 	idleConnTimeout = 30 * time.Second
-	// maxIdleConns bounds the pool. Each connection carries one query at a
-	// time, so this is also the concurrency ceiling per upstream — ample
-	// behind a cache, and the alternative (pipelining) needs message-ID
-	// bookkeeping this does not.
+	// maxIdleConns bounds the pool, and only the pool: it is how many idle
+	// connections may be kept, not how many queries may be in flight. get
+	// returns nil once the pool is empty and Exchange dials a fresh
+	// connection regardless, so a cold burst of fifty misses opens fifty
+	// connections and put closes the forty-six that no longer fit. Capping
+	// the dials as well would need a semaphore and a queue behind it, which
+	// is a different trade than a pool makes — and one nothing has asked
+	// for behind a cache.
 	//
 	// Both constants are also used by doh.go's http.Transport, which is why
 	// neither is named for a transport.

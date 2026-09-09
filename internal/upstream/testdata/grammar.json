@@ -25,6 +25,8 @@
     { "in": "1.1.1.1:53#cloudflare-dns.com", "code": "name_on_plain" },
     { "in": "udp://1.1.1.1:53#cloudflare-dns.com", "code": "name_on_plain" },
     { "in": "quic://1.1.1.1:853#dns.adguard.com", "code": "bad_scheme" },
+    { "in": "tls://2606:4700:4700::1111#cloudflare-dns.com", "code": "bad_addr" },
+    { "in": "https://2606:4700:4700::1111/dns-query#cloudflare-dns.com", "code": "bad_addr" },
     { "in": "tls://1.1.1.1:99999#cloudflare-dns.com", "code": "bad_addr" },
     { "in": "tls://1.1.1.1:domain#cloudflare-dns.com", "code": "bad_addr" },
     { "in": "tls://user:pw@1.1.1.1:853#cloudflare-dns.com", "code": "bad_url" },
