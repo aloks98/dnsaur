@@ -430,3 +430,31 @@ func TestConcurrentReloadsAgainstARealStoreDoNotLoseAZone(t *testing.T) {
 		}
 	})
 }
+
+// A zone's records are class IN, and nothing here ever read the question's
+// class — so a CH or HS query for a name inside a zone was answered with
+// this zone's IN records and AA set, which is a wrong answer rather than a
+// missing one. It goes to next instead, the way the cache already treats a
+// non-IN question.
+func TestMiddlewarePassesNonINClassesThrough(t *testing.T) {
+	for _, qclass := range []uint16{dns.ClassCHAOS, dns.ClassHESIOD} {
+		called := false
+		next := dnssrv.HandlerFunc(func(ctx context.Context, req *dnssrv.Request) (*dnssrv.Response, error) {
+			called = true
+			return &dnssrv.Response{Msg: new(dns.Msg), Decision: dnssrv.DecisionForwarded}, nil
+		})
+		r := resolverWith(t, store.ZoneRecord{Name: "bifrost", Type: "A", TTL: 3600, RData: "57.129.69.158", Enabled: true})
+		req := request("bifrost.e412.in.", dns.TypeA)
+		req.Msg.Question[0].Qclass = qclass
+		resp, err := r.Middleware()(next).ServeDNS(t.Context(), req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !called {
+			t.Errorf("class %d: answered from the zone's IN records", qclass)
+		}
+		if resp.Decision == dnssrv.DecisionAuthoritative {
+			t.Errorf("class %d: decision = authoritative", qclass)
+		}
+	}
+}

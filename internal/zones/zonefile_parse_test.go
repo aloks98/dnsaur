@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/aloks98/dnsaur/internal/store"
 	"github.com/aloks98/dnsaur/internal/zones"
@@ -1176,4 +1177,84 @@ func recordSignature(rr dns.RR, apex string) string {
 		rel = name[:len(name)-len(apex)-2]
 	}
 	return fmt.Sprintf("%s %s %d %s", rel, dns.TypeToString[rr.Header().Rrtype], rr.Header().Ttl, strings.TrimPrefix(rr.String(), rr.Header().String()))
+}
+
+// $GENERATE expands one line into up to 65,536 records, and nothing counted
+// what a whole file expands to: under the 1 MiB import cap a file of ~34k
+// directives asks this process for ~2.2 billion RRs before any check runs.
+// The budget is the file's, not the directive's.
+func TestParseRefusesAFileThatExpandsPastTheRecordCap(t *testing.T) {
+	const f = "$ORIGIN e412.in.\n" +
+		"$TTL 300\n" +
+		"@ IN SOA ns.e412.in. hostadmin.e412.in. ( 1 900 300 604800 900 )\n" +
+		"$GENERATE 0-65535 h$ 300 IN A 1.2.3.4\n" +
+		"$GENERATE 0-65535 g$ 300 IN A 1.2.3.4\n"
+	pz, errs := zones.Parse(f, "e412.in")
+	if len(errs) == 0 {
+		t.Fatalf("Parse accepted a file expanding to %d records", len(pz.Records))
+	}
+	if !strings.Contains(errs[0], "more than") {
+		t.Errorf("errs = %v; want a message naming the record limit", errs)
+	}
+}
+
+// Every statement used to be parsed with the file's whole $ORIGIN history
+// replayed ahead of it, so a file of n directives cost O(n^2) line parses —
+// 1 MiB of them is ~95k lines and ~4.5 billion parses. One synthesised
+// origin line carries the same state at a fixed cost per statement.
+//
+// The budget is wall clock because the cost is the point: 4,000 directives
+// took ~7s replayed and a few milliseconds resolved, so anything near the
+// budget is the quadratic walk coming back rather than a slow machine.
+func TestParseOfManyOriginDirectivesStaysLinear(t *testing.T) {
+	var b strings.Builder
+	b.WriteString("$ORIGIN e412.in.\n$TTL 300\n@ IN SOA ns.e412.in. hostadmin.e412.in. ( 1 900 300 604800 900 )\n")
+	for i := range 4000 {
+		fmt.Fprintf(&b, "$ORIGIN sub%d.e412.in.\n", i)
+	}
+	// Back to the apex, so the file ends with a record the zone can hold —
+	// this has to be a file Parse accepts, not one it bails out of early.
+	b.WriteString("$ORIGIN e412.in.\nhost 300 IN A 1.2.3.4\n")
+
+	start := time.Now()
+	pz, errs := zones.Parse(b.String(), "e412.in")
+	elapsed := time.Since(start)
+
+	if len(errs) != 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+	if len(pz.Records) != 1 || pz.Records[0].Name != "host" {
+		t.Fatalf("records = %+v, want the single host A", pz.Records)
+	}
+	// The line number still has to be right: the synthesised origin line is
+	// not a line of the file, and attributing it as one would shift every
+	// record's line by however many directives came before it.
+	if pz.Records[0].Line != 4005 {
+		t.Errorf("host is on line %d, want 4005", pz.Records[0].Line)
+	}
+	if elapsed > 2*time.Second {
+		t.Errorf("parsing 4000 $ORIGIN lines took %v", elapsed)
+	}
+}
+
+// A relative $ORIGIN resolves against the one in force, not against the zone
+// apex (RFC 1035 §5.1) — the property the replayed history had for free and
+// a synthesised line has to keep.
+func TestParseResolvesARelativeOriginAgainstTheCurrentOne(t *testing.T) {
+	const f = "$ORIGIN e412.in.\n" +
+		"$TTL 300\n" +
+		"@ IN SOA ns.e412.in. hostadmin.e412.in. ( 1 900 300 604800 900 )\n" +
+		"$ORIGIN ab\n" +
+		"$ORIGIN cd\n" +
+		"host 300 IN A 1.2.3.4\n"
+	pz, errs := zones.Parse(f, "e412.in")
+	if len(errs) != 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+	if len(pz.Records) != 1 || pz.Records[0].Name != "host.cd.ab" {
+		t.Fatalf("records = %+v, want one record named host.cd.ab", pz.Records)
+	}
+	if pz.Records[0].Line != 6 {
+		t.Errorf("host is on line %d, want 6", pz.Records[0].Line)
+	}
 }

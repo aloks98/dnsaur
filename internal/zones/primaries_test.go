@@ -82,7 +82,9 @@ func TestValidatePrimariesAcceptsAHostnameWithoutResolvingIt(t *testing.T) {
 // FormatPrimaries is the inverse: what a caller writes back after resolving,
 // in the form ParsePrimaries reads.
 func TestFormatPrimariesRoundTrips(t *testing.T) {
-	const in = "192.168.150.5:53,[2001:db8::1]:5353"
+	// The separator is ", " — the one FormatForwardTo, FormatNotifyTo and
+	// FormatACL all write, and one the reader trims back off.
+	const in = "192.168.150.5:53, [2001:db8::1]:5353"
 	aps, err := zones.ParsePrimaries(t.Context(), nil, in)
 	if err != nil {
 		t.Fatalf("ParsePrimaries(%q): %v", in, err)

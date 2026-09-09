@@ -2294,11 +2294,28 @@ paths:
         spelling means one thing in both.
 
 
+        A bare "@" in rdata is the zone apex, the same thing it is in a
+        zone file: {"type":"MX","rdata":"10 @"} is stored as "10 <zone>.".
+        Where the value is text rather than a name — a TXT — "@" stays the
+        character it is, on this path and on import alike.
+
+
         name is zone-relative ("@", "bifrost", "*", "*.nexus"); omitted or
         equal to the zone's own name means the apex. A name that already
         carries the zone's apex as a suffix (e.g. "www.example.com" typed
         against zone "example.com") has that suffix stripped rather than
-        doubled.
+        doubled. It must be a domain name the zone's export can carry:
+        whitespace, ';', '"', '(', ')', '\', '/', an empty label and a
+        leading '$' are refused with 400, because each of them changes how
+        the exported line reads back. A leading underscore is fine.
+
+
+        type must be one the server can serve. SOA is refused: a zone's SOA
+        lives on the zone row (PATCH /zones/{id}), and a second one among
+        the records would be exported beside it and make the file
+        unloadable. So is a type miekg/dns has no name for, including RFC
+        3597's TYPE65280 spelling — nothing could match it, since the
+        stored type is what a query is matched against.
 
 
         Three write conflicts are rejected with 409 rather than accepted
@@ -2358,9 +2375,10 @@ paths:
                   id: { type: integer, format: int64 }
         "400":
           description: >
-            invalid json; ttl above 2147483647 (RFC 2181 §8); or rdata
-            that fails to parse against name, ttl and type — message is
-            the DNS parser's own error text
+            invalid json; a name the zone's export cannot carry; type SOA
+            or a type the server cannot serve; ttl above 2147483647 (RFC
+            2181 §8); or rdata that fails to parse against name, ttl and
+            type — message is the DNS parser's own error text
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -2450,9 +2468,10 @@ paths:
           description: No Content
         "400":
           description: >
-            bad id, invalid json; ttl above 2147483647 (RFC 2181 §8); or
-            rdata that fails to parse — message is the DNS parser's own
-            error text
+            bad id, invalid json; a name the zone's export cannot carry;
+            type SOA or a type the server cannot serve; ttl above
+            2147483647 (RFC 2181 §8); or rdata that fails to parse —
+            message is the DNS parser's own error text
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -2603,6 +2622,12 @@ paths:
         current ones, since the file is what the zone is about to be. Any
         failure rejects the whole file with 422 and no writes, and the
         response names every offending line rather than only the first.
+
+
+        A file that expands to more than 100,000 records is rejected as a
+        whole-file problem: $GENERATE turns one line into up to 65,536
+        records, so the 1 MiB body cap bounds the file and not the zone it
+        describes.
 
 
         The zone's SOA is replaced from the file — its NS, mbox, timers and

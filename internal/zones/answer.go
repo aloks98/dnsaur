@@ -163,10 +163,22 @@ func (z *Zone) resolve(m *dns.Msg, fqdn, rel string, qtype uint16, depth int) {
 		return
 	}
 
-	if w := z.wildcard(rel); len(w) > 0 {
+	src := z.sourceOfSynthesis(rel)
+	if w := z.rrs(src); len(w) > 0 {
 		if z.fill(m, fqdn, w, qtype, depth) {
 			return
 		}
+		z.deny(m, dns.RcodeSuccess)
+		return
+	}
+
+	// RFC 4592 §2.2.3: a wildcard owning no records but with something below
+	// it is an empty non-terminal like any other, so the source of synthesis
+	// exists. RFC 1034 §4.3.2 step 3(c) then finds the "*" label present and
+	// matches no RRs at it, which is NODATA — NXDOMAIN would be a claim (RFC
+	// 8020) that nothing at all exists under the closest encloser, made by a
+	// zone that holds a record there.
+	if z.hasDescendant(src) {
 		z.deny(m, dns.RcodeSuccess)
 		return
 	}
@@ -209,7 +221,9 @@ func (z *Zone) fill(m *dns.Msg, fqdn string, recs []store.ZoneRecord, qtype uint
 			// writer, though: internal/store's local_records migration
 			// (zonemigrate.go) inserts rows directly, which is exactly why
 			// it converts a TXT value into quoted presentation format
-			// rather than copying the stored bytes across.
+			// rather than copying the stored bytes across. Such a row is
+			// named once per reload, in NewZone — silence here is what made
+			// it unfindable, not the skipping.
 			continue
 		}
 		m.Answer = append(m.Answer, rr)
@@ -367,16 +381,20 @@ func (z *Zone) glue(target string) []dns.RR {
 	return out
 }
 
-// wildcard returns the records of the source of synthesis for rel, which
-// RFC 4592 §3.3.1 defines as "*." + the closest encloser — not any wildcard
-// further up. Because the asterisk is only ever placed leftmost here and
-// lookups are exact, a stored name like "a.*" is a literal that answers for
-// itself and synthesises for nothing (RFC 4592 §2.1.1).
-func (z *Zone) wildcard(rel string) []store.ZoneRecord {
+// sourceOfSynthesis returns the one name allowed to answer for rel by
+// wildcard, which RFC 4592 §3.3.1 defines as "*." + the closest encloser —
+// not any wildcard further up. Because the asterisk is only ever placed
+// leftmost here and lookups are exact, a stored name like "a.*" is a literal
+// that answers for itself and synthesises for nothing (RFC 4592 §2.1.1).
+//
+// The name is returned rather than its records because whether it exists at
+// all — records, or descendants alone — is a separate question from what it
+// holds, and resolve has to answer both.
+func (z *Zone) sourceOfSynthesis(rel string) string {
 	if ce := z.closestEncloser(rel); ce != apexName {
-		return z.rrs("*." + ce)
+		return "*." + ce
 	}
-	return z.rrs("*")
+	return "*"
 }
 
 // closestEncloser returns the deepest ancestor of rel that exists — with
@@ -415,9 +433,14 @@ func (z *Zone) rrs(rel string) []store.ZoneRecord {
 }
 
 // owns reports whether name is inside this zone.
+//
+// By label, not by bytes: RFC 1035 §5.1 lets a dot be escaped into a label,
+// so a CNAME target of `foo\.e412.in.` ends with this zone's name and shares
+// none of its labels. Read as ours, chase re-entered the zone with the
+// relative name `foo\` and answered NXDOMAIN carrying our SOA for a name we
+// do not hold — a claim RFC 8020 extends to everything below it.
 func (z *Zone) owns(name string) bool {
-	n, apex := normalizeName(name), normalizeName(z.Name)
-	return n == apex || strings.HasSuffix(n, "."+apex)
+	return dns.IsSubDomain(dns.Fqdn(normalizeName(z.Name)), dns.Fqdn(normalizeName(name)))
 }
 
 // rrType is a record's stored type as a wire type, or 0 for a type

@@ -520,7 +520,13 @@ Real capture, an unparseable A record:
 
 `name` is zone-relative: `@` (or blank, or the zone's own name) means the
 apex; `bifrost`, `*`, `*.nexus` name anything else. A name carrying the
-zone's own apex as a suffix has that suffix stripped rather than doubled.
+zone's own apex as a suffix has that suffix stripped rather than doubled
+(by whole labels — `foo\.example.com` is one escaped label under `com` and
+keeps its full name).
+
+A `@` in `rdata` is the zone apex, resolved the way a zone file resolves it:
+`{"type":"MX","rdata":"10 @"}` reads back `10 <zone>.`, and a `@` in a value
+that is text rather than a name (`TXT`) reads back as the character it is.
 
 Three write conflicts, checked in this order and each real-captured:
 
@@ -550,6 +556,9 @@ Other errors:
 | 400 | `bad id` | zone or record id fails to parse as a positive int64 |
 | 400 | `invalid json` | |
 | 400 | `ttl must not exceed 2147483647` | RFC 2181 §8; the citation is not part of the string |
+| 400 | `name "<name>" is not a valid record name` | the name as sent, quoted. A name has to survive being written into the zone's export and read back, so whitespace, `;`, `"`, `(`, `)`, `\`, `/`, an empty label and a leading `$` are all refused. `@`, `*`, `*.nexus` and a leading `_` are not |
+| 400 | `the SOA lives on the zone, not in its records` | `type` is `SOA`; the zone's own SOA is edited through `PATCH /zones/{id}` |
+| 400 | `unsupported record type "<type>"` | the type as sent, quoted — a type miekg/dns has no name for, including RFC 3597's `TYPE65280` spelling |
 | 404 | `not found` | unknown zone id, on `/zones/{id}` **or any `/zones/{id}/records*` route**, or `rid` doesn't belong to the zone named by `id` — real-captured; `openapi.yaml`'s per-route "zone not found" / "rid is not a record of this zone" wording is a description of the situation, not the actual response body, which is always the flat `{"error":"not found"}` |
 | 409 | `built-in zones cannot be changed` | any write to an `internal` zone or its records, `POST /zones/{id}/file` included |
 | 409 | `a secondary zone's records come from its primary; change them there` | any record write, or a file import, into a `secondary` |

@@ -171,6 +171,16 @@ func (r *Resolver) Snapshot() *Index { return r.snap.Load() }
 func (r *Resolver) Middleware() dnssrv.Middleware {
 	return func(next dnssrv.Handler) dnssrv.Handler {
 		return dnssrv.HandlerFunc(func(ctx context.Context, req *dnssrv.Request) (*dnssrv.Response, error) {
+			// Every record this server holds is class IN — zone_records has
+			// no class column and ToRR writes IN into every line it builds —
+			// so a CH or HS question is not one a zone here can answer. It
+			// went unread, and the zone answered its IN records with AA set:
+			// a wrong answer rather than a missing one. It goes to next
+			// instead, which is what the cache does with a non-IN question
+			// too (it falls through), so the forwarder decides.
+			if len(req.Msg.Question) > 0 && req.Msg.Question[0].Qclass != dns.ClassINET {
+				return next.ServeDNS(ctx, req)
+			}
 			idx := r.snap.Load()
 			z := idx.Find(req.QName())
 			if z == nil {

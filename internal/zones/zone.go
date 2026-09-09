@@ -6,7 +6,9 @@
 package zones
 
 import (
+	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 
 	"github.com/aloks98/dnsaur/internal/store"
@@ -41,6 +43,17 @@ func NewZone(z store.Zone, recs []store.ZoneRecord) Zone {
 			continue
 		}
 		key := normalizeName(r.Name)
+		// A row ToRR cannot parse is skipped by every reader downstream
+		// (answer.go's fill, glue and chase all do), and skipping it there
+		// says nothing: the record disappears, and inside a zone that is an
+		// authoritative NODATA rather than a lookup that goes anywhere else.
+		// Nothing written through BuildRecord can be such a row, but the
+		// local_records migration (internal/store/zonemigrate.go) inserts
+		// rows directly. Naming it once per reload is what makes it findable.
+		if _, err := ToRR(RecordFQDN(z.Name, r.Name), r); err != nil {
+			slog.Warn("zone record cannot be served and is being skipped",
+				"zone", z.Name, "record", r.ID, "name", r.Name, "type", r.Type, "err", err)
+		}
 		out.Records[key] = append(out.Records[key], r)
 	}
 	return out
@@ -75,22 +88,53 @@ func normalizeName(s string) string {
 }
 
 // RelName returns qname's name relative to apex: "@" if qname is the apex
-// itself, otherwise the labels left of the apex suffix, dot-joined. Both
-// arguments are compared case-insensitively and trailing-dot-insensitively.
+// itself, otherwise the labels left of the apex suffix, dot-joined. A qname
+// that is not inside apex at all is returned unchanged (normalized), which
+// is the only signal this function has for "not in the zone" — recordProblem
+// reads it that way.
+//
+// The comparison is by label, not by bytes, because RFC 1035 §5.1 lets a dot
+// be escaped into a label: `foo\.e412.in` is a two-label name under "in" and
+// shares no labels with "e412.in", but ends with those very bytes. Trimming
+// the byte suffix hands back the name `foo\` and puts a name this zone does
+// not hold inside it — the same mistake owns made, and the one Index.Find
+// never made because it splits labels.
 func RelName(qname, apex string) string {
 	qname = normalizeName(qname)
 	apex = normalizeName(apex)
 	if qname == apex {
 		return "@"
 	}
-	return strings.TrimSuffix(qname, "."+apex)
+	if !dns.IsSubDomain(dns.Fqdn(apex), dns.Fqdn(qname)) {
+		return qname
+	}
+	labels := dns.SplitDomainName(qname)
+	if n := len(labels) - dns.CountLabel(dns.Fqdn(apex)); n > 0 {
+		return strings.Join(labels[:n], ".")
+	}
+	return qname
 }
+
+// errParsesToNothing is what a record whose line lexes to no record at all
+// is refused with. dns.NewRR answers (nil, nil) for such a line — an owner
+// beginning ';' makes the whole line a comment — and every caller here reads
+// "no error" as "an RR", so passing that pair on made a nil RR each of their
+// problems: BuildRecord dereferenced it through RDataOf, and fill would have
+// appended it for Pack to trip over inside the response writer.
+var errParsesToNothing = errors.New("the record parses to nothing: a ';' makes the rest of the line a comment")
 
 // ToRR rebuilds an RR by handing miekg/dns a master-file line. This is the
 // same code path the API validates writes with, so a row that parses here
 // is a row that can be served — the two cannot drift.
 func ToRR(fqdn string, rec store.ZoneRecord) (dns.RR, error) {
-	return dns.NewRR(fmt.Sprintf("%s %d IN %s %s", dns.Fqdn(fqdn), rec.TTL, rec.Type, rec.RData))
+	rr, err := dns.NewRR(fmt.Sprintf("%s %d IN %s %s", dns.Fqdn(fqdn), rec.TTL, rec.Type, rec.RData))
+	if err != nil {
+		return nil, err
+	}
+	if rr == nil {
+		return nil, errParsesToNothing
+	}
+	return rr, nil
 }
 
 // RDataOf returns rr's rdata in presentation format: the record as

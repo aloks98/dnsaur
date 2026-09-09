@@ -161,6 +161,58 @@ The `DecisionLocal` value in `internal/dnssrv/pipeline.go` becomes
 `DecisionAuthoritative`, and `DecisionAllowed` — currently declared but never
 emitted (dead since it was written) — is removed.
 
+**What a record may be, added 2026-09-09.** "The parser decides" (§2's rdata
+decision) was read as deciding the whole record, and it does not: `dns.NewRR`
+tolerates far more in a *name* and a *type* than a zone can hold, and three
+of those went straight into the store.
+
+- **A name has to survive the round trip.** It is written at the start of a
+  line by `Render` and read back off one by `Parse`, where whitespace, `;`,
+  `"`, `(`, `)`, `\` and a leading `$` all mean something else — a record
+  called `$ttl` exported a line the parser read as a directive. `BuildRecord`
+  applies the check `normalizeZoneName` (internal/api) already applied to
+  zone names, allowing `@`, `*` and a leading `_`. One name was worse than
+  unexportable: an owner beginning `;` makes the whole line a comment, and
+  `dns.NewRR` answers `(nil, nil)` for it — no error and no RR — so the write
+  path dereferenced a nil interface and the request died with no response.
+  `ToRR` now returns an error for that pair, because every caller here reads
+  "no error" as "an RR".
+- **The zone's SOA is not a record.** It lives on the `zones` row (above), so
+  a `zone_records` row of type SOA is a second SOA: ignored by the apex
+  answer, written by `Render` beside the real one, and rejected by `Parse` on
+  the way back in. `BuildRecord` refuses it — one accepted write otherwise
+  breaks the §8 round trip permanently.
+- **Unknown types are refused, not carried.** `dns.NewRR` accepts RFC 3597's
+  `TYPE65280` syntax and returns a `*dns.RFC3597`, which nothing downstream
+  handles: `RDataOf` stores the entire RR text (RFC 3597 prints its class as
+  `CLASS1` where the header prints `IN`, so the prefix trim matches nothing),
+  the stored `TYPE65280` maps to no wire type so no query can match it, and
+  the export carries the result. §2's "new record types cost nothing" is
+  about types miekg/dns *parses*, and nothing here promised opaque ones, so
+  the refusal is the honest half of that sentence rather than a new limit.
+- **`@` in rdata is the apex.** It is the origin, and the two writers were
+  reading it under two origins: import resolved `10 @` against `$ORIGIN
+  <zone>.` and a hand write against the root, storing the null MX `10 .`
+  (RFC 7505). One rdata spelling with two meanings is exactly what the rdata
+  decision exists to prevent. The write path now reads such a line under the
+  zone's origin — miekg's own resolution rather than a text substitution, so
+  `TXT @` stays the one-character string it is on both paths.
+- **A class other than IN is not ours.** Every record here is class IN, so a
+  `CH` or `HS` question was being answered from IN records with AA set. It
+  falls through to the next stage instead.
+
+**Wildcards and escaped dots, corrected 2026-09-09.** Two label-shaped
+questions were being answered with byte comparisons:
+
+- `owns` and `RelName` tested a byte suffix while `Index.Find` split labels,
+  so a CNAME target `foo\.e412.in.` — one escaped label under `in`, RFC 1035
+  §5.1 — was chased as in-zone and answered NXDOMAIN carrying our SOA. Both
+  count labels now (`dns.IsSubDomain`).
+- A wildcard that owns no records but has something below it (`a.*`) is an
+  empty non-terminal like any other, so the source of synthesis *exists* and
+  RFC 4592 §2.2.3 makes the answer NODATA. It was NXDOMAIN, which RFC 8020
+  extends to every name under the closest encloser.
+
 ---
 
 ## 4. Milestones
@@ -432,6 +484,26 @@ verbatim can move the zone's serial *backwards*, which breaks any secondary
 that has already seen the higher value (§4 D). Import takes the file's SOA
 timers, NS and mbox, but the serial becomes `max(file, current) + 1` — never
 lower than what has already been served.
+
+**A file is bounded by its records, not its bytes, added 2026-09-09.** The
+1 MiB cap on the request body was the only limit, and `$GENERATE` decouples
+the two: `dns.ZoneParser` bounds one directive to the 65,536 RRs its range
+can name, but a 1 MiB file holds ~34k directives, which expand to ~2.2×10⁹
+RRs — every one allocated before any rule looks at a single record. `Parse`
+caps a file at `DefaultMaxTransferRecords` (100,000) on both of its passes.
+The number is the transfer's because it is the same question asked twice:
+how large a zone may this process be made to build in one go.
+
+**Recovery replays one origin line, not the file's history, added
+2026-09-09.** Recovery gives every statement its own parser, and each one
+needs the `$ORIGIN` that was in effect (RFC 1035 §5.1) — which it got by
+replaying every `$ORIGIN` line seen so far ahead of every statement, at
+O(directives × statements): ~4.5×10⁹ line parses for 1 MiB of them, on the
+*accepting* path, since line attribution runs the same splitter. A relative
+`$ORIGIN` is now resolved when it is read and stored as one synthesised
+line. The resolution is `dns.ZoneParser`'s own — a probe record owned by `@`
+comes back owned by the effective origin — because re-deriving a rule the
+parser already implements is the defect this pass has shipped three times.
 
 ---
 

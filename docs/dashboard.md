@@ -379,6 +379,13 @@ fully-qualified name works too — a trailing copy of the zone's own name is
 stripped automatically, so `bifrost.home.lan` and `bifrost` land on the same
 record in zone `home.lan`.
 
+The name has to be a domain name, and one the zone's own export can carry:
+no spaces, no `;`, `"`, `(`, `)`, `\` or `/`, no empty label, and no leading
+`$`. Every one of those means something else in a zone file — `;` starts a
+comment, `$` opens a directive — so a record named that way would be written
+into the export and then refuse to load back. Underscores are fine
+(`_dmarc`, `_acme-challenge`, `_sip._tcp`).
+
 The record's value (`rdata`) is DNS presentation format — the same syntax a
 zone file uses: `192.168.150.28` for an A record, `10 mail.example.com.` for
 MX, `0 issue "letsencrypt.org"` for CAA. It's validated by handing it to the
@@ -398,6 +405,19 @@ loaded somewhere else.
 
 The upshot is that the saved value is worth reading back — it is what the
 record actually is.
+
+**`@` in a value is the zone itself.** `10 @` on an MX is the zone apex, the
+same as in a zone file, and saves as `10 home.lan.`. In a value that is text
+rather than a name — a TXT — `@` is just the character.
+
+**The SOA belongs to the zone, not to its records.** It is edited on the
+zone, and a record of type `SOA` is refused: a zone has exactly one, and a
+second one written here would be exported beside the real one and make the
+file unloadable.
+
+**Types dnsaur cannot serve are refused**, including RFC 3597's `TYPE65280`
+form for a type it does not know. Anything the DNS parser understands works
+— that list already runs well past what a homelab needs.
 
 **Quote TXT values.** Presentation format is not a free-text field: spaces
 separate values and `;` starts a comment. Pasted raw, `v=spf1 -all` is
@@ -509,7 +529,10 @@ would be added, changed, and deleted — and nothing is written until you
 apply it.
 
 An invalid file is rejected whole, with every problem it found named, not
-just the first — no partial import, and nothing changes.
+just the first — no partial import, and nothing changes. A file describing
+more than 100,000 records is rejected the same way: `$GENERATE` expands one
+line into up to 65,536 records, so a small file can otherwise ask for a very
+large zone.
 
 Applying an import is all-or-nothing too: if storage fails part-way
 through, the zone is left exactly as it was, and the same file can be

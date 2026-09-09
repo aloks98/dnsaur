@@ -156,12 +156,18 @@ func PrimaryLiterals(s string) ([]netip.AddrPort, bool, error) {
 // FormatPrimaries writes addresses back in the format ParsePrimaries reads,
 // so a resolved list can be recorded (which primary answered, say) in the
 // same spelling the column uses.
+//
+// The separator is ", ", which is what FormatForwardTo, FormatNotifyTo and
+// FormatACL all write: four list columns of the same shape spelled three the
+// same way and one differently is a difference an operator reads as meaning
+// something. Every reader splits on "," and trims, so the space costs
+// nothing.
 func FormatPrimaries(aps []netip.AddrPort) string {
 	parts := make([]string, 0, len(aps))
 	for _, ap := range aps {
 		parts = append(parts, ap.String())
 	}
-	return strings.Join(parts, ",")
+	return strings.Join(parts, ", ")
 }
 
 func (p primary) resolve(ctx context.Context, res *net.Resolver) ([]netip.AddrPort, error) {

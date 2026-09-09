@@ -4,7 +4,9 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"strconv"
+	"strings"
 )
 
 // parseHostPort splits one "host", "host:port" or "[v6]:port" entry into a
@@ -34,6 +36,19 @@ func parseHostPort(label, field, hostPart string) (string, uint16, error) {
 			return "", 0, fmt.Errorf("%s %q: %w", label, field, err)
 		}
 		host, portStr = hostPart, ""
+		// "[fd00::2]" is the same address as "fd00::2": the brackets are how
+		// a v6 address is written when it carries a port, so an operator who
+		// writes one and then drops the port arrives here. Refusing it with
+		// "host must be an IP address or a domain name" sends them to inspect
+		// an address that is fine. Only a bracketed *address* is unwrapped —
+		// brackets around a hostname are not a form anything writes.
+		if inner, ok := strings.CutPrefix(host, "["); ok {
+			if inner, ok := strings.CutSuffix(inner, "]"); ok {
+				if _, err := netip.ParseAddr(inner); err == nil {
+					host = inner
+				}
+			}
+		}
 	}
 	port := uint16(DefaultPrimaryPort)
 	if portStr != "" {

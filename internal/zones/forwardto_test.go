@@ -19,6 +19,11 @@ func TestParseForwardTo(t *testing.T) {
 		{"a hostname is stored as written", "ns.corp.example", []zones.ForwardTarget{{Host: "ns.corp.example", Port: 53}}},
 		{"a bare IPv6 literal is the no-port form", "fd00::2", []zones.ForwardTarget{{Host: "fd00::2", Port: 53}}},
 		{"a bracketed IPv6 literal may carry a port", "[fd00::2]:5353", []zones.ForwardTarget{{Host: "fd00::2", Port: 5353}}},
+		// The brackets are how an address that carries a port is written, so
+		// an operator writes them out of habit and then deletes the port.
+		// Refusing that with "host must be an IP address or a domain name"
+		// sends them looking at the address, which is fine.
+		{"a bracketed IPv6 literal without a port", "[fd00::2]", []zones.ForwardTarget{{Host: "fd00::2", Port: 53}}},
 		{
 			"several, in order",
 			"10.0.0.1, 10.0.0.2:5353, ns.corp.example",

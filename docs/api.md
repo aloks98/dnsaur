@@ -402,9 +402,19 @@ Full parameter/response detail lives in `internal/api/openapi.yaml`
   `PUT /zones/{id}/records/{rid}`, `DELETE /zones/{id}/records/{rid}` —
   records within a zone, named relative to its apex (`@`, `bifrost`, `*`,
   `*.nexus`; a fully-qualified name has the apex stripped automatically).
+  `name` must be a domain name the zone's export can carry, which rules out
+  whitespace, `;`, `"`, `(`, `)`, `\`, `/`, an empty label and a leading
+  `$` — every one of them changes how the exported line reads back — and
+  `400` says so. `type` must be one the server can serve: an RFC 3597
+  `TYPE65280` is refused with the type named, since nothing could ever
+  match it, and `SOA` is refused because a zone's SOA lives on the zone
+  itself (`PATCH /zones/{id}`), not among its records.
   `rdata` is DNS presentation format, validated by handing it to the same
   DNS parser (`miekg/dns`) that builds the record dnsaur serves, so a `400`
-  carries that parser's own error text. **What is stored is that parser's
+  carries that parser's own error text. A bare `@` in `rdata` means the
+  zone apex, the same thing it means in a zone file — `{"type":"MX",
+  "rdata":"10 @"}` is stored as `10 <zone>.` — while a `@` in a value that
+  is text rather than a name (a `TXT`, say) stays the character it is. **What is stored is that parser's
   own spelling of the value, not the text you sent**, so a later `GET` can
   return a string that differs from the one you wrote: `nas.example.com`
   comes back `nas.example.com.`, `hello` comes back `"hello"`,
@@ -456,7 +466,10 @@ Full parameter/response detail lives in `internal/api/openapi.yaml`
   few — a missing SOA, say — are about the file as a whole and name
   neither. It comes alongside a flat `error` summary, so a client with one
   error handler for the `{"error": "<message>"}` convention above still
-  finds what it expects. A file whose SOA carries no TTL is one such
+  finds what it expects. A file that expands to more than 100,000 records
+  is one of the whole-file problems: `$GENERATE` turns a single line into
+  up to 65,536 of them, so the byte limit on the request bounds the file
+  and not the zone it describes. A file whose SOA carries no TTL is one such
   problem and is always rejected: a zero SOA TTL would make every
   negative answer from the zone uncacheable (RFC 2308 §4). On success
   the SOA's NS, mbox and timers come from the file, but the serial becomes

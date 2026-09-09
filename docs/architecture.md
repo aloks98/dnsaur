@@ -48,7 +48,11 @@ terminal upstream forwarder. Each stage can answer the query outright
    overrides: once a zone claims a name, that name is *never* forwarded.
    It either answers, or returns NODATA (name exists, wrong type) or
    NXDOMAIN (name absent), each carrying the zone's SOA so resolvers cache
-   the absence. A qname no zone claims passes straight through untouched.
+   the absence. A qname no zone claims passes straight through untouched,
+   and so does a question in a class other than `IN`: every record here is
+   class IN, so a `CH` or `HS` question is not one a zone can answer, and
+   it goes to the next stage rather than being answered from IN records —
+   the same fall-through the cache does with a non-IN question.
    The same stage answers reverse (`PTR`) queries — an `in-addr.arpa` or
    `ip6.arpa` name is just another apex a zone can claim, forward and
    reverse are not different code paths. A fixed set of zones is always

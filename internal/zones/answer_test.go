@@ -176,8 +176,14 @@ func TestNonLeftmostAsteriskIsALiteralName(t *testing.T) {
 
 	m := reply("a.b.e412.in.", dns.TypeA)
 	z.Answer(m, "a.b.e412.in", dns.TypeA, testNow)
-	if m.Rcode != dns.RcodeNameError || len(m.Answer) != 0 {
-		t.Errorf("got rcode=%d answers=%v; a non-leftmost asterisk must not match anything", m.Rcode, m.Answer)
+	if len(m.Answer) != 0 {
+		t.Errorf("answers = %v; a non-leftmost asterisk must not match anything", m.Answer)
+	}
+	// NODATA rather than NXDOMAIN, and not because anything synthesised:
+	// "a.*" puts something below "*.e412.in", which makes that name exist as
+	// an empty non-terminal — see TestWildcardThatIsOnlyAnEmptyNonTerminalIsNoData.
+	if m.Rcode != dns.RcodeSuccess {
+		t.Errorf("rcode = %d, want NOERROR", m.Rcode)
 	}
 
 	lit := reply("a.*.e412.in.", dns.TypeA)
@@ -622,5 +628,42 @@ func TestSecondaryExpiryBoundary(t *testing.T) {
 				t.Fatalf("rcode = %d, want %d", m.Rcode, tc.wantRcode)
 			}
 		})
+	}
+}
+
+// RFC 1035 §5.1 escaping makes `foo\.e412.in.` a two-label name — a child of
+// "in", not of "e412.in" — but a byte-suffix test reads it as ours. Chasing
+// it re-entered the zone with the relative name `foo\` and answered NXDOMAIN
+// carrying this zone's SOA for a name this zone does not hold, which every
+// RFC 8020 resolver caches as "and nothing below it either".
+func TestCNAMEToAnEscapedNameIsOutOfZone(t *testing.T) {
+	z := newZone(t, store.ZoneRecord{Name: "git", Type: "CNAME", TTL: 300, RData: `foo\.e412.in.`, Enabled: true})
+	m := reply("git.e412.in.", dns.TypeA)
+	z.Answer(m, "git.e412.in", dns.TypeA, testNow)
+	if m.Rcode != dns.RcodeSuccess {
+		t.Errorf("rcode = %d, want NOERROR — the target is outside this zone, so the rest is the pipeline's", m.Rcode)
+	}
+	if len(m.Answer) != 1 || m.Answer[0].Header().Rrtype != dns.TypeCNAME {
+		t.Errorf("ANSWER = %v, want the CNAME alone", m.Answer)
+	}
+	if len(m.Ns) != 0 {
+		t.Errorf("AUTHORITY = %v; this zone has nothing to say about a name it does not hold", m.Ns)
+	}
+}
+
+// RFC 4592 §2.2.3: a wildcard that owns no records but has something below
+// it is an empty non-terminal like any other, so the source of synthesis
+// *exists*. RFC 1034 §4.3.2 step 3(c) then matches no RRs at it and the
+// answer is NODATA — answering NXDOMAIN would be a claim (RFC 8020) that
+// nothing under this zone exists, made by a zone that holds a record.
+func TestWildcardThatIsOnlyAnEmptyNonTerminalIsNoData(t *testing.T) {
+	z := newZone(t, store.ZoneRecord{Name: "a.*", Type: "A", TTL: 3600, RData: "10.0.0.7", Enabled: true})
+	m := reply("foo.e412.in.", dns.TypeA)
+	z.Answer(m, "foo.e412.in", dns.TypeA, testNow)
+	if m.Rcode != dns.RcodeSuccess || len(m.Answer) != 0 {
+		t.Fatalf("got rcode=%d answers=%v; want NODATA — *.e412.in exists as an empty non-terminal", m.Rcode, m.Answer)
+	}
+	if len(m.Ns) != 1 || m.Ns[0].Header().Rrtype != dns.TypeSOA {
+		t.Fatalf("AUTHORITY = %v; want one SOA", m.Ns)
 	}
 }

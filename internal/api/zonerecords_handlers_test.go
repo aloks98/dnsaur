@@ -673,3 +673,148 @@ func TestRecordWritesIntoAPrimaryAreStillAccepted(t *testing.T) {
 		t.Fatalf("POST records: status = %d body = %s, want 201", rec.Code, rec.Body)
 	}
 }
+
+// The rdata half of this is TestRecordCreateRejectsRDataThatParsesToNothing;
+// the name half went further than a bad value. An owner beginning ';' makes
+// dns.NewRR read the whole line as a comment and return (nil, nil), which
+// BuildRecord dereferenced — so this request left with no response at all
+// rather than a 400.
+//
+// The rest are names that are stored and served happily and then cannot be
+// read back out of the zone's own export: Render writes the name at the
+// start of a line, where '$' opens a directive and a quote or parenthesis
+// runs on into whatever follows.
+func TestRecordCreateRejectsNamesTheExportCannotCarry(t *testing.T) {
+	for _, name := range []string{";x", "$ttl", "$origin", `a"b`, "a(b", "a b", "a..b", `a\.b`} {
+		srv, zid := newTestServerWithZone(t, "e412.in")
+		body := recordBody(t, name, "A", 300, "1.2.3.4")
+		rec := srv.do(t, "POST", fmt.Sprintf("/api/v1/zones/%d/records", zid), body)
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("name %q: status = %d body = %s, want 400", name, rec.Code, rec.Body)
+		}
+		if recs := srv.records(t, zid); len(recs) != 0 {
+			t.Errorf("name %q: stored a record the export cannot carry: %+v", name, recs)
+		}
+	}
+}
+
+// A zone's SOA is a zones-row field, because its serial needs managed
+// increments. A zone_records row of type SOA is therefore a second SOA that
+// the apex answer ignores, Render writes out beside the real one, and Parse
+// then rejects on the way back in — one accepted write and the zone no
+// longer round-trips through its own export.
+func TestRecordCreateRefusesSOARows(t *testing.T) {
+	srv, zid := newTestServerWithZone(t, "e412.in")
+	body := recordBody(t, "@", "SOA", 900, "ns.e412.in. hostadmin.e412.in. 9 900 300 604800 900")
+	rec := srv.do(t, "POST", fmt.Sprintf("/api/v1/zones/%d/records", zid), body)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d body = %s, want 400", rec.Code, rec.Body)
+	}
+	if recs := srv.records(t, zid); len(recs) != 0 {
+		t.Fatalf("stored a second SOA: %+v", recs)
+	}
+	// The export still has to reimport, which is what the refusal protects.
+	srv.reimport(t, zid, "e412.in")
+}
+
+// Importing a file *with* an SOA keeps working: the file's apex SOA becomes
+// the zone's own (it is taken onto the zones row, not stored as a record),
+// so the refusal above must not reach it.
+func TestZoneFileImportStillTakesTheFilesSOA(t *testing.T) {
+	const file = `$ORIGIN e412.in.
+$TTL 300
+@ IN SOA ns.e412.in. hostadmin.e412.in. ( 42 900 300 604800 900 )
+@ IN NS ns.e412.in.
+host 300 IN A 1.2.3.4
+`
+	srv, zid := newTestServerWithZone(t, "e412.in")
+	if rec := srv.do(t, "POST", fmt.Sprintf("/api/v1/zones/%d/file", zid), importBody(t, file, false)); rec.Code != http.StatusOK {
+		t.Fatalf("import status = %d body = %s, want 200", rec.Code, rec.Body)
+	}
+	if got := srv.zone(t, zid).SOASerial; got != 43 {
+		t.Errorf("zone serial = %d, want the file's 42 + 1", got)
+	}
+	for _, r := range srv.records(t, zid) {
+		if r.Type == "SOA" {
+			t.Errorf("the file's SOA was stored as a record: %+v", r)
+		}
+	}
+}
+
+// An RFC 3597 unknown type parses, stores and exports, and is unservable at
+// every step in between: rrType maps TYPEnnn to no wire type, so no query
+// ever matches it, and RDataOf stores the whole RR text because RFC3597
+// prints its class as CLASS1 where the header prints IN. Refused on both
+// write paths, naming the type.
+func TestUnknownRecordTypesAreRefusedOnBothWritePaths(t *testing.T) {
+	srv, zid := newTestServerWithZone(t, "e412.in")
+
+	body := recordBody(t, "x", "TYPE65280", 300, `\# 4 01020304`)
+	rec := srv.do(t, "POST", fmt.Sprintf("/api/v1/zones/%d/records", zid), body)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("hand write: status = %d body = %s, want 400", rec.Code, rec.Body)
+	}
+	if !strings.Contains(rec.Body.String(), "TYPE65280") {
+		t.Errorf("hand write: refusal does not name the type: %s", rec.Body)
+	}
+
+	const file = `$ORIGIN e412.in.
+$TTL 300
+@ IN SOA ns.e412.in. hostadmin.e412.in. ( 1 900 300 604800 900 )
+x 300 IN TYPE65280 \# 4 01020304
+`
+	imp := srv.do(t, "POST", fmt.Sprintf("/api/v1/zones/%d/file", zid), importBody(t, file, false))
+	if imp.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("import: status = %d body = %s, want 422", imp.Code, imp.Body)
+	}
+	if !strings.Contains(imp.Body.String(), "TYPE65280") {
+		t.Errorf("import: refusal does not name the type: %s", imp.Body)
+	}
+	if recs := srv.records(t, zid); len(recs) != 0 {
+		t.Errorf("stored an unservable record: %+v", recs)
+	}
+}
+
+// "@" is the zone apex in a master file, so `10 @` imported into e412.in is
+// the MX 10 e412.in. The hand-write path read the same two characters under
+// the root and stored the null MX `10 .` (RFC 7505) — the same text, two
+// meanings, which is the drift the stored-rdata normalisation exists to
+// prevent (TestRecordWriteStoresRDataWithOneMeaningEverywhere).
+func TestBothWritersReadBareAtAsTheApex(t *testing.T) {
+	for _, tc := range []struct{ what, name, recType, rdata string }{
+		{"MX exchange", "@", "MX", "10 @"},
+		{"CNAME target", "git", "CNAME", "@"},
+		// A TXT's rdata is a string, not a name, and neither writer resolves
+		// it — the agreement has to hold for the type where "@" stays "@".
+		{"TXT string", "note", "TXT", "@"},
+	} {
+		t.Run(tc.what, func(t *testing.T) {
+			handSrv, handZID := newTestServerWithZone(t, "e412.in")
+			body := recordBody(t, tc.name, tc.recType, 300, tc.rdata)
+			if rec := handSrv.do(t, "POST", fmt.Sprintf("/api/v1/zones/%d/records", handZID), body); rec.Code != http.StatusCreated {
+				t.Fatalf("hand write: status = %d body = %s, want 201", rec.Code, rec.Body)
+			}
+			hand := handSrv.recordsByType(t, handZID, tc.recType)
+			if len(hand) != 1 {
+				t.Fatalf("hand write stored %+v, want one %s", hand, tc.recType)
+			}
+
+			file := fmt.Sprintf("$ORIGIN e412.in.\n$TTL 300\n"+
+				"@ IN SOA ns.e412.in. hostadmin.e412.in. ( 1 900 300 604800 900 )\n"+
+				"%s 300 IN %s %s\n", tc.name, tc.recType, tc.rdata)
+			impSrv, impZID := newTestServerWithZone(t, "e412.in")
+			if rec := impSrv.do(t, "POST", fmt.Sprintf("/api/v1/zones/%d/file", impZID), importBody(t, file, false)); rec.Code != http.StatusOK {
+				t.Fatalf("import: status = %d body = %s, want 200", rec.Code, rec.Body)
+			}
+			imported := impSrv.recordsByType(t, impZID, tc.recType)
+			if len(imported) != 1 {
+				t.Fatalf("import stored %+v, want one %s", imported, tc.recType)
+			}
+
+			if hand[0].RData != imported[0].RData {
+				t.Errorf("the same %s rdata %q is stored as %q by hand and %q by import",
+					tc.recType, tc.rdata, hand[0].RData, imported[0].RData)
+			}
+		})
+	}
+}

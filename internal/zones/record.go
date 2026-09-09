@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/aloks98/dnsaur/internal/store"
+	"github.com/miekg/dns"
 )
 
 // The rules a record has to satisfy to be written into a zone, and the diff
@@ -95,12 +96,12 @@ func RelRecordName(raw, zoneName string) string {
 	if name == "" || name == zoneName {
 		return apexName
 	}
-	if suffix := "." + zoneName; strings.HasSuffix(name, suffix) {
-		if rel := strings.TrimSuffix(name, suffix); rel != "" {
-			return rel
-		}
-	}
-	return name
+	// RelName strips the apex by whole labels and returns a name that is not
+	// inside the zone unchanged, which is exactly the two cases this needs.
+	// Stripping the byte suffix instead would turn `foo\.e412.in` — one
+	// escaped label under "in", not a name in this zone at all — into the
+	// record `foo\`.
+	return RelName(name, zoneName)
 }
 
 // RecordFQDN rebuilds a record's owner FQDN from its zone-relative name —
@@ -114,6 +115,109 @@ func RecordFQDN(zoneName, relName string) string {
 	return relName + "." + zoneName
 }
 
+// forbiddenNameChars are the characters a relative record name may not
+// contain. dns.IsDomainName rules out none of them — it documents itself as
+// "extremely liberal — almost any string is a valid domain name" — and every
+// one of them changes how the line Render writes is read back:
+//
+//	space, tab, CR, LF   split the line into different fields
+//	;                    makes the rest of the line a comment
+//	" ( )                open a quoted string or a multi-line group
+//	\                    escapes the next character, so a stored `a\.b` is
+//	                     one label that every label-counting reader here
+//	                     (RelName, owns, Index.Find) has to agree about
+//	/                    never appears in a hostname, and is how a path
+//	                     typed into the wrong field arrives
+//
+// The first three groups are the reason a record was storable, servable and
+// impossible to reimport; ';' as the first character was the reason a write
+// could return no response at all (see ToRR).
+const forbiddenNameChars = " \t\r\n;\"()\\/"
+
+// validRecordName reports whether name — already relative to the apex, as
+// RelRecordName returns it — is one this zone can hold, serve and export.
+//
+// It is normalizeZoneName's check (internal/api/zones_handlers.go) applied to
+// the other half of a record's name, which is what makes the hand write, the
+// zone-file import and the AXFR transfer agree about it: they share this
+// validator and have no second copy to drift from.
+//
+// The apex, a wildcard label and a leading '_' are all allowed, because all
+// three are names this server already holds: "@", "*.nexus", "_sip._tcp".
+func validRecordName(name string) bool {
+	if name == apexName {
+		return true
+	}
+	if name == "" || strings.ContainsAny(name, forbiddenNameChars) {
+		return false
+	}
+	// A '$' only opens a directive as the first token on a line, which is
+	// exactly where Render writes the name: a record called "$ttl" exports
+	// as a line the parser reads as $TTL.
+	if strings.HasPrefix(name, "$") {
+		return false
+	}
+	for _, label := range strings.Split(name, ".") {
+		if label == "" {
+			return false
+		}
+	}
+	_, ok := dns.IsDomainName(name)
+	return ok
+}
+
+// resolvesBareAt reports whether rdata carries a standalone "@" token, the
+// one spelling whose meaning depends on the origin the line is read under.
+//
+// The test is deliberately coarse: an "@" inside a quoted string matches it
+// too, and all that costs is reading such a line under the zone's origin
+// instead of the root, which changes nothing about a quoted string.
+func resolvesBareAt(rdata string) bool {
+	for _, f := range strings.Fields(rdata) {
+		if f == "@" {
+			return true
+		}
+	}
+	return false
+}
+
+// rrForWrite parses a record being written, reading a standalone "@" in its
+// rdata as the zone apex rather than as the root.
+//
+// "@" means the origin, and dns.NewRR — which is ToRR, and the root — is not
+// the origin a record of this zone is written under. A master file loaded
+// into the same zone resolves the identical token to the apex, so `10 @`
+// stored as the null MX `10 .` (RFC 7505) by one writer and as `10 e412.in.`
+// by the other is one rdata spelling with two meanings, the drift RDataOf's
+// comment says it exists to prevent.
+//
+// The substitution is miekg's rather than a replacement of the text, because
+// "@" is a name only where the type says it is: `MX 10 @` names the apex,
+// while `TXT @` is the one-character string "@" on both paths and has to
+// stay that way. Reading the line under the zone's origin is what makes this
+// path produce, for every type, what the import path already produces.
+//
+// Only the "@" case takes this route. Every other relative name in rdata is
+// read under the root here by design — a bare "nas" is served as "nas." and
+// stored as "nas." so that the stored text says what is served (see the
+// rdata comment in BuildRecord) — and reading those under the zone origin
+// would silently move them.
+func rrForWrite(fqdn, apex string, rec store.ZoneRecord) (dns.RR, error) {
+	if !resolvesBareAt(rec.RData) {
+		return ToRR(fqdn, rec)
+	}
+	line := fmt.Sprintf("%s %d IN %s %s\n", dns.Fqdn(fqdn), rec.TTL, rec.Type, rec.RData)
+	zp := dns.NewZoneParser(strings.NewReader(line), dns.Fqdn(apex), "")
+	rr, ok := zp.Next()
+	if err := zp.Err(); err != nil {
+		return nil, err
+	}
+	if !ok || rr == nil {
+		return nil, errParsesToNothing
+	}
+	return rr, nil
+}
+
 // BuildRecord validates w against zone and its existing records and returns
 // the store.ZoneRecord ready to write. existing is every record already in
 // the zone (the full set, not pre-filtered by name); selfID and hasSelf
@@ -121,10 +225,10 @@ func RecordFQDN(zoneName, relName string) string {
 // sibling/RRSet checks below — otherwise replacing a record would always
 // conflict with itself.
 //
-// Check order is part of the contract, not an implementation detail: parse
-// (invalid), TTL range (invalid), apex CNAME (conflict), CNAME siblings both
-// directions (conflict), RRSet TTL match (conflict). See
-// docs/superpowers/specs/2026-08-08-zones-design.md §6.
+// Check order is part of the contract, not an implementation detail: name
+// (invalid), type (invalid), parse (invalid), TTL range (invalid), apex
+// CNAME (conflict), CNAME siblings both directions (conflict), RRSet TTL
+// match (conflict). See docs/superpowers/specs/2026-08-08-zones-design.md §6.
 //
 // Every error is a *RecordProblem.
 func BuildRecord(zone store.Zone, w RecordWrite, existing []store.ZoneRecord, selfID int64, hasSelf bool) (store.ZoneRecord, error) {
@@ -144,11 +248,41 @@ func BuildRecord(zone store.Zone, w RecordWrite, existing []store.ZoneRecord, se
 		Comment: w.Comment,
 	}
 
+	// A name is not just rdata's owner: it is written at the start of a line
+	// on every export and read back off one on every import, and the parser
+	// tolerates far more there than survives that trip. See validRecordName.
+	if !validRecordName(name) {
+		return store.ZoneRecord{}, invalidRecord("name %q is not a valid record name", w.Name)
+	}
+
+	// RFC 1034 §4.1.1: a zone has exactly one SOA, and this one's lives on
+	// the zones row because its serial needs managed increments. A record row
+	// of type SOA is therefore a second SOA — ignored by the apex answer,
+	// written out by Render beside the real one, and rejected by Parse on the
+	// way back in, so a single accepted write breaks the export/import round
+	// trip spec §8 rests on. Off the apex it is worse: it is served with AA
+	// set, claiming an authority this server does not have.
+	if recType == "SOA" {
+		return store.ZoneRecord{}, invalidRecord("the SOA lives on the zone, not in its records")
+	}
+
+	// A type miekg/dns cannot name is a type this server cannot serve.
+	// dns.NewRR accepts RFC 3597's TYPEnnn syntax and hands back an
+	// *dns.RFC3597, which then breaks every path that reads the row: RDataOf
+	// stores the entire RR text (RFC3597 prints its class as CLASS1 where the
+	// header prints IN, so the prefix trim matches nothing), rrType maps the
+	// stored "TYPE65280" to 0 so no query ever matches it, and Render exports
+	// the result. Spec §3 promises the types miekg/dns parses, not a way to
+	// carry opaque ones, so this is refused rather than made to work.
+	if _, known := dns.StringToType[recType]; !known {
+		return store.ZoneRecord{}, invalidRecord("unsupported record type %q", w.Type)
+	}
+
 	// Validation is dns.NewRR itself, via the same ToRR the resolver uses to
 	// build the RR it serves. One validator, so an accepted record is by
 	// construction a servable one — there is no second copy to drift from
 	// the parser.
-	rr, err := ToRR(RecordFQDN(zone.Name, name), rec)
+	rr, err := rrForWrite(RecordFQDN(zone.Name, name), zone.Name, rec)
 	if err != nil {
 		return store.ZoneRecord{}, invalidRecord("%s", err.Error())
 	}

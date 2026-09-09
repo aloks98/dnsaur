@@ -224,14 +224,20 @@ type statement struct {
 // record in the original file, which is not necessarily anything nearby
 // (RFC 1035 §5.1: it persists until the next $ORIGIN, or EOF — not just
 // for the one record that happens to follow it). So splitStatements
-// tracks every $ORIGIN line verified so far, in file order, and replays
-// all of them verbatim ahead of every later record's own lines. Replaying
-// the full ordered history rather than just the latest line is what keeps
-// a second, relative $ORIGIN ("$ORIGIN dev" after an earlier
-// "$ORIGIN e412.in.") resolving against the origin actually in effect at
-// that point rather than against the zone apex directly — which decides
-// whether a name is in this zone at all, and so whether recovery has an
-// out-of-zone line to report.
+// tracks the origin in effect and replays it ahead of every later
+// statement — as one synthesised "$ORIGIN <effective>." line, not as the
+// file's own history of them.
+//
+// The history is what this used to replay, and the cost was quadratic:
+// every statement re-parsed every $ORIGIN line before it, so a 1 MiB file
+// of ~95k directives (the import cap allows exactly that) came to ~4.5
+// billion line parses. One line carries the same state, because a
+// relative $ORIGIN is resolved *before* it is stored: "$ORIGIN dev" after
+// an earlier "$ORIGIN e412.in." becomes the one line
+// "$ORIGIN dev.e412.in.". Which origin is in effect decides whether a name
+// is in this zone at all, and so whether recovery has an out-of-zone line
+// to report, so the resolution is dns.ZoneParser's own rather than a rule
+// re-derived here — see effectiveOrigin.
 //
 // $TTL is deliberately NOT replayed, though it persists exactly the same
 // way. All it decides is the TTL a record that omits its own falls back to
@@ -242,16 +248,14 @@ type statement struct {
 // A $TTL line that is itself malformed is still checked and reported,
 // because that is the one observable thing it can do here.
 //
-// "Verified so far" matters for $ORIGIN: a new one is checked against the
-// replayed history plus just that line, nothing else, before being trusted
-// for replay. A directive that fails the check is reported once, as its
-// own statement, and never replayed — so one broken $ORIGIN doesn't also
-// fail every record after it with a copy of the same error (it would,
-// every time, if the bad line stayed in the replay list: the replayed
-// prefix is always parsed before a statement's own record, so the same
-// failure would recur on every single one). This is also what keeps
-// splitStatements' own cost bounded to roughly one extra parse per
-// directive, not one per (directive, later record) pair.
+// "Verified" matters for $ORIGIN: a new one is checked, against the origin
+// in effect and nothing else, before it becomes the origin in effect. A
+// directive that fails the check is reported once, as its own statement,
+// and never takes effect — so one broken $ORIGIN doesn't also fail every
+// record after it with a copy of the same error (it would, every time, if
+// the bad line became the replayed prefix: the prefix is always parsed
+// before a statement's own record, so the same failure would recur on
+// every single one).
 //
 // $INCLUDE and $GENERATE are not persistent state, so neither is folded
 // into a following record's statement or deferred — each gets its own
@@ -293,23 +297,32 @@ func splitStatements(text, origin string) []statement {
 	}
 
 	var out []statement
-	var originLines []int // 0-based indices into lines, verified, in file order
+	// The origin in effect, as the one synthesised line replayed ahead of
+	// every statement, and the file line the directive that set it was on —
+	// so that a parse error reported against the synthesised line (nothing
+	// produces one: it is a line dns.ZoneParser itself just accepted) still
+	// names something real. Empty until the file's first $ORIGIN.
+	var originLine string
+	var originLineNo int
 
 	linesFor := func(idx []int) (string, []int) {
-		stmtLines := make([]string, len(idx))
-		lineNumbers := make([]int, len(idx))
-		for k, li := range idx {
-			stmtLines[k] = lines[li]
-			lineNumbers[k] = li + 1
+		stmtLines := make([]string, 0, len(idx)+1)
+		lineNumbers := make([]int, 0, len(idx)+1)
+		if originLine != "" {
+			stmtLines = append(stmtLines, originLine)
+			lineNumbers = append(lineNumbers, originLineNo)
+		}
+		for _, li := range idx {
+			stmtLines = append(stmtLines, lines[li])
+			lineNumbers = append(lineNumbers, li+1)
 		}
 		return strings.Join(stmtLines, "\n") + "\n", lineNumbers
 	}
 
-	// validated reports whether idx's lines, replayed on their own with no
-	// record following, parse without error — see splitStatements' doc
-	// comment for why a new $ORIGIN line is checked this way before ever
-	// being trusted for replay, and why a $TTL line is checked but not
-	// replayed.
+	// validated reports whether idx's lines, replayed after the origin in
+	// effect and with no record following, parse without error — see
+	// splitStatements' doc comment for why a $TTL line is checked this way
+	// and then dropped.
 	validated := func(idx []int) bool {
 		text, _ := linesFor(idx)
 		zp := dns.NewZoneParser(strings.NewReader(text), origin, "")
@@ -319,7 +332,7 @@ func splitStatements(text, origin string) []statement {
 	}
 
 	// directiveStatement builds the standalone statement emitted for a
-	// directive line: the verified replay history, then the line itself.
+	// directive line: the origin in effect, then the line itself.
 	directiveStatement := func(kind string, idx []int, at int) statement {
 		text, lineNumbers := linesFor(idx)
 		return statement{text: text, lineNumbers: lineNumbers, directive: kind, recordLine: at + 1}
@@ -334,11 +347,10 @@ func splitStatements(text, origin string) []statement {
 
 		switch kind := directiveKind(trimmed); kind {
 		case dirOrigin:
-			probe := append(append([]int{}, originLines...), i)
-			if validated(probe) {
-				originLines = probe
+			if eff, ok := effectiveOrigin(originLine, lines[i], origin); ok {
+				originLine, originLineNo = dirOrigin+" "+eff, i+1
 			} else {
-				out = append(out, directiveStatement(kind, probe, i))
+				out = append(out, directiveStatement(kind, []int{i}, i))
 			}
 			i++
 			continue
@@ -352,8 +364,7 @@ func splitStatements(text, origin string) []statement {
 			i++
 			continue
 		case dirInclude, dirGenerate:
-			idx := append(append([]int{}, originLines...), i)
-			out = append(out, directiveStatement(kind, idx, i))
+			out = append(out, directiveStatement(kind, []int{i}, i))
 			i++
 			continue
 		}
@@ -371,8 +382,8 @@ func splitStatements(text, origin string) []statement {
 			span++
 		}
 
-		idx := append([]int{}, originLines...)
-		for k := 0; k < span; k++ {
+		idx := make([]int, 0, span)
+		for k := range span {
 			idx = append(idx, start+k)
 		}
 		text, lineNumbers := linesFor(idx)
@@ -380,6 +391,42 @@ func splitStatements(text, origin string) []statement {
 		i = start + span
 	}
 	return out
+}
+
+// originProbe is the record effectiveOrigin appends to a $ORIGIN line to
+// read the origin back out of dns.ZoneParser. Its owner is "@", so the
+// parser resolves it to whatever origin is in effect — which is the answer —
+// and the rest of the line is the cheapest RR that parses.
+const originProbe = "@ 0 IN A 0.0.0.0\n"
+
+// effectiveOrigin returns the origin in effect after line (a $ORIGIN
+// directive), given the origin line currently in effect and the file's base
+// origin, and reports whether line is usable at all.
+//
+// The resolution is dns.ZoneParser's, not this file's. A relative $ORIGIN is
+// resolved against the origin already in effect (RFC 1035 §5.1), and
+// re-deriving that rule here is precisely the class of defect this parser's
+// recovery pass has shipped three times — every one of them recovery
+// reimplementing something dns.ZoneParser already owns. Asking the parser
+// for the owner name it gives a record owned by "@" costs one line and
+// cannot disagree with it.
+//
+// It doubles as the check the directive has to pass before it takes effect:
+// a $ORIGIN the parser rejects yields ok=false, and the caller reports the
+// line instead of adopting it.
+func effectiveOrigin(originLine, line, base string) (string, bool) {
+	text := line + "\n" + originProbe
+	if originLine != "" {
+		text = originLine + "\n" + text
+	}
+	zp := dns.NewZoneParser(strings.NewReader(text), base, "")
+	rr, ok := zp.Next()
+	for _, more := zp.Next(); more; _, more = zp.Next() {
+	}
+	if !ok || rr == nil || zp.Err() != nil {
+		return "", false
+	}
+	return rr.Header().Name, true
 }
 
 // recordStatementLines returns the 1-based start line of every record
@@ -458,9 +505,13 @@ func classify(rr dns.RR, apex string, line int) (*ParsedRecord, *dns.SOA) {
 		return nil, s
 	}
 	return &ParsedRecord{
-		Name:  RelName(rr.Header().Name, apex),
-		Type:  dns.TypeToString[rr.Header().Rrtype],
-		RData: strings.TrimPrefix(rr.String(), rr.Header().String()),
+		Name: RelName(rr.Header().Name, apex),
+		// dns.Type.String, not the TypeToString map, so a type miekg/dns has
+		// no name for comes back as "TYPE65280" rather than as the empty
+		// string: BuildRecord refuses it either way, and only one of those
+		// two can name it in the message the importer reports.
+		Type:  dns.Type(rr.Header().Rrtype).String(),
+		RData: RDataOf(rr),
 		TTL:   rr.Header().Ttl,
 		Line:  line,
 	}, nil
@@ -633,6 +684,22 @@ func soaTTLProblem(soa *dns.SOA) string {
 	return "the zone's SOA has a TTL of 0: add a $TTL directive (RFC 2308 §4) or a TTL on the SOA record, or every negative answer this zone gives becomes uncacheable (RFC 2308 §5)"
 }
 
+// maxZoneFileRecords bounds how many RRs one file may expand to, on both of
+// Parse's passes.
+//
+// $GENERATE is why a byte cap on the file is not one: dns.ZoneParser bounds
+// a single directive to the 65,536 RRs its range can name, but nothing
+// bounded a file, and under the 1 MiB import cap ~34k such lines expand to
+// ~2.2 billion RRs — all of them allocated before any rule got to look at
+// one. It is DefaultMaxTransferRecords because a file and a transfer are the
+// same question asked twice: how large a zone may this process be made to
+// build in one go. Both are far above any zone this server is likely to hold
+// and far below anything that would threaten it.
+const maxZoneFileRecords = DefaultMaxTransferRecords
+
+// tooManyRecords is the message both passes report when the budget runs out.
+var tooManyRecords = fmt.Sprintf("the file expands to more than %d records", maxZoneFileRecords)
+
 // parseClean reads the whole file with one dns.ZoneParser — see Parse's
 // doc comment. It is the only producer of records, on both the accepting
 // and the rejecting path; on the latter it returns whatever it read before
@@ -655,6 +722,9 @@ func parseClean(text, apex, origin string) (ParsedZone, int, []string) {
 	zp := dns.NewZoneParser(strings.NewReader(text), origin, "")
 	var rrs []dns.RR
 	for rr, ok := zp.Next(); ok; rr, ok = zp.Next() {
+		if len(rrs) >= maxZoneFileRecords {
+			return ParsedZone{}, 0, []string{tooManyRecords}
+		}
 		rrs = append(rrs, rr)
 	}
 	parseErr := zp.Err()
@@ -710,11 +780,18 @@ func parseClean(text, apex, origin string) (ParsedZone, int, []string) {
 func parseWithRecovery(text, apex, origin string) []string {
 	var errs []string
 	var seenSOA bool
+	// Recovery expands every $GENERATE again, so it needs the same budget
+	// parseClean has — without it, the file that made parseClean give up
+	// would simply be expanded a second time to say so.
+	budget := maxZoneFileRecords
 
 	for _, stmt := range splitStatements(text, origin) {
 		zp := dns.NewZoneParser(strings.NewReader(stmt.text), origin, "")
 
 		for rr, ok := zp.Next(); ok; rr, ok = zp.Next() {
+			if budget--; budget < 0 {
+				return append(errs, fmt.Sprintf("line %d: %s", stmt.recordLine, tooManyRecords))
+			}
 			if rr.Header().Name == "" {
 				// A continuation line, cut off from the owner it inherits
 				// (RFC 1035 §5.1) by the very splitting that lets recovery

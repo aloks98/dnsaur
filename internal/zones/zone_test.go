@@ -55,6 +55,13 @@ func TestRelName(t *testing.T) {
 		{"e412.in", "e412.in", "@"},
 		{"bifrost.e412.in", "e412.in", "bifrost"},
 		{"a.b.e412.in", "e412.in", "a.b"},
+		// RFC 1035 §5.1's escape: `foo\.e412` is one label, so this name is
+		// a child of "in" and not of "e412.in" at all — a byte-suffix trim
+		// says otherwise and hands back the nonsense name `foo\`.
+		{`foo\.e412.in`, "e412.in", `foo\.e412.in`},
+		// The same escape one label deeper, where the name really is inside
+		// the zone: the label count is what decides, not the byte count.
+		{`a\.b.e412.in`, "e412.in", `a\.b`},
 	} {
 		if got := zones.RelName(tc.q, tc.apex); got != tc.want {
 			t.Errorf("RelName(%q,%q) = %q, want %q", tc.q, tc.apex, got, tc.want)
@@ -144,5 +151,20 @@ func TestZoneSOAFieldMapping(t *testing.T) {
 	}
 	if soa.Minttl != 300 {
 		t.Errorf("Minttl = %d, want 300", soa.Minttl)
+	}
+}
+
+// dns.NewRR reports (nil, nil) — not an error — for a line that lexes to no
+// record at all: an owner beginning ';' turns the whole line into a comment.
+// Every caller here is written as "err == nil means an RR", so passing that
+// pair through made a nil RR everyone's problem: BuildRecord dereferenced it
+// through RDataOf, and fill would have appended it for Pack to trip over.
+func TestToRRRejectsALineThatParsesToNothing(t *testing.T) {
+	rr, err := zones.ToRR(";x.e412.in.", store.ZoneRecord{Type: "A", TTL: 300, RData: "1.2.3.4"})
+	if err == nil {
+		t.Fatalf("ToRR accepted a line that parses to nothing, returning %v", rr)
+	}
+	if rr != nil {
+		t.Errorf("ToRR returned both an error and an RR: %v", rr)
 	}
 }
