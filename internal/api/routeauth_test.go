@@ -205,11 +205,11 @@ func TestEveryRouteEnforcesAuth(t *testing.T) {
 	}
 
 	_ = login(t, srv, s) // creates admin user id 1
-	readTok, err := srv.deps.Auth.CreateAPIToken(context.Background(), 1, "route-auth-read", "read")
+	_, readTok, err := srv.deps.Auth.CreateAPIToken(context.Background(), 1, "route-auth-read", "read")
 	if err != nil {
 		t.Fatal(err)
 	}
-	writeTok, err := srv.deps.Auth.CreateAPIToken(context.Background(), 1, "route-auth-write", "write")
+	_, writeTok, err := srv.deps.Auth.CreateAPIToken(context.Background(), 1, "route-auth-write", "write")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -400,7 +400,7 @@ func TestOpenAPIDocumentsObservedGETStatuses(t *testing.T) {
 	spec := specResponses(t, h)
 
 	_ = login(t, srv, s)
-	readTok, err := srv.deps.Auth.CreateAPIToken(context.Background(), 1, "spec-observe-read", "read")
+	_, readTok, err := srv.deps.Auth.CreateAPIToken(context.Background(), 1, "spec-observe-read", "read")
 	if err != nil {
 		t.Fatal(err)
 	}

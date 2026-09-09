@@ -3,7 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
-	"strings"
+	"errors"
 )
 
 // execOne runs a statement expected to affect exactly one row.
@@ -85,12 +85,13 @@ func (c *clientStore) DeleteGroup(ctx context.Context, id int64) error {
 
 	// Delete the group itself
 	if err := execOneTx(ctx, tx, c.s.dialect, `DELETE FROM groups WHERE id = ?`, id); err != nil {
-		// Check if this is a foreign key constraint error and translate to ErrInUse
-		if err == ErrNotFound {
-			return err
-		}
-		errStr := err.Error()
-		if strings.Contains(errStr, "FOREIGN KEY") || strings.Contains(errStr, "foreign key") {
+		// Some row this transaction did not clear still references the
+		// group, which is the same answer the clients check above gives —
+		// arrived at from the driver instead. Matched on the typed error
+		// rather than on "FOREIGN KEY" in the message: that text is sqlite's
+		// and postgres words it differently, so the string match answered
+		// ErrInUse on one driver and a raw error on the other.
+		if errors.Is(wrapDBErr(err), ErrReference) {
 			return ErrInUse
 		}
 		return err

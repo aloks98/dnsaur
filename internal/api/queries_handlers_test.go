@@ -5,7 +5,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -16,11 +18,17 @@ import (
 	"github.com/miekg/dns"
 )
 
+// seedAPIQlog writes two entries dated within the last hour. They used to
+// sit at the Unix epoch, which made every stats test ask for a window of
+// half a million hours to reach them — a window `hours` now refuses (see
+// maxStatsHours), and one no operator ever means. Dating them from now
+// instead lets the stats tests use ordinary windows.
 func seedAPIQlog(t *testing.T, s store.Store) {
 	t.Helper()
+	now := time.Now().UnixMilli()
 	err := s.QueryLog().InsertBatch(t.Context(), []store.QueryLogEntry{
-		{At: 1000, InstanceID: "i", ClientIP: "10.0.0.5", QName: "a.example", QType: "A", Decision: "forwarded", RCode: "NOERROR"},
-		{At: 2000, InstanceID: "i", ClientIP: "10.0.0.6", QName: "ads.example", QType: "A", Decision: "blocked", RCode: "NOERROR"},
+		{At: now - 2000, InstanceID: "i", ClientIP: "10.0.0.5", QName: "a.example", QType: "A", Decision: "forwarded", RCode: "NOERROR"},
+		{At: now - 1000, InstanceID: "i", ClientIP: "10.0.0.6", QName: "ads.example", QType: "A", Decision: "blocked", RCode: "NOERROR"},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -66,11 +74,11 @@ func TestStatsEndpoints(t *testing.T) {
 	if _, err := s.Stats().Rollup(t.Context(), 0); err != nil {
 		t.Fatal(err)
 	}
-	// The seeded entries carry near-epoch At values (1000/2000ms), so the
-	// window must reach back past Unix zero regardless of the real wall
-	// clock the test happens to run under; a fixed literal like 87600h
-	// (~10yr) would only cover them before ~1980 and is not date-stable.
-	farHours := time.Now().Unix()/3600 + 24
+	// The seeded entries are minutes old (seedAPIQlog), so an ordinary
+	// window covers them — but the hour bucket they land in starts before
+	// "now minus 24h" only if the window reaches the bucket's own start, so
+	// 48 hours rather than 24.
+	const farHours = 48
 	w := doReq(t, srv.Handler(), "GET", fmt.Sprintf("/api/v1/stats/overview?hours=%d", farHours), "", cookie)
 	var ov map[string]int64
 	_ = json.Unmarshal(w.Body.Bytes(), &ov)
@@ -178,5 +186,40 @@ func TestSSETail(t *testing.T) {
 	line, _ := bufio.NewReader(w.Body).ReadString('\n')
 	if !strings.HasPrefix(line, "data: ") || !strings.Contains(line, "live.example") {
 		t.Fatalf("sse line: %q", line)
+	}
+}
+
+// `hours` had no upper bound, and time.Duration(hours)*time.Hour overflows
+// int64 at about 2.5 million hours — so a large enough value wrapped
+// negative and asked the store for a window in the future, which answers
+// nothing. Clamped to a year, the answer stays the same as the largest
+// window anyone can actually mean.
+func TestStatsHoursIsClamped(t *testing.T) {
+	srv, s, _ := testServer(t)
+	cookie := login(t, srv, s)
+	h := srv.Handler()
+	seedAPIQlog(t, s)
+	if _, err := s.Stats().Rollup(t.Context(), 0); err != nil {
+		t.Fatal(err)
+	}
+
+	want := hoursFromSec(httptest.NewRequest("GET", "/api/v1/stats/overview?hours="+strconv.Itoa(maxStatsHours), nil))
+	got := hoursFromSec(httptest.NewRequest("GET", "/api/v1/stats/overview?hours=999999999999", nil))
+	if got != want {
+		t.Errorf("hours=999999999999 resolved to %d, want the %d-hour clamp at %d", got, maxStatsHours, want)
+	}
+
+	for _, path := range []string{
+		"/api/v1/stats/overview?hours=999999999999",
+		"/api/v1/stats/timeline?hours=999999999999",
+		"/api/v1/stats/top?metric=domain&hours=999999999999",
+	} {
+		w := doReq(t, h, "GET", path, "", cookie)
+		if w.Code != http.StatusOK {
+			t.Fatalf("GET %s: %d %s", path, w.Code, w.Body.String())
+		}
+		if strings.Contains(w.Body.String(), `"total":0`) {
+			t.Errorf("GET %s answered an empty window: %s", path, w.Body.String())
+		}
 	}
 }

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"mime"
 	"net/http"
 	"strings"
 	"time"
@@ -53,7 +54,13 @@ func (s *Server) handleZoneFileExport(w http.ResponseWriter, r *http.Request) {
 	body := zones.Render(zone, recs)
 
 	w.Header().Set("Content-Type", "text/dns; charset=utf-8")
-	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s.zone"`, zone.Name))
+	// mime.FormatMediaType rather than a hand-written `filename="%s"`: the
+	// filename is built from operator input, and that function is the one
+	// that knows when a value needs quoting and how to escape what it
+	// quotes. Written by hand, a zone name containing a `"` closed the
+	// quoted string early and produced a header no client could parse.
+	w.Header().Set("Content-Disposition", mime.FormatMediaType("attachment",
+		map[string]string{"filename": zone.Name + ".zone"}))
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte(body))
 }

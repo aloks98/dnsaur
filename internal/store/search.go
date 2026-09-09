@@ -30,7 +30,10 @@ func (q *queryLogStore) Search(ctx context.Context, f QueryLogFilter) ([]QueryLo
 		args = append(args, f.QType)
 	}
 	if f.QNameContains != "" {
-		sb.WriteString(` AND qname LIKE ?`)
+		// ESCAPE is spelled out rather than left to the dialect's default:
+		// sqlite has none at all (a backslash in a LIKE pattern is just a
+		// backslash without it), and postgres's default is only a default.
+		sb.WriteString(` AND qname LIKE ? ESCAPE '\'`)
 		args = append(args, "%"+escapeLike(f.QNameContains)+"%")
 	}
 	limit := f.Limit
@@ -62,13 +65,21 @@ func (q *queryLogStore) Search(ctx context.Context, f QueryLogFilter) ([]QueryLo
 	return out, rows.Err()
 }
 
-// escapeLike escapes LIKE wildcards; both dialects accept backslash escaping
-// with an explicit ESCAPE clause omitted since \ is default in sqlite and
-// postgres treats \ specially only in older modes — to stay portable we
-// strip the wildcards instead of escaping them.
+// escapeLike escapes the two LIKE wildcards, and the escape character
+// itself, so a needle matches only itself. The caller pairs it with an
+// explicit `ESCAPE '\'` — see Search — which is what makes one spelling work
+// on both dialects.
+//
+// It used to *strip* the wildcards instead, which quietly widened the
+// search: a query-log filter for "_dmarc" became one for "dmarc" and matched
+// "xdmarc" too, with nothing to say the needle had been changed.
+//
+// The backslash goes first, or the backslashes this function adds would
+// themselves be escaped by the pass that follows.
 func escapeLike(s string) string {
-	s = strings.ReplaceAll(s, "%", "")
-	return strings.ReplaceAll(s, "_", "")
+	s = strings.ReplaceAll(s, `\`, `\\`)
+	s = strings.ReplaceAll(s, "%", `\%`)
+	return strings.ReplaceAll(s, "_", `\_`)
 }
 
 func (st *statsStore) Timeline(ctx context.Context, fromSec int64) (map[int64]map[string]int64, error) {

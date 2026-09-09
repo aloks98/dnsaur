@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/rand/v2"
+	"mime"
 	"net/http"
 	"strings"
 	"testing"
@@ -27,6 +28,30 @@ func TestZoneFileExport(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), "57.129.69.158") {
 		t.Errorf("body missing the record:\n%s", rec.Body)
+	}
+}
+
+// The filename is built from operator input, so it goes through
+// mime.FormatMediaType rather than into a hand-written `filename="%s"`:
+// that is the function that decides when a value needs quoting and escapes
+// what it quotes. A zone name can no longer carry a `"` (see
+// TestZoneCreateRejectsPunctuationInLabels), so this pins the header a
+// legitimate name produces rather than an escape.
+func TestZoneFileExportContentDispositionIsWellFormed(t *testing.T) {
+	srv, zid := newTestServerWithZone(t, "e412.in")
+	rec := srv.do(t, "GET", fmt.Sprintf("/api/v1/zones/%d/file", zid), "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body)
+	}
+	disp, params, err := mime.ParseMediaType(rec.Header().Get("Content-Disposition"))
+	if err != nil {
+		t.Fatalf("Content-Disposition %q does not parse: %v", rec.Header().Get("Content-Disposition"), err)
+	}
+	if disp != "attachment" {
+		t.Errorf("disposition = %q, want attachment", disp)
+	}
+	if params["filename"] != "e412.in.zone" {
+		t.Errorf("filename = %q, want e412.in.zone", params["filename"])
 	}
 }
 

@@ -48,6 +48,9 @@ func (f *fakeFilterStore) Rules(ctx context.Context, g int64) ([]store.Rule, err
 }
 func (f *fakeFilterStore) AddList(ctx context.Context, l store.List) (int64, error) { return 0, nil }
 func (f *fakeFilterStore) AssignList(ctx context.Context, g, l int64) error         { return nil }
+func (f *fakeFilterStore) ReplaceGroupLists(ctx context.Context, g int64, ids []int64) error {
+	return nil
+}
 func (f *fakeFilterStore) AddRule(ctx context.Context, r store.Rule) (int64, error) { return 0, nil }
 func (f *fakeFilterStore) TouchList(ctx context.Context, id, at, n int64) error {
 	f.touched.Add(1)

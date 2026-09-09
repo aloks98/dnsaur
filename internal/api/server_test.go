@@ -212,13 +212,70 @@ func TestAuthRequired(t *testing.T) {
 		t.Fatalf("cookie auth: %d %s", w.Code, w.Body.String())
 	}
 	// bearer path
-	tok, _ := srv.deps.Auth.CreateAPIToken(context.Background(), 1, "t", "write")
+	_, tok, _ := srv.deps.Auth.CreateAPIToken(context.Background(), 1, "t", "write")
 	req := httptest.NewRequest("GET", "/api/v1/_probe", nil)
 	req.Header.Set("Authorization", "Bearer "+tok)
 	w := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(w, req)
 	if w.Code != 200 {
 		t.Fatalf("bearer auth: %d", w.Code)
+	}
+}
+
+// RFC 9110 §11.1: an authentication scheme name is case-insensitive. A
+// client sending "bearer <token>" was answered 401 "authentication
+// required", which reads as a bad token rather than as a rejected spelling.
+func TestBearerSchemeIsCaseInsensitive(t *testing.T) {
+	srv, s, _ := testServer(t)
+	srv.route("GET /api/v1/_probe", srv.requireAuth(func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]string{"user": userFrom(r).Username})
+	}))
+	_ = login(t, srv, s)
+	_, tok, err := srv.deps.Auth.CreateAPIToken(context.Background(), 1, "case", "write")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, scheme := range []string{"Bearer", "bearer", "BEARER", "BeArEr"} {
+		req := httptest.NewRequest("GET", "/api/v1/_probe", nil)
+		req.Header.Set("Authorization", scheme+" "+tok)
+		w := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Errorf("scheme %q: status = %d %s", scheme, w.Code, w.Body)
+		}
+	}
+}
+
+// http.ErrAbortHandler is the one panic value net/http defines as *not* an
+// error: it means "stop this response silently", and the server itself
+// recovers it. Swallowing it here logged a bogus "api panic" and then tried
+// to write a 500 onto a connection the handler had deliberately abandoned,
+// so it has to be re-panicked for net/http to see.
+func TestRecoverPanicRepanicsAbortHandler(t *testing.T) {
+	srv, _, _ := testServer(t)
+	srv.route("GET /api/v1/_abort", func(w http.ResponseWriter, r *http.Request) {
+		panic(http.ErrAbortHandler)
+	})
+	srv.route("GET /api/v1/_boom", func(w http.ResponseWriter, r *http.Request) {
+		panic("boom")
+	})
+	h := srv.Handler()
+
+	var recovered any
+	func() {
+		defer func() { recovered = recover() }()
+		h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/api/v1/_abort", nil))
+	}()
+	if recovered != http.ErrAbortHandler {
+		t.Fatalf("recovered = %v; want ErrAbortHandler to travel on to net/http", recovered)
+	}
+
+	// The other half: an ordinary panic is still turned into a 500 rather
+	// than taking the connection down.
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, httptest.NewRequest("GET", "/api/v1/_boom", nil))
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("ordinary panic: status = %d, want 500", w.Code)
 	}
 }
 
@@ -233,7 +290,7 @@ func TestReadScopeToken(t *testing.T) {
 	// login first so the admin user (id 1) exists before minting an API
 	// token for it, mirroring TestAuthRequired's ordering.
 	_ = login(t, srv, s)
-	tok, err := srv.deps.Auth.CreateAPIToken(context.Background(), 1, "ro", "read")
+	_, tok, err := srv.deps.Auth.CreateAPIToken(context.Background(), 1, "ro", "read")
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -29,7 +29,16 @@ curl or any HTTP client.
 - DNS resolution is never affected by API/DB problems — by design
   (`docs/architecture.md`'s "DNS must not die" principle), DB-dependent
   endpoints return `503` on storage errors rather than taking anything else
-  down.
+  down. **`503` means a genuine storage failure and nothing else.** A write
+  naming a row that does not exist is user input error, not infrastructure:
+  it answers `404` when the missing row is the resource the URL addressed,
+  and `400` naming the field when it came from the body.
+- A body that does not decode — malformed JSON, an unknown key, a
+  wrong-typed field, an empty body — is always `400 invalid json`, on every
+  endpoint. Field validation runs after that and says something about the
+  field. Endpoints used to fold the two together, so `{"name": 5}` came
+  back as `name required`, a claim about a field that had in fact been
+  sent.
 - `GET /health` and `GET /openapi.yaml` are unauthenticated; every other
   endpoint requires auth (`401` if missing/invalid).
 
@@ -161,9 +170,20 @@ Full parameter/response detail lives in `internal/api/openapi.yaml`
   `GET /groups/{id}/lists` and `PUT /groups/{id}/lists` (assign filter
   lists to a group), `GET /groups/{id}/rules` and `POST /groups/{id}/rules`
   (per-group allow/block rules, literal or regex pattern).
+  Every `list_ids` entry must name a list that exists — one that doesn't is
+  a `400` naming the id, on create and on `PUT` alike, and creates nothing.
+  **`PUT /groups/{id}/lists` is one transaction**: a bad id leaves the
+  group's current assignments exactly as they were, rather than the
+  half-emptied set the old unassign-then-assign loop left behind. Duplicate
+  ids in the array are a set, not an error. Every route under
+  `/groups/{id}` answers `404` for a group that does not exist, reads
+  included — `GET /groups/999/lists` is `404`, not `200 []`.
 - **Clients** — `GET /clients`, `POST /clients`, `PUT /clients/{id}`,
   `DELETE /clients/{id}` — each client is an IP or CIDR `matcher` bound to
-  a `group_id`.
+  a `group_id`. A `group_id` naming no group is `400 group_id does not name
+  an existing group`; the same reference from the *path* (`POST
+  /groups/{id}/rules`) is a `404` instead, since there the missing row is
+  the resource the URL addressed.
 - **Filters** — `GET /filters/lists`, `POST /filters/lists` (subscribe a
   block/allow list URL; refreshes synchronously before responding),
   `PATCH /filters/lists/{id}` (enable/disable),
@@ -172,10 +192,28 @@ Full parameter/response detail lives in `internal/api/openapi.yaml`
   asynchronous refresh of all lists).
 - **Zones** — `GET /zones`, `POST /zones`, `GET /zones/{id}`,
   `PATCH /zones/{id}`, `DELETE /zones/{id}` (cascades its records).
+  `PATCH` is conditional on the zone not having changed since it was read:
+  two patches touching different fields no longer overwrite each other, and
+  only a second collision answers `409 zone changed since it was read`.
+  Renaming a `primary`, or disabling or re-enabling one, moves the PTR
+  records its `A`/`AAAA` records own — retired under the old name and
+  re-added under the new, the same rules `DELETE /zones/{id}` follows.
   A name inside an enabled zone is answered or routed by that zone, never
   handed to the default upstreams. `name` alone is enough to create a
   `primary` — SOA fields default to generated values, and an apex NS record
-  is created alongside it. **That apex NS is seeded for a `primary` only**:
+  is created alongside it.
+  A zone `name` is restricted to labels of letters, digits, hyphen and
+  underscore: `miekg/dns`'s own check is deliberately liberal and accepts
+  `;`, `"`, `!` and NUL, none of which survive a zone-file export (`;`
+  opens a comment) or a `Content-Disposition` header. `soa_ns` and
+  `soa_mbox` take the same labels and are checked on `POST` and `PATCH`
+  alike — an unchecked `soa_ns` used to produce an apex NS record whose
+  rdata the DNS parser rejects, silently dropped from answers and fatal to
+  every outbound AXFR. `soa_mbox` is a mailbox written as a domain name
+  (RFC 1035 §8), so a dot in the local part is escaped:
+  `first\.last.example.com` for `first.last@example.com`. Both are stored
+  with any trailing dot removed. The seeded apex NS goes through the same
+  validator a hand-written record does. **That apex NS is seeded for a `primary` only**:
   every other type's contents come from somewhere else, and writing one would
   be dnsaur authoring data in a zone it does not own. `type` may be
   `"primary"`, `"secondary"`, `"forwarder"` or `"stub"`, and the four
@@ -444,7 +482,9 @@ Full parameter/response detail lives in `internal/api/openapi.yaml`
   different zone** than the one in the request path — the reverse zone's,
   not just the forward zone's — since its contents just changed too.
 - **Zone files** — `GET /zones/{id}/file` renders the zone as a BIND
-  master file (RFC 1035 §5) and returns it as an attachment; disabled
+  master file (RFC 1035 §5) and returns it as an attachment (the
+  `Content-Disposition` filename is built with `mime.FormatMediaType`, so
+  it is always a well-formed header); disabled
   records are omitted (a master file can't express "present but disabled"),
   and a built-in zone exports like any other. `POST /zones/{id}/file`
   (`{content, dry_run}`) replaces the zone's records and SOA from a master
@@ -488,7 +528,16 @@ Full parameter/response detail lives in `internal/api/openapi.yaml`
   and not on a forwarder.
 - **TSIG keys** — `GET /tsig-keys`, `POST /tsig-keys`, `GET /tsig-keys/{id}`,
   `PUT /tsig-keys/{id}` (full replace — `name`, `algorithm` and `secret` are
-  all required, same as create), `DELETE /tsig-keys/{id}`. A TSIG key (RFC
+  all required, same as create), `DELETE /tsig-keys/{id}`.
+  **A `PUT` that renames a key a zone still names is refused with `409
+  resource in use`**, the same guard `DELETE` applies and for the same
+  reason: `allow_transfer` and `notify_to` carry the key's *name*, so
+  renaming it leaves the zone naming a key that no longer exists and every
+  signed transfer refused with nothing to say why. Everything else stays
+  editable on a referenced key — rotating the secret is most of what `PUT`
+  is for — and a key referenced only by a zone's `tsig_key_id` renames
+  freely, since that reference is by id. `name` takes the same labels a
+  zone name does. A TSIG key (RFC
   8945) authenticates a zone transfer between dnsaur and a peer. Changes take
   effect on the next signed message: the DNS server reads keys from the store
   per message, so a create, edit or delete needs no restart. `name` is
@@ -531,10 +580,15 @@ Full parameter/response detail lives in `internal/api/openapi.yaml`
   discarded since start because the write buffer was full, so a non-zero
   value means the totals beside it are undercounts), `GET /stats/timeline?hours=`
   (decision counts bucketed over time), `GET /stats/top?metric=&n=&hours=`
-  (top-N by `domain`, `blocked_domain`, or `client`).
+  (top-N by `domain`, `blocked_domain`, or `client`). `hours` defaults to
+  24 and is capped at 8784 (24 × 366): a larger window overflowed the
+  duration arithmetic and asked for a span in the future, which answers
+  nothing.
 - **Tokens** — `GET /tokens` (list this user's API tokens; session tokens
   and hashes are never included), `POST /tokens` (`{name, scope}`, returns
-  the plaintext token once), `DELETE /tokens/{id}` (revoke).
+  the plaintext token once, and the `id` is the row that was actually
+  inserted), `DELETE /tokens/{id}` (revoke — `404` means this user owns no
+  token with that id, and only that; a storage failure is a `503`).
 
 TOTP enrollment/management endpoints are listed under Auth above, not
 Tokens — they manage account 2FA, not API tokens.

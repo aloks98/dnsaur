@@ -143,20 +143,36 @@ func (s *Service) Logout(ctx context.Context, plain string) error {
 	return s.tokens.Delete(ctx, tok.ID)
 }
 
-func (s *Service) CreateAPIToken(ctx context.Context, userID int64, name, scope string) (string, error) {
+// CreateAPIToken mints an API token and returns its row id alongside the
+// plaintext. The id is returned rather than discarded because the caller has
+// no other way to learn it: the token's hash is one-way, so a handler that
+// needed the id used to re-list the user's tokens and pick the highest one
+// with a matching name — ambiguous the moment two tokens share a name, and
+// 0 when the listing itself failed.
+func (s *Service) CreateAPIToken(ctx context.Context, userID int64, name, scope string) (int64, string, error) {
 	if scope != "read" && scope != "write" {
-		return "", fmt.Errorf("scope must be read or write")
+		return 0, "", fmt.Errorf("scope must be read or write")
 	}
 	plain, hash, err := NewToken()
 	if err != nil {
-		return "", err
+		return 0, "", err
 	}
-	_, err = s.tokens.Create(ctx, store.AuthToken{
+	id, err := s.tokens.Create(ctx, store.AuthToken{
 		UserID: userID, Kind: "api", Name: name, TokenHash: hash, Scope: scope, CreatedAt: s.Now().UnixMilli(),
 	})
-	return plain, err
+	if err != nil {
+		return 0, "", err
+	}
+	return id, plain, nil
 }
 
+// RevokeToken deletes one of this user's API tokens.
+//
+// A token that is not theirs (or does not exist) comes back wrapping
+// store.ErrNotFound, so the API can answer 404 for that case *and only that
+// case*. Every error here used to be indistinguishable, and the handler
+// mapped all of them to 404 — so a database that was merely unreachable told
+// a script the token was gone.
 func (s *Service) RevokeToken(ctx context.Context, userID, tokenID int64) error {
 	list, err := s.tokens.ListAPI(ctx, userID)
 	if err != nil {
@@ -167,7 +183,7 @@ func (s *Service) RevokeToken(ctx context.Context, userID, tokenID int64) error 
 			return s.tokens.Delete(ctx, tokenID)
 		}
 	}
-	return fmt.Errorf("token %d not owned by user %d", tokenID, userID)
+	return fmt.Errorf("token %d not owned by user %d: %w", tokenID, userID, store.ErrNotFound)
 }
 
 func (s *Service) ListAPITokens(ctx context.Context, userID int64) ([]store.AuthToken, error) {

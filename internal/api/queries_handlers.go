@@ -83,10 +83,23 @@ func (s *Server) handleQueriesTail(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// maxStatsHours bounds the ?hours= window on the stats endpoints: a leap
+// year, which is the longest span any of them can usefully answer for.
+//
+// Unbounded, time.Duration(hours)*time.Hour overflows int64 at about 2.5
+// million hours and wraps negative, so a large enough value asked the store
+// for a window in the *future* and got an empty answer back — a 200 that
+// reports nothing happened. Clamping keeps the largest window anyone can
+// mean and makes every larger one mean the same thing.
+const maxStatsHours = 24 * 366
+
 func hoursFromSec(r *http.Request) int64 {
 	hours := qInt(r, "hours")
 	if hours <= 0 {
 		hours = 24
+	}
+	if hours > maxStatsHours {
+		hours = maxStatsHours
 	}
 	return time.Now().Add(-time.Duration(hours) * time.Hour).Unix()
 }

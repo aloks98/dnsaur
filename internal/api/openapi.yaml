@@ -1089,8 +1089,11 @@ paths:
       parameters:
         - name: group_id
           in: query
-          required: true
-          schema: { type: integer, format: int64 }
+          required: false
+          description: >
+            Omitted (or unparseable — qInt discards the error) means group
+            0. The handler has always defaulted it; the spec said required.
+          schema: { type: integer, format: int64, default: 0 }
       responses:
         "204":
           description: No Content
@@ -1154,7 +1157,9 @@ paths:
                     The exact set of lists to assign, an empty array
                     included — "assign nothing" is a real choice. Omitted
                     assigns every list that exists, because a group with
-                    none filters nothing at all.
+                    none filters nothing at all. Every id must name an
+                    existing list; one that does not is a 400 and no group
+                    is created.
       responses:
         "201":
           description: Created
@@ -1165,7 +1170,9 @@ paths:
                 properties:
                   id: { type: integer, format: int64 }
         "400":
-          description: name required
+          description: >
+            invalid json, name required, or `list_ids names list <id>,
+            which does not exist`
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -1296,6 +1303,11 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
+        "404":
+          description: no group with this id
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
         "503":
           description: storage unavailable
           content:
@@ -1304,6 +1316,10 @@ paths:
     put:
       tags: [Groups, Filters]
       summary: Replace the set of filter lists assigned to a group
+      description: >
+        Applied as one transaction: an id that names no list changes
+        nothing, so the group keeps the assignments it already had.
+        Duplicate ids are a set — the same list twice is one assignment.
       requestBody:
         required: true
         content:
@@ -1319,7 +1335,9 @@ paths:
         "204":
           description: No Content
         "400":
-          description: bad id or invalid json
+          description: >
+            bad id, invalid json, or `list_ids names list <id>, which does
+            not exist`
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -1330,6 +1348,11 @@ paths:
               schema: { $ref: "#/components/schemas/Error" }
         "403":
           $ref: "#/components/responses/ReadOnlyToken"
+        "404":
+          description: no group with this id
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
         "503":
           description: storage unavailable
           content:
@@ -1370,6 +1393,11 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
+        "404":
+          description: no group with this id
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
         "503":
           description: storage unavailable
           content:
@@ -1402,8 +1430,8 @@ paths:
                   id: { type: integer, format: int64 }
         "400":
           description: >
-            bad id; action allow|block and pattern required; regex pattern
-            too long (max 512); or invalid regex
+            invalid json; bad id; action allow|block and pattern required;
+            regex pattern too long (max 512); or invalid regex
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -1414,6 +1442,11 @@ paths:
               schema: { $ref: "#/components/schemas/Error" }
         "403":
           $ref: "#/components/responses/ReadOnlyToken"
+        "404":
+          description: no group with this id
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
         "503":
           description: storage unavailable
           content:
@@ -1472,7 +1505,9 @@ paths:
                 properties:
                   id: { type: integer, format: int64 }
         "400":
-          description: matcher must be an IP or CIDR and group_id set
+          description: >
+            invalid json; matcher must be an IP or CIDR and group_id set;
+            or `group_id does not name an existing group`
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -1520,7 +1555,9 @@ paths:
         "204":
           description: No Content
         "400":
-          description: bad id, or matcher must be an IP or CIDR and group_id set
+          description: >
+            bad id; invalid json; matcher must be an IP or CIDR and
+            group_id set; or `group_id does not name an existing group`
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -1903,8 +1940,20 @@ paths:
                   description: >
                     forwarder only; rejected on every other type — see
                     the Zone schema's forward_to field for the format.
-                soa_ns: { type: string, description: 'defaults to "ns.<name>"' }
-                soa_mbox: { type: string, description: 'defaults to "hostadmin.<name>"' }
+                soa_ns:
+                  type: string
+                  description: >
+                    An absolute domain name, same label rules as name;
+                    stored with any trailing dot removed. Defaults to
+                    "ns.<name>".
+                soa_mbox:
+                  type: string
+                  description: >
+                    The zone contact as a domain name (RFC 1035 §8), so a
+                    dot in the local part is written \. — "first\.last.
+                    example.com" for first.last@example.com. Same label
+                    rules as name otherwise, stored with any trailing dot
+                    removed. Defaults to "hostadmin.<name>".
                 soa_refresh: { type: integer, format: int64, description: seconds; defaults to 900 }
                 soa_retry: { type: integer, format: int64, description: seconds; defaults to 300 }
                 soa_expire: { type: integer, format: int64, description: seconds; defaults to 604800 }
@@ -1930,7 +1979,9 @@ paths:
             names a TSIG key that does not exist; notify_to is set on a
             type other than primary or secondary, is malformed, or names
             a TSIG key that does not exist; or forward_to is set on a
-            type other than forwarder, or is malformed
+            type other than forwarder, or is malformed; or soa_ns/soa_mbox
+            is not a valid domain name ("soa_ns must be a valid domain
+            name")
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -2008,6 +2059,20 @@ paths:
         zone as it will be, not against the request: patching a zone to
         secondary without giving it primaries is rejected, and so is
         clearing the primaries of a zone that is already one.
+
+
+        Renaming a primary zone, or disabling or re-enabling one, moves
+        the PTR records its A/AAAA records own in whichever reverse zone
+        holds them — retired under the old name and re-added under the
+        new, exactly as DELETE /zones/{id} retires them. Only PTRs that
+        still point at this zone's own names are touched.
+
+
+        The write is conditional on the zone not having changed since it
+        was read. Two concurrent patches touching different fields no
+        longer overwrite each other: the losing one redoes its merge
+        against the row as it now is, and only a second failure answers
+        409.
       requestBody:
         required: true
         content:
@@ -2018,8 +2083,17 @@ paths:
                 name: { type: string, description: apex domain name, e.g. example.com }
                 type: { type: string, enum: [primary, secondary, forwarder, stub] }
                 enabled: { type: boolean }
-                soa_ns: { type: string }
-                soa_mbox: { type: string }
+                soa_ns:
+                  type: string
+                  description: >
+                    An absolute domain name, same label rules as name;
+                    stored with any trailing dot removed. "" is rejected.
+                soa_mbox:
+                  type: string
+                  description: >
+                    The zone contact as a domain name (RFC 1035 §8), so a
+                    dot in the local part is written \. — see the same
+                    field on POST /zones. "" is rejected.
                 soa_refresh: { type: integer, format: int64, description: seconds }
                 soa_retry: { type: integer, format: int64, description: seconds }
                 soa_expire: { type: integer, format: int64, description: seconds }
@@ -2053,7 +2127,8 @@ paths:
             notify_to is set on a type other than primary or secondary /
             is malformed / names a TSIG key that does not exist, or
             forward_to is set on a type other than forwarder / is
-            malformed
+            malformed, or soa_ns/soa_mbox is not a valid domain name
+            ("soa_ns must be a valid domain name")
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -2072,7 +2147,9 @@ paths:
         "409":
           description: >
             the zone is type internal ("built-in zones cannot be
-            changed"); or a zone with that name already exists
+            changed"); a zone with that name already exists; or the zone
+            was written by someone else while this request was preparing
+            its own write, twice over ("zone changed since it was read")
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -2902,6 +2979,16 @@ paths:
       description: >
         Full replacement, not a partial patch -- name, algorithm and secret
         are all required, the same as create.
+
+
+        A *rename* is refused with 409 "resource in use" while any zone's
+        allow_transfer or notify_to names this key by name: renaming it
+        would leave that zone naming a key that no longer exists, and every
+        signed transfer or NOTIFY under it refused with nothing to say why
+        -- the same reason DELETE is refused. Everything else stays
+        editable on a referenced key, rotating the secret included, and a
+        key referenced only by a zone's tsig_key_id can be renamed freely,
+        since that reference is by id.
       requestBody:
         required: true
         content:
@@ -2920,8 +3007,9 @@ paths:
           description: No Content
         "400":
           description: >
-            bad id, name is not a valid domain name, algorithm is not one of
-            the five miekg/dns can sign with, or secret is not valid base64
+            bad id, invalid json, name is not a valid domain name,
+            algorithm is not one of the five miekg/dns can sign with, or
+            secret is not valid base64
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -2938,7 +3026,10 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
         "409":
-          description: a TSIG key with that name already exists
+          description: >
+            "a TSIG key with that name already exists", or "resource in
+            use" when the write renames a key a zone names in
+            allow_transfer or notify_to
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -2951,10 +3042,11 @@ paths:
       tags: [TSIG Keys]
       summary: Delete a TSIG key
       description: >
-        Refused with 409 while any zone's tsig_key_id names this key.
-        Deleting it would leave that secondary unable to authenticate its
-        transfers, with nothing on the zone to say why — so the key has to
-        be released from every zone that uses it first.
+        Refused with 409 while any zone names this key — by tsig_key_id, or
+        by `key:` in allow_transfer or notify_to. Deleting it would leave
+        that zone unable to authenticate its transfers, with nothing on the
+        zone to say why — so the key has to be released from every zone
+        that uses it first. PUT applies the name half of the same guard.
       responses:
         "204":
           description: No Content
@@ -3087,7 +3179,13 @@ paths:
       parameters:
         - name: hours
           in: query
-          schema: { type: integer, description: lookback window; <=0 defaults to 24 }
+          schema:
+            type: integer
+            maximum: 8784
+            description: >
+              Lookback window. <=0 defaults to 24; anything above 8784
+              (24 x 366) is clamped to it, since a larger window overflowed
+              the duration arithmetic and asked for a span in the future.
       responses:
         "200":
           description: OK
@@ -3120,7 +3218,13 @@ paths:
       parameters:
         - name: hours
           in: query
-          schema: { type: integer, description: lookback window; <=0 defaults to 24 }
+          schema:
+            type: integer
+            maximum: 8784
+            description: >
+              Lookback window. <=0 defaults to 24; anything above 8784
+              (24 x 366) is clamped to it, since a larger window overflowed
+              the duration arithmetic and asked for a span in the future.
       responses:
         "200":
           description: OK, sorted ascending by bucket
@@ -3161,7 +3265,13 @@ paths:
           schema: { type: integer, description: "<=0 defaults to 10, capped at 100" }
         - name: hours
           in: query
-          schema: { type: integer, description: lookback window; <=0 defaults to 24 }
+          schema:
+            type: integer
+            maximum: 8784
+            description: >
+              Lookback window. <=0 defaults to 24; anything above 8784
+              (24 x 366) is clamped to it, since a larger window overflowed
+              the duration arithmetic and asked for a span in the future.
       responses:
         "200":
           description: OK, sorted descending by count
@@ -3245,10 +3355,17 @@ paths:
               schema:
                 type: object
                 properties:
-                  id: { type: integer, format: int64 }
+                  id:
+                    type: integer
+                    format: int64
+                    description: >
+                      The id of the row this request inserted. Previously
+                      a guess derived from re-listing the caller's tokens,
+                      which two tokens of the same name made ambiguous and
+                      a failed listing made 0.
                   token: { type: string, description: plaintext token; shown once }
         "400":
-          description: name required, or invalid scope
+          description: invalid json, name required, or invalid scope
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -3269,6 +3386,11 @@ paths:
     delete:
       tags: [Tokens]
       summary: Revoke an API token
+      description: >
+        404 means this user owns no token with that id — and only that.
+        Every error used to map to 404, storage failures included, so a
+        database that was merely unreachable told the caller the token was
+        already gone.
       responses:
         "204":
           description: No Content
@@ -3285,7 +3407,12 @@ paths:
         "403":
           $ref: "#/components/responses/ReadOnlyToken"
         "404":
-          description: not found
+          description: no token with this id belongs to the current user
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503":
+          description: storage unavailable
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"reflect"
 	"testing"
+	"time"
 )
 
 func TestZoneStoreRoundTrip(t *testing.T) {
@@ -784,6 +785,72 @@ func TestBumpSerialWrapsAtMaxUint32(t *testing.T) {
 		}
 		if z.SOASerial != 1 {
 			t.Errorf("SOASerial = %d, want 1", z.SOASerial)
+		}
+	})
+}
+
+// The optimistic predicate behind the API's PATCH. Both drivers, because
+// what is being asserted is a row count from a conditional UPDATE — sqlite
+// and postgres each report it their own way, and the whole guard is that
+// number being zero.
+func TestUpdateZoneIfUnchangedRefusesAStaleWrite(t *testing.T) {
+	forEachDriver(t, func(t *testing.T, s Store) {
+		ctx := context.Background()
+		now := time.Now().UnixMilli()
+		id, err := s.Zones().AddZone(ctx, Zone{
+			Name: testGroupName("stale.test"), Type: "primary", Enabled: true,
+			SOASerial: 1, SOARefresh: 900, SOARetry: 300, CreatedAt: now, ModifiedAt: now,
+		})
+		if err != nil {
+			t.Fatalf("AddZone: %v", err)
+		}
+		read, err := s.Zones().Zone(ctx, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Somebody else lands first, moving modified_at.
+		winner := read
+		winner.SOARetry = 111
+		winner.ModifiedAt = read.ModifiedAt + 1
+		if err := s.Zones().UpdateZoneIfUnchanged(ctx, winner, read.ModifiedAt); err != nil {
+			t.Fatalf("first write: %v", err)
+		}
+
+		// The write computed from the earlier read must not land — it would
+		// carry the old soa_retry back over the winner's.
+		loser := read
+		loser.SOARefresh = 222
+		loser.ModifiedAt = read.ModifiedAt + 1
+		if err := s.Zones().UpdateZoneIfUnchanged(ctx, loser, read.ModifiedAt); !errors.Is(err, ErrStale) {
+			t.Fatalf("stale write: err = %v, want ErrStale", err)
+		}
+		z, err := s.Zones().Zone(ctx, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if z.SOARetry != 111 || z.SOARefresh == 222 {
+			t.Fatalf("soa_retry/soa_refresh = %d/%d; the stale write landed", z.SOARetry, z.SOARefresh)
+		}
+
+		// Redone against the row as it now is, it lands.
+		fresh, err := s.Zones().Zone(ctx, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		retry := fresh
+		retry.SOARefresh = 222
+		retry.ModifiedAt = fresh.ModifiedAt + 1
+		if err := s.Zones().UpdateZoneIfUnchanged(ctx, retry, fresh.ModifiedAt); err != nil {
+			t.Fatalf("retry: %v", err)
+		}
+		if z, _ := s.Zones().Zone(ctx, id); z.SOARefresh != 222 || z.SOARetry != 111 {
+			t.Fatalf("soa_refresh/soa_retry = %d/%d, want 222/111", z.SOARefresh, z.SOARetry)
+		}
+
+		// A zone that is gone is a different answer from one that moved.
+		if err := s.Zones().UpdateZoneIfUnchanged(ctx, Zone{ID: 999999}, 0); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("missing zone: err = %v, want ErrNotFound", err)
 		}
 	})
 }

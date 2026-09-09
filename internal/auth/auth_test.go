@@ -160,7 +160,7 @@ func TestAPITokens(t *testing.T) {
 	svc := New(&memUsers{}, newMemTokens())
 	_ = svc.CreateAdmin(ctx, "admin", "password")
 	u, _, _ := func() (store.User, bool, error) { return svc.users.ByUsername(ctx, "admin") }()
-	plain, err := svc.CreateAPIToken(ctx, u.ID, "homeassistant", "write")
+	_, plain, err := svc.CreateAPIToken(ctx, u.ID, "homeassistant", "write")
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -2,10 +2,12 @@ package api
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"net/http"
 	"net/url"
 	"regexp"
+	"strconv"
 
 	"github.com/aloks98/dnsaur/internal/store"
 )
@@ -50,9 +52,8 @@ type listCreate struct {
 }
 
 func (s *Server) handleListCreate(w http.ResponseWriter, r *http.Request) {
-	body, err := decode[listCreate](r)
-	if err != nil {
-		errJSON(w, http.StatusBadRequest, "invalid json")
+	body, ok := decodeOr400[listCreate](w, r)
+	if !ok {
 		return
 	}
 	u, uerr := url.Parse(body.URL)
@@ -127,10 +128,13 @@ func (s *Server) handleListPatch(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusBadRequest, "bad id")
 		return
 	}
-	body, err := decode[listPatch](r)
+	body, ok := decodeOr400[listPatch](w, r)
+	if !ok {
+		return
+	}
 	// Either field alone is a valid patch. An `enabled`-only body — what
 	// the row's toggle sends — must keep behaving exactly as it did.
-	if err != nil || (body.Enabled == nil && body.Name == nil) {
+	if body.Enabled == nil && body.Name == nil {
 		errJSON(w, http.StatusBadRequest, "enabled or name required")
 		return
 	}
@@ -170,10 +174,36 @@ func (s *Server) handleListDelete(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// groupExists reports whether the group named in the path is there,
+// answering 404 itself when it is not.
+//
+// A sub-resource of a group that does not exist has to be a 404, the same as
+// /zones/{id}/records already answered: `GET /groups/999/lists` returning
+// `200 []` says the group exists and has nothing assigned, which is a claim
+// a client cannot tell from the truth. The write routes get this from the
+// foreign key instead — a read has none to violate.
+func (s *Server) groupExists(w http.ResponseWriter, r *http.Request, gid int64) bool {
+	groups, err := s.deps.Store.Clients().Groups(r.Context())
+	if err != nil {
+		storeErr(w, err)
+		return false
+	}
+	for _, g := range groups {
+		if g.ID == gid {
+			return true
+		}
+	}
+	errJSON(w, http.StatusNotFound, "not found")
+	return false
+}
+
 func (s *Server) handleGroupListsGet(w http.ResponseWriter, r *http.Request) {
 	id, ok := pathID(r)
 	if !ok {
 		errJSON(w, http.StatusBadRequest, "bad id")
+		return
+	}
+	if !s.groupExists(w, r, id) {
 		return
 	}
 	ls, err := s.deps.Store.Filters().ListsForGroup(r.Context(), id)
@@ -194,27 +224,24 @@ func (s *Server) handleGroupListsPut(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusBadRequest, "bad id")
 		return
 	}
-	body, err := decode[groupListsPut](r)
-	if err != nil {
-		errJSON(w, http.StatusBadRequest, "invalid json")
+	body, ok := decodeOr400[groupListsPut](w, r)
+	if !ok {
 		return
 	}
-	current, err := s.deps.Store.Filters().ListsForGroup(r.Context(), gid)
-	if err != nil {
+	// One transaction, in the store. This used to unassign the current rows
+	// one at a time and then assign the new ones, so a list id naming
+	// nothing failed *after* the unassigns had committed: the caller got an
+	// error and the group was left with no lists at all — the destructive
+	// half of a replace it had been told did not happen.
+	if err := s.deps.Store.Filters().ReplaceGroupLists(r.Context(), gid, body.ListIDs); err != nil {
+		var missing *store.MissingRef
+		if errors.As(err, &missing) {
+			errJSON(w, http.StatusBadRequest,
+				"list_ids names list "+strconv.FormatInt(missing.ID, 10)+", which does not exist")
+			return
+		}
 		storeErr(w, err)
 		return
-	}
-	for _, l := range current {
-		if err := s.deps.Store.Filters().UnassignList(r.Context(), gid, l.ID); err != nil {
-			storeErr(w, err)
-			return
-		}
-	}
-	for _, id := range body.ListIDs {
-		if err := s.deps.Store.Filters().AssignList(r.Context(), gid, id); err != nil {
-			storeErr(w, err)
-			return
-		}
 	}
 	s.refreshFilters(r)
 	w.WriteHeader(http.StatusNoContent)
@@ -224,6 +251,9 @@ func (s *Server) handleRulesGet(w http.ResponseWriter, r *http.Request) {
 	gid, ok := pathID(r)
 	if !ok {
 		errJSON(w, http.StatusBadRequest, "bad id")
+		return
+	}
+	if !s.groupExists(w, r, gid) {
 		return
 	}
 	rs, err := s.deps.Store.Filters().Rules(r.Context(), gid)
@@ -246,8 +276,11 @@ func (s *Server) handleRuleCreate(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusBadRequest, "bad id")
 		return
 	}
-	body, err := decode[ruleCreate](r)
-	if err != nil || (body.Action != "allow" && body.Action != "block") || body.Pattern == "" {
+	body, ok := decodeOr400[ruleCreate](w, r)
+	if !ok {
+		return
+	}
+	if (body.Action != "allow" && body.Action != "block") || body.Pattern == "" {
 		errJSON(w, http.StatusBadRequest, "action allow|block and pattern required")
 		return
 	}
@@ -261,6 +294,10 @@ func (s *Server) handleRuleCreate(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// storeErr, not storeErrDupRef: rules.group_id is a foreign key and the
+	// group it names came from the path, so a violation means the resource
+	// this URL addresses does not exist — 404, which is what storeErr
+	// answers for ErrReference with no field to name.
 	id, err := s.deps.Store.Filters().AddRule(r.Context(), store.Rule{GroupID: gid, Action: body.Action, Pattern: body.Pattern, IsRegex: body.IsRegex})
 	if err != nil {
 		storeErr(w, err)

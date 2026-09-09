@@ -42,7 +42,9 @@ document still carries line-number citations, unverified since they were
 written; see §10 item 16.
 
 **Auth** — a `dnsaur_session` cookie or `Authorization: Bearer <token>`. Bearer
-wins if both are sent (`Server.requireAuth`, `internal/api/server.go`).
+wins if both are sent (`Server.requireAuth`, `internal/api/server.go`). The
+scheme name is matched case-insensitively (RFC 9110 §11.1), so `bearer` and
+`BEARER` work too.
 
 | Cookie attribute | Value |
 |---|---|
@@ -63,9 +65,18 @@ session is never 403'd — the SPA has no 403 handling and doesn't need any.
 
 **Request bodies** — decoded with `DisallowUnknownFields` and a 1 MiB cap
 (`decode[T]`, `internal/api/server.go`). An unknown key, malformed JSON, an empty
-body and a wrong-typed field are indistinguishable to the handler, so they all
-produce that endpoint's single decode-failure string — which is often *not*
-`invalid json`. See each endpoint.
+body and a wrong-typed field are still indistinguishable to the handler, but
+they now all produce **`400 invalid json`**, everywhere (`decodeOr400`, same
+file). Field validation runs after the decode and says something about the
+field, so `POST /tokens {"name": 5}` is `invalid json` rather than the
+`name required` it used to claim. Two files are not yet converted and answer
+`invalid json` already anyway: `auth_handlers.go` and `settings_handlers.go`.
+
+**Reference failures are not `503`.** A write naming a row that does not
+exist — `rules.group_id`, `clients.group_id`, either half of `group_lists` —
+used to reach the storage-failure branch and answer `503 storage
+unavailable`. It is now `404 not found` when the missing row is the resource
+the URL named, and `400` naming the field when it came from the body.
 
 **Status codes** — `201` for creates (no `Location` header, ever), `204` for
 updates/deletes (empty body — refetch to observe state), `202` for exactly one
@@ -86,8 +97,12 @@ on every `GET` route.
 brand-new instance (`internal/store/sql.go`, `search.go:54`, `tokenstore.go:42`).
 
 **Numeric query params never error.** `qInt` discards parse errors
-(`internal/api/queries_handlers.go:22-25`), so `limit=banana`, `hours=-5` and a
+(`internal/api/queries_handlers.go`), so `limit=banana`, `hours=-5` and a
 missing param are all `0`, which each endpoint then replaces with its default.
+`hours` is also capped at **8784** (24 × 366) on the three stats endpoints: it
+had no upper bound, and `time.Duration(hours)*time.Hour` overflows at about
+2.5 million hours, so a large enough value wrapped negative and asked for a
+window in the future — a 200 reporting that nothing had happened.
 
 ---
 
@@ -303,7 +318,7 @@ Path ids must parse as int64 **and be > 0**, else 400 `bad id`. So `0`, `-1`,
 | Endpoint | Success | Notes |
 |---|---|---|
 | `GET /groups` | 200 array | ordered by id |
-| `POST /groups` | 201 `{"id":2}` | body `{"name"[, "enabled"][, "list_ids"]}`; `name` required non-empty. `enabled` omitted = true. `list_ids` omitted = every existing list; `[]` = none |
+| `POST /groups` | 201 `{"id":2}` | body `{"name"[, "enabled"][, "list_ids"]}`; `name` required non-empty. `enabled` omitted = true. `list_ids` omitted = every existing list; `[]` = none. Every id must exist — one that doesn't is a 400 and **no group is created** |
 | `PATCH /groups/{id}` | 204 | body `{"name"?, "enabled"?}` — both optional pointers; `{}` is a legal no-op |
 | `DELETE /groups/{id}` | 204 | cascades the group's `group_lists` and `rules` |
 | `GET /clients` | 200 array | |
@@ -322,9 +337,12 @@ Path ids must parse as int64 **and be > 0**, else 400 `bad id`. So `0`, `-1`,
 
 | Status | Error string | When |
 |---|---|---|
-| 400 | `name required` | groups: also the decode-failure message |
+| 400 | `invalid json` | any body that fails to decode, on every route here |
+| 400 | `name required` | groups: `name` missing or empty |
 | 400 | `name cannot be empty` | PATCH with `"name": ""` |
-| 400 | `matcher must be an IP or CIDR and group_id set` | clients: **one string covers decode failure, bad matcher and bad group_id** |
+| 400 | `list_ids names list <id>, which does not exist` | `POST /groups` with an unknown list id; nothing is created |
+| 400 | `matcher must be an IP or CIDR and group_id set` | clients: bad matcher or missing group_id (decode failure is `invalid json`) |
+| 400 | `group_id does not name an existing group` | `POST`/`PUT /clients` naming a group that isn't there |
 | 409 | `resource in use` | deleting group id 1, or a group with clients attached |
 | 409 | `a group with that name already exists` | duplicate name on create **or** rename |
 | 409 | `another client already matches <matcher>` | duplicate client matcher on create or update |
@@ -341,10 +359,10 @@ Path ids must parse as int64 **and be > 0**, else 400 `bad id`. So `0`, `-1`,
 | `POST /filters/lists` | **201** `{"id":1}` | body `{"url","kind"}` + **optional `name`**; kicks off a background refresh of *every* list |
 | `PATCH /filters/lists/{id}` | 204 | body `{"enabled": bool}` and/or `{"name": string}` — **at least one required**; `url`/`kind` are rejected |
 | `DELETE /filters/lists/{id}` | 204 | |
-| `GET /groups/{id}/lists` | 200 array | a **nonexistent group returns `[]` + 200**, not 404 |
-| `PUT /groups/{id}/lists` | 204 | body `{"list_ids":[...]}`; `null`/omitted unassigns everything |
-| `GET /groups/{id}/rules` | 200 array | `[]` for a nonexistent group |
-| `POST /groups/{id}/rules` | 201 `{"id":1}` | group comes from the **path**, not the body |
+| `GET /groups/{id}/lists` | 200 array | **404** for a group that does not exist (it used to answer `[]` + 200) |
+| `PUT /groups/{id}/lists` | 204 | body `{"list_ids":[...]}`; `null`/omitted unassigns everything. One transaction; duplicate ids are a set; unknown id → 400, unknown group → 404 |
+| `GET /groups/{id}/rules` | 200 array | **404** for a group that does not exist |
+| `POST /groups/{id}/rules` | 201 `{"id":1}` | group comes from the **path**, not the body; a group that does not exist → **404** |
 | `DELETE /filters/rules/{id}` | 204 | note the asymmetry: created under `/groups/{id}/rules`, deleted under `/filters/rules/{id}` |
 | `POST /filters/refresh` | **202** `{"status":"refreshing"}` | no body read |
 
@@ -369,11 +387,14 @@ Path ids must parse as int64 **and be > 0**, else 400 `bad id`. So `0`, `-1`,
 | Status | Error string |
 |---|---|
 | 409 | `that list URL is already subscribed` |
+| 400 | `invalid json` — every body that fails to decode, PATCHing `url`/`kind` included (`DisallowUnknownFields` rejects them) |
 | 400 | `url must be http(s)` |
 | 400 | `kind must be block or allow` |
-| 400 | `enabled or name required` (also the decode-failure message for PATCH — including an attempt to PATCH `url` or `kind`, which `DisallowUnknownFields` rejects) |
+| 400 | `enabled or name required` (PATCH with neither field) |
 | 400 | `name too long (max 120)` (create and PATCH) |
-| 400 | `action allow\|block and pattern required` (also decode failure) |
+| 400 | `action allow\|block and pattern required` |
+| 400 | `list_ids names list <id>, which does not exist` (`PUT /groups/{id}/lists`) |
+| 404 | `not found` — a group that does not exist, on any `/groups/{id}/…` route |
 | 400 | `regex pattern too long (max 512)` |
 | 400 | `invalid regex: <Go's compile error, verbatim>` — e.g. `invalid regex: error parsing regexp: missing closing ]: ` + `` `[unclosed` `` |
 
@@ -385,11 +406,12 @@ only hit the server log. Poll `GET /filters/lists` and read `last_status` /
 freshly added list reads `entry_count: 0` with `last_status: "pending"` until
 the fetch lands.
 
-**`PUT /groups/{id}/lists` is not transactional** — it unassigns every current
-list one-by-one, then assigns the requested ids
-(`internal/api/filters_handlers.go:148-164`). A failure partway (duplicate id in
-the array, or a nonexistent list id) returns 503 *after* the unassign loop has
-already committed, leaving the group with a partial set.
+**`PUT /groups/{id}/lists` is one transaction** (`FilterStore.ReplaceGroupLists`,
+`internal/store/sql.go`). It used to unassign every current list one-by-one and
+then assign the requested ids, so a nonexistent list id returned 503 *after* the
+unassign loop had committed and left the group with a partial set. Now an
+unknown id is a 400 naming it and the group keeps exactly the assignments it
+had; a duplicate id in the array is a set, not a failure.
 
 ---
 
@@ -405,7 +427,7 @@ forwarded**, which is the entire point of the change (see
 | `GET /zones` | 200 array |
 | `POST /zones` | 201 `{"id":1}` |
 | `GET /zones/{id}` | 200 object |
-| `PATCH /zones/{id}` | 204 |
+| `PATCH /zones/{id}` | 204 — conditional on the zone not having changed since it was read (a lost race is retried once, then 409); renaming, disabling or re-enabling a `primary` moves the PTRs its records own |
 | `DELETE /zones/{id}` | 204 — cascades every record in the zone, and retires the PTRs those records owned from whatever reverse zone holds them (the cascade cannot reach those: they are rows in a different zone) |
 | `GET /zones/{id}/records` | 200 array |
 | `POST /zones/{id}/records` | 201 `{"id":1}` |
@@ -486,10 +508,32 @@ Zone create/patch errors:
 | 400 | `invalid json` |
 | 400 | `bad id` |
 | 400 | `name must be a valid domain name` |
+| 400 | `soa_ns must be a valid domain name` |
+| 400 | `soa_mbox must be a valid domain name (a dot in the local part is written \.)` |
 | 400 | `only primary, secondary, forwarder and stub zones are supported` |
 | 404 | `not found` |
 | 409 | `a zone with that name already exists` |
+| 409 | `zone changed since it was read` — two writers, twice over |
 | 503 | `storage unavailable` |
+
+**What counts as a valid domain name here.** `name`, `soa_ns` and `soa_mbox`
+all take labels of letters, digits, hyphen and underscore, nothing else
+(`validDomainLabels`, `internal/api/zones_handlers.go`). `dns.IsDomainName`
+alone accepts `;`, `"`, `!` and NUL — verified — and none of those survive a
+zone-file export or a `Content-Disposition` header, so a zone called
+`a;b.lan` could be created and never exported back in. `soa_mbox` is a
+mailbox written as a domain name (RFC 1035 §8), so a dot in the local part is
+escaped: `first\.last.e412.in` for `first.last@e412.in`. Both SOA names are
+stored with any trailing dot removed — `zones.Render` writes `SOA %s. %s.`,
+so a stored trailing dot would export as `..` — and both are checked on
+`POST` and `PATCH` alike. On `PATCH` they are pointers, so `""` is a value
+the caller chose and is rejected; on `POST` they are plain strings, where
+`""` still means "use the generated default".
+
+The seeded apex NS goes through `buildZoneRecord`, the same validator a hand
+write uses. Before that it went straight to the store, so an unvalidated
+`soa_ns` produced an NS row whose rdata `dns.NewRR` rejects: the answer path
+dropped it silently and every outbound AXFR errored on it.
 
 Real capture, `GET /zones/1/records` after adding an A record at `bifrost`
 (name typed relative) and another at `nas.home.lan` (typed fully-qualified —
@@ -735,16 +779,17 @@ Metric universes differ, so counts across metrics are not comparable:
 `expires_at: 0` means **never expires** — every API token is non-expiring.
 `token_hash` is `json:"-"` and never leaves the server.
 
-Errors: 400 `name required` (also the decode-failure message), 400
-`scope must be read or write`, 404 `not found` on delete — which also covers
-another user's token *and* any underlying storage failure.
+Errors: 400 `invalid json` (any body that fails to decode), 400 `name required`,
+400 `scope must be read or write`, 404 `not found` on delete — which covers a
+token that does not exist and another user's token, **and nothing else**: a
+storage failure is a 503. Every error used to map to 404, so a database that
+was merely unreachable told a script the token was already gone.
 
-> The `id` in the create response is **not** the insert id. The handler
-> re-lists the user's tokens and picks the highest id with a matching name
-> (`internal/api/tokens_handlers.go:49-55`). Two tokens with the same name make
-> it ambiguous, and a failed listing makes it `0`. Refetch `GET /tokens` rather
-> than trusting it. Verified: creating a second `grafana-scraper` returned
-> `{"id":5,...}` with no error.
+The `id` in the create response **is** the insert id
+(`auth.Service.CreateAPIToken` returns it). It used to be a guess — the handler
+re-listed the user's tokens and picked the highest id with a matching name,
+which two tokens of one name made ambiguous and a failed listing made `0`,
+silently, since that listing's error was discarded too.
 
 ---
 
@@ -755,7 +800,7 @@ another user's token *and* any underlying storage failure.
 | `GET /tsig-keys` | 200 array | `[]` when empty, never `null` |
 | `POST /tsig-keys` | 201 `{"id"}` | |
 | `GET /tsig-keys/{id}` | 200 object | |
-| `PUT /tsig-keys/{id}` | 204 | full replace — all three fields required, same as create |
+| `PUT /tsig-keys/{id}` | 204 | full replace — all three fields required, same as create. **409** when it renames a key a zone names by name — see below |
 | `DELETE /tsig-keys/{id}` | 204 | **404** for an id that never existed, **409** when a zone names the key — see below |
 
 ```json
@@ -781,13 +826,14 @@ Three things about this shape are easy to get wrong:
   into the peer's config, so the screen's masking is a display choice about
   what sits on screen rather than a boundary of any kind.
 
-Errors: 400 `name must be a valid domain name`, 400 `algorithm must be one of
-hmac-sha1., hmac-sha224., hmac-sha256., hmac-sha384., hmac-sha512.`, 400
+Errors: 400 `name must be a valid domain name` (the same label rules a zone
+name takes — see §2.6), 400 `algorithm must be one of hmac-sha1.,
+hmac-sha224., hmac-sha256., hmac-sha384., hmac-sha512.`, 400
 `secret must be base64-encoded`, 400 `invalid json` / `bad id`, 404
-`not found` (**get, update *and* delete** — `Update` goes through `execOne`
-and `Delete` re-reads on 0 rows precisely so it can tell "never existed"
-from "spoken for"), 409 `a TSIG key with that name already exists` (create
-and update), 409 `resource in use` (delete, when a zone names the key — see
+`not found` (**get, update *and* delete** — both `Update` and `Delete` re-read
+on 0 rows precisely so they can tell "never existed" from "spoken for"), 409
+`a TSIG key with that name already exists` (create and update), 409
+`resource in use` (**update *and* delete**, when a zone names the key — see
 below). This document said delete "succeeds even for an id that never
 existed" and scoped the 404 to `GET` until D6's docs pass; both were false
 and both contradicted the shipped `openapi.yaml`, which documents 404 on all
@@ -803,7 +849,20 @@ three.
 > `DELETE /tsig-keys/{id}` answers **409 `resource in use`** when any zone
 > names the key — by `tsig_key_id`, or by `key:` in either list — enforced
 > in the `DELETE` statement itself (`tsigKeyStore.Delete`) because
-> `zones.tsig_key_id` carries no foreign key. The screen has a **USED BY**
+> `zones.tsig_key_id` carries no foreign key.
+>
+> **`PUT /tsig-keys/{id}` applies the name half of the same guard.** A write
+> that *changes the name* while `allow_transfer` or `notify_to` names the key
+> answers the same **409 `resource in use`**: those two columns carry the
+> name as text, so a rename leaves the zone naming a key that does not exist
+> and every signed transfer or NOTIFY refused with nothing to say why —
+> exactly what the delete guard exists to prevent, reached by editing. It
+> answered 204 until now. A write that *keeps* the name never consults the
+> checks at all, so rotating a secret or correcting an algorithm on a
+> referenced key still works; and a key referenced only by `tsig_key_id`
+> renames freely, since that reference is by id. Enforced in the `UPDATE`
+> statement itself (`tsigKeyStore.Update`), the same way the delete is. The
+> dashboard side of this is task #41. The screen has a **USED BY**
 > column to match, counting the zones that name the key; it is computed
 > client-side from `GET /zones` rather than served as a field, so if that
 > request fails every row reads `—` and the 409 is what reports the truth.
@@ -1729,8 +1788,10 @@ Go source. **The code is the source of truth.**
    storage.) The **409-on-duplicate** half of this entry is fully resolved —
    every one of the nine `storeErrDup` endpoints documents it — and is
    withdrawn rather than narrowed.
-7. `openapi.yaml` marks `group_id` **required** on `DELETE /blocking/pause`;
-   the code makes it optional, defaulting to 0 (the global pause).
+7. ~~`openapi.yaml` marks `group_id` **required** on `DELETE
+   /blocking/pause`; the code makes it optional, defaulting to 0 (the global
+   pause).~~ **Fixed in the spec**, which is the half that was wrong: the
+   parameter is `required: false` with `default: 0` and says why.
 8. `openapi.yaml` marks `group_id` required on `POST /blocking/pause`; only
    `minutes` is actually validated.
 9. **Partly fixed.** The 1 MiB cap is documented on
@@ -1739,9 +1800,10 @@ Go source. **The code is the source of truth.**
    `io.LimitReader(r.Body, 1<<20)` bounds *every* JSON body; only the import
    turns exceeding it into a 413 instead of a decode failure).
    `openapi.yaml` still documents neither `DisallowUnknownFields` — so a
-   client sending an unknown key gets that endpoint's decode-failure string
-   with nothing in the spec to explain why — nor that a method mismatch
-   yields 404 rather than 405.
+   client sending an unknown key gets `invalid json` with nothing in the
+   spec to explain why — nor that a method mismatch yields 404 rather than
+   405. The decode failure is at least one string everywhere now (§1)
+   rather than a different one per endpoint.
 10. `openapi.yaml` describes the SSE stream without noting the absent
     `event:`/`id:` fields, the absent heartbeat, or the 64-entry
     drop-on-slow-consumer behaviour.
@@ -1773,9 +1835,8 @@ Go source. **The code is the source of truth.**
     re-checked in that pass and should be converted the same way when each
     section is next touched. A line number is a claim about a file's history; a function name
     is a claim about its behaviour, which is what this document is for.
-17. `openapi.yaml`'s `DELETE /tsig-keys/{id}` describes the 409 as "while any
-    zone's `tsig_key_id` names this key". The `DELETE` statement also refuses
-    when a zone's `allow_transfer` or `notify_to` carries a matching `key:`
-    entry (`aclKeyRef`/`notifyKeyRef`, `internal/store/tsigkeys.go`), so the
-    spec's reason is narrower than the behaviour. §2.10 above states the full
-    rule.
+17. ~~`openapi.yaml`'s `DELETE /tsig-keys/{id}` describes the 409 as "while
+    any zone's `tsig_key_id` names this key", narrower than the `DELETE`
+    statement, which also refuses on a matching `key:` entry in
+    `allow_transfer` or `notify_to`.~~ **Fixed in the spec**, which now
+    states the full rule and carries `PUT`'s rename guard beside it.

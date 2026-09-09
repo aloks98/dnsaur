@@ -353,6 +353,62 @@ func TestAutoPTRRetiredWhenForwardZoneDeleted(t *testing.T) {
 	}
 }
 
+// Renaming a forward zone moves every name its records answer to, so the
+// PTRs pointing at the old names have to move with it. Before this, PATCH
+// never touched auto-PTR at all: the reverse zone went on answering
+// `nas.home.lan.` for a zone now called `home.arpa`, and a later delete of
+// the A record looked for a PTR naming `nas.home.arpa`, never matched it,
+// and left the stale one behind for good.
+func TestAutoPTRFollowsAForwardZoneRename(t *testing.T) {
+	srv := newTestServer(t)
+	fwd := srv.createZone(t, "e412.in")
+	rev := srv.createZone(t, "150.168.192.in-addr.arpa")
+	srv.createRecord(t, fwd, `{"name":"bifrost","type":"A","ttl":300,"rdata":"192.168.150.10"}`)
+	snap := srv.captureReloads()
+
+	if rec := srv.do(t, "PATCH", fmt.Sprintf("/api/v1/zones/%d", fwd), `{"name":"nexus.test"}`); rec.Code != http.StatusNoContent {
+		t.Fatalf("rename: status = %d body = %s", rec.Code, rec.Body)
+	}
+
+	ptr := srv.recordsByType(t, rev, ptrType)
+	if len(ptr) != 1 || ptr[0].RData != "bifrost.nexus.test." {
+		t.Fatalf("PTRs = %+v; want one pointing at bifrost.nexus.test.", ptr)
+	}
+	// The rename's own reload has to publish the moved PTR, for the reason
+	// TestAutoPTRIsServedByTheSameRequestsReload gives.
+	if got := snap.servedPTRs(rev); len(got) != 1 || got[0] != "10" {
+		t.Fatalf("reload served PTRs %v; want [10]", got)
+	}
+}
+
+// Disabling a forward zone takes its names out of service, so the reverse
+// must stop answering with them; enabling it again puts them back. A PTR
+// naming a zone that answers nothing is a reverse answer for a name that
+// resolves nowhere — the same reason addPTR refuses to write one for a
+// disabled record.
+func TestAutoPTRFollowsAForwardZoneBeingDisabledAndEnabled(t *testing.T) {
+	srv := newTestServer(t)
+	fwd := srv.createZone(t, "e412.in")
+	rev := srv.createZone(t, "150.168.192.in-addr.arpa")
+	srv.createRecord(t, fwd, `{"name":"bifrost","type":"A","ttl":300,"rdata":"192.168.150.10"}`)
+	path := fmt.Sprintf("/api/v1/zones/%d", fwd)
+
+	if rec := srv.do(t, "PATCH", path, `{"enabled":false}`); rec.Code != http.StatusNoContent {
+		t.Fatalf("disable: status = %d body = %s", rec.Code, rec.Body)
+	}
+	if ptr := srv.recordsByType(t, rev, ptrType); len(ptr) != 0 {
+		t.Fatalf("PTRs = %+v; want them retired with the zone that answers for them", ptr)
+	}
+
+	if rec := srv.do(t, "PATCH", path, `{"enabled":true}`); rec.Code != http.StatusNoContent {
+		t.Fatalf("enable: status = %d body = %s", rec.Code, rec.Body)
+	}
+	ptr := srv.recordsByType(t, rev, ptrType)
+	if len(ptr) != 1 || ptr[0].RData != "bifrost.e412.in." {
+		t.Fatalf("PTRs = %+v; want the zone's PTR back", ptr)
+	}
+}
+
 // The same guard removePTR applies everywhere else: a zone delete retires
 // only the PTRs that still point at its own names. Here neither surviving
 // PTR does — one was typed by hand, the other is owned by a name in a

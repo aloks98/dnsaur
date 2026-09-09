@@ -236,10 +236,21 @@ func (s *Server) Handler() http.Handler {
 func recoverPanic(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer func() {
-			if rec := recover(); rec != nil {
-				slog.Error("api panic", "path", r.URL.Path, "panic", rec)
-				errJSON(w, http.StatusInternalServerError, "internal error")
+			rec := recover()
+			if rec == nil {
+				return
 			}
+			// http.ErrAbortHandler is the one panic value that is not a
+			// failure: net/http defines it as "abandon this response
+			// quietly", recovers it itself, and expects nothing else to be
+			// written. Catching it here logged a panic that never happened
+			// and then tried to write a 500 onto a connection the handler
+			// had deliberately given up on.
+			if rec == http.ErrAbortHandler {
+				panic(rec)
+			}
+			slog.Error("api panic", "path", r.URL.Path, "panic", rec)
+			errJSON(w, http.StatusInternalServerError, "internal error")
 		}()
 		next.ServeHTTP(w, r)
 	})
@@ -289,6 +300,21 @@ func storeErr(w http.ResponseWriter, err error) {
 // collided on instead of answering "storage unavailable" to what is really
 // user input error.
 func storeErrDup(w http.ResponseWriter, err error, dupMsg string) {
+	storeErrDupRef(w, err, dupMsg, "")
+}
+
+// storeErrDupRef is storeErrDup with the reference case named too, for a
+// write whose foreign key came from the request *body*: refMsg says which
+// field named a row that does not exist, and the answer is 400.
+//
+// A reference failure has no single right status, which is why the choice
+// is the call site's. When the only reference in the write is the one the
+// URL named — POST /groups/{id}/rules, whose group comes from the path —
+// the missing row *is* the resource the request addressed, and 404 is the
+// answer; that is what refMsg == "" selects. When it came from the body
+// there is no missing resource, only a bad field, and answering 404 would
+// claim the URL's own resource was gone.
+func storeErrDupRef(w http.ResponseWriter, err error, dupMsg, refMsg string) {
 	switch {
 	case errors.Is(err, store.ErrNotFound):
 		errJSON(w, http.StatusNotFound, "not found")
@@ -296,6 +322,12 @@ func storeErrDup(w http.ResponseWriter, err error, dupMsg string) {
 		errJSON(w, http.StatusConflict, "resource in use")
 	case errors.Is(err, store.ErrDuplicate):
 		errJSON(w, http.StatusConflict, dupMsg)
+	case errors.Is(err, store.ErrReference):
+		if refMsg == "" {
+			errJSON(w, http.StatusNotFound, "not found")
+			return
+		}
+		errJSON(w, http.StatusBadRequest, refMsg)
 	default:
 		errJSON(w, http.StatusServiceUnavailable, "storage unavailable")
 	}
@@ -311,9 +343,31 @@ func decode[T any](r *http.Request) (T, error) {
 	return v, nil
 }
 
+// decodeOr400 decodes the body and answers 400 "invalid json" itself when it
+// cannot, returning ok == false so the handler simply returns.
+//
+// It exists to keep that answer one answer. Handlers used to fold the decode
+// error into the field check — `if err != nil || body.Name == ""` — so
+// `{"name": 5}` came back as "name required", which is a claim about a field
+// that was in fact sent, and every endpoint documented a different string for
+// the same failure. Field validation belongs after this call, where it can
+// say something true.
+func decodeOr400[T any](w http.ResponseWriter, r *http.Request) (T, bool) {
+	v, err := decode[T](r)
+	if err != nil {
+		errJSON(w, http.StatusBadRequest, "invalid json")
+		return v, false
+	}
+	return v, true
+}
+
 type ctxKey int
 
 const userKey ctxKey = 0
+
+// bearerPrefix is the Authorization scheme, with its separating space.
+// Compared case-insensitively — see requireAuth.
+const bearerPrefix = "Bearer "
 
 func userFrom(r *http.Request) store.User {
 	u, _ := r.Context().Value(userKey).(store.User)
@@ -323,8 +377,13 @@ func userFrom(r *http.Request) store.User {
 func (s *Server) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var token string
-		if h := r.Header.Get("Authorization"); strings.HasPrefix(h, "Bearer ") {
-			token = strings.TrimPrefix(h, "Bearer ")
+		// RFC 9110 §11.1: the scheme name is case-insensitive, so
+		// "bearer <token>" is the same request as "Bearer <token>". A
+		// case-sensitive prefix answered it 401 "authentication required",
+		// which reads as a rejected credential rather than a rejected
+		// spelling.
+		if h := r.Header.Get("Authorization"); len(h) > len(bearerPrefix) && strings.EqualFold(h[:len(bearerPrefix)], bearerPrefix) {
+			token = h[len(bearerPrefix):]
 		} else if c, err := r.Cookie("dnsaur_session"); err == nil {
 			token = c.Value
 		}

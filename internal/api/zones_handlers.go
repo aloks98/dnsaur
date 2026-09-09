@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -41,6 +42,14 @@ func (s *Server) notifyZones() {
 // with (RFC 2181 §10.1, see handleZoneCreate). It matches the TTL convention
 // used elsewhere for generated/example zone_records rows.
 const apexNSTTL = 3600
+
+// The refusals for the two SOA domain-name fields. Spelled out once because
+// create and patch both answer them, and §1 of docs/ui-contract.md holds
+// this project to the exact string.
+const (
+	soaNSMsg   = "soa_ns must be a valid domain name"
+	soaMboxMsg = `soa_mbox must be a valid domain name (a dot in the local part is written \.)`
+)
 
 // defaultSOATTL is the SOA record's own header TTL, fixed rather than
 // client-settable in Milestone A (zoneCreate/zonePatch have no soa_ttl
@@ -254,22 +263,92 @@ func canonicalForwardTo(input string) (string, error) {
 	return zones.FormatForwardTo(ts), nil
 }
 
-// normalizeZoneName lowercases name, strips a trailing dot, and validates
-// it. dns.IsDomainName gives RFC 1035 §2.3.4 (label <= 63 octets, name <=
-// 255 octets) but documents itself as "extremely liberal — almost any
-// string is a valid domain name", so it alone would accept "not a domain".
-// The extra checks here catch what it deliberately doesn't: an empty label
-// (e.g. "e412..in") and whitespace/path characters that never appear in a
-// real hostname.
+// validDomainLabels reports whether name — already trimmed of whitespace and
+// of a trailing dot — is built only from labels this API will accept.
+//
+// dns.IsDomainName is the RFC 1035 §2.3.4 length check and nothing more; it
+// documents itself as "extremely liberal — almost any string is a valid
+// domain name" and, verified, accepts `"`, `;`, `!` and NUL inside a label.
+// None of those survive where a zone or key name actually goes: a zone named
+// "a;b.lan" exports `$ORIGIN a;b.lan.`, where `;` opens a comment, so the
+// file it hands the operator cannot be read back; `a"b.lan` closes the
+// quoted filename in Content-Disposition; and a NUL truncates whatever
+// reads it as a C string.
+//
+// The accepted set is letters, digits, hyphen and underscore — RFC 1035's
+// LDH plus the underscore that `_dmarc` and every other service label needs,
+// which is also what a punycode `xn--` label is spelled in. No wildcard:
+// neither caller can be one, since a zone apex and a TSIG key's owner name
+// name a specific thing. (Record names, which *can* be wildcards, are
+// validated in internal/zones.)
+//
+// escapeDot admits `\.` — a literal dot inside a label rather than the
+// separator between two. Only soa_mbox sets it: a mailbox is carried as a
+// domain name (RFC 1035 §8), so a dot in the local part has to be escaped,
+// and that escape is the only backslash anything here accepts.
+func validDomainLabels(name string, escapeDot bool) bool {
+	if name == "" {
+		return false
+	}
+	labelLen := 0
+	for i := 0; i < len(name); i++ {
+		switch c := name[i]; {
+		case c == '\\' && escapeDot:
+			if i+1 >= len(name) || name[i+1] != '.' {
+				return false
+			}
+			i++
+			labelLen++
+		case c == '.':
+			// An empty label — "e412..in", or a leading dot.
+			if labelLen == 0 {
+				return false
+			}
+			labelLen = 0
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9', c == '-', c == '_':
+			labelLen++
+		default:
+			return false
+		}
+	}
+	// A trailing dot would leave the last label empty; callers strip it
+	// before calling, so one here is the same defect as an empty label
+	// anywhere else.
+	return labelLen > 0
+}
+
+// normalizeZoneName lowercases name, strips a trailing dot, and validates it
+// — see validDomainLabels for what "valid" means and why dns.IsDomainName
+// alone is not it.
 func normalizeZoneName(raw string) (string, bool) {
 	name := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(raw), "."))
-	if name == "" || strings.ContainsAny(name, " \t\r\n/\\") {
+	if !validDomainLabels(name, false) {
 		return "", false
 	}
-	for _, label := range strings.Split(name, ".") {
-		if label == "" {
-			return "", false
-		}
+	if _, ok := dns.IsDomainName(name); !ok {
+		return "", false
+	}
+	return name, true
+}
+
+// normalizeSOAName validates one of the SOA's two domain-name fields and
+// returns it in the form the rest of the codebase stores: trimmed, with no
+// trailing dot.
+//
+// The trailing dot is not cosmetic. zones.Render writes `SOA %s. %s.`, and a
+// transfer stores what it received with the dot trimmed off
+// (Transferrer.applySOA), so a hand-written "ns1.e412.in." would export as
+// "ns1.e412.in.." — a zone file no parser accepts, produced by a zone that
+// looked fine everywhere else.
+//
+// Neither field was checked at all before. `POST /zones {"soa_ns":"not a
+// hostname"}` answered 201 and seeded an apex NS record whose rdata fails
+// ToRR ("garbage after rdata"): the answer path drops such a record
+// silently (zones/answer.go) and every outbound AXFR errors on it.
+func normalizeSOAName(raw string, escapeDot bool) (string, bool) {
+	name := strings.TrimSuffix(strings.TrimSpace(raw), ".")
+	if !validDomainLabels(name, escapeDot) {
+		return "", false
 	}
 	if _, ok := dns.IsDomainName(name); !ok {
 		return "", false
@@ -343,9 +422,8 @@ type zoneCreate struct {
 }
 
 func (s *Server) handleZoneCreate(w http.ResponseWriter, r *http.Request) {
-	body, err := decode[zoneCreate](r)
-	if err != nil {
-		errJSON(w, http.StatusBadRequest, "invalid json")
+	body, ok := decodeOr400[zoneCreate](w, r)
+	if !ok {
 		return
 	}
 	name, ok := normalizeZoneName(body.Name)
@@ -385,13 +463,21 @@ func (s *Server) handleZoneCreate(w http.ResponseWriter, r *http.Request) {
 		enabled = *body.Enabled
 	}
 
-	soaNS := body.SOANS
-	if soaNS == "" {
-		soaNS = "ns." + name
+	soaNS := "ns." + name
+	if body.SOANS != "" {
+		var ok bool
+		if soaNS, ok = normalizeSOAName(body.SOANS, false); !ok {
+			errJSON(w, http.StatusBadRequest, soaNSMsg)
+			return
+		}
 	}
-	soaMbox := body.SOAMbox
-	if soaMbox == "" {
-		soaMbox = "hostadmin." + name
+	soaMbox := "hostadmin." + name
+	if body.SOAMbox != "" {
+		var ok bool
+		if soaMbox, ok = normalizeSOAName(body.SOAMbox, true); !ok {
+			errJSON(w, http.StatusBadRequest, soaMboxMsg)
+			return
+		}
 	}
 	soaRefresh := body.SOARefresh
 	if soaRefresh == 0 {
@@ -411,7 +497,7 @@ func (s *Server) handleZoneCreate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	now := time.Now().UnixMilli()
-	id, err := s.deps.Store.Zones().AddZone(r.Context(), store.Zone{
+	zone := store.Zone{
 		Name:       name,
 		Type:       zoneType,
 		Enabled:    enabled,
@@ -437,33 +523,55 @@ func (s *Server) handleZoneCreate(w http.ResponseWriter, r *http.Request) {
 		ForwardTo:  forwardTo,
 		CreatedAt:  now,
 		ModifiedAt: now,
-	})
-	if err != nil {
-		storeErrDup(w, err, "a zone with that name already exists")
-		return
 	}
 
 	// RFC 2181 §10.1: a zone's apex must have NS records, or the zone is
 	// malformed from the moment it exists — every future zone-file export
-	// and transfer would carry the defect outward. Best-effort like
-	// handleGroupCreate's list assignment below it: the zone itself already
-	// committed, so a failure here is logged rather than turned into a
-	// response the caller can't reconcile with the id it was just handed.
+	// and transfer would carry the defect outward.
+	//
+	// Built through buildZoneRecord, the same validator behind a hand write,
+	// and built *before* the zone is inserted. Writing it straight into
+	// AddRecord skipped every rule the API enforces on a human, so an
+	// unvalidated soa_ns produced an NS row whose rdata fails ToRR: the
+	// answer path drops it and every outbound AXFR errors on it, in a zone
+	// that reports itself created and healthy. soa_ns is checked above now
+	// too, which makes a refusal here all but unreachable — but "all but"
+	// is why the record is built first and the zone written only if it
+	// holds, rather than logged after the fact against a zone that already
+	// exists.
 	//
 	// Primary zones only. A secondary's contents are its primary's, arriving
 	// whole on the first transfer and replacing whatever is there; seeding
 	// an NS record here would be dnsaur authoring data in a zone it does not
 	// own, and serving it as authoritative in the window before that
 	// transfer lands.
+	var apexNS store.ZoneRecord
 	if zoneType == zoneTypePrimary {
-		if _, err := s.deps.Store.Zones().AddRecord(r.Context(), store.ZoneRecord{
-			ZoneID:  id,
-			Name:    "@",
-			Type:    "NS",
-			TTL:     apexNSTTL,
-			RData:   dns.Fqdn(soaNS),
-			Enabled: true,
-		}); err != nil {
+		rec, code, msg, ok := buildZoneRecord(zone, zoneRecordWrite{
+			Name:  "@",
+			Type:  "NS",
+			TTL:   apexNSTTL,
+			RData: dns.Fqdn(soaNS),
+		}, nil, 0, false)
+		if !ok {
+			errJSON(w, code, msg)
+			return
+		}
+		apexNS = rec
+	}
+
+	id, err := s.deps.Store.Zones().AddZone(r.Context(), zone)
+	if err != nil {
+		storeErrDup(w, err, "a zone with that name already exists")
+		return
+	}
+
+	if zoneType == zoneTypePrimary {
+		apexNS.ZoneID = id
+		// Still best-effort at the storage layer: the zone itself already
+		// committed, so a failure here is logged rather than turned into a
+		// response the caller cannot reconcile with the id just handed back.
+		if _, err := s.deps.Store.Zones().AddRecord(r.Context(), apexNS); err != nil {
 			slog.Error("creating apex NS record for new zone failed", "zone", id, "err", err)
 		}
 	}
@@ -508,39 +616,18 @@ type zonePatch struct {
 	ForwardTo *string `json:"forward_to"`
 }
 
-func (s *Server) handleZonePatch(w http.ResponseWriter, r *http.Request) {
-	id, ok := pathID(r)
-	if !ok {
-		errJSON(w, http.StatusBadRequest, "bad id")
-		return
-	}
-	body, err := decode[zonePatch](r)
-	if err != nil {
-		errJSON(w, http.StatusBadRequest, "invalid json")
-		return
-	}
-	if body.Type != nil && *body.Type != zoneTypePrimary && *body.Type != zoneTypeSecondary && *body.Type != zoneTypeForwarder && *body.Type != zoneTypeStub {
-		errJSON(w, http.StatusBadRequest, "only primary, secondary, forwarder and stub zones are supported")
-		return
-	}
-
-	z, err := s.deps.Store.Zones().Zone(r.Context(), id)
-	if err != nil {
-		storeErr(w, err)
-		return
-	}
-	// A built-in zone is seeded infrastructure (RFC 6303), not user content —
-	// see internal/store/builtins.go. Reads are fine; writes are not.
-	if z.Type == "internal" {
-		errJSON(w, http.StatusConflict, "built-in zones cannot be changed")
-		return
-	}
-
+// mergeZonePatch applies body to z and validates the result, returning the
+// zone as it should be stored or the status and message to refuse with.
+//
+// Separate from the handler because the handler may have to run it twice —
+// see handleZonePatch's retry. A merge computed from a row that has since
+// moved is worthless, so redoing it, rather than replaying the same merged
+// struct, is the whole of what makes the retry safe.
+func (s *Server) mergeZonePatch(ctx context.Context, z store.Zone, body zonePatch) (store.Zone, int, string) {
 	if body.Name != nil {
 		name, ok := normalizeZoneName(*body.Name)
 		if !ok {
-			errJSON(w, http.StatusBadRequest, "name must be a valid domain name")
-			return
+			return z, http.StatusBadRequest, "name must be a valid domain name"
 		}
 		z.Name = name
 	}
@@ -550,11 +637,25 @@ func (s *Server) handleZonePatch(w http.ResponseWriter, r *http.Request) {
 	if body.Enabled != nil {
 		z.Enabled = *body.Enabled
 	}
+	// Both SOA names are validated here for the same reason they are on
+	// create: soa_ns becomes the zone's advertised MNAME and, on a zone
+	// created through this API, matches the apex NS record beside it. A
+	// pointer field, unlike zoneCreate's plain string, makes "" a value the
+	// caller chose rather than one they omitted — and an empty MNAME is not
+	// a name.
 	if body.SOANS != nil {
-		z.SOANS = *body.SOANS
+		soaNS, ok := normalizeSOAName(*body.SOANS, false)
+		if !ok {
+			return z, http.StatusBadRequest, soaNSMsg
+		}
+		z.SOANS = soaNS
 	}
 	if body.SOAMbox != nil {
-		z.SOAMbox = *body.SOAMbox
+		soaMbox, ok := normalizeSOAName(*body.SOAMbox, true)
+		if !ok {
+			return z, http.StatusBadRequest, soaMboxMsg
+		}
+		z.SOAMbox = soaMbox
 	}
 	if body.SOARefresh != nil {
 		z.SOARefresh = *body.SOARefresh
@@ -587,9 +688,8 @@ func (s *Server) handleZonePatch(w http.ResponseWriter, r *http.Request) {
 	// type without primaries, or clears primaries without changing type,
 	// leaves a secondary with nowhere to pull from either way, and only the
 	// result says which.
-	if code, msg := s.checkZoneTransferConfig(r.Context(), z.Type, z.Primaries, z.TSIGKeyID, z.AllowTransfer, z.NotifyTo, z.ForwardTo); code != 0 {
-		errJSON(w, code, msg)
-		return
+	if code, msg := s.checkZoneTransferConfig(ctx, z.Type, z.Primaries, z.TSIGKeyID, z.AllowTransfer, z.NotifyTo, z.ForwardTo); code != 0 {
+		return z, code, msg
 	}
 	// The canonical spelling, not whatever was sent — see
 	// canonicalAllowTransfer. A no-op when AllowTransfer wasn't in the
@@ -597,33 +697,104 @@ func (s *Server) handleZonePatch(w http.ResponseWriter, r *http.Request) {
 	// canonical.
 	allowTransfer, err := canonicalAllowTransfer(z.AllowTransfer)
 	if err != nil {
-		errJSON(w, http.StatusBadRequest, err.Error())
-		return
+		return z, http.StatusBadRequest, err.Error()
 	}
 	z.AllowTransfer = allowTransfer
 	// Same reasoning for NotifyTo — see canonicalNotifyTo.
 	notifyTo, err := canonicalNotifyTo(z.NotifyTo)
 	if err != nil {
-		errJSON(w, http.StatusBadRequest, err.Error())
-		return
+		return z, http.StatusBadRequest, err.Error()
 	}
 	z.NotifyTo = notifyTo
 	// Same reasoning for ForwardTo — see canonicalForwardTo.
 	forwardTo, err := canonicalForwardTo(z.ForwardTo)
 	if err != nil {
-		errJSON(w, http.StatusBadRequest, err.Error())
-		return
+		return z, http.StatusBadRequest, err.Error()
 	}
 	z.ForwardTo = forwardTo
-	z.ModifiedAt = time.Now().UnixMilli()
+	return z, 0, ""
+}
 
-	if err := s.deps.Store.Zones().UpdateZone(r.Context(), z); err != nil {
-		storeErrDup(w, err, "a zone with that name already exists")
+// zonePatchAttempts is how many times handleZonePatch will read, merge and
+// write before giving up with a 409.
+//
+// Two, not one and not many. One would surface a benign race — two PATCHes
+// touching different fields, which is the shape a dashboard produces when an
+// operator edits two panels — as an error the user has to understand and
+// retry by hand. Many would let a row under continuous write pressure hold
+// a request open indefinitely; the second failure is evidence of genuine
+// contention, and saying so is more useful than trying again.
+const zonePatchAttempts = 2
+
+func (s *Server) handleZonePatch(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(r)
+	if !ok {
+		errJSON(w, http.StatusBadRequest, "bad id")
 		return
 	}
-	s.reloadZones(r)
-	s.notifyZones()
-	w.WriteHeader(http.StatusNoContent)
+	body, ok := decodeOr400[zonePatch](w, r)
+	if !ok {
+		return
+	}
+	if body.Type != nil && *body.Type != zoneTypePrimary && *body.Type != zoneTypeSecondary && *body.Type != zoneTypeForwarder && *body.Type != zoneTypeStub {
+		errJSON(w, http.StatusBadRequest, "only primary, secondary, forwarder and stub zones are supported")
+		return
+	}
+
+	// A PATCH is a read, a merge and a write of the whole row, and nothing
+	// used to stop two of them interleaving: whichever wrote second wrote
+	// every column from a snapshot taken before the first one landed, so the
+	// first one's field was silently reverted. UpdateZoneIfUnchanged refuses
+	// to land on a row that moved, and the loop redoes the merge against the
+	// row as it now is — so an ordinary race costs a second attempt rather
+	// than a lost edit or an error the operator has to interpret.
+	for attempt := 0; attempt < zonePatchAttempts; attempt++ {
+		before, err := s.deps.Store.Zones().Zone(r.Context(), id)
+		if err != nil {
+			storeErr(w, err)
+			return
+		}
+		// A built-in zone is seeded infrastructure (RFC 6303), not user
+		// content — see internal/store/builtins.go. Reads are fine; writes
+		// are not.
+		if before.Type == "internal" {
+			errJSON(w, http.StatusConflict, "built-in zones cannot be changed")
+			return
+		}
+		z, code, msg := s.mergeZonePatch(r.Context(), before, body)
+		if code != 0 {
+			errJSON(w, code, msg)
+			return
+		}
+		// Strictly greater than the value being replaced, not simply "now":
+		// modified_at is what the write predicates on, and it has
+		// millisecond resolution, so two PATCHes landing inside one
+		// millisecond would otherwise write the same value the second one is
+		// checking against and go undetected — the exact race this guard
+		// exists for.
+		z.ModifiedAt = time.Now().UnixMilli()
+		if z.ModifiedAt <= before.ModifiedAt {
+			z.ModifiedAt = before.ModifiedAt + 1
+		}
+
+		err = s.deps.Store.Zones().UpdateZoneIfUnchanged(r.Context(), z, before.ModifiedAt)
+		if errors.Is(err, store.ErrStale) {
+			continue
+		}
+		if err != nil {
+			storeErrDup(w, err, "a zone with that name already exists")
+			return
+		}
+		// Before the reload, so the same snapshot rebuild publishes the zone
+		// change and the reverse zone's new PTRs together — see
+		// handleZoneRecordCreate for the same ordering.
+		s.syncZonePTRsAfterPatch(r.Context(), before, z)
+		s.reloadZones(r)
+		s.notifyZones()
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	errJSON(w, http.StatusConflict, "zone changed since it was read")
 }
 
 func (s *Server) handleZoneDelete(w http.ResponseWriter, r *http.Request) {

@@ -100,6 +100,23 @@ type ZoneStore interface {
 	Zone(ctx context.Context, id int64) (Zone, error)
 	AddZone(ctx context.Context, z Zone) (int64, error)
 	UpdateZone(ctx context.Context, z Zone) error
+	// UpdateZoneIfUnchanged is UpdateZone for a caller that computed z by
+	// merging into a row it read earlier: the write lands only while
+	// modified_at still holds prevModifiedAt, and returns ErrStale when the
+	// row moved in between (ErrNotFound when there is no such row at all).
+	//
+	// It is a separate method rather than a predicate on UpdateZone because
+	// the two have different callers with different claims. UpdateZone's
+	// callers own the row for the duration — the transfer install writes a
+	// zone it just built, the refresher writes fields nothing else touches —
+	// and have nothing to lose a race against. The API's PATCH is the
+	// read-merge-write, and it is the one that needs to be told.
+	//
+	// The caller must make z.ModifiedAt strictly greater than
+	// prevModifiedAt. This column is a millisecond clock, so two writes
+	// inside one millisecond would otherwise store the value the second is
+	// predicating on and slip through the guard.
+	UpdateZoneIfUnchanged(ctx context.Context, z Zone, prevModifiedAt int64) error
 	DeleteZone(ctx context.Context, id int64) error
 	// BumpSerial increments soa_serial in SQL rather than read-modify-write,
 	// so two concurrent record edits on the same zone can't land on the
@@ -253,6 +270,33 @@ func updateRecordArgs(r ZoneRecord) []any {
 
 func (z *zoneStore) UpdateZone(ctx context.Context, zn Zone) error {
 	return z.s.execOne(ctx, updateZoneSQL, updateZoneArgs(zn)...)
+}
+
+// updateZoneIfUnchangedSQL is updateZoneSQL with the optimistic predicate
+// appended rather than a second statement of its own: the column list is the
+// thing that must not drift between the two paths (see the const block
+// above), and a copy would drift the first time a column is added.
+const updateZoneIfUnchangedSQL = updateZoneSQL + ` AND modified_at = ?`
+
+func (z *zoneStore) UpdateZoneIfUnchanged(ctx context.Context, zn Zone, prevModifiedAt int64) error {
+	res, err := z.s.db.ExecContext(ctx, z.s.q(updateZoneIfUnchangedSQL), append(updateZoneArgs(zn), prevModifiedAt)...)
+	if err != nil {
+		return wrapDBErr(err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n > 0 {
+		return nil
+	}
+	// Nothing was updated, and the two reasons for that are different
+	// answers to the caller: the zone is gone (404), or it moved under the
+	// read this write was computed from (409, after a retry).
+	if _, err := z.Zone(ctx, zn.ID); err != nil {
+		return err
+	}
+	return ErrStale
 }
 
 // noteTransferAttemptSQL names the only two columns any transfer outcome is

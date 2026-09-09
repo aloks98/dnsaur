@@ -22,7 +22,40 @@ var (
 	// name. Unique columns today: groups.name, clients.matcher, lists.url,
 	// users.username, auth_tokens.token_hash.
 	ErrDuplicate = errors.New("already exists")
+	// ErrReference is a foreign-key violation — a write naming a parent row
+	// that does not exist (rules.group_id, clients.group_id, either half of
+	// group_lists). Like ErrDuplicate it is user input error and must not be
+	// lumped in with genuine storage failures: without it the API answered
+	// 503 "storage unavailable" to a POST that simply named a group nobody
+	// had created. Whether that becomes a 404 or a 400 is the API's
+	// question, not this package's — it depends on whether the missing
+	// parent was named in the path or in the body.
+	ErrReference = errors.New("referenced row does not exist")
+	// ErrStale is a conditional write that lost a race: the row it was
+	// computed from has been modified since it was read, so applying it
+	// would revert whatever the other writer changed. See
+	// ZoneStore.UpdateZoneIfUnchanged.
+	ErrStale = errors.New("modified since read")
 )
+
+// MissingRef names the row a write referenced that does not exist, for the
+// callers that have to say *which* id was wrong rather than only that one
+// was. It wraps ErrReference, so code matching the sentinel keeps matching
+// while code building a message can reach the id.
+//
+// It is raised by the store methods that check references themselves
+// (ReplaceGroupLists); a violation the driver raises carries no usable id,
+// and stays a bare ErrReference.
+type MissingRef struct {
+	// Table is the referenced table, in the spelling the API uses when it
+	// names the field to the caller ("list", "group").
+	Table string
+	ID    int64
+}
+
+func (e *MissingRef) Error() string { return fmt.Sprintf("%s %d does not exist", e.Table, e.ID) }
+
+func (e *MissingRef) Unwrap() error { return ErrReference }
 
 // User represents an authenticated user.
 type User struct {
@@ -190,6 +223,12 @@ type FilterStore interface {
 	Rules(ctx context.Context, groupID int64) ([]Rule, error)
 	AddList(ctx context.Context, l List) (int64, error)
 	AssignList(ctx context.Context, groupID, listID int64) error
+	// ReplaceGroupLists sets a group's assigned lists to exactly listIDs, in
+	// one transaction: an id that names no list leaves the group's existing
+	// assignments untouched rather than half-removed. Duplicates in listIDs
+	// are one assignment. An unknown list is a *MissingRef (wrapping
+	// ErrReference); an unknown group is ErrNotFound.
+	ReplaceGroupLists(ctx context.Context, groupID int64, listIDs []int64) error
 	AddRule(ctx context.Context, r Rule) (int64, error)
 	// TouchList records a successful refresh that produced entries: status
 	// ListStatusOK, last_refreshed and last_attempt set to refreshedAt,

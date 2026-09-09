@@ -59,11 +59,52 @@ type groupCreate struct {
 }
 
 func (s *Server) handleGroupCreate(w http.ResponseWriter, r *http.Request) {
-	body, err := decode[groupCreate](r)
-	if err != nil || body.Name == "" {
+	body, ok := decodeOr400[groupCreate](w, r)
+	if !ok {
+		return
+	}
+	if body.Name == "" {
 		errJSON(w, http.StatusBadRequest, "name required")
 		return
 	}
+
+	// The lists are resolved and checked *before* the group exists.
+	//
+	// This used to run after the insert, with every failure logged and 201
+	// answered anyway: a body naming a list that does not exist produced a
+	// group with no lists at all and no indication that anything had gone
+	// wrong. Checking first means a request that cannot be carried out
+	// leaves nothing behind for the caller to clean up.
+	//
+	// An explicit list_ids wins, empty array included — "assign nothing" is
+	// a real choice and has to be distinguishable from not choosing.
+	// Omitted still means every list: a group's ruleset compiles only from
+	// its assigned lists, so a group created with none filters nothing at
+	// all, and the clients moved into it would silently stop being
+	// protected — the opposite of why groups exist.
+	lists, err := s.deps.Store.Filters().Lists(r.Context())
+	if err != nil {
+		storeErr(w, err)
+		return
+	}
+	known := make(map[int64]bool, len(lists))
+	for _, l := range lists {
+		known[l.ID] = true
+	}
+	listIDs := body.ListIDs
+	if listIDs == nil {
+		for _, l := range lists {
+			listIDs = append(listIDs, l.ID)
+		}
+	}
+	for _, lid := range listIDs {
+		if !known[lid] {
+			errJSON(w, http.StatusBadRequest,
+				"list_ids names list "+strconv.FormatInt(lid, 10)+", which does not exist")
+			return
+		}
+	}
+
 	id, err := s.deps.Store.Clients().AddGroup(r.Context(), body.Name)
 	if err != nil {
 		storeErrDup(w, err, "a group with that name already exists")
@@ -71,33 +112,20 @@ func (s *Server) handleGroupCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	// Applied after creation rather than in AddGroup: the store's insert
 	// takes only a name, and a second UPDATE is cheaper than a migration
-	// for a field that is almost always its default.
+	// for a field that is almost always its default. Its failure is
+	// surfaced, not logged — answering 201 for a group that came out
+	// enabled when the caller asked for disabled is a lie about the one
+	// field they bothered to send.
 	if body.Enabled != nil && !*body.Enabled {
 		if err := s.deps.Store.Clients().SetGroupEnabled(r.Context(), id, false); err != nil {
-			slog.Error("disabling new group failed", "group", id, "err", err)
+			storeErr(w, err)
+			return
 		}
 	}
-
-	// An explicit list_ids wins, empty array included — "assign nothing" is
-	// a real choice and has to be distinguishable from not choosing.
-	//
-	// Omitted still means every list. A group's ruleset compiles only from
-	// its assigned lists, so a group created with none filters nothing at
-	// all, and the clients moved into it would silently stop being
-	// protected — the opposite of why groups exist.
-	listIDs := body.ListIDs
-	if listIDs == nil {
-		lists, lerr := s.deps.Store.Filters().Lists(r.Context())
-		if lerr != nil {
-			slog.Error("assigning lists to new group failed", "group", id, "err", lerr)
-		}
-		for _, l := range lists {
-			listIDs = append(listIDs, l.ID)
-		}
-	}
-	for _, lid := range listIDs {
-		if err := s.deps.Store.Filters().AssignList(r.Context(), id, lid); err != nil {
-			slog.Error("assigning list to new group failed", "group", id, "list", lid, "err", err)
+	if len(listIDs) > 0 {
+		if err := s.deps.Store.Filters().ReplaceGroupLists(r.Context(), id, listIDs); err != nil {
+			storeErr(w, err)
+			return
 		}
 	}
 	s.reloadClients(r)
@@ -115,9 +143,8 @@ func (s *Server) handleGroupPatch(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusBadRequest, "bad id")
 		return
 	}
-	body, err := decode[groupPatch](r)
-	if err != nil {
-		errJSON(w, http.StatusBadRequest, "invalid json")
+	body, ok := decodeOr400[groupPatch](w, r)
+	if !ok {
 		return
 	}
 	if body.Name != nil && *body.Name == "" {
@@ -171,15 +198,25 @@ func validMatcher(m string) bool {
 	return err == nil
 }
 
+// missingGroupMsg is the answer to a client write whose group_id names no
+// group. clients.group_id is a foreign key, and this one is named in the
+// *body*, so it is a bad field (400) rather than a missing resource (404) —
+// see storeErrDupRef. Before it was mapped at all, this was a 503 "storage
+// unavailable" for a typo.
+const missingGroupMsg = "group_id does not name an existing group"
+
 func (s *Server) handleClientCreate(w http.ResponseWriter, r *http.Request) {
-	body, err := decode[store.Client](r)
-	if err != nil || !validMatcher(body.Matcher) || body.GroupID <= 0 {
+	body, ok := decodeOr400[store.Client](w, r)
+	if !ok {
+		return
+	}
+	if !validMatcher(body.Matcher) || body.GroupID <= 0 {
 		errJSON(w, http.StatusBadRequest, "matcher must be an IP or CIDR and group_id set")
 		return
 	}
 	id, err := s.deps.Store.Clients().AddClient(r.Context(), body)
 	if err != nil {
-		storeErrDup(w, err, "another client already matches "+body.Matcher)
+		storeErrDupRef(w, err, "another client already matches "+body.Matcher, missingGroupMsg)
 		return
 	}
 	s.reloadClients(r)
@@ -192,14 +229,17 @@ func (s *Server) handleClientPut(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusBadRequest, "bad id")
 		return
 	}
-	body, err := decode[store.Client](r)
-	if err != nil || !validMatcher(body.Matcher) || body.GroupID <= 0 {
+	body, ok := decodeOr400[store.Client](w, r)
+	if !ok {
+		return
+	}
+	if !validMatcher(body.Matcher) || body.GroupID <= 0 {
 		errJSON(w, http.StatusBadRequest, "matcher must be an IP or CIDR and group_id set")
 		return
 	}
 	body.ID = id
 	if err := s.deps.Store.Clients().UpdateClient(r.Context(), body); err != nil {
-		storeErrDup(w, err, "another client already matches "+body.Matcher)
+		storeErrDupRef(w, err, "another client already matches "+body.Matcher, missingGroupMsg)
 		return
 	}
 	s.reloadClients(r)

@@ -66,6 +66,38 @@ func TestQueryLogSearch(t *testing.T) {
 	})
 }
 
+// A LIKE wildcard typed into the search box has to match itself. escapeLike
+// used to strip `_` and `%` rather than escape them, so a search for
+// "_dmarc" became a search for "dmarc" and returned every name containing
+// it — the opposite of narrowing, and silently.
+func TestQueryLogSearchTreatsWildcardsLiterally(t *testing.T) {
+	forEachDriver(t, func(t *testing.T, s Store) {
+		ctx := context.Background()
+		cleanupStats(t, s)
+		if err := s.QueryLog().InsertBatch(ctx, []QueryLogEntry{
+			{At: 1000, InstanceID: "i", ClientIP: "10.0.0.5", QName: "_dmarc.example", QType: "TXT", Decision: "forwarded", RCode: "NOERROR"},
+			{At: 2000, InstanceID: "i", ClientIP: "10.0.0.5", QName: "xdmarc.example", QType: "TXT", Decision: "forwarded", RCode: "NOERROR"},
+			{At: 3000, InstanceID: "i", ClientIP: "10.0.0.5", QName: "100%.example", QType: "A", Decision: "forwarded", RCode: "NOERROR"},
+			{At: 4000, InstanceID: "i", ClientIP: "10.0.0.5", QName: "100pc.example", QType: "A", Decision: "forwarded", RCode: "NOERROR"},
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		for _, tc := range []struct{ needle, want string }{
+			{"_dmarc", "_dmarc.example"},
+			{"100%", "100%.example"},
+		} {
+			got, err := s.QueryLog().Search(ctx, QueryLogFilter{QNameContains: tc.needle})
+			if err != nil {
+				t.Fatalf("search %q: %v", tc.needle, err)
+			}
+			if len(got) != 1 || got[0].QName != tc.want {
+				t.Errorf("search %q matched %+v; want only %q", tc.needle, got, tc.want)
+			}
+		}
+	})
+}
+
 func TestTimelineAndSettingsAll(t *testing.T) {
 	forEachDriver(t, func(t *testing.T, s Store) {
 		ctx := context.Background()

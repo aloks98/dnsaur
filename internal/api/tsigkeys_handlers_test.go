@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -190,6 +191,87 @@ func TestDeletingATSIGKeyInUseIsRefused(t *testing.T) {
 	}
 	if _, found, err := srv.store.TSIGKeys().Get(t.Context(), keyID); err != nil || !found {
 		t.Fatalf("key gone after a refused delete: found=%v err=%v", found, err)
+	}
+}
+
+// The delete guard's missing twin. allow_transfer and notify_to name a key
+// by *name*, so renaming one is exactly as destructive as deleting it: the
+// zone goes on naming a key that no longer exists, and every signed transfer
+// is refused with nothing to say why. PUT answered 204 to that until now.
+func TestRenamingATSIGKeyInUseIsRefused(t *testing.T) {
+	const body = `{"name":%q,"algorithm":"hmac-sha256.","secret":"c2VjcmV0LXNlY3JldC1zZWNyZXQ="}`
+	for _, tc := range []struct {
+		name string
+		zone string
+	}{
+		{"allow_transfer", `{"name":"e412.in","allow_transfer":"key:xfer.e412.in."}`},
+		{"notify_to", `{"name":"e412.in","notify_to":"10.0.0.2 key:xfer.e412.in."}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := newTestServer(t)
+			keyID := createTSIGKey(t, srv, "xfer.e412.in.")
+			if rec := srv.do(t, "POST", "/api/v1/zones", tc.zone); rec.Code != http.StatusCreated {
+				t.Fatalf("create zone: %d %s", rec.Code, rec.Body)
+			}
+			path := "/api/v1/tsig-keys/" + itoa(keyID)
+
+			rec := srv.do(t, "PUT", path, fmt.Sprintf(body, "renamed.e412.in."))
+			if rec.Code != http.StatusConflict {
+				t.Fatalf("rename status = %d %s; want 409 — the zone names this key by name", rec.Code, rec.Body)
+			}
+			k, found, err := srv.store.TSIGKeys().Get(t.Context(), keyID)
+			if err != nil || !found || k.Name != "xfer.e412.in." {
+				t.Fatalf("key after a refused rename: %+v found=%v err=%v", k, found, err)
+			}
+
+			// The other half: everything except the name is still editable
+			// on a referenced key — rotating a secret is the whole reason
+			// PUT exists — and so is a write that keeps the name.
+			rec = srv.do(t, "PUT", path,
+				`{"name":"xfer.e412.in.","algorithm":"hmac-sha512.","secret":"bmV3LXNlY3JldC1oZXJlLg=="}`)
+			if rec.Code != http.StatusNoContent {
+				t.Fatalf("same-name update status = %d %s; want 204", rec.Code, rec.Body)
+			}
+			if k, _, _ := srv.store.TSIGKeys().Get(t.Context(), keyID); k.Algorithm != "hmac-sha512." {
+				t.Fatalf("same-name update did not land: %+v", k)
+			}
+		})
+	}
+}
+
+// A key referenced only by zones.tsig_key_id may still be renamed: that
+// reference is by id and a new name does not break it. The guard is about
+// the two columns that name a key in text, and widening it to every
+// reference would refuse an edit that harms nothing.
+func TestRenamingATSIGKeyReferencedByIDIsAllowed(t *testing.T) {
+	srv := newTestServer(t)
+	keyID := createTSIGKey(t, srv, "xfer.e412.in.")
+	if rec := srv.do(t, "POST", "/api/v1/zones",
+		`{"name":"e412.in","type":"secondary","primaries":"192.168.150.5","tsig_key_id":`+itoa(keyID)+`}`); rec.Code != http.StatusCreated {
+		t.Fatalf("create zone: %d %s", rec.Code, rec.Body)
+	}
+	rec := srv.do(t, "PUT", "/api/v1/tsig-keys/"+itoa(keyID),
+		`{"name":"renamed.e412.in.","algorithm":"hmac-sha256.","secret":"c2VjcmV0LXNlY3JldC1zZWNyZXQ="}`)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d %s; want 204", rec.Code, rec.Body)
+	}
+}
+
+// A TSIG key name is a domain name and goes into the same places a zone name
+// does, so it gets the same label rules — dns.IsDomainName alone accepts a
+// semicolon and a quote.
+func TestTSIGKeyCreateRejectsPunctuationInLabels(t *testing.T) {
+	srv := newTestServer(t)
+	for _, name := range []string{`a;b.e412.in.`, `a"b.e412.in.`, `a!b.e412.in.`, `*.e412.in.`} {
+		body, err := json.Marshal(map[string]string{
+			"name": name, "algorithm": "hmac-sha256.", "secret": "c2VjcmV0LXNlY3JldC1zZWNyZXQ=",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if rec := srv.do(t, "POST", "/api/v1/tsig-keys", string(body)); rec.Code != http.StatusBadRequest {
+			t.Errorf("POST name=%q status = %d %s, want 400", name, rec.Code, rec.Body)
+		}
 	}
 }
 

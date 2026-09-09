@@ -3,6 +3,7 @@ package api
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/aloks98/dnsaur/internal/store"
@@ -166,5 +167,60 @@ func TestGroupCreateEnabledAndLists(t *testing.T) {
 	one := create(fmt.Sprintf(`{"name":"one","list_ids":[%d]}`, lid))
 	if n := assigned(one); n != 1 {
 		t.Errorf("explicit list_ids should assign exactly those, got %d", n)
+	}
+}
+
+// clients.group_id is a foreign key and the group is named in the *body*, so
+// an id that names nothing is a bad field — 400 saying which — not the 404
+// the path-named case gets, and certainly not the 503 "storage unavailable"
+// the unmapped driver error used to produce.
+func TestClientWriteWithAMissingGroupIs400(t *testing.T) {
+	srv, s, _ := testServer(t)
+	cookie := login(t, srv, s)
+	h := srv.Handler()
+	gid, _ := s.Clients().AddGroup(t.Context(), "g")
+	w := doReq(t, h, "POST", "/api/v1/clients", `{"name":"x","matcher":"10.1.2.3","group_id":999999}`, cookie)
+	if w.Code != 400 {
+		t.Fatalf("create: status = %d body = %s, want 400", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "group_id") {
+		t.Errorf("create body = %s; want group_id named", w.Body.String())
+	}
+
+	w = doReq(t, h, "POST", "/api/v1/clients", fmt.Sprintf(`{"name":"x","matcher":"10.1.2.3","group_id":%d}`, gid), cookie)
+	if w.Code != 201 {
+		t.Fatalf("seed client: status = %d body = %s", w.Code, w.Body.String())
+	}
+	var created map[string]int64
+	_ = json.Unmarshal(w.Body.Bytes(), &created)
+	w = doReq(t, h, "PUT", fmt.Sprintf("/api/v1/clients/%d", created["id"]),
+		`{"name":"x","matcher":"10.1.2.3","group_id":999999}`, cookie)
+	if w.Code != 400 {
+		t.Fatalf("update: status = %d body = %s, want 400", w.Code, w.Body.String())
+	}
+}
+
+// POST /groups logged and ignored every failure after the insert, so a body
+// naming a list that does not exist answered 201 and produced a group with
+// no lists at all — silently the opposite of what was asked for, and for a
+// group the caller now has to clean up.
+func TestGroupCreateRejectsUnknownListIDs(t *testing.T) {
+	srv, s, _ := testServer(t)
+	cookie := login(t, srv, s)
+	w := doReq(t, srv.Handler(), "POST", "/api/v1/groups", `{"name":"kids","enabled":false,"list_ids":[999999]}`, cookie)
+	if w.Code != 400 {
+		t.Fatalf("status = %d body = %s, want 400", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "999999") {
+		t.Errorf("body = %s; want the offending id named", w.Body.String())
+	}
+	groups, err := s.Clients().Groups(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, g := range groups {
+		if g.Name == "kids" {
+			t.Fatalf("a refused create left a group behind: %+v", g)
+		}
 	}
 }

@@ -121,6 +121,97 @@ func (s *Server) retireZonePTRs(ctx context.Context, recs []store.ZoneRecord, zo
 	}
 }
 
+// restoreZonePTRs writes the PTRs a zone's address records should own under
+// zoneName — retireZonePTRs' opposite, and addPTR's whole-zone form.
+//
+// It is what a rename's second half needs: the PTRs were retired under the
+// old name, and the same addresses have to claim them again under the new
+// one. It shares retireZonePTRs' contract exactly — the zone list is read
+// once rather than per record, every write goes through addPTR, so the
+// first-wins rule and the reverse zone's own validator still apply, and a
+// failure is logged rather than surfaced because the zone write already
+// committed.
+func (s *Server) restoreZonePTRs(ctx context.Context, recs []store.ZoneRecord, zoneName string) {
+	type owned struct {
+		addr netip.Addr
+		fqdn string
+		ttl  uint32
+	}
+	var todo []owned
+	for i := range recs {
+		// A disabled record answers nothing forward, so it gets no PTR —
+		// the same rule syncPTR applies to a single write.
+		if !recs[i].Enabled {
+			continue
+		}
+		addr, ok := recordAddr(&recs[i])
+		if !ok {
+			continue
+		}
+		todo = append(todo, owned{addr: addr, fqdn: recordFQDN(zoneName, recs[i].Name), ttl: recs[i].TTL})
+	}
+	if len(todo) == 0 {
+		return
+	}
+
+	// Same reasoning as syncPTR: the zone write already committed.
+	ctx = context.WithoutCancel(ctx)
+	zs, err := s.deps.Store.Zones().Zones(ctx)
+	if err != nil {
+		slog.Error("auto-ptr: reading zones failed", "err", err)
+		return
+	}
+	names, byName := ptrZoneCandidates(zs)
+	for _, o := range todo {
+		s.addPTR(ctx, names, byName, o.addr, o.fqdn, o.ttl)
+	}
+}
+
+// ownsPTRs reports whether a zone in this state is one auto-PTR maintains
+// reverse entries for — the same test ptrZoneCandidates applies, asked about
+// one zone rather than used to filter a list.
+func ownsPTRs(z store.Zone) bool {
+	return z.Enabled && z.Type == zoneTypePrimary
+}
+
+// syncZonePTRsAfterPatch moves the PTRs a zone's records own to match what
+// the patch did to the zone itself.
+//
+// PATCH used to touch none of this, so a rename left the reverse zone
+// answering with names that no longer resolve, and — worse — a later delete
+// of one of those A records looked for a PTR naming the *new* name, never
+// matched the stale one, and orphaned it for good. Disabling had the same
+// shape: the forward names stop answering, the reverse keeps publishing them.
+//
+// The two conditions are one rule: a zone that owned PTRs and no longer
+// does, or owns them under a different name, gives them up; a zone that owns
+// them now and did not, or owns them under a different name, takes them. A
+// rename satisfies both, which is what makes it a move.
+func (s *Server) syncZonePTRsAfterPatch(ctx context.Context, before, after store.Zone) {
+	renamed := !strings.EqualFold(before.Name, after.Name)
+	wasOwner, isOwner := ownsPTRs(before), ownsPTRs(after)
+	if !renamed && wasOwner == isOwner {
+		return
+	}
+	// The zone's own records, which are unchanged by a zone patch — only
+	// the name they hang under is.
+	recs, err := s.deps.Store.Zones().Records(context.WithoutCancel(ctx), after.ID)
+	if err != nil {
+		slog.Error("auto-ptr: reading zone records after a zone patch failed", "zone", after.ID, "err", err)
+		return
+	}
+	// Retire first, under the old name. Doing it the other way round would
+	// meet the zone's own stale PTR on the way in and decline to touch it
+	// under the first-wins rule, so the address would keep pointing at the
+	// name the zone no longer has.
+	if wasOwner && (renamed || !isOwner) {
+		s.retireZonePTRs(ctx, recs, before.Name)
+	}
+	if isOwner && (renamed || !wasOwner) {
+		s.restoreZonePTRs(ctx, recs, after.Name)
+	}
+}
+
 // recordAddr returns the address rec points at. ok is false when rec is
 // absent or is not an address record: A and AAAA are the only types whose
 // rdata is an address, and every other type has no reverse name to derive.

@@ -38,17 +38,14 @@ var tsigAlgorithms = map[string]bool{
 // the form store.TSIGKeyStore.ByName looks keys up by: lowercase and fully
 // qualified, via dns.CanonicalName. dns.IsDomainName alone would accept it --
 // it documents itself as "extremely liberal", the same gap normalizeZoneName
-// (zones_handlers.go) works around -- so the same extra checks apply here:
-// no whitespace or path characters, and no empty label (e.g. "e412..in").
+// (zones_handlers.go) works around -- so the same label rules apply here,
+// through the same validator. A key name is written into allow_transfer and
+// notify_to as `key:<name>` in a comma-separated list, so a name carrying
+// punctuation would not survive being read back out of one either.
 func normalizeTSIGName(raw string) (string, bool) {
-	name := strings.TrimSpace(raw)
-	if name == "" || strings.ContainsAny(name, " \t\r\n/\\") {
+	name := strings.TrimSuffix(strings.TrimSpace(raw), ".")
+	if !validDomainLabels(name, false) {
 		return "", false
-	}
-	for _, label := range strings.Split(strings.TrimSuffix(name, "."), ".") {
-		if label == "" {
-			return "", false
-		}
 	}
 	if _, ok := dns.IsDomainName(name); !ok {
 		return "", false
@@ -115,9 +112,8 @@ func (s *Server) handleTSIGKeyGet(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleTSIGKeyCreate(w http.ResponseWriter, r *http.Request) {
-	body, err := decode[tsigKeyWrite](r)
-	if err != nil {
-		errJSON(w, http.StatusBadRequest, "invalid json")
+	body, ok := decodeOr400[tsigKeyWrite](w, r)
+	if !ok {
 		return
 	}
 	name, code, msg, ok := validateTSIGKeyWrite(body)
@@ -144,9 +140,8 @@ func (s *Server) handleTSIGKeyUpdate(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusBadRequest, "bad id")
 		return
 	}
-	body, err := decode[tsigKeyWrite](r)
-	if err != nil {
-		errJSON(w, http.StatusBadRequest, "invalid json")
+	body, ok := decodeOr400[tsigKeyWrite](w, r)
+	if !ok {
 		return
 	}
 	name, code, msg, ok := validateTSIGKeyWrite(body)
@@ -154,7 +149,12 @@ func (s *Server) handleTSIGKeyUpdate(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, code, msg)
 		return
 	}
-	err = s.deps.Store.TSIGKeys().Update(r.Context(), store.TSIGKey{
+	// A rename is refused with 409 "resource in use" while a zone still
+	// names this key in allow_transfer or notify_to — the same guard that
+	// refuses the delete, since renaming a key referenced by name breaks the
+	// reference exactly as removing it does. Enforced in the UPDATE itself;
+	// see tsigKeyStore.Update.
+	err := s.deps.Store.TSIGKeys().Update(r.Context(), store.TSIGKey{
 		ID:        id,
 		Name:      name,
 		Algorithm: body.Algorithm,

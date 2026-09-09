@@ -340,3 +340,104 @@ func TestDuplicateSurfacesAsErrDuplicate(t *testing.T) {
 		}
 	})
 }
+
+// A write naming a row that does not exist is user input error, not a
+// storage failure. Without a sentinel for it the driver error fell to the
+// API's default branch and `POST /groups/999/rules` answered 503 "storage
+// unavailable" to what is a 404 or a 400.
+//
+// Every column here is a REFERENCES with foreign_keys on, so the violation
+// is raised by the driver rather than by application code — which is why
+// this runs on both drivers: sqlite reports extended result code 787 and
+// postgres SQLSTATE 23503, and neither message text resembles the other.
+func TestForeignKeyViolationIsErrReference(t *testing.T) {
+	forEachDriver(t, func(t *testing.T, s Store) {
+		ctx := context.Background()
+		gid, err := s.Clients().AddGroup(ctx, testGroupName("fkref"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		lid, err := s.Filters().AddList(ctx, List{URL: testGroupName("https://x.example/fkref"), Kind: "block", Enabled: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		const missing = 999999
+
+		cases := []struct {
+			name string
+			run  func() error
+		}{
+			{"rule names a missing group", func() error {
+				_, err := s.Filters().AddRule(ctx, Rule{GroupID: missing, Action: "block", Pattern: "x.example"})
+				return err
+			}},
+			{"client names a missing group", func() error {
+				_, err := s.Clients().AddClient(ctx, Client{Name: "c", Matcher: "10.77.77.77", GroupID: missing})
+				return err
+			}},
+			{"assign a missing list", func() error { return s.Filters().AssignList(ctx, gid, missing) }},
+			{"assign to a missing group", func() error { return s.Filters().AssignList(ctx, missing, lid) }},
+		}
+		for _, tc := range cases {
+			if err := tc.run(); !errors.Is(err, ErrReference) {
+				t.Errorf("%s: err = %v, want ErrReference", tc.name, err)
+			}
+		}
+	})
+}
+
+// ReplaceGroupLists is why PUT /groups/{id}/lists is one transaction rather
+// than an unassign loop followed by an assign loop: a bad id has to leave
+// the group's assignments exactly as they were, not half-unassigned.
+func TestReplaceGroupListsIsAllOrNothing(t *testing.T) {
+	forEachDriver(t, func(t *testing.T, s Store) {
+		ctx := context.Background()
+		gid, err := s.Clients().AddGroup(ctx, testGroupName("replace"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		l1, _ := s.Filters().AddList(ctx, List{URL: testGroupName("https://x.example/r1"), Kind: "block", Enabled: true})
+		l2, _ := s.Filters().AddList(ctx, List{URL: testGroupName("https://x.example/r2"), Kind: "block", Enabled: true})
+		if err := s.Filters().ReplaceGroupLists(ctx, gid, []int64{l1}); err != nil {
+			t.Fatal(err)
+		}
+
+		const missing = 999999
+		err = s.Filters().ReplaceGroupLists(ctx, gid, []int64{l2, missing})
+		var ref *MissingRef
+		if !errors.As(err, &ref) || ref.ID != missing {
+			t.Fatalf("err = %v, want a MissingRef naming %d", err, missing)
+		}
+		if !errors.Is(err, ErrReference) {
+			t.Errorf("MissingRef must still match ErrReference: %v", err)
+		}
+		got, err := s.Filters().ListsForGroup(ctx, gid)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != 1 || got[0].ID != l1 {
+			t.Fatalf("assignments = %+v; want the pre-failure set [%d] intact", got, l1)
+		}
+
+		// A duplicate id is a set, not an error: the same list named twice
+		// is still one assignment.
+		if err := s.Filters().ReplaceGroupLists(ctx, gid, []int64{l2, l1, l2}); err != nil {
+			t.Fatalf("duplicate ids: %v", err)
+		}
+		if got, _ := s.Filters().ListsForGroup(ctx, gid); len(got) != 2 {
+			t.Fatalf("assignments = %+v; want both lists once each", got)
+		}
+
+		// An empty set means "no lists"; an unknown group is a different
+		// answer from an unknown list, and has to stay one.
+		if err := s.Filters().ReplaceGroupLists(ctx, gid, nil); err != nil {
+			t.Fatalf("empty set: %v", err)
+		}
+		if got, _ := s.Filters().ListsForGroup(ctx, gid); len(got) != 0 {
+			t.Fatalf("assignments = %+v; want none", got)
+		}
+		if err := s.Filters().ReplaceGroupLists(ctx, missing, []int64{l1}); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("unknown group: err = %v, want ErrNotFound", err)
+		}
+	})
+}

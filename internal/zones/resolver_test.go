@@ -27,8 +27,11 @@ func (f *fakeZoneStore) Zone(ctx context.Context, id int64) (store.Zone, error) 
 }
 func (f *fakeZoneStore) AddZone(ctx context.Context, z store.Zone) (int64, error) { return 0, nil }
 func (f *fakeZoneStore) UpdateZone(ctx context.Context, z store.Zone) error       { return nil }
-func (f *fakeZoneStore) DeleteZone(ctx context.Context, id int64) error           { return nil }
-func (f *fakeZoneStore) BumpSerial(ctx context.Context, zoneID int64) error       { return nil }
+func (f *fakeZoneStore) UpdateZoneIfUnchanged(ctx context.Context, z store.Zone, prevModifiedAt int64) error {
+	return nil
+}
+func (f *fakeZoneStore) DeleteZone(ctx context.Context, id int64) error     { return nil }
+func (f *fakeZoneStore) BumpSerial(ctx context.Context, zoneID int64) error { return nil }
 func (f *fakeZoneStore) Records(ctx context.Context, zoneID int64) ([]store.ZoneRecord, error) {
 	return f.records[zoneID], nil
 }

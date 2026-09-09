@@ -189,9 +189,8 @@ func (s *Server) handleZoneRecordCreate(w http.ResponseWriter, r *http.Request) 
 		errJSON(w, http.StatusConflict, msg)
 		return
 	}
-	body, err := decode[zoneRecordWrite](r)
-	if err != nil {
-		errJSON(w, http.StatusBadRequest, "invalid json")
+	body, ok := decodeOr400[zoneRecordWrite](w, r)
+	if !ok {
 		return
 	}
 	existing, err := s.deps.Store.Zones().Records(r.Context(), zid)
@@ -239,9 +238,8 @@ func (s *Server) handleZoneRecordUpdate(w http.ResponseWriter, r *http.Request) 
 		errJSON(w, http.StatusConflict, msg)
 		return
 	}
-	body, err := decode[zoneRecordWrite](r)
-	if err != nil {
-		errJSON(w, http.StatusBadRequest, "invalid json")
+	body, ok := decodeOr400[zoneRecordWrite](w, r)
+	if !ok {
 		return
 	}
 	existing, err := s.deps.Store.Zones().Records(r.Context(), zid)

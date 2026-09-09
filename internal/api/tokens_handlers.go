@@ -33,25 +33,24 @@ type tokenCreate struct {
 }
 
 func (s *Server) handleTokenCreate(w http.ResponseWriter, r *http.Request) {
-	body, err := decode[tokenCreate](r)
-	if err != nil || body.Name == "" {
+	body, ok := decodeOr400[tokenCreate](w, r)
+	if !ok {
+		return
+	}
+	if body.Name == "" {
 		errJSON(w, http.StatusBadRequest, "name required")
 		return
 	}
 	if body.Scope == "" {
 		body.Scope = "write"
 	}
-	plain, err := s.deps.Auth.CreateAPIToken(r.Context(), userFrom(r).ID, body.Name, body.Scope)
+	// The insert id, not a guess. This used to re-list the user's tokens and
+	// take the highest id with a matching name, which two tokens called the
+	// same thing made ambiguous and a failed listing made 0.
+	id, plain, err := s.deps.Auth.CreateAPIToken(r.Context(), userFrom(r).ID, body.Name, body.Scope)
 	if err != nil {
 		errJSON(w, http.StatusBadRequest, err.Error())
 		return
-	}
-	list, _ := s.deps.Auth.ListAPITokens(r.Context(), userFrom(r).ID)
-	var id int64
-	for _, t := range list {
-		if t.Name == body.Name && t.ID > id {
-			id = t.ID
-		}
 	}
 	writeJSON(w, http.StatusCreated, map[string]any{"id": id, "token": plain})
 }
@@ -62,8 +61,13 @@ func (s *Server) handleTokenRevoke(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusBadRequest, "bad id")
 		return
 	}
+	// storeErr, so only "no such token of yours" is a 404 — RevokeToken
+	// wraps store.ErrNotFound for exactly that case. Mapping every error
+	// here to 404 told a caller the token was gone when the database was
+	// merely unreachable, which is the one answer that makes them stop
+	// looking.
 	if err := s.deps.Auth.RevokeToken(r.Context(), userFrom(r).ID, id); err != nil {
-		errJSON(w, http.StatusNotFound, "not found")
+		storeErr(w, err)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -85,9 +89,8 @@ type totpConfirm struct {
 }
 
 func (s *Server) handleTOTPConfirm(w http.ResponseWriter, r *http.Request) {
-	body, err := decode[totpConfirm](r)
-	if err != nil {
-		errJSON(w, http.StatusBadRequest, "invalid json")
+	body, ok := decodeOr400[totpConfirm](w, r)
+	if !ok {
 		return
 	}
 	if err := s.deps.Auth.EnableTOTPConfirm(r.Context(), userFrom(r).ID, body.Secret, body.Code); err != nil {
@@ -102,9 +105,8 @@ type totpDisable struct {
 }
 
 func (s *Server) handleTOTPDisable(w http.ResponseWriter, r *http.Request) {
-	body, err := decode[totpDisable](r)
-	if err != nil {
-		errJSON(w, http.StatusBadRequest, "invalid json")
+	body, ok := decodeOr400[totpDisable](w, r)
+	if !ok {
 		return
 	}
 	if err := s.deps.Auth.DisableTOTP(r.Context(), userFrom(r).ID, body.Code); err != nil {

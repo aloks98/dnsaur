@@ -11,10 +11,12 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/aloks98/dnsaur/internal/store"
 	"github.com/aloks98/dnsaur/internal/zones"
+	"github.com/miekg/dns"
 )
 
 // zoneTestServer is a thin convenience wrapper over the package's existing
@@ -166,6 +168,165 @@ func TestZoneCreateRejectsBadName(t *testing.T) {
 			t.Errorf("POST name=%q status = %d, want 400", name, rec.Code)
 		}
 	}
+}
+
+// dns.IsDomainName documents itself as "extremely liberal" and accepts a
+// semicolon, a quote, an exclamation mark and a NUL inside a label. None of
+// those survive a round trip through the things a zone name is put into: a
+// zone named "a;b.lan" exports `$ORIGIN a;b.lan.`, where `;` starts a
+// comment, so the file it hands the operator cannot be imported back; and
+// `a"b.lan` closes the quoted filename in Content-Disposition.
+func TestZoneCreateRejectsPunctuationInLabels(t *testing.T) {
+	srv := newTestServer(t)
+	for _, name := range []string{`a;b.lan`, `a"b.lan`, `a!b.lan`, "a\x00b.lan", `a\\b.lan`, `*.lan`} {
+		body, err := json.Marshal(map[string]string{"name": name})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if rec := srv.do(t, "POST", "/api/v1/zones", string(body)); rec.Code != http.StatusBadRequest {
+			t.Errorf("POST name=%q status = %d, want 400", name, rec.Code)
+		}
+	}
+	// The other half: the characters a real zone apex is built from stay
+	// accepted, underscore included (_dmarc and friends are ordinary labels).
+	for _, name := range []string{"e412.in", "150.168.192.in-addr.arpa", "_dmarc.e412.in", "xn--80ak6aa92e.com"} {
+		if rec := srv.do(t, "POST", "/api/v1/zones", `{"name":"`+name+`"}`); rec.Code != http.StatusCreated {
+			t.Errorf("POST name=%q status = %d body = %s, want 201", name, rec.Code, rec.Body)
+		}
+	}
+}
+
+// soa_ns and soa_mbox go straight into the zone's SOA and, for soa_ns, into
+// the apex NS record seeded beside it. Unvalidated, `POST /zones
+// {"soa_ns":"not a hostname"}` answered 201 and wrote an NS row whose rdata
+// fails ToRR: the answer path drops it silently and every outbound AXFR
+// errors, with a zone that looks fine in the dashboard.
+func TestZoneCreateValidatesSOAFields(t *testing.T) {
+	srv := newTestServer(t)
+	for _, body := range []string{
+		`{"name":"a.e412.in","soa_ns":"not a hostname"}`,
+		`{"name":"b.e412.in","soa_ns":"ns;evil.e412.in"}`,
+		`{"name":"c.e412.in","soa_ns":"ns..e412.in"}`,
+		`{"name":"d.e412.in","soa_mbox":"not a hostname"}`,
+		`{"name":"e.e412.in","soa_mbox":"host admin.e412.in"}`,
+	} {
+		if rec := srv.do(t, "POST", "/api/v1/zones", body); rec.Code != http.StatusBadRequest {
+			t.Errorf("POST %s status = %d body = %s, want 400", body, rec.Code, rec.Body)
+		}
+	}
+	// A mailbox whose local part contains a dot spells it `\.` (RFC 1035
+	// §8), and that escape has to survive the check rather than be read as
+	// a label separator with a stray backslash in it.
+	if rec := srv.do(t, "POST", "/api/v1/zones",
+		`{"name":"ok.e412.in","soa_ns":"ns1.e412.in.","soa_mbox":"first\\.last.e412.in."}`); rec.Code != http.StatusCreated {
+		t.Fatalf("valid SOA fields: status = %d body = %s", rec.Code, rec.Body)
+	}
+}
+
+// The seeded apex NS is written through buildZoneRecord — the same validator
+// a hand write goes through — rather than straight into AddRecord, so it
+// cannot be a row the resolver refuses to serve. Checking existence is not
+// enough: the defect this pins produced an NS row that existed and could not
+// be parsed.
+func TestZoneCreateSeedsAServableApexNS(t *testing.T) {
+	srv := newTestServer(t)
+	id := srv.createZone(t, "e412.in")
+	z := srv.zone(t, id)
+	ns := srv.recordsByType(t, id, "NS")
+	if len(ns) != 1 {
+		t.Fatalf("apex NS records = %+v; want exactly one", ns)
+	}
+	if ns[0].Name != "@" {
+		t.Errorf("apex NS name = %q, want %q", ns[0].Name, "@")
+	}
+	rr, err := zones.ToRR(zones.RecordFQDN(z.Name, ns[0].Name)+".", ns[0])
+	if err != nil {
+		t.Fatalf("seeded apex NS does not parse, so nothing can serve or transfer it: %v", err)
+	}
+	if rr.Header().Rrtype != dns.TypeNS {
+		t.Errorf("seeded record is %s, want NS", dns.TypeToString[rr.Header().Rrtype])
+	}
+}
+
+// The same rule on PATCH: a rule enforced on POST and not on PATCH is a rule
+// with a way around it.
+func TestZonePatchValidatesNameAndSOAFields(t *testing.T) {
+	srv := newTestServer(t)
+	id := srv.createZone(t, "e412.in")
+	before := srv.zone(t, id)
+	path := fmt.Sprintf("/api/v1/zones/%d", id)
+	for _, body := range []string{
+		`{"soa_ns":"not a hostname"}`,
+		`{"soa_mbox":"not a hostname"}`,
+		`{"soa_ns":""}`,
+		`{"name":"a;b.lan"}`,
+	} {
+		if rec := srv.do(t, "PATCH", path, body); rec.Code != http.StatusBadRequest {
+			t.Errorf("PATCH %s status = %d body = %s, want 400", body, rec.Code, rec.Body)
+		}
+	}
+	if after := srv.zone(t, id); after.SOANS != before.SOANS || after.SOAMbox != before.SOAMbox || after.Name != before.Name {
+		t.Errorf("a refused PATCH changed the zone: %+v -> %+v", before, after)
+	}
+}
+
+// A PATCH is a read-merge-write of the whole row, so two of them touching
+// different fields used to overwrite each other: whichever committed second
+// wrote the whole zone from a snapshot taken before the first one landed.
+//
+// The hook fires once, on the read the outer PATCH performs, and runs a
+// second complete PATCH inside that window — the exact interleaving, made
+// deterministic instead of hoped for. The outer write must then notice the
+// row moved, redo its merge against the row as it now is, and land both
+// fields.
+func TestZonePatchDoesNotClobberAConcurrentPatch(t *testing.T) {
+	srv := newTestServer(t)
+	id := srv.createZone(t, "e412.in")
+	path := fmt.Sprintf("/api/v1/zones/%d", id)
+
+	hooked := &hookedZoneStore{ZoneStore: srv.store.Zones()}
+	srv.srv.deps.Store = &hookedStore{Store: srv.store, zones: hooked}
+	hooked.afterRead = func() {
+		if rec := srv.do(t, "PATCH", path, `{"soa_retry":222}`); rec.Code != http.StatusNoContent {
+			t.Errorf("inner PATCH: status = %d body = %s", rec.Code, rec.Body)
+		}
+	}
+
+	if rec := srv.do(t, "PATCH", path, `{"soa_refresh":111}`); rec.Code != http.StatusNoContent {
+		t.Fatalf("outer PATCH: status = %d body = %s", rec.Code, rec.Body)
+	}
+	z := srv.zone(t, id)
+	if z.SOARefresh != 111 || z.SOARetry != 222 {
+		t.Fatalf("soa_refresh/soa_retry = %d/%d, want 111/222 — one PATCH overwrote the other's field",
+			z.SOARefresh, z.SOARetry)
+	}
+}
+
+// hookedStore/hookedZoneStore let a test run code inside the window between
+// a handler's read of a zone and its write of one. Everything but Zone() is
+// the real store: this is a seam for timing, not a fake.
+type hookedStore struct {
+	store.Store
+	zones store.ZoneStore
+}
+
+func (h *hookedStore) Zones() store.ZoneStore { return h.zones }
+
+type hookedZoneStore struct {
+	store.ZoneStore
+	// afterRead runs once, after the first Zone() read completes. Guarded by
+	// an atomic rather than a sync.Once because the hook itself reads a zone,
+	// and Once.Do is not reentrant.
+	afterRead func()
+	fired     atomic.Bool
+}
+
+func (h *hookedZoneStore) Zone(ctx context.Context, id int64) (store.Zone, error) {
+	z, err := h.ZoneStore.Zone(ctx, id)
+	if h.afterRead != nil && h.fired.CompareAndSwap(false, true) {
+		h.afterRead()
+	}
+	return z, err
 }
 
 // primary, secondary, forwarder and stub are the four types this API can

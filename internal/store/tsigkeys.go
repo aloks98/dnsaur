@@ -87,9 +87,52 @@ func (t *tsigKeyStore) Create(ctx context.Context, k TSIGKey) (int64, error) {
 		k.Name, k.Algorithm, k.Secret, k.CreatedAt)
 }
 
+// Update replaces a key's three fields, refusing a *rename* while a zone
+// still names the key in allow_transfer or notify_to — ErrInUse, which the
+// API answers 409.
+//
+// It is Delete's guard applied to the other way a reference can be broken.
+// Both of those columns hold the key's name as text, so renaming a key
+// referenced by one leaves the zone naming a key that does not exist, and
+// every signed transfer or NOTIFY under it is refused with nothing on the
+// zone to say why — exactly the failure Delete refuses to create, reached by
+// editing instead of deleting.
+//
+// zones.tsig_key_id is deliberately not part of the guard: that reference is
+// by id and survives a rename untouched. Refusing on it would block an edit
+// that breaks nothing.
+//
+// The `name = ?` disjunct is what keeps everything else editable. A write
+// that keeps the name — rotating a secret, correcting an algorithm, which is
+// most of what PUT is for — never consults the reference checks at all. As
+// in Delete, the predicate lives in the UPDATE rather than in a SELECT
+// before it, so nothing can slip between the check and the write.
 func (t *tsigKeyStore) Update(ctx context.Context, k TSIGKey) error {
-	return t.s.execOne(ctx, `UPDATE tsig_keys SET name = ?, algorithm = ?, secret = ? WHERE id = ?`,
-		k.Name, k.Algorithm, k.Secret, k.ID)
+	res, err := t.s.db.ExecContext(ctx, t.s.q(
+		`UPDATE tsig_keys SET name = ?, algorithm = ?, secret = ? WHERE id = ?
+		   AND (name = ?
+		        OR (NOT EXISTS (`+aclKeyRef(t.s.dialect)+`)
+		            AND NOT EXISTS (`+notifyKeyRef(t.s.dialect)+`)))`),
+		k.Name, k.Algorithm, k.Secret, k.ID, k.Name)
+	if err != nil {
+		return wrapDBErr(err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n > 0 {
+		return nil
+	}
+	// Nothing was updated, and the two reasons for that are different
+	// answers to the caller — the same split Delete makes: the key never
+	// existed (404), or it is spoken for by name (409).
+	if _, found, err := t.Get(ctx, k.ID); err != nil {
+		return err
+	} else if !found {
+		return ErrNotFound
+	}
+	return ErrInUse
 }
 
 // aclKeyRef reports the SQL that finds a zone whose allow_transfer names

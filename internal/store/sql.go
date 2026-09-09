@@ -110,9 +110,71 @@ func (f *filterStore) RenameList(ctx context.Context, id int64, name string) err
 	return f.s.execOne(ctx, `UPDATE lists SET name = ? WHERE id = ?`, strings.TrimSpace(name), id)
 }
 
+// AssignList adds one list to one group. Both columns are foreign keys and
+// the pair is the primary key, so an id that names nothing and a repeated
+// assignment both come back as driver errors — routed through wrapDBErr like
+// every other write, so they reach the API as ErrReference and ErrDuplicate
+// rather than as "storage unavailable".
 func (f *filterStore) AssignList(ctx context.Context, groupID, listID int64) error {
 	_, err := f.s.db.ExecContext(ctx, f.s.q(`INSERT INTO group_lists (group_id, list_id) VALUES (?, ?)`), groupID, listID)
-	return err
+	return wrapDBErr(err)
+}
+
+// ReplaceGroupLists sets a group's filter lists to exactly listIDs, in one
+// transaction.
+//
+// The API's PUT /groups/{id}/lists used to unassign the current rows one at
+// a time and then assign the new ones, so a list id that named nothing
+// failed *after* the unassigns had committed: the request answered an error
+// and the group was left with no lists at all. Nothing about that sequence
+// can be fixed from the caller's side — the failure is only detectable once
+// the destructive half has already happened — so the replace belongs here,
+// where it can be one commit.
+//
+// listIDs is treated as a set: the same id twice is one assignment, which is
+// what the group_lists primary key means anyway. An id naming no list is a
+// *MissingRef so the caller can say which one; a group that does not exist
+// is ErrNotFound, because that one is the request's path rather than its
+// body.
+func (f *filterStore) ReplaceGroupLists(ctx context.Context, groupID int64, listIDs []int64) error {
+	tx, err := f.s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	// Undoes every statement below unless Commit ran — same shape as
+	// clientStore.DeleteGroup (crud.go).
+	defer tx.Rollback()
+
+	// The group is checked here rather than left to the foreign key: a
+	// missing group and a missing list are different answers, and the
+	// driver's violation says only that some reference failed.
+	var exists int64
+	if err := tx.QueryRowContext(ctx, f.s.q(`SELECT COUNT(*) FROM groups WHERE id = ?`), groupID).Scan(&exists); err != nil {
+		return err
+	}
+	if exists == 0 {
+		return ErrNotFound
+	}
+	if _, err := tx.ExecContext(ctx, f.s.q(`DELETE FROM group_lists WHERE group_id = ?`), groupID); err != nil {
+		return wrapDBErr(err)
+	}
+	seen := make(map[int64]bool, len(listIDs))
+	for _, id := range listIDs {
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		if err := tx.QueryRowContext(ctx, f.s.q(`SELECT COUNT(*) FROM lists WHERE id = ?`), id).Scan(&exists); err != nil {
+			return err
+		}
+		if exists == 0 {
+			return &MissingRef{Table: "list", ID: id}
+		}
+		if _, err := tx.ExecContext(ctx, f.s.q(`INSERT INTO group_lists (group_id, list_id) VALUES (?, ?)`), groupID, id); err != nil {
+			return wrapDBErr(err)
+		}
+	}
+	return tx.Commit()
 }
 
 func (f *filterStore) AddRule(ctx context.Context, r Rule) (int64, error) {

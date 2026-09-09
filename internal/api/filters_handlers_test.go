@@ -301,3 +301,78 @@ func TestListNamingOverTheAPI(t *testing.T) {
 		t.Fatalf("renaming a missing list: %d", w.Code)
 	}
 }
+
+// rules.group_id is a foreign key, and the group here comes from the path.
+// The violation used to fall through to storeErr's default branch, so
+// POST /groups/999/rules answered 503 "storage unavailable" — an
+// infrastructure failure reported for a group that simply does not exist.
+func TestRuleCreateOnAMissingGroupIs404(t *testing.T) {
+	srv, s, _ := testServer(t)
+	cookie := login(t, srv, s)
+	w := doReq(t, srv.Handler(), "POST", "/api/v1/groups/999999/rules", `{"action":"block","pattern":"x.example"}`, cookie)
+	if w.Code != 404 {
+		t.Fatalf("status = %d body = %s, want 404", w.Code, w.Body.String())
+	}
+}
+
+// A sub-resource of a group that does not exist is a missing resource, the
+// same answer /zones/{id}/records already gave. Answering 200 [] instead
+// said the group existed and had nothing assigned, which a dashboard cannot
+// tell from the truth.
+func TestGroupSubresourceGetsOnAMissingGroupAre404(t *testing.T) {
+	srv, s, _ := testServer(t)
+	cookie := login(t, srv, s)
+	h := srv.Handler()
+	for _, path := range []string{"/api/v1/groups/999999/lists", "/api/v1/groups/999999/rules"} {
+		if w := doReq(t, h, "GET", path, "", cookie); w.Code != 404 {
+			t.Errorf("GET %s status = %d body = %s, want 404", path, w.Code, w.Body.String())
+		}
+	}
+}
+
+// PUT /groups/{id}/lists replaced the set by unassigning row by row and then
+// assigning, so a bad id failed after the unassigns had committed: the
+// request answered an error and the group was left with nothing. The replace
+// is one transaction now, and a bad id has to leave the group exactly as it
+// was.
+func TestGroupListsPutIsAllOrNothing(t *testing.T) {
+	srv, s, _ := testServer(t)
+	cookie := login(t, srv, s)
+	h := srv.Handler()
+	gid, _ := s.Clients().AddGroup(t.Context(), "g")
+	l1, _ := s.Filters().AddList(t.Context(), store.List{URL: "https://x.example/1", Kind: "block", Enabled: true})
+	l2, _ := s.Filters().AddList(t.Context(), store.List{URL: "https://x.example/2", Kind: "block", Enabled: true})
+	path := fmt.Sprintf("/api/v1/groups/%d/lists", gid)
+	if w := doReq(t, h, "PUT", path, fmt.Sprintf(`{"list_ids":[%d]}`, l1), cookie); w.Code != 204 {
+		t.Fatalf("seed assignment: %d %s", w.Code, w.Body.String())
+	}
+
+	w := doReq(t, h, "PUT", path, fmt.Sprintf(`{"list_ids":[%d,999999]}`, l2), cookie)
+	if w.Code != 400 {
+		t.Fatalf("unknown list id: status = %d body = %s, want 400", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "999999") {
+		t.Errorf("body = %s; want the offending id named", w.Body.String())
+	}
+	got, err := s.Filters().ListsForGroup(t.Context(), gid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].ID != l1 {
+		t.Fatalf("assignments = %+v; want the pre-failure set intact", got)
+	}
+
+	// The same list named twice is one assignment, not a duplicate-key
+	// failure.
+	if w := doReq(t, h, "PUT", path, fmt.Sprintf(`{"list_ids":[%d,%d,%d]}`, l1, l2, l1), cookie); w.Code != 204 {
+		t.Fatalf("duplicate ids: %d %s", w.Code, w.Body.String())
+	}
+	if got, _ := s.Filters().ListsForGroup(t.Context(), gid); len(got) != 2 {
+		t.Fatalf("assignments = %+v; want both lists once each", got)
+	}
+
+	// An unknown group is the path's problem, not the body's.
+	if w := doReq(t, h, "PUT", "/api/v1/groups/999999/lists", `{"list_ids":[]}`, cookie); w.Code != 404 {
+		t.Fatalf("unknown group: status = %d body = %s, want 404", w.Code, w.Body.String())
+	}
+}
