@@ -1196,17 +1196,30 @@ test("a first load that fails shows the destructive states, not the empty ones",
     http.get("/api/v1/stats/top", () => HttpResponse.json({ error: "boom" }, { status: 500 })),
   );
 
-  renderWithProviders(<Dashboard />);
+  const { queryClient } = renderWithProviders(<Dashboard />);
 
+  // Four independent queries, each retried once (lib/query-client.ts sets
+  // `retry: 1`, and react-query backs off ~1s before the retry), so they
+  // reach their error state at four different moments. Waiting for the first
+  // one and then counting the other three synchronously was a race that only
+  // showed up on a loaded machine.
+  const settle = { timeout: 10_000 };
+  expect(await screen.findByText(/couldn't load stats/i, undefined, settle)).toBeInTheDocument();
   expect(
-    await screen.findByText(/couldn't load stats/i, undefined, { timeout: 3000 }),
+    await screen.findByText(/couldn't load the timeline/i, undefined, settle),
   ).toBeInTheDocument();
-  expect(screen.getByText(/couldn't load the timeline/i)).toBeInTheDocument();
-  expect(screen.getAllByText(/couldn't load this list/i)).toHaveLength(2);
+  await waitFor(
+    () => expect(screen.getAllByText(/couldn't load this list/i)).toHaveLength(2),
+    settle,
+  );
+
+  // With nothing left in flight, "the empty state is absent" is a fact about
+  // the settled page rather than about a render that hadn't caught up yet.
+  await waitFor(() => expect(queryClient.isFetching()).toBe(0), settle);
   expect(screen.queryByText(/no query activity yet/i)).not.toBeInTheDocument();
   expect(screen.queryByText(/nothing blocked in this window yet/i)).not.toBeInTheDocument();
   expect(screen.queryByText(/couldn't refresh/i)).not.toBeInTheDocument();
-});
+}, 20_000);
 
 // --- 8. the chart's own render budget ----------------------------------------
 

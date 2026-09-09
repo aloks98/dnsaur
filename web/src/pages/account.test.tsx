@@ -460,6 +460,94 @@ test("creating a token reveals the plaintext exactly once, then it's gone", asyn
   expect(screen.queryByText("dnsaur_pat_abcdef123456")).not.toBeInTheDocument();
 });
 
+/** Reveal a freshly created token and hand back the banner's Copy button. */
+async function revealToken(user: ReturnType<typeof userEvent.setup>) {
+  mockMe();
+  server.use(
+    http.get("/api/v1/tokens", () => HttpResponse.json([])),
+    http.post("/api/v1/tokens", () =>
+      HttpResponse.json({ id: 7, token: "dnsaur_pat_abcdef123456" }, { status: 201 }),
+    ),
+  );
+
+  renderWithProviders(<Account />);
+  await screen.findByText("No API tokens yet");
+  await user.click(screen.getByRole("button", { name: /new token/i }));
+  const row = document.querySelector<HTMLElement>('[data-slot="new-token-row"]')!;
+  await user.type(within(row).getByLabelText(/^name$/i), "Home Assistant");
+  await user.click(within(row).getByRole("button", { name: /^create$/i }));
+
+  await screen.findByText("dnsaur_pat_abcdef123456");
+  return screen.getByRole("button", { name: /copy token/i });
+}
+
+// `navigator.clipboard` is undefined outside a secure context, which is
+// exactly where a homelab instance reached over plain HTTP lives. The button
+// toasted success unconditionally, so on http://192.168.1.2 the operator saw
+// "Token copied", pressed "I've saved it", and the token was gone.
+test("a clipboard the browser won't hand over is reported, not toasted as success", async () => {
+  const user = userEvent.setup();
+  const successSpy = vi.spyOn(toast, "success");
+  const errorSpy = vi.spyOn(toast, "error");
+  vi.spyOn(navigator, "clipboard", "get").mockReturnValue(
+    undefined as unknown as Navigator["clipboard"],
+  );
+
+  await user.click(await revealToken(user));
+
+  await waitFor(() => expect(errorSpy).toHaveBeenCalledWith(expect.stringMatching(/couldn't/i)));
+  expect(successSpy).not.toHaveBeenCalledWith("Token copied");
+  // And the token is still on screen to copy by hand.
+  expect(screen.getByText("dnsaur_pat_abcdef123456")).toBeInTheDocument();
+});
+
+test("a clipboard write that fails is reported too, not assumed to have worked", async () => {
+  const user = userEvent.setup();
+  const successSpy = vi.spyOn(toast, "success");
+  const errorSpy = vi.spyOn(toast, "error");
+  vi.spyOn(navigator, "clipboard", "get").mockReturnValue({
+    writeText: () => Promise.reject(new Error("denied")),
+  } as unknown as Navigator["clipboard"]);
+
+  await user.click(await revealToken(user));
+
+  await waitFor(() => expect(errorSpy).toHaveBeenCalledWith(expect.stringMatching(/couldn't/i)));
+  expect(successSpy).not.toHaveBeenCalledWith("Token copied");
+});
+
+test("a clipboard write that lands says so", async () => {
+  const user = userEvent.setup();
+  const successSpy = vi.spyOn(toast, "success");
+  const written: string[] = [];
+  vi.spyOn(navigator, "clipboard", "get").mockReturnValue({
+    writeText: (text: string) => {
+      written.push(text);
+      return Promise.resolve();
+    },
+  } as unknown as Navigator["clipboard"]);
+
+  await user.click(await revealToken(user));
+
+  await waitFor(() => expect(successSpy).toHaveBeenCalledWith("Token copied"));
+  expect(written).toEqual(["dnsaur_pat_abcdef123456"]);
+});
+
+// TOKEN_GRID and the Section band are fixed-pixel column templates inside a
+// shell that is h-screen/overflow-hidden (components/app-shell.tsx), so a
+// narrow viewport clipped the Revoke column with nothing to scroll.
+test("the fixed-width token grid sits in a horizontal scroll container", async () => {
+  mockMe();
+  mockTokens([sampleToken({ id: 3, name: "CI script" })]);
+
+  renderWithProviders(<Account />);
+  await screen.findByText("CI script");
+
+  const scroller = document.querySelector('[data-slot="h-scroll"]');
+  expect(scroller).not.toBeNull();
+  expect(scroller!.className).toContain("overflow-x-auto");
+  expect(scroller!.contains(screen.getByText("CI script"))).toBe(true);
+});
+
 // Required test (b): revoke DELETEs the token and its row disappears.
 test("revoking a token DELETEs it and the row disappears", async () => {
   const user = userEvent.setup();

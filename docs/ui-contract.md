@@ -1287,8 +1287,8 @@ no `onMutate` and no `setQueryData` in the whole client.
 | Groups | Rename | `PATCH /groups/{id}` | `Couldn't rename ${group.name}` |
 | Groups | Delete | `DELETE /groups/{id}` | `Can't delete ${group.name} — it's still in use` (on 409) |
 | Groups | Apply/remove a list | `PUT /groups/{id}/lists` | `Couldn't update lists for ${group.name}` |
-| Clients | Edit / Add | `PUT|POST /clients` | server message, else `Couldn't ${update\|add} the client` |
-| Clients | Delete | `DELETE /clients/{id}` | `Couldn't delete ${target.matcher}` — the **matcher**, not a name; a client has no name field |
+| Clients | Add | `POST /clients` | server message, else `Couldn't add the client` |
+| Clients | Delete | `DELETE /clients/{id}` | `Couldn't delete ${target.matcher}` — the **matcher**, not the name, which may be empty (§3.4) |
 | Zones | Add | `POST /zones` | server message, else `Couldn't add the zone` |
 | Zones | Delete | `DELETE /zones/{id}` | `Couldn't delete ${target.name}` |
 | Zone detail | Enable / disable | `PATCH /zones/{id}` | `Couldn't ${enabled ? "disable" : "enable"} ${target.name}` |
@@ -1316,9 +1316,14 @@ no `onMutate` and no `setQueryData` in the whole client.
 
 **Disabled states that actually occur:** dashboard quick actions while
 `groups.isPending || groups.isError`; query-log Block/Allow while
-`clients.isPending || clients.isError`; Add client when no groups exist
-(`Create a group first`); delete on group id 1
-(`The default group can't be deleted`); Save changes when the form isn't dirty.
+`clients.isPending || clients.isError`, and on a row whose `q_name` is `""`
+(`This query carried no name to write a rule for`); the query log's **Client**
+filter whenever `qlog.privacy` is not `full`, which shows the single option
+`Client IPs masked`; Add client when no groups exist (`Create a group first`);
+delete on group id 1 (`The default group can't be deleted`); delete on a group
+any client still points at (`Move its N clients first`) — the 409 above is the
+race guard behind it, not the first line of defence; a list toggle while that
+group's assignment read is in flight; Save changes when the form isn't dirty.
 
 Settings saves are per-key via `Promise.allSettled`, so a partial failure keeps
 the failed fields dirty with the admin's typed value intact.

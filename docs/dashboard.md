@@ -35,6 +35,17 @@ view — every number on it is derived from the query log, so a query log privac
 setting of `none` (see [Settings](#settings)) leaves it empty going forward
 while keeping the history already recorded.
 
+The **q/s** figure beside Live queries is the one number here that isn't from
+the stats tables: it counts rows arriving on the live stream over the last 30
+seconds, so it appears only once the page has been watching for ten seconds and
+falls back to zero when the stream goes quiet. The page of history the feed
+opens with doesn't count towards it.
+
+The **query volume** chart is hourly whatever the window, and the window's
+oldest hour is only partly covered — stats buckets are whole hours, so the
+server drops that one rather than reporting a fraction of it. A 24-hour window
+is therefore 24 bars, not 25, and a 1-hour window is the current hour alone.
+
 ---
 
 ## Query log
@@ -45,6 +56,12 @@ filters over what's already stored.
 How much lands here is set by `qlog.privacy`, and how long it stays is set by
 `qlog.retention_days` — a background pruner deletes rows older than the cutoff.
 Setting retention to `0` prunes everything on the next pass.
+
+The **client** filter matches the stored `client_ip` exactly, so it is
+unavailable unless `qlog.privacy` is `full`: `anon` masks the last octet on the
+way in and `none` records nothing, and in both cases no client's address could
+ever match. The **hostname** column keeps working either way — it resolves
+through the row's client id, not its address.
 
 ---
 
@@ -103,6 +120,10 @@ regular expressions matched against the whole name; **an invalid pattern is
 skipped with a warning at compile time rather than failing the whole ruleset**,
 so a rule that silently does nothing is usually a regex that didn't compile.
 
+Go syntax is what counts, including the parts your browser's own regex engine
+has no equivalent for — inline flags like `(?i)ads` and the `(?P<name>…)`
+capture spelling are both accepted.
+
 ### Groups & clients
 
 A **group** is a filtering policy: a set of assigned lists, plus an on/off
@@ -124,7 +145,12 @@ assigns every existing list by default, because a group that silently protects
 nothing is rarely what anyone means by "new group".
 
 Deleting a group is refused with `409 resource in use` while clients still
-point at it — move them first.
+point at it — move them first. The screen says so up front: Delete is
+unavailable on a group with clients, and the row says how many to move.
+
+Disabling a group stops filtering for every client in it. For the **default**
+group that is every device you haven't pinned somewhere else, not just the
+clients listed under it.
 
 ---
 
