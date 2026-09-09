@@ -64,3 +64,11 @@ func (t *tokenStore) DeleteExpired(ctx context.Context, nowMs int64) error {
 func (t *tokenStore) SetExpiry(ctx context.Context, id, ts int64) error {
 	return t.s.execOne(ctx, `UPDATE auth_tokens SET expires_at = ? WHERE id = ?`, ts, id)
 }
+
+func (t *tokenStore) DeleteSessions(ctx context.Context, userID, exceptID int64) error {
+	// Not execOne: deleting nothing is the ordinary case (an account with
+	// one browser open has no other session to revoke), not a missing row.
+	_, err := t.s.db.ExecContext(ctx,
+		t.s.q(`DELETE FROM auth_tokens WHERE user_id = ? AND kind = 'session' AND id <> ?`), userID, exceptID)
+	return err
+}

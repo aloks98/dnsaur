@@ -47,6 +47,49 @@ func TestFileAndEnvPrecedence(t *testing.T) {
 	}
 }
 
+// TestTrustedProxies covers the one bootstrap key whose value decides
+// whether a forwarded header is believed at all: written either way (YAML
+// list or env), a bare address accepted as a single host, and a value that
+// is not an address refused at startup rather than silently ignored — a
+// typo'd CIDR that loaded as "trust nothing" would ship the session cookie
+// without Secure and say nothing.
+func TestTrustedProxies(t *testing.T) {
+	if c, err := Load(noConfigFile(t)); err != nil || len(c.TrustedProxies) != 0 {
+		t.Fatalf("default should trust nothing: %v %v", c.TrustedProxies, err)
+	}
+
+	p := filepath.Join(t.TempDir(), "c.yaml")
+	if err := os.WriteFile(p, []byte("trusted_proxies:\n  - 10.0.0.0/8\n  - 192.168.1.5\n  - \"::1\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	c, err := Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := make([]string, 0, len(c.TrustedProxies))
+	for _, pfx := range c.TrustedProxies {
+		got = append(got, pfx.String())
+	}
+	want := "10.0.0.0/8 192.168.1.5/32 ::1/128"
+	if strings.Join(got, " ") != want {
+		t.Fatalf("trusted_proxies = %v, want %s", got, want)
+	}
+
+	t.Setenv("DNSAUR_TRUSTED_PROXIES", "172.16.0.0/12, 10.1.2.3")
+	c, err = Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(c.TrustedProxies) != 2 || c.TrustedProxies[0].String() != "172.16.0.0/12" || c.TrustedProxies[1].String() != "10.1.2.3/32" {
+		t.Fatalf("env should beat file: %v", c.TrustedProxies)
+	}
+
+	t.Setenv("DNSAUR_TRUSTED_PROXIES", "10.0.0.0/8, not-an-address")
+	if _, err := Load(p); err == nil {
+		t.Fatal("a trusted_proxies entry that is not an address or CIDR must be refused")
+	}
+}
+
 func TestInvalidDriver(t *testing.T) {
 	t.Setenv("DNSAUR_STORAGE_DRIVER", "mysql")
 	if _, err := Load(noConfigFile(t)); err == nil {

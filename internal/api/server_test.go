@@ -379,3 +379,66 @@ func TestDecode(t *testing.T) {
 }
 
 func stringsReader(s string) *strings.Reader { return strings.NewReader(s) }
+
+// TestCrossSiteCookieWriteRefused is CSRF defence in depth. SameSite=Strict
+// is the only thing standing between the session cookie and a form posted
+// from another origin, and it is one browser-configuration or
+// cookie-policy quirk away from not being there. Sec-Fetch-Site is sent by
+// every browser that implements fetch metadata and cannot be set by page
+// script, so a cookie-authenticated write that announces itself as
+// cross-site is refused outright.
+//
+// Bearer requests are deliberately untouched: a token is not attached
+// automatically by the browser, so a cross-site script that has one has
+// already won, and scripts and CLI clients legitimately send no
+// Sec-Fetch-Site at all.
+func TestCrossSiteCookieWriteRefused(t *testing.T) {
+	srv, s, _ := testServer(t)
+	cookie := login(t, srv, s)
+	_, tok, err := srv.deps.Auth.CreateAPIToken(t.Context(), 1, "csrf", "write")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := srv.Handler()
+
+	req := func(method, site, bearer string, c *http.Cookie) *httptest.ResponseRecorder {
+		r := httptest.NewRequest(method, "/api/v1/auth/logout", nil)
+		if site != "" {
+			r.Header.Set("Sec-Fetch-Site", site)
+		}
+		if bearer != "" {
+			r.Header.Set("Authorization", "Bearer "+bearer)
+		}
+		if c != nil {
+			r.AddCookie(c)
+		}
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, r)
+		return w
+	}
+
+	if w := req("POST", "cross-site", "", cookie); w.Code != http.StatusForbidden {
+		t.Fatalf("cross-site cookie POST = %d %s, want 403", w.Code, strings.TrimSpace(w.Body.String()))
+	}
+	var body map[string]string
+	_ = json.Unmarshal(req("POST", "cross-site", "", cookie).Body.Bytes(), &body)
+	if body["error"] != "cross-site request" {
+		t.Fatalf("error string = %q", body["error"])
+	}
+	// A bearer credential is not ambient, so the same header changes nothing.
+	if w := req("POST", "cross-site", tok, nil); w.Code == http.StatusForbidden {
+		t.Fatalf("cross-site bearer POST refused: %d %s", w.Code, strings.TrimSpace(w.Body.String()))
+	}
+	// Everything a browser or a script legitimately sends still works.
+	for _, site := range []string{"same-origin", "same-site", "none", ""} {
+		if w := req("POST", site, "", cookie); w.Code == http.StatusForbidden {
+			t.Errorf("Sec-Fetch-Site: %q cookie POST refused: %d", site, w.Code)
+		}
+		// A fresh session, since a successful logout revoked the last one.
+		cookie = login(t, srv, s)
+	}
+	// Reads are not state-changing, so they are not the target.
+	if w := req("GET", "cross-site", "", cookie); w.Code == http.StatusForbidden {
+		t.Fatalf("cross-site cookie GET refused: %d", w.Code)
+	}
+}

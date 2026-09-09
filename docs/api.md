@@ -51,24 +51,58 @@ curl or any HTTP client.
   authenticates and sets an `HttpOnly`, `SameSite=Strict` `dnsaur_session`
   cookie with a 30-day TTL. Sessions are sliding: a request that
   authenticates with less than half the TTL remaining gets silently
-  renewed. If the account has TOTP enabled and `totp_code` is omitted,
-  login fails with `428`; bad credentials return `401`.
+  renewed, up to an absolute ceiling of **90 days from the login that
+  created it** — past that the session is deleted and you log in again,
+  second factor and all. If the account has TOTP enabled and `totp_code`
+  is omitted, login fails with `428`; bad credentials return `401`.
   `POST /auth/logout` clears the cookie and revokes the session token.
   `GET /auth/me` returns the current user (`id`, `username`,
   `totp_enabled`).
+- **Throttle:** `POST /setup` and `POST /auth/login` share one budget of
+  **10 attempts per minute per source address**; exceeding it answers
+  `429` (`{"error": "too many attempts"}`) with a `Retry-After` header, in
+  seconds, for a one-minute lockout. Every answer costs an attempt — a
+  malformed body, a wrong password, and the `428` that says the password
+  was right. That last one is what keeps the `428`/`401` split from being
+  a free password oracle. Behind a reverse proxy, set `trusted_proxies`
+  (see [`docs/configuration.md`](configuration.md)) or every request shares
+  one source address and one budget.
+- **Cookie `Secure`:** set when Go terminated TLS, or when the request came
+  from a network named in `trusted_proxies` and its `X-Forwarded-Proto` is
+  `https`. `X-Forwarded-Proto` is never believed from anywhere else.
 - **API tokens:** scoped, revocable bearer tokens for scripts and other
   clients, created via `POST /tokens` and sent as
   `Authorization: Bearer <token>`. Each token has a `read` or `write`
   scope (`write` is the default if omitted); a `read` token gets `403`
   (`{"error": "read-only token"}`) on anything but `GET`/`HEAD`. The
   plaintext token is only ever shown in the `POST /tokens` response.
+  A `read` token also cannot read TSIG secrets: `GET /tsig-keys` and
+  `GET /tsig-keys/{id}` answer it with `secret: ""` and
+  `secret_redacted: true`. Sessions and `write` tokens get the real secret
+  and `secret_redacted: false`.
+  The `Authorization` scheme name is matched case-insensitively
+  (RFC 9110 §11.1), so `bearer <token>` works as well as `Bearer <token>`.
 - **Passwords** are hashed with argon2id; login timing is equalized for
-  unknown usernames to avoid leaking account existence.
+  unknown usernames to avoid leaking account existence. `POST /setup`
+  against an install that already has an admin answers `409` without
+  hashing anything, and no more than four argon2id computations run at
+  once server-wide.
 - **Optional TOTP 2FA**: `POST /auth/totp/start` begins enrollment
   (returns a base32 `secret` and an `otpauth_url` for a QR code);
   `POST /auth/totp/confirm` (`{secret, code}`) verifies a code and enables
   it; `POST /auth/totp/disable` (`{code}`) turns it off. Once enabled,
-  `totp_code` is required on every login.
+  `totp_code` is required on every login. **A code logs in once**
+  (RFC 6238 §5.2): the 30-second time step it matched is recorded, and any
+  later login presenting a code from that step or an earlier one is `401`,
+  indistinguishable from a wrong code. Enabling or disabling TOTP **revokes
+  every other session** — the one that made the change survives, and API
+  tokens are untouched.
+- **CSRF:** a cookie-authenticated `POST`/`PUT`/`PATCH`/`DELETE` whose
+  `Sec-Fetch-Site` header is `cross-site` is refused with `403`
+  (`{"error": "cross-site request"}`), behind `SameSite=Strict` rather than
+  instead of it. Bearer requests are never checked: a token is not attached
+  by the browser on its own, and scripts legitimately send no fetch
+  metadata at all.
 
 ## Quick example: setup → login → create a zone
 

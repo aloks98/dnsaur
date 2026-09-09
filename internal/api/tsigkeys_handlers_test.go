@@ -121,6 +121,94 @@ func TestTSIGKeyLifecycle(t *testing.T) {
 	}
 }
 
+// TestReadScopeTokenCannotReadTSIGSecrets — scope enforcement is purely
+// method-based (GET/HEAD for a read token), and a TSIG secret is the one
+// thing this API returns in the clear on a GET. So a token minted to let a
+// dashboard or a monitoring script look at zones also handed over every
+// signing credential the server has, which is not "read-only" in any sense
+// the person minting it would recognise.
+//
+// The secret still comes back for a session and for a write-scoped token:
+// it has to, or a peer can never be re-paired (see the TSIGKey schema).
+func TestReadScopeTokenCannotReadTSIGSecrets(t *testing.T) {
+	srv := newTestServer(t)
+	const secret = "c2VjcmV0LXNlY3JldC1zZWNyZXQ="
+	rec := srv.do(t, "POST", "/api/v1/tsig-keys",
+		`{"name":"xfer.e412.in.","algorithm":"hmac-sha256.","secret":"`+secret+`"}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create: %d %s", rec.Code, rec.Body)
+	}
+	var created map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &created); err != nil {
+		t.Fatal(err)
+	}
+	id := itoa(int64(created["id"].(float64)))
+
+	_, readTok, err := srv.srv.deps.Auth.CreateAPIToken(t.Context(), 1, "reader", "read")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, writeTok, err := srv.srv.deps.Auth.CreateAPIToken(t.Context(), 1, "writer", "write")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := srv.srv.Handler()
+
+	get := func(t *testing.T, token, path string) map[string]any {
+		t.Helper()
+		w := bearerReq(h, "GET", path, token)
+		if w.Code != http.StatusOK {
+			t.Fatalf("GET %s: %d %s", path, w.Code, w.Body)
+		}
+		var one map[string]any
+		if strings.HasPrefix(strings.TrimSpace(w.Body.String()), "[") {
+			var list []map[string]any
+			if err := json.Unmarshal(w.Body.Bytes(), &list); err != nil {
+				t.Fatal(err)
+			}
+			if len(list) != 1 {
+				t.Fatalf("list has %d keys", len(list))
+			}
+			one = list[0]
+		} else if err := json.Unmarshal(w.Body.Bytes(), &one); err != nil {
+			t.Fatal(err)
+		}
+		return one
+	}
+
+	for _, path := range []string{"/api/v1/tsig-keys", "/api/v1/tsig-keys/" + id} {
+		got := get(t, readTok, path)
+		if got["secret"] != "" || got["secret_redacted"] != true {
+			t.Errorf("read scope %s: secret=%v secret_redacted=%v; the secret must not be readable",
+				path, got["secret"], got["secret_redacted"])
+		}
+		// Everything else a read token legitimately needs is still there.
+		if got["name"] != "xfer.e412.in." || got["algorithm"] != "hmac-sha256." {
+			t.Errorf("read scope %s dropped more than the secret: %v", path, got)
+		}
+		for _, tok := range []string{writeTok, ""} {
+			var got map[string]any
+			if tok == "" {
+				got = map[string]any{}
+				w := srv.do(t, "GET", path, "") // session cookie
+				if strings.HasPrefix(strings.TrimSpace(w.Body.String()), "[") {
+					var list []map[string]any
+					_ = json.Unmarshal(w.Body.Bytes(), &list)
+					got = list[0]
+				} else {
+					_ = json.Unmarshal(w.Body.Bytes(), &got)
+				}
+			} else {
+				got = get(t, tok, path)
+			}
+			if got["secret"] != secret || got["secret_redacted"] != false {
+				t.Errorf("write access to %s: secret=%v secret_redacted=%v; the secret has to be readable "+
+					"or a peer can never be re-paired", path, got["secret"], got["secret_redacted"])
+			}
+		}
+	}
+}
+
 func TestTSIGKeyCreateRejectsInvalidName(t *testing.T) {
 	srv := newTestServer(t)
 	rec := srv.do(t, "POST", "/api/v1/tsig-keys",

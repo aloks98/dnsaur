@@ -53,15 +53,37 @@ scheme name is matched case-insensitively (RFC 9110 §11.1), so `bearer` and
 | `Max-Age` | `2592000` (30 days); `-1` on logout |
 | `HttpOnly` | yes |
 | `SameSite` | `Strict` |
-| `Secure` | **only when Go itself terminated TLS** (`r.TLS != nil` in `sessionCookie`, `internal/api/auth_handlers.go`). Behind a TLS-terminating reverse proxy the cookie ships without `Secure`. |
+| `Secure` | when Go itself terminated TLS (`r.TLS != nil`), **or** when the request arrived from a network listed in the `trusted_proxies` bootstrap key and its `X-Forwarded-Proto` is `https` (`Server.overHTTPS`, `internal/api/auth_handlers.go`). The header is never believed from any other source. With `trusted_proxies` unset — the default — a TLS-terminating reverse proxy still means no `Secure`. |
 
-Sessions slide: past the halfway mark the expiry is pushed out another 30 days
-(`Service.Authenticate`, `internal/auth/service.go`).
+Sessions slide: past the halfway mark the expiry is pushed out another 30 days,
+but never past **90 days from the login that created the session**
+(`auth.SessionMaxLifetime`); at that point the token is deleted and the next
+request is a plain **401** (`Service.Authenticate`, `internal/auth/service.go`).
+Nothing warns first — treat 401 as "log in again", which the SPA already does.
 
 **Scopes** — a `read` token is rejected on any method other than GET/HEAD with
 **403** `read-only token` (`Server.requireAuth`, same function). Enforcement is
-purely method-based. Session cookies are always minted `write`, so a browser
-session is never 403'd — the SPA has no 403 handling and doesn't need any.
+method-based with one exception on the read side: `GET /tsig-keys` and
+`GET /tsig-keys/{id}` blank a `read` token's `secret` and set
+`secret_redacted: true` (§2.10). Session cookies are always minted `write`, so
+a browser session is never 403'd for scope — the SPA has no 403 handling and
+doesn't need any.
+
+**CSRF** — a cookie-authenticated non-GET/HEAD request whose `Sec-Fetch-Site`
+header is `cross-site` is refused with **403** `cross-site request`
+(`Server.requireAuth`), on top of `SameSite=Strict`. Every same-origin
+request a browser makes from the SPA sends `same-origin`, and a request with
+no `Sec-Fetch-Site` at all (curl, a script) is not treated as cross-site, so
+this is invisible to the dashboard. Bearer-authenticated requests are never
+checked.
+
+**Throttle** — `POST /api/v1/setup` and `POST /api/v1/auth/login` share one
+budget of **10 attempts per minute per source address**. The 11th is **429**
+`too many attempts` with a `Retry-After` header (seconds), and the source stays
+locked out for a minute. *Every* answer costs an attempt, including 400, 428
+and a successful 200, so a UI that retries a login automatically will burn the
+budget. Behind a proxy, `trusted_proxies` must be set or every browser shares
+one budget.
 
 **Request bodies** — decoded with `DisallowUnknownFields` and a 1 MiB cap
 (`decode[T]`, `internal/api/server.go`). An unknown key, malformed JSON, an empty
@@ -144,6 +166,7 @@ call `/auth/login`.
 | 400 | `invalid input: username required` |
 | 400 | `invalid input: password must be at least 8 characters` |
 | 409 | `setup already completed` |
+| 429 | `too many attempts` |
 | 503 | `storage unavailable` |
 
 #### `POST /api/v1/auth/login` — public
@@ -156,7 +179,8 @@ Body: `username`, `password`, `totp_code` (only needed once TOTP is enabled).
 | 400 | `invalid json` | |
 | 409 | `setup required` | no admin exists yet |
 | 428 | `totp code required` | password correct, TOTP on, code **empty** |
-| 401 | `bad credentials` | unknown user, wrong password, **or wrong TOTP code** |
+| 401 | `bad credentials` | unknown user, wrong password, wrong TOTP code, **or a TOTP code already used once** |
+| 429 | `too many attempts` | 11th attempt in a minute from this source |
 | 503 | `storage unavailable` | |
 
 > **The 428/401 split matters for the UI.** A *missing* code is 428; a *wrong*
@@ -165,6 +189,12 @@ Body: `username`, `password`, `totp_code` (only needed once TOTP is enabled).
 > "bad password" will throw the user back to step one on a typo'd 6-digit code.
 > Unknown user and wrong password are also deliberately identical, and both burn
 > the same argon2 cost, so login timing doesn't leak whether a username exists.
+
+> **A TOTP code works once.** The 30-second time step a code matched is
+> recorded, and a later login with a code from that step or an earlier one is
+> **401**, indistinguishable from a wrong code (RFC 6238 §5.2). So a user who
+> mistypes a password, gets 401, and retries with the *same* still-on-screen
+> code gets 401 again — prompt for a fresh code, not just the password.
 
 #### `POST /api/v1/auth/logout`
 **204**, always, plus a cookie-clearing header. Behind `requireAuth`, so an
@@ -186,8 +216,10 @@ either way. A bearer-authenticated logout revokes nothing but still 204s.
 | `POST /auth/totp/disable` | `{"code"}` | **204** | 400 `invalid json`, 400 `invalid totp code`, 400 `bad credentials` |
 
 `start` is **stateless** — nothing is persisted, the client holds the secret and
-passes it back to `confirm`. Enabling TOTP does **not** invalidate existing
-sessions.
+passes it back to `confirm`. `confirm` and `disable` both **revoke every other
+session** on the account; the session making the request survives, and API
+tokens are untouched. Any other tab is logged out on its next request with a
+plain 401.
 
 ---
 
@@ -806,6 +838,7 @@ silently, since that listing's error was discarded too.
 ```json
 [{"id":1,"name":"xfer.e412.in.","algorithm":"hmac-sha256.",
   "secret":"Sh5ZuulpjcmcJuN6VwMQCVEhTJyUmlPTSHexvePtaWo=",
+  "secret_redacted":false,
   "created_at":1786000000000}]
 ```
 
@@ -824,7 +857,12 @@ Three things about this shape are easy to get wrong:
 - **`secret` is returned on every read** — the deliberate opposite of an API
   token. It is base64, stored in plaintext, and has to be pasted unchanged
   into the peer's config, so the screen's masking is a display choice about
-  what sits on screen rather than a boundary of any kind.
+  what sits on screen rather than a boundary of any kind. **One caller does
+  not get it:** a `read`-scoped API token reads `"secret":""` with
+  `"secret_redacted":true` alongside. Every response carries
+  `secret_redacted` — `false` for a session or a `write` token — so an
+  empty secret you may not see is distinguishable from one that was never
+  set. The dashboard runs on a session and always sees the real value.
 
 Errors: 400 `name must be a valid domain name` (the same label rules a zone
 name takes — see §2.6), 400 `algorithm must be one of hmac-sha1.,
@@ -1229,7 +1267,7 @@ Anything a UI shows for DHCP today would be invented.
 
 | Struct | Field |
 |---|---|
-| `store.User` | `PasswordHash`, `TOTPSecret` (`json:"-"`) |
+| `store.User` | `PasswordHash`, `TOTPSecret`, `TOTPLastStep` (`json:"-"`) |
 | `store.AuthToken` | `TokenHash` (`json:"-"`) |
 
 Computed and discarded, so the UI cannot have them: the matched

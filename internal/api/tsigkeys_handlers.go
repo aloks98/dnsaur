@@ -84,13 +84,47 @@ func validateTSIGKeyWrite(body tsigKeyWrite) (name string, code int, msg string,
 	return name, 0, "", true
 }
 
+// tsigKeyView is a TSIG key as a read answers with it. It exists for the
+// one field the answer depends on the caller for.
+//
+// Scope enforcement is method-based (see Server.requireAuth): a read token
+// may call any GET, and a TSIG secret is the only credential this API
+// returns in the clear on one. So a token minted so a dashboard or a
+// monitoring script could look around also handed over every signing key
+// the server holds, which is not what "read-only" means to the person who
+// minted it.
+//
+// The secret is still returned to a session and to a write-scoped token,
+// because it has to be: the same value must be configured on the peer
+// (BIND's key{} clause, Technitium's transfer settings), so it has to be
+// readable whenever that peer needs re-pairing. secret_redacted is always
+// present, never omitted when false, so a client can tell "no secret was
+// set" from "you may not see it" without guessing from an empty string.
+type tsigKeyView struct {
+	store.TSIGKey
+	SecretRedacted bool `json:"secret_redacted"`
+}
+
+// tsigKeyFor renders one key for the caller behind r.
+func tsigKeyFor(r *http.Request, k store.TSIGKey) tsigKeyView {
+	if tokenFrom(r).Scope != "read" {
+		return tsigKeyView{TSIGKey: k}
+	}
+	k.Secret = ""
+	return tsigKeyView{TSIGKey: k, SecretRedacted: true}
+}
+
 func (s *Server) handleTSIGKeysList(w http.ResponseWriter, r *http.Request) {
 	keys, err := s.deps.Store.TSIGKeys().List(r.Context())
 	if err != nil {
 		storeErr(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, keys)
+	out := make([]tsigKeyView, 0, len(keys))
+	for _, k := range keys {
+		out = append(out, tsigKeyFor(r, k))
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 func (s *Server) handleTSIGKeyGet(w http.ResponseWriter, r *http.Request) {
@@ -108,7 +142,7 @@ func (s *Server) handleTSIGKeyGet(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusNotFound, "not found")
 		return
 	}
-	writeJSON(w, http.StatusOK, k)
+	writeJSON(w, http.StatusOK, tsigKeyFor(r, k))
 }
 
 func (s *Server) handleTSIGKeyCreate(w http.ResponseWriter, r *http.Request) {

@@ -25,6 +25,7 @@ over built-in defaults, then overridden by environment variables.
 | `log_level` | `DNSAUR_LOG_LEVEL` | `info` | slog level: `debug`, `info`, `warn` or `error`. Anything else is refused at startup |
 | `storage.driver` | `DNSAUR_STORAGE_DRIVER` | `sqlite` | `sqlite` or `postgres` |
 | `storage.dsn` | `DNSAUR_STORAGE_DSN` | `<data_dir>/dnsaur.db` (sqlite) | Data source name; **required** when `storage.driver` is `postgres` |
+| `trusted_proxies` | `DNSAUR_TRUSTED_PROXIES` (comma-separated) | *(empty)* | Networks a reverse proxy in front of dnsaur may connect from, as CIDRs (a bare address means that one host). A request arriving from one of them has its `X-Forwarded-Proto` and `X-Forwarded-For` believed; every other request does not. See Behind a reverse proxy below |
 
 Example `dnsaur.yaml`:
 
@@ -33,6 +34,7 @@ dns_listen: [":53"]
 http_listen: ":8080"
 data_dir: "/var/lib/dnsaur"
 log_level: "info"
+trusted_proxies: []   # e.g. ["10.0.0.0/8", "192.168.1.5"]
 storage:
   driver: sqlite
   dsn: ""   # defaults to <data_dir>/dnsaur.db
@@ -67,6 +69,40 @@ server that answers nothing (see
   operator who asked for debug output got none and nothing said why.
 - **An unknown `storage.driver`**, and a `postgres` driver with no
   `storage.dsn`.
+- **A `trusted_proxies` entry that is not an IP address or CIDR.** Dropping
+  it silently would leave the operator with a proxy they believe is trusted,
+  a session cookie shipping without `Secure`, and nothing anywhere saying
+  why.
+
+## Behind a reverse proxy
+
+dnsaur speaks plain HTTP behind nginx, Caddy or Traefik, which is the usual
+deployment. Two things it does depend on facts only the proxy knows — whether
+the user's connection was HTTPS, and which client the request came from —
+and both arrive as headers that any client could also send. So they are
+believed from nothing except the addresses named in `trusted_proxies`:
+
+```yaml
+trusted_proxies:
+  - 10.0.0.0/8
+  - 192.168.1.5   # a bare address means that host alone
+```
+
+With that set, a request arriving from one of those networks has:
+
+- **`X-Forwarded-Proto`** decide the session cookie's `Secure` attribute.
+  Without it, the 30-day cookie set by `POST /api/v1/auth/login` ships
+  without `Secure` on any install where Go did not terminate TLS itself, and
+  a single plaintext request to the same host carries the session over the
+  wire. Only the first entry is read, since a chain of proxies appends.
+- **`X-Forwarded-For`** decide which client the login/setup throttle counts
+  against (see [`docs/api.md`](api.md)). Without it every request behind the
+  proxy shares one source address and one budget, so one attacker locks
+  everybody out. The list is read right to left, skipping hops that are
+  themselves trusted proxies.
+
+Leave it empty — the default — when dnsaur is reachable directly. An empty
+list trusts nothing, and a header that arrives anyway is ignored.
 
 ## Database-managed settings
 

@@ -1,0 +1,17 @@
+-- +goose Up
+-- The last TOTP time step this user successfully authenticated with.
+--
+-- RFC 6238 section 5.2 requires a verifier to refuse a code it has already
+-- accepted: the codes are valid for a 30-second step and the login window
+-- spans the neighbouring steps too, so without this a code observed once
+-- (shoulder-surfed, read off a proxy log, replayed from a captured request)
+-- stays usable for up to 90 seconds. auth.Service records the step a code
+-- matched and refuses anything at or below it.
+--
+-- A column on users rather than a table of its own: it is exactly one
+-- integer per account, written on the same row the secret already lives on,
+-- and there is nothing to keep once the account is gone. 0 means "no code
+-- has ever been accepted", which is the state every account starts in --
+-- including accounts that predate this column, whose first TOTP login after
+-- the upgrade is correctly not a replay of anything.
+ALTER TABLE users ADD COLUMN totp_last_step INTEGER NOT NULL DEFAULT 0;

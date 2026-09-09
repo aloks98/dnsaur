@@ -10,7 +10,13 @@ info:
     "write" (all methods); the session cookie always has full access.
     A read-scoped token used for a POST/PUT/PATCH/DELETE request is
     rejected with 403 {"error": "read-only token"} — see the 403
-    response documented on each mutating operation below.
+    response documented on each mutating operation below. Scope is
+    enforced by method, with one exception on the read side: a
+    read-scoped token gets TSIG secrets redacted (see the TSIGKey
+    schema's secret_redacted field), because a GET that returns a
+    signing credential in the clear is not something "read-only"
+    should cover. The Authorization scheme name is matched
+    case-insensitively per RFC 9110 §11.1.
     There is no separate "upstreams" resource: upstream DNS servers are
     configured via the "upstreams" key in /settings (a comma-separated
     list), alongside "upstream.strategy". Each entry is plain by default
@@ -463,15 +469,26 @@ components:
         secret:
           type: string
           description: >
-            Base64, and returned in the clear on every read -- not hidden
-            the way a freshly minted API token is. An API token only ever
-            needs to be shown once, because only the holder who requested it
-            uses it again. A TSIG secret is different: the same value has to
-            be configured identically on the peer (BIND's key{} clause,
-            Technitium's transfer settings), so a caller must be able to
-            come back and read it whenever that peer needs re-pairing.
-            Hiding it after creation would make the feature unusable without
-            direct database access.
+            Base64, and returned in the clear on every read to a session or
+            a write-scoped token -- not hidden the way a freshly minted API
+            token is. An API token only ever needs to be shown once, because
+            only the holder who requested it uses it again. A TSIG secret is
+            different: the same value has to be configured identically on
+            the peer (BIND's key{} clause, Technitium's transfer settings),
+            so a caller must be able to come back and read it whenever that
+            peer needs re-pairing. Hiding it after creation would make the
+            feature unusable without direct database access.
+            Empty for a read-scoped token -- see secret_redacted.
+        secret_redacted:
+          type: boolean
+          description: >
+            True when secret was withheld because the caller presented a
+            read-scoped API token. Scope is enforced by method (a read token
+            may call any GET), and this is the only credential the API
+            returns in the clear on a GET, so a token minted to let a
+            dashboard look around would otherwise hand over every signing
+            key the server holds. Always present, so an empty secret you may
+            not see is distinguishable from one that was never set.
         created_at: { type: integer, format: int64, description: unix ms }
     ZoneNotify:
       type: object
@@ -548,7 +565,27 @@ components:
             a target whose state is still never.
   responses:
     ReadOnlyToken:
-      description: read-only token used for a write operation
+      description: >
+        read-only token used for a write operation, or a cookie-authenticated
+        write whose Sec-Fetch-Site is cross-site ({"error": "cross-site
+        request"}) -- CSRF defence in depth behind SameSite=Strict. Bearer
+        requests are never checked for the latter.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    TooManyAttempts:
+      description: >
+        too many attempts. POST /setup and POST /auth/login share one budget
+        of 10 attempts per minute per source address, after which the source
+        is locked out for a minute. Retry-After carries the wait in seconds.
+        Every answer costs an attempt, including 428 and a malformed body,
+        so neither endpoint is a free password oracle. Behind a reverse
+        proxy, set the trusted_proxies bootstrap key or every request shares
+        one source address and one budget.
+      headers:
+        Retry-After:
+          schema: { type: integer }
+          description: seconds to wait before the next attempt
       content:
         application/json:
           schema: { $ref: "#/components/schemas/Error" }
@@ -634,6 +671,8 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
+        "429":
+          $ref: "#/components/responses/TooManyAttempts"
         "503":
           description: storage unavailable
           content:
@@ -647,10 +686,17 @@ paths:
       summary: Log in and receive a session cookie
       description: >
         On success, sets the dnsaur_session cookie (HttpOnly, SameSite=Strict,
-        30-day TTL). If the account has TOTP enabled, totp_code must be
-        supplied or the request fails with 428. If first-run setup hasn't
-        completed yet, the request fails with 409 instead of being
-        evaluated against the (empty) users table.
+        30-day TTL, sliding but never past 90 days from this login). Secure
+        is set when TLS terminated here, or when the request arrived from a
+        network named in the trusted_proxies bootstrap setting and its
+        X-Forwarded-Proto is https. If the account has TOTP enabled,
+        totp_code must be supplied or the request fails with 428, and a code
+        that has already logged in once is refused as 401 bad credentials
+        (RFC 6238 section 5.2). If first-run setup hasn't completed yet, the
+        request fails with 409 instead of being evaluated against the
+        (empty) users table. Shares a 10-attempt-per-minute-per-source
+        budget with POST /setup; every answer costs an attempt, the 428
+        included.
       requestBody:
         required: true
         content:
@@ -695,6 +741,8 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
+        "429":
+          $ref: "#/components/responses/TooManyAttempts"
         "503":
           description: storage unavailable
           content:
@@ -773,6 +821,9 @@ paths:
     post:
       tags: [Auth]
       summary: Confirm and enable TOTP with a code from the secret
+      description: >
+        Also revokes every other session belonging to this account -- the
+        session making the request survives, and API tokens are untouched.
       requestBody:
         required: true
         content:
@@ -803,6 +854,9 @@ paths:
     post:
       tags: [Auth]
       summary: Disable TOTP for the current user
+      description: >
+        Also revokes every other session belonging to this account, for the
+        same reason enabling does. The session making the request survives.
       requestBody:
         required: true
         content:

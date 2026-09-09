@@ -3,10 +3,116 @@ package api
 import (
 	"errors"
 	"net/http"
+	"strconv"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/aloks98/dnsaur/internal/auth"
 )
+
+// The throttle on POST /setup and POST /auth/login. Both are
+// unauthenticated and both pay for an argon2id hash, so without a ceiling a
+// single client can spend the server's memory and CPU indefinitely — and
+// login with no throttle is also an unmetered password oracle, which is
+// what makes the 428 "totp code required" answer (given once the password
+// verified) tolerable rather than a free confirmation service.
+//
+// Ten attempts a minute is far above what a person typing a password needs
+// and far below what guessing needs. Exceeding it locks the source out for
+// a minute rather than merely refusing the extra attempts, so a script that
+// keeps hammering keeps extending its own lockout.
+const (
+	attemptLimit   = 10
+	attemptWindow  = time.Minute
+	attemptLockout = time.Minute
+)
+
+// attemptLimiter counts recent attempts per source and locks a source out
+// once it exceeds attemptLimit within attemptWindow.
+//
+// Per Server, in memory, and deliberately not persisted: it is a brake on a
+// burst, not an account-lockout policy, and a restart clearing it is the
+// correct behaviour rather than a hole (the operator restarting the server
+// is not the attacker).
+type attemptLimiter struct {
+	mu      sync.Mutex
+	now     func() time.Time
+	entries map[string]*attemptEntry
+	swept   time.Time
+}
+
+type attemptEntry struct {
+	count       int
+	windowStart time.Time
+	lockedUntil time.Time
+}
+
+func newAttemptLimiter() *attemptLimiter {
+	return &attemptLimiter{now: time.Now, entries: map[string]*attemptEntry{}}
+}
+
+// allow records one attempt from key and reports whether it may proceed.
+// When it may not, the duration is how long the caller has to wait, for
+// Retry-After.
+func (l *attemptLimiter) allow(key string) (time.Duration, bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	now := l.now()
+	l.sweep(now)
+
+	e := l.entries[key]
+	if e == nil {
+		e = &attemptEntry{windowStart: now}
+		l.entries[key] = e
+	}
+	if now.Before(e.lockedUntil) {
+		return e.lockedUntil.Sub(now), false
+	}
+	if now.Sub(e.windowStart) >= attemptWindow {
+		e.count, e.windowStart = 0, now
+	}
+	e.count++
+	if e.count > attemptLimit {
+		e.lockedUntil = now.Add(attemptLockout)
+		return attemptLockout, false
+	}
+	return 0, true
+}
+
+// sweep drops entries that can no longer refuse anything, so a scan across
+// many source addresses cannot grow this map without bound. Once a window
+// per sweep: the map is small, and the work is proportional to it.
+func (l *attemptLimiter) sweep(now time.Time) {
+	if now.Sub(l.swept) < attemptWindow {
+		return
+	}
+	l.swept = now
+	for k, e := range l.entries {
+		if now.After(e.lockedUntil) && now.Sub(e.windowStart) >= attemptWindow {
+			delete(l.entries, k)
+		}
+	}
+}
+
+// throttle counts this request against its source and, when the source is
+// over its budget, answers 429 and reports false. Called before anything
+// else in the two handlers it guards, so a malformed body, a wrong
+// password and the 428 that says the password was right all cost the same
+// one attempt.
+func (s *Server) throttle(w http.ResponseWriter, r *http.Request) bool {
+	retry, ok := s.attempts.allow(s.clientIP(r))
+	if ok {
+		return true
+	}
+	secs := int(retry / time.Second)
+	if retry%time.Second != 0 {
+		secs++
+	}
+	w.Header().Set("Retry-After", strconv.Itoa(secs))
+	errJSON(w, http.StatusTooManyRequests, "too many attempts")
+	return false
+}
 
 func (s *Server) authRoutes() {
 	s.route("GET /api/v1/setup", s.handleSetupState)
@@ -32,9 +138,11 @@ type credsReq struct {
 }
 
 func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
-	body, err := decode[credsReq](r)
-	if err != nil {
-		errJSON(w, http.StatusBadRequest, "invalid json")
+	if !s.throttle(w, r) {
+		return
+	}
+	body, ok := decodeOr400[credsReq](w, r)
+	if !ok {
 		return
 	}
 	switch err := s.deps.Auth.CreateAdmin(r.Context(), body.Username, body.Password); {
@@ -52,9 +160,11 @@ func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
-	body, err := decode[credsReq](r)
-	if err != nil {
-		errJSON(w, http.StatusBadRequest, "invalid json")
+	if !s.throttle(w, r) {
+		return
+	}
+	body, ok := decodeOr400[credsReq](w, r)
+	if !ok {
 		return
 	}
 	// Global constraint: while first-run setup hasn't happened, login must
@@ -79,7 +189,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		storeErr(w, err)
 		return
 	}
-	http.SetCookie(w, sessionCookie(tok, int(auth.SessionTTL/time.Second), r))
+	http.SetCookie(w, s.sessionCookie(tok, int(auth.SessionTTL/time.Second), r))
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
@@ -87,7 +197,7 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 	if c, err := r.Cookie("dnsaur_session"); err == nil {
 		_ = s.deps.Auth.Logout(r.Context(), c.Value)
 	}
-	http.SetCookie(w, sessionCookie("", -1, r))
+	http.SetCookie(w, s.sessionCookie("", -1, r))
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -98,10 +208,34 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func sessionCookie(value string, maxAge int, r *http.Request) *http.Cookie {
+func (s *Server) sessionCookie(value string, maxAge int, r *http.Request) *http.Cookie {
 	return &http.Cookie{
 		Name: "dnsaur_session", Value: value, Path: "/",
 		MaxAge: maxAge, HttpOnly: true, SameSite: http.SameSiteStrictMode,
-		Secure: r.TLS != nil,
+		Secure: s.overHTTPS(r),
 	}
+}
+
+// overHTTPS reports whether the request reached the user over TLS, which
+// decides the session cookie's Secure attribute.
+//
+// r.TLS covers the case where Go terminated TLS itself. It is not the usual
+// deployment: dnsaur behind nginx or Caddy speaks plain HTTP on the inside,
+// and judging by r.TLS alone shipped a 30-day session cookie with no Secure
+// attribute to every such install. X-Forwarded-Proto is what the proxy says
+// about the outside connection, and it is believed only when the request
+// came from an address the operator named in trusted_proxies — it is a
+// header, and a client that could set it at will would be choosing its own
+// cookie attributes.
+func (s *Server) overHTTPS(r *http.Request) bool {
+	if r.TLS != nil {
+		return true
+	}
+	if !s.fromTrustedProxy(r) {
+		return false
+	}
+	// A chain of proxies appends, so the client-facing hop is the first
+	// entry (RFC 7239 §7.1 says the same of Forwarded).
+	proto, _, _ := strings.Cut(r.Header.Get("X-Forwarded-Proto"), ",")
+	return strings.EqualFold(strings.TrimSpace(proto), "https")
 }

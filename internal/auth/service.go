@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/aloks98/dnsaur/internal/store"
-	"github.com/pquerna/otp/totp"
 )
 
 var (
@@ -21,6 +20,14 @@ var (
 )
 
 const SessionTTL = 30 * 24 * time.Hour
+
+// SessionMaxLifetime is how long a session may live counting from the login
+// that created it, no matter how often it is used. Sliding renewal alone
+// has no ceiling: a browser that checks in every fortnight pushes the
+// expiry out forever, so a cookie lifted once and quietly kept warm never
+// expires on its own. Past this the session is deleted and the user logs
+// in again, second factor and all.
+const SessionMaxLifetime = 90 * 24 * time.Hour
 
 // dummyHash burns the same argon2 cost on unknown-user logins so response
 // timing doesn't reveal whether a username exists.
@@ -36,14 +43,21 @@ type Service struct {
 	users  store.UserStore
 	tokens store.TokenStore
 	Now    func() time.Time
-	// verifyTOTP is swapped in by the TOTP feature (Task 12); default rejects
-	// any login for users that have a TOTP secret but supplied no valid code.
-	verifyTOTP func(secret, code string) bool
+	// verifyTOTP reports the 30-second time step a code matched, so the
+	// caller can refuse a step that has already been used. It answers
+	// ok=false for a user that has a TOTP secret but supplied no valid code.
+	verifyTOTP func(secret, code string, now time.Time) (step int64, ok bool)
+	// hashPassword is HashPassword, indirected so a test can count how often
+	// a request pays the argon2id cost. Which requests hash and which do not
+	// is a property of this service, not of wall-clock timing, so it has to
+	// be observable as a fact rather than measured.
+	hashPassword func(pw string) (string, error)
 }
 
 func New(users store.UserStore, tokens store.TokenStore) *Service {
 	return &Service{users: users, tokens: tokens, Now: time.Now,
-		verifyTOTP: func(secret, code string) bool { return totp.Validate(code, secret) }}
+		verifyTOTP:   verifyTOTPStep,
+		hashPassword: HashPassword}
 }
 
 func (s *Service) SetupRequired(ctx context.Context) (bool, error) {
@@ -52,9 +66,19 @@ func (s *Service) SetupRequired(ctx context.Context) (bool, error) {
 }
 
 // CreateAdmin creates the single admin account during first-run setup.
-// Validation runs first (cheap, no I/O), then an atomic conditional insert
-// (UserStore.CreateIfNone) decides the race: Count-then-Create would let two
-// concurrent setup requests both pass the emptiness check and both insert.
+// Validation runs first (cheap, no I/O), then an emptiness check, then the
+// argon2id hash, and only then an atomic conditional insert
+// (UserStore.CreateIfNone) that decides the race: Count-then-Create is not
+// atomic on its own, so it cannot be the last word — two concurrent setup
+// requests can both see an empty table, and CreateIfNone is what keeps them
+// from both inserting.
+//
+// The Count is there for cost, not for correctness. /setup is
+// unauthenticated and stays reachable forever, so hashing before the check
+// let anyone spend a 64 MiB, t=3 argon2id pass per request on an install
+// that was configured months ago — and 50 of those at once is 3.2 GiB of
+// transient allocation. Checking first makes the request that cannot
+// possibly succeed cost one SELECT.
 func (s *Service) CreateAdmin(ctx context.Context, username, password string) error {
 	if len(username) == 0 {
 		return fmt.Errorf("%w: username required", ErrInvalidInput)
@@ -62,7 +86,14 @@ func (s *Service) CreateAdmin(ctx context.Context, username, password string) er
 	if len(password) < 8 {
 		return fmt.Errorf("%w: password must be at least 8 characters", ErrInvalidInput)
 	}
-	hash, err := HashPassword(password)
+	n, err := s.users.Count(ctx)
+	if err != nil {
+		return err
+	}
+	if n > 0 {
+		return ErrSetupDone
+	}
+	hash, err := s.hashPassword(password)
 	if err != nil {
 		return err
 	}
@@ -95,7 +126,19 @@ func (s *Service) Login(ctx context.Context, username, password, totpCode string
 		if totpCode == "" {
 			return "", ErrTOTPRequired
 		}
-		if !s.verifyTOTP(u.TOTPSecret, totpCode) {
+		step, ok := s.verifyTOTP(u.TOTPSecret, totpCode, s.Now())
+		if !ok {
+			return "", ErrBadCredentials
+		}
+		// RFC 6238 §5.2: a code that has authenticated once must not
+		// authenticate again. Claiming the step is what refuses the second
+		// use, and a refused claim answers exactly as a wrong code does, so
+		// the difference is not something an attacker can read off.
+		claimed, cerr := s.users.ClaimTOTPStep(ctx, u.ID, step)
+		if cerr != nil {
+			return "", cerr
+		}
+		if !claimed {
 			return "", ErrBadCredentials
 		}
 	}
@@ -124,15 +167,35 @@ func (s *Service) Authenticate(ctx context.Context, plain string) (store.User, s
 		_ = s.tokens.Delete(ctx, tok.ID)
 		return store.User{}, store.AuthToken{}, ErrBadCredentials
 	}
+	ceiling, capped := sessionCeiling(tok)
+	if capped && !now.Before(ceiling) {
+		_ = s.tokens.Delete(ctx, tok.ID)
+		return store.User{}, store.AuthToken{}, ErrBadCredentials
+	}
 	_ = s.tokens.Touch(ctx, tok.ID, now.UnixMilli())
 	if tok.ExpiresAt > 0 && time.UnixMilli(tok.ExpiresAt).Sub(now) < SessionTTL/2 {
-		_ = s.tokens.SetExpiry(ctx, tok.ID, now.Add(SessionTTL).UnixMilli()) // sliding renewal
+		exp := now.Add(SessionTTL) // sliding renewal
+		if capped && exp.After(ceiling) {
+			exp = ceiling
+		}
+		_ = s.tokens.SetExpiry(ctx, tok.ID, exp.UnixMilli())
 	}
 	u, ok, err := s.users.ByID(ctx, tok.UserID)
 	if err != nil || !ok {
 		return store.User{}, store.AuthToken{}, ErrBadCredentials
 	}
 	return u, tok, nil
+}
+
+// sessionCeiling is when tok stops being valid however often it is used.
+// Only session tokens have one: an API token is a credential the operator
+// minted deliberately and revokes by name, and expiring it out from under a
+// script on a schedule nobody set would be a surprise, not a safeguard.
+func sessionCeiling(tok store.AuthToken) (time.Time, bool) {
+	if tok.Kind != "session" || tok.CreatedAt <= 0 {
+		return time.Time{}, false
+	}
+	return time.UnixMilli(tok.CreatedAt).Add(SessionMaxLifetime), true
 }
 
 func (s *Service) Logout(ctx context.Context, plain string) error {

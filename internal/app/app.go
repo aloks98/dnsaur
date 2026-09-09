@@ -772,6 +772,7 @@ func (a *App) Start(ctx context.Context) error {
 		// a, again: App is what knows the ladder fell to plaintext defaults.
 		ResolverStatus: a,
 		Version:        a.version, Static: web.Dist(),
+		TrustedProxies: a.cfg.TrustedProxies,
 	})
 	ln, err := net.Listen("tcp", a.cfg.HTTPListen)
 	if err != nil {

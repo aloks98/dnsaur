@@ -93,7 +93,10 @@ func (s *Server) handleTOTPConfirm(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if err := s.deps.Auth.EnableTOTPConfirm(r.Context(), userFrom(r).ID, body.Secret, body.Code); err != nil {
+	// The caller's own token is kept: enabling TOTP logs every other
+	// session out, and logging the user out of the tab they are enrolling
+	// from would be a bug rather than a safeguard.
+	if err := s.deps.Auth.EnableTOTPConfirm(r.Context(), userFrom(r).ID, body.Secret, body.Code, tokenFrom(r).ID); err != nil {
 		errJSON(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -109,7 +112,7 @@ func (s *Server) handleTOTPDisable(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if err := s.deps.Auth.DisableTOTP(r.Context(), userFrom(r).ID, body.Code); err != nil {
+	if err := s.deps.Auth.DisableTOTP(r.Context(), userFrom(r).ID, body.Code, tokenFrom(r).ID); err != nil {
 		errJSON(w, http.StatusBadRequest, err.Error())
 		return
 	}

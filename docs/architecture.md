@@ -740,7 +740,7 @@ an HTTP client just typed and the other about a stored row.
 | `internal/stats` | Hourly stats rollups from the query log |
 | `internal/store` | Storage interfaces plus SQLite/Postgres implementations, migrations, settings |
 | `internal/api` | HTTP REST API server + handlers (`/api/v1`: setup, settings, blocking, groups, clients, filters, zones, queries, stats, tokens), embedded OpenAPI 3.1 doc; also mounts the web dashboard's static files (`internal/api.StaticHandler`) on every non-`/api` path when `Deps.Static` is set. The static mount — and only the static mount, so SSE on `/api/v1/queries/tail` stays unbuffered — gzips responses and sets `Content-Security-Policy` (`frame-ancestors 'none'`), `X-Content-Type-Options: nosniff`, `Referrer-Policy: same-origin`, and `X-Frame-Options: DENY` |
-| `internal/auth` | Auth service: argon2id password hashing, session + scoped (read/write) API tokens, optional TOTP 2FA |
+| `internal/auth` | Auth service: argon2id password hashing (bounded concurrency), session + scoped (read/write) API tokens with a 90-day session ceiling, optional TOTP 2FA with single-use codes |
 | `web` | The dashboard's Go-side glue: `//go:embed all:dist` over the React SPA's Vite build output, exposed as `web.Dist() fs.FS` for `internal/app` to hand to `internal/api.Deps.Static`. The actual frontend source (React 19 + TypeScript + Tailwind + TanStack Query, see `web/README.md`) lives under `web/src`, built independently (`pnpm build`) before the Go build embeds its output |
 
 Planned, not yet present: `internal/dhcp` (Phase 2), `internal/sync`

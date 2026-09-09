@@ -8,6 +8,16 @@ import (
 
 type userStore struct{ s *sqlStore }
 
+// userColumns is the select list every user read shares, so a column added
+// to User is added to one place rather than three that can disagree.
+const userColumns = `id, username, password_hash, totp_secret, totp_last_step, created_at`
+
+func scanUser(row interface{ Scan(...any) error }) (User, error) {
+	var usr User
+	err := row.Scan(&usr.ID, &usr.Username, &usr.PasswordHash, &usr.TOTPSecret, &usr.TOTPLastStep, &usr.CreatedAt)
+	return usr, err
+}
+
 func (u *userStore) Create(ctx context.Context, usr User) (int64, error) {
 	return u.s.insert(ctx, `INSERT INTO users (username, password_hash, totp_secret, created_at) VALUES (?, ?, ?, ?)`,
 		usr.Username, usr.PasswordHash, usr.TOTPSecret, usr.CreatedAt)
@@ -84,9 +94,7 @@ func (u *userStore) createIfNonePostgres(ctx context.Context, usr User) (bool, e
 }
 
 func (u *userStore) ByUsername(ctx context.Context, name string) (User, bool, error) {
-	var usr User
-	err := u.s.db.QueryRowContext(ctx, u.s.q(`SELECT id, username, password_hash, totp_secret, created_at FROM users WHERE username = ?`), name).
-		Scan(&usr.ID, &usr.Username, &usr.PasswordHash, &usr.TOTPSecret, &usr.CreatedAt)
+	usr, err := scanUser(u.s.db.QueryRowContext(ctx, u.s.q(`SELECT `+userColumns+` FROM users WHERE username = ?`), name))
 	if errors.Is(err, sql.ErrNoRows) {
 		return User{}, false, nil
 	}
@@ -94,9 +102,7 @@ func (u *userStore) ByUsername(ctx context.Context, name string) (User, bool, er
 }
 
 func (u *userStore) ByID(ctx context.Context, id int64) (User, bool, error) {
-	var usr User
-	err := u.s.db.QueryRowContext(ctx, u.s.q(`SELECT id, username, password_hash, totp_secret, created_at FROM users WHERE id = ?`), id).
-		Scan(&usr.ID, &usr.Username, &usr.PasswordHash, &usr.TOTPSecret, &usr.CreatedAt)
+	usr, err := scanUser(u.s.db.QueryRowContext(ctx, u.s.q(`SELECT `+userColumns+` FROM users WHERE id = ?`), id))
 	if errors.Is(err, sql.ErrNoRows) {
 		return User{}, false, nil
 	}
@@ -109,7 +115,28 @@ func (u *userStore) Count(ctx context.Context) (int64, error) {
 	return n, err
 }
 
+// SetTOTP also clears totp_last_step: the counter only means anything
+// relative to the secret it was recorded against, and a new secret (or the
+// removal of one) starts a fresh sequence. Leaving a stale high-water mark
+// behind would refuse the first code of a re-enrolment for up to 90 seconds
+// for no reason anyone could observe.
 func (u *userStore) SetTOTP(ctx context.Context, id int64, secret string) error {
-	_, err := u.s.db.ExecContext(ctx, u.s.q(`UPDATE users SET totp_secret = ? WHERE id = ?`), secret, id)
+	_, err := u.s.db.ExecContext(ctx, u.s.q(`UPDATE users SET totp_secret = ?, totp_last_step = 0 WHERE id = ?`), secret, id)
 	return err
+}
+
+func (u *userStore) ClaimTOTPStep(ctx context.Context, id, step int64) (bool, error) {
+	// One conditional UPDATE, not a read followed by a write: two logins
+	// presenting the same code at the same moment must not both find the
+	// stored step lower than theirs and both proceed.
+	res, err := u.s.db.ExecContext(ctx,
+		u.s.q(`UPDATE users SET totp_last_step = ? WHERE id = ? AND totp_last_step < ?`), step, id, step)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n == 1, nil
 }

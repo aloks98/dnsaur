@@ -63,7 +63,11 @@ type User struct {
 	Username     string `json:"username"`
 	PasswordHash string `json:"-"`
 	TOTPSecret   string `json:"-"`
-	CreatedAt    int64  `json:"created_at"`
+	// TOTPLastStep is the last 30-second TOTP time step this account
+	// authenticated with, so a code cannot be used twice (RFC 6238 §5.2).
+	// Never serialized, for the same reason the secret isn't.
+	TOTPLastStep int64 `json:"-"`
+	CreatedAt    int64 `json:"created_at"`
 }
 
 // AuthToken represents an API or session token.
@@ -313,6 +317,13 @@ type UserStore interface {
 	ByID(ctx context.Context, id int64) (User, bool, error)
 	Count(ctx context.Context) (int64, error)
 	SetTOTP(ctx context.Context, id int64, secret string) error
+	// ClaimTOTPStep records step as the last TOTP time step user id
+	// authenticated with, and reports whether the claim was granted. It is
+	// refused (false, nil error) when step is not strictly greater than the
+	// stored one — the code has been used already. The compare and the
+	// write are one statement so two logins racing with the same code
+	// cannot both win.
+	ClaimTOTPStep(ctx context.Context, id, step int64) (bool, error)
 }
 
 // TokenStore manages API and session tokens.
@@ -324,6 +335,12 @@ type TokenStore interface {
 	Touch(ctx context.Context, id, ts int64) error
 	DeleteExpired(ctx context.Context, nowMs int64) error
 	SetExpiry(ctx context.Context, id, ts int64) error
+	// DeleteSessions removes every session-kind token belonging to userID
+	// except exceptID, which is how a second-factor change logs out every
+	// other browser without logging out the one that made the change. Pass
+	// 0 for exceptID to remove all of them. API tokens are untouched: they
+	// are credentials the operator minted deliberately and revokes by name.
+	DeleteSessions(ctx context.Context, userID, exceptID int64) error
 }
 
 // sqliteDSN adds the pragmas every connection needs, as another parameter

@@ -9,6 +9,7 @@ import (
 	"io/fs"
 	"log/slog"
 	"net/http"
+	"net/netip"
 	"strings"
 	"sync"
 	"time"
@@ -116,6 +117,12 @@ type Deps struct {
 	// Static serves the embedded web dashboard on non-/api paths. Nil
 	// disables it (e.g. tests that don't care about the SPA).
 	Static fs.FS
+	// TrustedProxies are the networks a reverse proxy in front of this
+	// server may connect from (config.Config.TrustedProxies). A request
+	// arriving from one of them has its X-Forwarded-* headers believed;
+	// every other request does not, because those headers are just headers.
+	// Empty — the default — trusts nothing.
+	TrustedProxies []netip.Prefix
 }
 
 // routeReg is one handler registered through route(): the pattern handed to
@@ -146,10 +153,13 @@ type Server struct {
 	routes      []routeReg
 	mux         *http.ServeMux
 	buildMuxOne sync.Once
+	// attempts throttles the two unauthenticated endpoints that cost an
+	// argon2id hash. See attemptLimiter in auth_handlers.go.
+	attempts *attemptLimiter
 }
 
 func New(d Deps) *Server {
-	s := &Server{deps: d}
+	s := &Server{deps: d, attempts: newAttemptLimiter()}
 	s.registerRoutes()
 	return s
 }
@@ -363,7 +373,15 @@ func decodeOr400[T any](w http.ResponseWriter, r *http.Request) (T, bool) {
 
 type ctxKey int
 
-const userKey ctxKey = 0
+const (
+	userKey ctxKey = iota
+	// tokenKey carries the credential the request authenticated with, not
+	// just the account behind it. A handler that has to distinguish one
+	// session from another (revoking every session but the caller's) or one
+	// credential from another (a read-scoped token asking for a secret)
+	// cannot get that from the user.
+	tokenKey
+)
 
 // bearerPrefix is the Authorization scheme, with its separating space.
 // Compared case-insensitively — see requireAuth.
@@ -374,9 +392,80 @@ func userFrom(r *http.Request) store.User {
 	return u
 }
 
+// tokenFrom returns the token the request authenticated with. The zero
+// value comes back on an unauthenticated route, which no caller of this
+// reaches: every one of them is behind requireAuth.
+func tokenFrom(r *http.Request) store.AuthToken {
+	t, _ := r.Context().Value(tokenKey).(store.AuthToken)
+	return t
+}
+
+// remoteIP is the address the request's connection actually came from —
+// the socket's peer, never a header. False for anything that is not an
+// address at all (a unix socket), which no forwarding decision may treat as
+// trusted.
+func remoteIP(r *http.Request) (netip.Addr, bool) {
+	if ap, err := netip.ParseAddrPort(r.RemoteAddr); err == nil {
+		return ap.Addr().Unmap(), true
+	}
+	if a, err := netip.ParseAddr(r.RemoteAddr); err == nil {
+		return a.Unmap(), true
+	}
+	return netip.Addr{}, false
+}
+
+func (s *Server) isTrustedProxy(addr netip.Addr) bool {
+	for _, p := range s.deps.TrustedProxies {
+		if p.Contains(addr) {
+			return true
+		}
+	}
+	return false
+}
+
+// fromTrustedProxy reports whether this request's X-Forwarded-* headers may
+// be believed: it arrived from one of the networks the operator named in
+// trusted_proxies.
+func (s *Server) fromTrustedProxy(r *http.Request) bool {
+	addr, ok := remoteIP(r)
+	return ok && s.isTrustedProxy(addr)
+}
+
+// clientIP is the address a request is attributed to when counting login
+// attempts. Behind a proxy every request arrives from the same socket, so
+// counting by RemoteAddr alone would put the whole install on one budget
+// and let one attacker lock everybody out — which is why this reads
+// X-Forwarded-For, and why it only does so from a trusted source.
+//
+// The list is walked right to left, skipping hops that are themselves
+// trusted proxies: entries a client prepended are to the left of the ones
+// the proxies appended, so the rightmost untrusted address is the nearest
+// hop nobody could have forged.
+func (s *Server) clientIP(r *http.Request) string {
+	addr, ok := remoteIP(r)
+	if !ok {
+		return r.RemoteAddr
+	}
+	if !s.isTrustedProxy(addr) {
+		return addr.String()
+	}
+	hops := strings.Split(r.Header.Get("X-Forwarded-For"), ",")
+	for i := len(hops) - 1; i >= 0; i-- {
+		hop, err := netip.ParseAddr(strings.TrimSpace(hops[i]))
+		if err != nil {
+			break
+		}
+		if hop = hop.Unmap(); !s.isTrustedProxy(hop) {
+			return hop.String()
+		}
+	}
+	return addr.String()
+}
+
 func (s *Server) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var token string
+		var viaCookie bool
 		// RFC 9110 §11.1: the scheme name is case-insensitive, so
 		// "bearer <token>" is the same request as "Bearer <token>". A
 		// case-sensitive prefix answered it 401 "authentication required",
@@ -385,10 +474,23 @@ func (s *Server) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 		if h := r.Header.Get("Authorization"); len(h) > len(bearerPrefix) && strings.EqualFold(h[:len(bearerPrefix)], bearerPrefix) {
 			token = h[len(bearerPrefix):]
 		} else if c, err := r.Cookie("dnsaur_session"); err == nil {
-			token = c.Value
+			token, viaCookie = c.Value, true
 		}
 		if token == "" {
 			errJSON(w, http.StatusUnauthorized, "authentication required")
+			return
+		}
+		// CSRF, behind SameSite=Strict rather than instead of it. The
+		// cookie is ambient — a browser attaches it to a cross-origin form
+		// post without being asked — so a write that announces itself as
+		// cross-site is refused. Sec-Fetch-Site is set by the browser and
+		// cannot be forged by page script; its absence means a client that
+		// does not send fetch metadata (curl, a script), which is not a
+		// cross-site request and is left alone. A bearer token is not
+		// ambient, so it is not checked at all.
+		if viaCookie && r.Method != http.MethodGet && r.Method != http.MethodHead &&
+			strings.EqualFold(r.Header.Get("Sec-Fetch-Site"), "cross-site") {
+			errJSON(w, http.StatusForbidden, "cross-site request")
 			return
 		}
 		u, at, err := s.deps.Auth.Authenticate(r.Context(), token)
@@ -400,6 +502,7 @@ func (s *Server) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 			errJSON(w, http.StatusForbidden, "read-only token")
 			return
 		}
-		next(w, r.WithContext(context.WithValue(r.Context(), userKey, u)))
+		ctx := context.WithValue(r.Context(), userKey, u)
+		next(w, r.WithContext(context.WithValue(ctx, tokenKey, at)))
 	}
 }

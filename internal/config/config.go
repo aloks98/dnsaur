@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
@@ -25,7 +26,14 @@ type Config struct {
 	HTTPListen string   `yaml:"http_listen"`
 	DataDir    string   `yaml:"data_dir"`
 	LogLevel   string   `yaml:"log_level"`
-	Storage    struct {
+	// TrustedProxies are the networks a reverse proxy in front of dnsaur
+	// may connect from. A request arriving from one of them has its
+	// X-Forwarded-Proto and X-Forwarded-For headers believed; a request
+	// from anywhere else does not, because those headers are just headers
+	// and any client can send them. Empty (the default) trusts nothing,
+	// which is the right answer for a dnsaur exposed directly.
+	TrustedProxies []netip.Prefix `yaml:"trusted_proxies"`
+	Storage        struct {
 		Driver string `yaml:"driver"`
 		DSN    string `yaml:"dsn"`
 	} `yaml:"storage"`
@@ -57,6 +65,40 @@ func listenAddrs(k *koanf.Koanf) []string {
 		}
 	}
 	return out
+}
+
+// trustedProxies reads trusted_proxies from either shape it can arrive in
+// — a YAML list or a comma-separated env value, both already flattened by
+// koanf — and parses each entry.
+//
+// A bare address is accepted as the single host it plainly means
+// ("192.168.1.5" for a proxy on one machine, which is the common case)
+// rather than being refused for missing a prefix length. An entry that is
+// neither an address nor a CIDR is an error: silently dropping it would
+// leave the operator with a proxy they believe is trusted and a session
+// cookie shipping without Secure, with nothing anywhere saying why.
+func trustedProxies(k *koanf.Koanf) ([]netip.Prefix, error) {
+	raw := k.Strings("trusted_proxies")
+	if s, ok := k.Get("trusted_proxies").(string); ok {
+		raw = strings.Split(s, ",")
+	}
+	out := make([]netip.Prefix, 0, len(raw))
+	for _, e := range raw {
+		e = strings.TrimSpace(e)
+		if e == "" {
+			continue
+		}
+		if pfx, err := netip.ParsePrefix(e); err == nil {
+			out = append(out, pfx.Masked())
+			continue
+		}
+		addr, err := netip.ParseAddr(e)
+		if err != nil {
+			return nil, fmt.Errorf("trusted_proxies %q is not an IP address or CIDR", e)
+		}
+		out = append(out, netip.PrefixFrom(addr, addr.BitLen()))
+	}
+	return out, nil
 }
 
 func Load(path string) (*Config, error) {
@@ -107,6 +149,12 @@ func Load(path string) (*Config, error) {
 		}
 	}
 
+	if v := os.Getenv("DNSAUR_TRUSTED_PROXIES"); v != "" {
+		if err := k.Set("trusted_proxies", strings.Split(v, ",")); err != nil {
+			return nil, fmt.Errorf("set trusted_proxies: %w", err)
+		}
+	}
+
 	// Handle DNSAUR_DNS_LISTEN specially (comma-separated list). The entries
 	// are trimmed by listenAddrs below, along with the file's, so the two
 	// ways of writing the same list produce the same value.
@@ -125,6 +173,11 @@ func Load(path string) (*Config, error) {
 	}
 	c.Storage.Driver = k.String("storage.driver")
 	c.Storage.DSN = k.String("storage.dsn")
+	proxies, err := trustedProxies(k)
+	if err != nil {
+		return nil, err
+	}
+	c.TrustedProxies = proxies
 
 	// Validation
 	if len(c.DNSListen) == 0 {

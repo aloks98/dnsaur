@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -46,16 +48,37 @@ func (m *memUsers) SetTOTP(ctx context.Context, id int64, secret string) error {
 	for i := range m.users {
 		if m.users[i].ID == id {
 			m.users[i].TOTPSecret = secret
+			m.users[i].TOTPLastStep = 0
 		}
 	}
 	return nil
 }
+func (m *memUsers) ClaimTOTPStep(ctx context.Context, id, step int64) (bool, error) {
+	for i := range m.users {
+		if m.users[i].ID == id {
+			if step <= m.users[i].TOTPLastStep {
+				return false, nil
+			}
+			m.users[i].TOTPLastStep = step
+			return true, nil
+		}
+	}
+	return false, nil
+}
 
-type memTokens struct{ toks map[string]store.AuthToken }
+type memTokens struct {
+	toks map[string]store.AuthToken
+	// next is a monotonic counter rather than len(toks)+1: deleting a token
+	// and creating another would otherwise hand out an id that is already
+	// in use, and a test about revocation would be asserting against the
+	// wrong row.
+	next int64
+}
 
 func newMemTokens() *memTokens { return &memTokens{toks: map[string]store.AuthToken{}} }
 func (m *memTokens) Create(ctx context.Context, t store.AuthToken) (int64, error) {
-	t.ID = int64(len(m.toks) + 1)
+	m.next++
+	t.ID = m.next
 	m.toks[t.TokenHash] = t
 	return t.ID, nil
 }
@@ -90,6 +113,14 @@ func (m *memTokens) Touch(ctx context.Context, id, ts int64) error {
 	return nil
 }
 func (m *memTokens) DeleteExpired(ctx context.Context, now int64) error { return nil }
+func (m *memTokens) DeleteSessions(ctx context.Context, userID, exceptID int64) error {
+	for h, t := range m.toks {
+		if t.UserID == userID && t.Kind == "session" && t.ID != exceptID {
+			delete(m.toks, h)
+		}
+	}
+	return nil
+}
 func (m *memTokens) SetExpiry(ctx context.Context, id, ts int64) error {
 	for h, t := range m.toks {
 		if t.ID == id {
@@ -224,5 +255,152 @@ func TestLoginEqualizesTimingForUnknownUser(t *testing.T) {
 	elapsed := time.Since(start)
 	if elapsed < 500*time.Microsecond {
 		t.Fatalf("unknown-user login returned in %v without running argon2; timing oracle reopened", elapsed)
+	}
+}
+
+// TestSessionSlidesButNotForever covers both halves of the session clock,
+// neither of which had a test: that use past the halfway mark really does
+// extend the expiry (the sliding renewal nothing asserted), and that the
+// sliding stops at an absolute ceiling. Without the ceiling a browser that
+// checks in once a fortnight keeps one token alive indefinitely, so a
+// stolen cookie quietly kept warm never expires on its own.
+func TestSessionSlidesButNotForever(t *testing.T) {
+	ctx := context.Background()
+	svc := New(&memUsers{}, newMemTokens())
+	created := time.Unix(1_700_000_000, 0)
+	now := created
+	svc.Now = func() time.Time { return now }
+	if err := svc.CreateAdmin(ctx, "admin", "correct-horse"); err != nil {
+		t.Fatal(err)
+	}
+	tok, err := svc.Login(ctx, "admin", "correct-horse", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Before the halfway mark: nothing moves.
+	now = created.Add(10 * 24 * time.Hour)
+	if _, _, err := svc.Authenticate(ctx, tok); err != nil {
+		t.Fatal(err)
+	}
+	_, at, err := svc.Authenticate(ctx, tok)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := at.ExpiresAt, created.Add(SessionTTL).UnixMilli(); got != want {
+		t.Fatalf("expiry moved before the halfway mark: %d, want %d", got, want)
+	}
+
+	// Past it: the expiry is pushed out a full TTL from now.
+	now = created.Add(20 * 24 * time.Hour)
+	if _, _, err := svc.Authenticate(ctx, tok); err != nil {
+		t.Fatal(err)
+	}
+	_, at, err = svc.Authenticate(ctx, tok)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := at.ExpiresAt, now.Add(SessionTTL).UnixMilli(); got != want {
+		t.Fatalf("session not renewed past the halfway mark: expiry %d, want %d", got, want)
+	}
+
+	// Used every twenty days it keeps sliding, which is exactly the
+	// problem: on renewal alone this session never dies. Walk it up to the
+	// ceiling, and the renewal has to stop there rather than at now+TTL.
+	for _, day := range []int{40, 60, 80, 85, 89} {
+		now = created.Add(time.Duration(day) * 24 * time.Hour)
+		if _, _, err := svc.Authenticate(ctx, tok); err != nil {
+			t.Fatalf("session refused on day %d, before the ceiling: %v", day, err)
+		}
+		_, at, err = svc.Authenticate(ctx, tok)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if want := created.Add(SessionMaxLifetime).UnixMilli(); at.ExpiresAt > want {
+			t.Fatalf("renewal on day %d set expiry %d, past the %d ceiling", day, at.ExpiresAt, want)
+		}
+	}
+	now = created.Add(SessionMaxLifetime)
+	if _, _, err := svc.Authenticate(ctx, tok); !errors.Is(err, ErrBadCredentials) {
+		t.Fatalf("session used every few days outlived the %v ceiling: %v", SessionMaxLifetime, err)
+	}
+}
+
+// TestArgon2WorkIsBounded asserts the ceiling on concurrent argon2id
+// computations. Fifty simultaneous logins must not put fifty 64 MiB
+// allocations in flight at once — the whole point of the gate — so this
+// drives the real gate instance with a body that records peak occupancy,
+// and checks both halves of the claim: never more than argonSlots at once,
+// and every caller still gets through.
+func TestArgon2WorkIsBounded(t *testing.T) {
+	const callers = 50
+	var live, peak atomic.Int64
+	var done atomic.Int64
+	var wg sync.WaitGroup
+	for range callers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			argon2Gate.do(func() {
+				n := live.Add(1)
+				for {
+					old := peak.Load()
+					if n <= old || peak.CompareAndSwap(old, n) {
+						break
+					}
+				}
+				// Long enough that the goroutines genuinely overlap: an
+				// instant body would let them file through one at a time
+				// and pass whatever the bound was.
+				time.Sleep(2 * time.Millisecond)
+				live.Add(-1)
+				done.Add(1)
+			})
+		}()
+	}
+	wg.Wait()
+	if got := peak.Load(); got > argonSlots {
+		t.Fatalf("%d argon2 computations ran at once, bound is %d", got, argonSlots)
+	}
+	if got := done.Load(); got != callers {
+		t.Fatalf("%d of %d callers completed; the gate must queue work, not drop it", got, callers)
+	}
+	// The bound above is only worth having if it is low enough to cap the
+	// allocation, so the budget is asserted as a number rather than against
+	// the constant under test — otherwise raising argonSlots would raise
+	// the expectation with it and this test would agree with anything.
+	if peakMiB := argonSlots * argonMemory / 1024; peakMiB > 512 {
+		t.Fatalf("argonSlots=%d lets %d MiB of argon2 scratch memory be in flight at once",
+			argonSlots, peakMiB)
+	}
+}
+
+// TestSetupAfterSetupDoesNoHashing pins the order CreateAdmin does its work
+// in: the emptiness check comes before the argon2id hash, so a POST /setup
+// against an install that already has an admin costs one SELECT rather than
+// 64 MiB of scratch memory and a full argon2id pass. Counted rather than
+// timed — whether a request hashes is a fact about the code path, and a
+// wall-clock assertion would be measuring the machine instead.
+func TestSetupAfterSetupDoesNoHashing(t *testing.T) {
+	ctx := context.Background()
+	svc := New(&memUsers{}, newMemTokens())
+	hashes := 0
+	realHash := svc.hashPassword
+	svc.hashPassword = func(pw string) (string, error) { hashes++; return realHash(pw) }
+
+	if err := svc.CreateAdmin(ctx, "admin", "correct-horse"); err != nil {
+		t.Fatal(err)
+	}
+	if hashes != 1 {
+		t.Fatalf("first setup hashed %d times, want exactly 1", hashes)
+	}
+	for i := range 5 {
+		if err := svc.CreateAdmin(ctx, "again", "another-valid-pw"); !errors.Is(err, ErrSetupDone) {
+			t.Fatalf("setup attempt %d: %v", i, err)
+		}
+	}
+	if hashes != 1 {
+		t.Fatalf("setup after setup hashed %d times in total, want 1: POST /setup stays an "+
+			"unauthenticated argon2id burner for as long as it hashes before it checks", hashes)
 	}
 }
