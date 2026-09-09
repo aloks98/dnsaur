@@ -219,6 +219,113 @@ type TransferResult struct {
 	// unix milliseconds — the two values Zone.Serving reads.
 	RefreshedAt int64
 	ExpiresAt   int64
+	// Unchanged is true when the primary's serial said there was nothing to
+	// fetch, so the two stamps above moved and nothing else did. Records is 0
+	// for such a result rather than the zone's size: nothing was installed to
+	// count. See Sync.
+	Unchanged bool
+}
+
+// Sync is the attempt the schedule makes: ask the primary what serial it is
+// at, and transfer only if that serial has moved.
+//
+// It is RFC 1034 §4.3.5's refresh timer as the RFC describes it — "check to
+// see if the zone has been updated", an SOA query first and a transfer only if
+// the answer says so. Transferring unconditionally, which is what the schedule
+// used to do, spends a whole zone on the wire, a record diff, a whole-store
+// snapshot rebuild and a NOTIFY pass every refresh interval, per secondary,
+// for a zone nobody has touched.
+//
+// A check that succeeded still stamps refreshed_at and expires_at, because
+// that is what the check *is*: §4.3.5 restarts the expire timer when the
+// primary answers, not only when it answers with something new. A secondary
+// that probed successfully and stamped nothing would go dark on schedule with
+// its primary reachable the whole time.
+//
+// **A probe that fails falls through to the transfer rather than failing the
+// attempt.** The probe is one UDP exchange and the transfer is TCP, so a
+// primary — or a middlebox — that answers one and not the other is an ordinary
+// misconfiguration; and of the two ways to be wrong about it, an AXFR nobody
+// needed costs bandwidth, while an attempt abandoned over a probe leaves a
+// secondary stale and then expired. A primary that is genuinely down fails the
+// transfer too, a moment later, and is recorded as the one failure it is.
+//
+// A zone that has never transferred does not probe at all: there is no
+// baseline to compare against, since a secondary created through the API
+// starts at the placeholder soa_serial 1 and a primary that happens to be at 1
+// would make every comparison say "not newer" and leave the zone permanently
+// empty while reporting nothing wrong. NotifyServer.act declines the same
+// comparison for the same reason.
+//
+// The manual path (Refresher.Refresh, behind POST /zones/{id}/refresh) does
+// not come through here: a person pressing a button means "fetch it", and a
+// button that answered "your serial has not moved" would be indistinguishable
+// from one that did nothing.
+func (t *Transferrer) Sync(ctx context.Context, z store.Zone) (TransferResult, error) {
+	if !strings.EqualFold(z.Type, "secondary") || z.RefreshedAt == 0 {
+		return t.Transfer(ctx, z)
+	}
+	remote, from, err := t.ProbeSerial(ctx, z)
+	if err != nil {
+		slog.Debug("the SOA probe before a scheduled transfer failed, transferring anyway",
+			"zone", z.Name, "err", err)
+		return t.Transfer(ctx, z)
+	}
+	if SerialNewer(remote, z.SOASerial) {
+		slog.Debug("the primary is ahead, transferring",
+			"zone", z.Name, "ours", z.SOASerial, "theirs", remote, "primary", from)
+		return t.Transfer(ctx, z)
+	}
+	return t.markChecked(ctx, z, from)
+}
+
+// markChecked writes the two stamps a successful check earns, for a zone whose
+// primary confirmed it is already current.
+func (t *Transferrer) markChecked(ctx context.Context, z store.Zone, ap netip.AddrPort) (TransferResult, error) {
+	// The write must not be abandoned because whoever asked for the attempt
+	// went away: everything cancellable has already happened. install's own
+	// context is stripped for the same reason.
+	ctx = context.WithoutCancel(ctx)
+	// Re-read for the reason install re-reads. This binds every column of the
+	// zone row, and a probe takes as long as a primary takes to answer, so
+	// writing back the copy the attempt started from would silently undo an
+	// edit made while it was in flight.
+	current, err := t.zs.Zone(ctx, z.ID)
+	if err != nil {
+		return TransferResult{}, fmt.Errorf("re-reading zone %q after its SOA probe: %w", z.Name, err)
+	}
+	if !strings.EqualFold(current.Type, "secondary") {
+		return TransferResult{}, fmt.Errorf("zone %q became type %q while its SOA was being probed", current.Name, current.Type)
+	}
+	nowMs := t.now().UnixMilli()
+	current.RefreshedAt = nowMs
+	// The same arithmetic install uses, from the same field, so "checked" and
+	// "transferred" cannot drift into two different expiries.
+	current.ExpiresAt = nowMs + int64(current.SOAExpire)*1000
+	// modified_at is deliberately untouched: nothing about the zone's contents
+	// changed, and moving it would make every secondary look edited on every
+	// refresh — the same rule install applies through contentChanged.
+	if err := t.zs.UpdateZone(ctx, current); err != nil {
+		return TransferResult{}, fmt.Errorf("stamping zone %q after its SOA probe: %w", current.Name, err)
+	}
+	// The stamps are what let the zone answer (Zone.Serving), and the
+	// answering path reads a snapshot rather than the row. A zone whose expiry
+	// moved in the store and not in the snapshot expires anyway, on time, with
+	// its primary answering — which is the failure this whole path exists to
+	// prevent, reached through the back door.
+	if t.reload != nil {
+		if err := t.reload(ctx); err != nil {
+			slog.Error("zone reload after an SOA probe failed",
+				"zone", current.Name, "primary", ap.String(), "err", err)
+		}
+	}
+	return TransferResult{
+		Primary:     ap,
+		Serial:      current.SOASerial,
+		RefreshedAt: current.RefreshedAt,
+		ExpiresAt:   current.ExpiresAt,
+		Unchanged:   true,
+	}, nil
 }
 
 // Transfer fetches z from its primaries and installs what arrives.
@@ -530,7 +637,7 @@ func (t *Transferrer) probeOne(ctx context.Context, zoneName string, ap netip.Ad
 		// would make SerialNewer compare against the wrong number and, when
 		// that number happens to be higher, silently decline a transfer
 		// that should have happened — leaving a stale zone reporting
-		// nothing wrong, which is the exact failure this task exists to
+		// nothing wrong, which is the exact failure the probe exists to
 		// prevent.
 		if !strings.EqualFold(dns.CanonicalName(soa.Hdr.Name), dns.CanonicalName(dns.Fqdn(zoneName))) {
 			return 0, fmt.Errorf("SOA probe answered with the SOA of %q, not of %q", soa.Hdr.Name, zoneName)
@@ -575,8 +682,22 @@ func (t *Transferrer) build(z store.Zone, rrs []dns.RR) ([]store.ZoneRecord, *dn
 	}
 	body := rrs[1:]
 	if len(rrs) > 1 {
-		if _, ok := rrs[len(rrs)-1].(*dns.SOA); !ok {
+		last, ok := rrs[len(rrs)-1].(*dns.SOA)
+		if !ok {
 			return nil, nil, errors.New("the transfer does not end with the zone's SOA")
+		}
+		// RFC 5936 §2.2 asks for "the same SOA resource record" at both ends,
+		// and a serial that moved between them is a primary that edited the
+		// zone mid-stream — BIND aborts such a transfer rather than serving
+		// it. What arrived is then neither version: part of it predates the
+		// edit and part of it does not. Installed under the opening serial it
+		// would be a zone nobody else holds, and every later comparison —
+		// this server's own next probe, and every secondary below it — would
+		// read that serial as one it has already seen and never ask again.
+		if last.Serial != soa.Serial {
+			return nil, nil, fmt.Errorf(
+				"the transfer opens at serial %d and closes at serial %d: the zone changed while it was being sent",
+				soa.Serial, last.Serial)
 		}
 		body = rrs[1 : len(rrs)-1]
 	}
@@ -598,6 +719,21 @@ func (t *Transferrer) build(z store.Zone, rrs []dns.RR) ([]store.ZoneRecord, *dn
 
 	apex := dns.CanonicalName(dns.Fqdn(z.Name))
 	recs := make([]store.ZoneRecord, 0, len(body))
+	// The same records, keyed by the relative name BuildRecord stores them
+	// under. BuildRecord judges each arriving record against its *siblings* —
+	// RFC 2181 §5.2's one TTL per RRSet, RFC 1034 §3.6.2's lone CNAME — and
+	// skips every entry whose name differs, so handing it the whole
+	// accumulating slice makes each record cost a scan of the zone so far:
+	// quadratic, holding the per-zone transfer lock, with the refresh pass
+	// queued behind it. At the 100,000 records a transfer will accept that is
+	// 5×10⁹ comparisons to answer a question about, typically, one or two.
+	//
+	// Indexed here rather than inside BuildRecord because the same function is
+	// what validates a single record arriving through the API, where the
+	// caller has the zone's rows and no index — and one validator for both
+	// paths is what keeps a transfer unable to install what a human could not
+	// write (see this file's own header).
+	byName := make(map[string][]store.ZoneRecord, len(body))
 	// named holds the first maxNamedProblems messages; problems counts all of
 	// them. Kept apart so a wholly unacceptable zone costs a counter rather
 	// than one string per record.
@@ -649,12 +785,13 @@ func (t *Transferrer) build(z store.Zone, rrs []dns.RR) ([]store.ZoneRecord, *dn
 			continue
 		}
 
+		name := RelRecordName(rr.Header().Name, z.Name)
 		rec, err := BuildRecord(z, RecordWrite{
 			Name:  rr.Header().Name,
 			Type:  dns.Type(rr.Header().Rrtype).String(),
 			TTL:   rr.Header().Ttl,
 			RData: RDataOf(rr),
-		}, recs, 0, false)
+		}, byName[name], 0, false)
 		if err != nil {
 			note(rr, "%s", err.Error())
 			continue
@@ -662,6 +799,7 @@ func (t *Transferrer) build(z store.Zone, rrs []dns.RR) ([]store.ZoneRecord, *dn
 		// Only records that passed accumulate, so a later record is never
 		// judged against one that is not going to exist.
 		recs = append(recs, rec)
+		byName[name] = append(byName[name], rec)
 	}
 
 	if problems > 0 {

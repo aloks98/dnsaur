@@ -220,6 +220,25 @@ answers from, not a fresh database read, so a peer can't drive store load,
 and a transfer racing a reload sees one consistent zone rather than a
 mixture.
 
+**IXFR is answered with the whole zone** — RFC 1995 §4 permits exactly that
+("the server may choose to transfer the entire zone just as in a normal full
+zone transfer"), and dnsaur has no journal to compute a delta from — **except
+for a client that is already current**, which gets the single SOA §2 asks for.
+That case is the common one, not a corner: a secondary asks again on every
+`refresh` timer it has, and a server that answered each of those with the
+entire zone would spend precisely the bandwidth IXFR exists to save on the peer
+that needed nothing. The client's serial is read from the SOA its query carries
+in the authority section (§3); a query with no SOA of this zone in it has
+nothing to compare and gets the whole zone.
+
+A stalled peer does not hold a transfer slot indefinitely. `dns.Server`'s
+documented `WriteTimeout` is never applied by the library and
+`dns.ResponseWriter` exposes no connection to set a deadline on, so a peer that
+stops reading blocks inside `WriteMsg` where the between-envelope deadline
+check can never reach it. The transfer's own context therefore closes the
+writer when it expires — the same lever the AXFR *client* already uses — which
+fails that write and returns the slot.
+
 The gate answers with one of five rcodes, and the first three are what an
 operator debugging a secondary that has stopped updating actually needs to
 read:
@@ -277,8 +296,23 @@ zone's `primaries` to check the sender against them. That ordering is
 load-bearing, not tidiness: `ParsePrimaries` may do a live, uncached DNS
 lookup for a hostname primary, and doing that before the local checks would
 let one unauthenticated, trivially spoofable UDP packet drive an outbound
-recursive lookup for a NOTIFY that was going to be refused anyway. The gate,
-in order:
+recursive lookup for a NOTIFY that was going to be refused anyway. Two more
+bounds sit on that lookup for the NOTIFYs that do get past the local checks:
+the IP literals in `primaries` are matched first, so the ordinary
+`10.0.0.5, ns1.example.com` configuration costs no lookup at all for a NOTIFY
+from `10.0.0.5`; and when a hostname really must be resolved, the result — a
+failure included — is reused for the length of one throttle window, so a flood
+costs one lookup rather than one each. A primary that has just moved is
+therefore refused for at most that window, which RFC 1996 §3.6's
+retransmission covers.
+
+One unresolvable entry no longer disables the rest: `ParsePrimaries` skips it
+and fails only when *nothing* in the list resolved. All-or-nothing resolution
+meant a name-server outage took a perfectly dialable IP literal written beside
+the name out of service with it — no primary contacted, and every NOTIFY for
+the zone refused for want of a source to match against.
+
+The gate, in order:
 
 | Rcode | TSIG error | Means |
 |---|---|---|
@@ -330,10 +364,17 @@ compare, transfer.
    *any* response, so a responder that waited for the transfer to finish
    before replying would earn itself a second NOTIFY for the transfer
    already in flight.
-2. **Throttle** (5s per zone): a primary editing ten records sends ten
-   NOTIFYs; each gets its own immediate reply, and they collapse to one
-   probe. Without this, "NOTIFY is cheap" becomes a probe amplifier pointed
-   at dnsaur's own configured primary.
+2. **Throttle** (5s per zone, trailing-edge): a primary editing ten records
+   sends ten NOTIFYs; each gets its own immediate reply, and they collapse to
+   one probe. Without this, "NOTIFY is cheap" becomes a probe amplifier
+   pointed at dnsaur's own configured primary. A NOTIFY that arrives inside an
+   open window is *deferred*, not dropped: the window remembers that something
+   arrived and runs one more probe when it closes. Dropping it instead lost
+   any serial bump that landed after the window's own probe had already asked
+   — the primary editing at t=0 and again at t=2s — until the SOA `refresh`
+   fired, with the peer told `NOERROR` so it had stopped retransmitting. The
+   bound is unchanged, because what is remembered is "something arrived", not
+   how much: ten suppressed NOTIFYs are worth one probe between them.
 3. **Probe**: an SOA query against the zone's primaries checks whether they
    are actually ahead, skipped only when no probe is wired in or for a zone
    that has never transferred (see below, where a serial comparison would
@@ -640,6 +681,34 @@ a busy loop against itself. `refreshed_at`, `last_attempt` and `last_error`
 are written the same way for both, which is what makes a stub's state
 readable after a restart. Only the third SOA timer, `expire`, is
 type-specific — see above.
+
+**A scheduled refresh of a secondary checks the serial before it transfers.**
+That is RFC 1034 §4.3.5's refresh timer as the RFC describes it — "check to see
+if the zone has been updated", an SOA query first and an AXFR only if the
+answer moved. A check that finds nothing new still stamps `refreshed_at` *and*
+`expires_at`, because §4.3.5 restarts the expire timer when the primary
+answers, not only when it answers with something new; what it skips is the
+zone on the wire, the record diff, the snapshot rebuild and the NOTIFY pass. A
+probe that *fails* falls through to the transfer rather than failing the
+attempt: the probe is one UDP exchange and the transfer is TCP, so a primary
+that answers one and not the other is an ordinary misconfiguration, and an
+unnecessary AXFR is a cheaper mistake than a zone left to expire with its
+primary reachable the whole time. A zone that has never transferred does not
+probe at all, for the reason the NOTIFY path gives below: there is no honest
+baseline to compare against. `POST /zones/{id}/refresh` is unchanged and still
+transfers unconditionally — a button that answered "your serial has not moved"
+would be indistinguishable from one that did nothing.
+
+Two more things bound the schedule. Each scheduled attempt gets the same
+two-minute deadline dnsaur gives a transfer it is *serving*, because
+`transferReadTimeout` bounds each individual read and nothing bounded their
+sum — a primary dripping one envelope every twenty seconds could hold a zone's
+transfer lock, and the manual refresh and NOTIFY work queued behind it, for as
+long as it liked. And a zone whose SOA `expire` is shorter than its `refresh`
+is polled at half the expiry instead, with one warning per zone saying so: the
+published pair means "stop answering, and do not check", and followed literally
+it takes the secondary dark on a schedule (55 minutes of every hour for an
+`expire` of 300 against a `refresh` of 3600) with nothing anywhere saying why.
 
 A forwarder is not in that set and cannot be: it has no master and nothing
 to fetch, so refreshing it would be a button that does nothing.

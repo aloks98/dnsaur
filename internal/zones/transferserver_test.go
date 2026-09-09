@@ -963,6 +963,63 @@ func TestIXFRIsAnsweredWithTheWholeZone(t *testing.T) {
 	}
 }
 
+// ixfr asks for an incremental transfer over TCP, naming the serial the client
+// already holds in the authority section the way RFC 1995 §3 specifies. The
+// reply is read as one message: a client that is current gets exactly one, and
+// a client that is behind gets a stream whose first message is what the
+// assertions here are about.
+func (f *xfrFixture) ixfr(t *testing.T, qname string, serial uint32) *dns.Msg {
+	t.Helper()
+	m := new(dns.Msg)
+	m.SetIxfr(dns.Fqdn(qname), serial, dns.Fqdn("ns1."+qname), dns.Fqdn("hostmaster."+qname))
+	c := &dns.Client{Net: "tcp"}
+	reply, _, err := c.Exchange(m, f.addr)
+	if err != nil {
+		t.Fatalf("Exchange: %v", err)
+	}
+	return reply
+}
+
+// RFC 1995 §2: "If an IXFR query with the same or newer version number than
+// that of the server is received, it is replied to with a single SOA record of
+// the server's current version." §4's permission to answer IXFR with a whole
+// AXFR — which is what this server does, having no journal — is about a client
+// that is genuinely behind; it is not licence to hand the entire zone to a
+// secondary that already has it, on its own refresh timer, forever.
+func TestIXFRFromACurrentClientIsAnsweredWithOneSOA(t *testing.T) {
+	f := newXFRFixture(t, xfrZone("127.0.0.0/8"), xfrRecords())
+
+	// xfrZone's serial is 3: the same, and one ahead — the client's clock
+	// having run away is still not a reason to send it the zone.
+	for _, serial := range []uint32{3, 4} {
+		m := f.ixfr(t, xfrApex, serial)
+		assertRcode(t, m, dns.RcodeSuccess)
+		if len(m.Answer) != 1 {
+			t.Fatalf("client serial %d: got %d RRs (%v), want one SOA",
+				serial, len(m.Answer), rrNames(m.Answer))
+		}
+		soa, ok := m.Answer[0].(*dns.SOA)
+		if !ok {
+			t.Fatalf("client serial %d: answer is %T, want an SOA", serial, m.Answer[0])
+		}
+		if soa.Serial != 3 {
+			t.Errorf("client serial %d: answered serial %d, want this server's 3", serial, soa.Serial)
+		}
+	}
+}
+
+// The other half: a client that really is behind still gets the zone, so the
+// check above cannot be satisfied by never transferring anything.
+func TestIXFRFromABehindClientStillGetsTheZone(t *testing.T) {
+	f := newXFRFixture(t, xfrZone("127.0.0.0/8"), xfrRecords())
+
+	m := f.ixfr(t, xfrApex, 2)
+	assertRcode(t, m, dns.RcodeSuccess)
+	if len(m.Answer) != 4 {
+		t.Fatalf("got %d RRs (%v), want the whole zone", len(m.Answer), rrNames(m.Answer))
+	}
+}
+
 // captureWriter is a dns.ResponseWriter that keeps what was written, for the
 // tests that call ServeTransfer directly because what they assert on is not
 // reachable through the fixture: a context shorter than dnssrv's own
@@ -1758,6 +1815,136 @@ func TestTheTransferContextBoundsAStalledTransfer(t *testing.T) {
 			got = dns.RcodeToString[w2.msg.Rcode]
 		}
 		t.Fatalf("the transfer after the stalled one got %s, want a served transfer", got)
+	}
+}
+
+// deadWriter is the peer §9.5.7 is a bound on: one that stops reading
+// altogether, so WriteMsg blocks with no deadline the library will ever apply
+// (dns.Server.WriteTimeout is documented and never used, and
+// dns.ResponseWriter exposes no connection to set one on).
+//
+// Close is the only lever there is, and it is the one this models: in
+// production it closes the TCP connection, which makes the blocked write fail.
+// A writer whose WriteMsg returned on a timer of its own would test a peer
+// that is slow, which the test above already covers, rather than one that is
+// gone.
+type deadWriter struct {
+	mu     sync.Mutex
+	writes int
+	closed chan struct{}
+	once   sync.Once
+}
+
+func newDeadWriter() *deadWriter { return &deadWriter{closed: make(chan struct{})} }
+
+func (w *deadWriter) LocalAddr() net.Addr {
+	return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 53}
+}
+
+func (w *deadWriter) RemoteAddr() net.Addr {
+	return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 40000}
+}
+
+func (w *deadWriter) WriteMsg(*dns.Msg) error {
+	w.mu.Lock()
+	w.writes++
+	w.mu.Unlock()
+	<-w.closed
+	return net.ErrClosed
+}
+
+func (w *deadWriter) Write(b []byte) (int, error) {
+	if err := w.WriteMsg(nil); err != nil {
+		return 0, err
+	}
+	return len(b), nil
+}
+
+func (w *deadWriter) Close() error {
+	w.once.Do(func() { close(w.closed) })
+	return nil
+}
+
+func (w *deadWriter) TsigStatus() error   { return nil }
+func (w *deadWriter) TsigTimersOnly(bool) {}
+func (w *deadWriter) Hijack()             {}
+
+// The case the concurrency cap exists for and nothing exercised: a peer whose
+// WriteMsg never returns at all. The deadline is only checked between
+// envelopes, so a transfer already blocked inside a write stays blocked, and
+// with it a slot that four such peers can exhaust — every later secondary
+// SERVFAILs until those TCP connections die of their own accord, which for a
+// peer that is merely not reading may be never.
+//
+// Closing the writer is the lever, and it is the same one Transferrer.fetch
+// already uses from the client side.
+func TestATransferToAPeerThatNeverReadsReleasesItsSlot(t *testing.T) {
+	f := newXFRFixture(t, xfrZone("127.0.0.0/8"), xfrBigRecords(stalledZoneRecordCount))
+	ts := zones.NewTransferServer(f.res, f.st.Zones(), zones.WithMaxConcurrentTransfers(1))
+
+	w := newDeadWriter()
+	q := new(dns.Msg)
+	q.SetAxfr(dns.Fqdn(xfrApex))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		ts.ServeTransfer(ctx, w, q, "", dnssrv.ErrTSIGUnsigned)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("ServeTransfer never returned: the write it is blocked in outlives its own deadline")
+	}
+
+	// The slot is the assertion. With the cap at 1, a transfer that left its
+	// slot held would refuse this one.
+	w2 := new(captureWriter)
+	ts.ServeTransfer(context.Background(), w2, q, "", dnssrv.ErrTSIGUnsigned)
+	if w2.msg == nil || w2.msg.Rcode != dns.RcodeSuccess {
+		got := "no message"
+		if w2.msg != nil {
+			got = dns.RcodeToString[w2.msg.Rcode]
+		}
+		t.Fatalf("the transfer after the stalled one got %s, want a served transfer", got)
+	}
+}
+
+// A refusal that says nothing about a zone this server holds is not an
+// operator's problem: an apex it holds nothing for, or a peer using UDP for a
+// TCP protocol, is one unauthenticated packet away for anybody, so a Warn per
+// packet is a log an attacker writes. The NOTIFY gate's twin already logs its
+// refusals at debug for exactly this reason. A refusal *about a zone this
+// server holds* stays loud, because that is the one an operator is hunting
+// when a secondary stops updating.
+func TestARefusalAboutNoZoneOfOursIsNotWarned(t *testing.T) {
+	logs := captureLogs(t)
+	f := newXFRFixture(t, xfrZone("key:ns2."+xfrApex), xfrRecords())
+
+	// No zone at that apex, and an AXFR over UDP: the two rows any source can
+	// reach without being anywhere near the ACL.
+	f.exchange(t, "somewhere.else", dns.TypeAXFR)
+	f.exchangeUDP(t, xfrApex, dns.TypeAXFR)
+	for _, r := range logs() {
+		if r.Message == "zone transfer refused" && r.Level >= slog.LevelWarn {
+			t.Errorf("a refusal any UDP source can provoke was logged at %s: %s", r.Level, r.Message)
+		}
+	}
+
+	// The control: the ACL refusing a peer for a zone this server does hold is
+	// still a warning, or this check would pass by silencing everything.
+	f.exchange(t, xfrApex, dns.TypeAXFR)
+	warned := false
+	for _, r := range logs() {
+		if r.Message == "zone transfer refused" && r.Level >= slog.LevelWarn {
+			warned = true
+		}
+	}
+	if !warned {
+		t.Error("a peer refused by allow_transfer for a zone we hold was not warned about")
 	}
 }
 

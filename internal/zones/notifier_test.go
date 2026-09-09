@@ -262,6 +262,55 @@ func TestNotifierFailsClosedOnAnUnparseableList(t *testing.T) {
 	}
 }
 
+// A secondary that has never transferred, or whose data has expired, is the
+// disabled zone's twin: Zone.Serving says it may not answer, and its own
+// TransferServer refuses the AXFR its NOTIFY would invite. A freshly created
+// secondary sits at the placeholder soa_serial 1, so without this it notifies
+// every target the moment it is created and invites a transfer that SERVFAILs.
+func TestNotifierSkipsAZoneThatIsNotServing(t *testing.T) {
+	ctx := context.Background()
+	f := newNotifierFixture(t, "10.0.0.2:53", 1)
+
+	// A secondary as the API creates one: serial 1, nothing transferred.
+	z, _ := f.st.Zones().Zone(ctx, f.zoneID)
+	z.Type = "secondary"
+	z.Primaries = "10.0.0.9"
+	z.RefreshedAt = 0
+	if err := f.st.Zones().UpdateZone(ctx, z); err != nil {
+		t.Fatalf("UpdateZone: %v", err)
+	}
+	f.pass(t)
+	if got := f.sender.count(); got != 0 {
+		t.Errorf("a never-transferred secondary sent %d notifies, want 0", got)
+	}
+
+	// Expired is the same state reached the other way.
+	z, _ = f.st.Zones().Zone(ctx, f.zoneID)
+	z.RefreshedAt = f.clock.Add(-2 * time.Hour).UnixMilli()
+	z.ExpiresAt = f.clock.Add(-time.Hour).UnixMilli()
+	if err := f.st.Zones().UpdateZone(ctx, z); err != nil {
+		t.Fatalf("UpdateZone: %v", err)
+	}
+	f.pass(t)
+	if got := f.sender.count(); got != 0 {
+		t.Errorf("an expired secondary sent %d notifies, want 0", got)
+	}
+
+	// And a transfer that lands is what lets it speak: the zone is serving
+	// data it can vouch for, so a target asking for it is answered.
+	z, _ = f.st.Zones().Zone(ctx, f.zoneID)
+	z.RefreshedAt = f.clock.UnixMilli()
+	z.ExpiresAt = f.clock.Add(time.Hour).UnixMilli()
+	z.SOASerial = 47
+	if err := f.st.Zones().UpdateZone(ctx, z); err != nil {
+		t.Fatalf("UpdateZone: %v", err)
+	}
+	f.pass(t)
+	if got := f.sender.count(); got != 1 {
+		t.Errorf("a secondary serving its primary's zone sent %d notifies, want 1", got)
+	}
+}
+
 // A disabled zone answers nothing (Zone.Serving), so its own NOTIFY would
 // invite a transfer this server would REFUSE — handing a third party's
 // secondary a retry loop. The mirror of refresh.go's disabled-zone skip.

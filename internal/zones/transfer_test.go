@@ -847,6 +847,35 @@ func TestTransferRejectsAnSOAThatExpiresImmediately(t *testing.T) {
 	}
 }
 
+// The closing SOA delimits the zone and says which version of it just
+// arrived. A primary that edited the zone mid-stream sends a different serial
+// on the way out — BIND aborts such a transfer — and installing it anyway
+// files a half-old, half-new zone under the opening serial, which every
+// downstream comparison then reads as "already have that one".
+func TestTransferRejectsAClosingSOAWithADifferentSerial(t *testing.T) {
+	soaAt := func(serial uint32) dns.RR {
+		return mustRR(t, fmt.Sprintf("%s. 900 IN SOA ns1.%s. hostadmin.%s. %d %d 300 %d 900",
+			transferApex, transferApex, transferApex, serial, primaryRefresh, primaryExpire))
+	}
+	primary := startTestPrimary(t, transferApex, []dns.RR{
+		soaAt(primarySerial),
+		mustRR(t, fmt.Sprintf("%s. 3600 IN NS ns1.%s.", transferApex, transferApex)),
+		soaAt(primarySerial + 1),
+	})
+	f := newTransferFixture(t, primary.addr, 0)
+
+	_, err := f.transferrer().Transfer(context.Background(), f.zone(t))
+	if err == nil {
+		t.Fatal("transfer succeeded with a closing SOA at a different serial")
+	}
+	if !strings.Contains(err.Error(), "serial") {
+		t.Errorf("error does not name what disagreed: %v", err)
+	}
+	if z := f.zone(t); z.RefreshedAt != 0 {
+		t.Error("a refused transfer stamped refreshed_at")
+	}
+}
+
 // A primary answering something that is not a zone must not leave the
 // secondary holding an empty one.
 func TestTransferRejectsAnAnswerThatDoesNotStartWithTheSOA(t *testing.T) {

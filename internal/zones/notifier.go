@@ -223,6 +223,17 @@ func (n *Notifier) Pass(ctx context.Context) error {
 		if !z.Enabled {
 			continue
 		}
+		// The same rule reached the other way, and asked of the function that
+		// owns it. A secondary that has never transferred, or whose data has
+		// expired, may not answer (Zone.Serving) and its own TransferServer
+		// refuses the AXFR — so a NOTIFY from it is an invitation to a
+		// SERVFAIL. It matters most at the one moment it is easiest to miss:
+		// a secondary created through the API sits at the placeholder
+		// soa_serial 1 with notify_to already set, and would otherwise notify
+		// every target before it holds a single record.
+		if !(&Zone{Zone: z}).Serving(nowMs) {
+			continue
+		}
 		targets, err := ParseNotifyTo(z.NotifyTo)
 		if err != nil {
 			// Fails closed, and loudly enough to fix: an unparseable stored

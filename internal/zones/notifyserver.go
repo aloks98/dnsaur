@@ -39,10 +39,32 @@ type notifyRefusal struct {
 // to one probe. Without this, "NOTIFY is cheap" becomes a probe amplifier
 // pointed at our own primary.
 //
+// **The collapse is trailing-edge, not leading-edge**, and the difference is
+// a stale zone. A NOTIFY arriving inside an open window is not dropped: the
+// window remembers it and one more probe runs when the window closes. Dropped
+// instead, a serial bump that lands after the window's own probe has already
+// asked — the primary editing at t=0 and again at t=2s — is lost until the SOA
+// refresh fires, with the peer told NOERROR so it stops retransmitting (RFC
+// 1996 §3.6). The bound the throttle exists for is unchanged, because what is
+// remembered is "something arrived", not how much: ten suppressed NOTIFYs are
+// worth one probe between them.
+//
 // It is the same shape as transferStateThrottle and deliberately not the same
 // constant: that one throttles a database write, this one throttles a network
 // round trip to somebody else's server.
 const notifyThrottle = 5 * time.Second
+
+// deferredProbeTick is how often a deferred NOTIFY re-reads the clock while it
+// waits for its window to close.
+//
+// One timer for the remaining duration would be the obvious shape and would be
+// wrong here: the clock this server reads is injectable
+// (WithNotifyServerNow), so a test that moves it would still have to wait out
+// real seconds, and the wait would then be measured against a clock nothing
+// else in this file uses. Polling a comparison is what makes the wait honour
+// whichever clock is in use, and at this resolution it costs a few hundred
+// wakeups spread over one window.
+const deferredProbeTick = 20 * time.Millisecond
 
 // Refreshes is the half of *Refresher this needs, taken as an interface so a
 // test can drive the gate without a Transferrer or a live primary.
@@ -51,10 +73,12 @@ type Refreshes interface {
 }
 
 // Probes is the half of *Transferrer NotifyServer needs to decide whether a
-// NOTIFY's zone has actually moved before transferring it. Declared here and
-// used from Task 7 onward: a NotifyServer built without one (the ordinary
-// construction until then) skips the probe and always refreshes, which is
-// what this file's own tests exercise.
+// NOTIFY's zone has actually moved before transferring it. It is an option
+// (WithNotifyProbes) rather than a constructor argument because a
+// NotifyServer built without one still works — it skips the probe and
+// refreshes on every admitted NOTIFY, which is what some of this file's own
+// tests exercise — but production wires it, and act says so loudly when it is
+// missing.
 type Probes interface {
 	ProbeSerial(ctx context.Context, z store.Zone) (uint32, netip.AddrPort, error)
 }
@@ -67,8 +91,8 @@ type NotifyServer struct {
 	res       *Resolver
 	zs        store.ZoneStore
 	refresher Refreshes
-	// probes is nil until Task 7 wires WithNotifyProbes in production; see
-	// Probes' doc comment.
+	// probes is nil only in a server built without WithNotifyProbes; see
+	// Probes' doc comment. App wires it.
 	probes Probes
 	// dnsRes is the resolver ParsePrimaries uses to look up a hostname
 	// primary. nil means net.DefaultResolver — see ParsePrimaries' own
@@ -80,13 +104,13 @@ type NotifyServer struct {
 	// drive the throttle rather than wait for it.
 	now func() time.Time
 
-	// mu guards lastAct, the throttle state behind admit, and stopped, the
-	// half of the work lifetime that has to be decided atomically with
-	// wg.Add. Held only across those checks — the probe and the transfer
-	// happen well outside it, so a slow primary cannot serialise other
-	// zones' NOTIFYs.
+	// mu guards states, the per-zone throttle and resolution state behind
+	// admit, and stopped, the half of the work lifetime that has to be decided
+	// atomically with wg.Add. Held only across those checks — the probe, the
+	// lookup and the transfer all happen well outside it, so a slow primary
+	// cannot serialise other zones' NOTIFYs.
 	mu      sync.Mutex
-	lastAct map[int64]time.Time
+	states  map[int64]*notifyState
 	stopped bool
 
 	// work is the context every goroutine ServeNotify starts runs under, and
@@ -107,9 +131,9 @@ func WithNotifyServerNow(now func() time.Time) NotifyServerOption {
 }
 
 // WithNotifyProbes attaches the SOA probe a NOTIFY's zone is checked against
-// before it is transferred (Task 7). Without it, every admitted NOTIFY
-// transfers unconditionally — this file's own tests build no probe and
-// assert exactly that.
+// before it is transferred. Without it, every admitted NOTIFY transfers
+// unconditionally — some of this file's own tests build no probe and assert
+// exactly that.
 func WithNotifyProbes(p Probes) NotifyServerOption {
 	return func(n *NotifyServer) { n.probes = p }
 }
@@ -128,7 +152,7 @@ func WithNotifyServerResolver(res *net.Resolver) NotifyServerOption {
 func NewNotifyServer(r *Resolver, zs store.ZoneStore, rf Refreshes, opts ...NotifyServerOption) *NotifyServer {
 	n := &NotifyServer{
 		res: r, zs: zs, refresher: rf, now: time.Now,
-		lastAct: make(map[int64]time.Time),
+		states: make(map[int64]*notifyState),
 	}
 	// Not derived from a caller's context on purpose: the work must outlive
 	// the request that started it (RFC 1996 §4.7 replies first and acts
@@ -299,20 +323,12 @@ func (n *NotifyServer) ServeNotify(ctx context.Context, w dns.ResponseWriter, m 
 	// throttled by nothing — the throttle below covers the transfer, not
 	// this. That is the hazard acl.go's own comment refuses, and lifting the
 	// call out of decide into ServeNotify achieved purity without removing
-	// it. A zone whose primaries are IP literals short-circuits with no
-	// lookup at all (primaries.go), which is the common case; this ordering
-	// makes the hostname case cost nothing for a NOTIFY that was going to be
-	// refused anyway.
+	// it. This ordering makes the hostname case cost nothing for a NOTIFY that
+	// was going to be refused anyway; primariesFor is what makes it cost
+	// nothing for most of the ones that were not (see its own comment).
 	z, ref := n.decideZone(m)
 	if ref == nil {
-		var primaries []netip.AddrPort
-		if aps, err := ParsePrimaries(ctx, n.dnsRes, z.Primaries); err == nil {
-			primaries = aps
-		} else {
-			slog.Warn("resolving a zone's primaries for a notify failed",
-				"zone", z.Name, "err", err)
-		}
-		ref = n.decidePeer(z, peer, primaries, key, tsigErr)
+		ref = n.decidePeer(z, peer, n.primariesFor(ctx, z, peer), key, tsigErr)
 	}
 	if ref != nil {
 		slog.Debug("notify refused", "peer", peer, "qname", qnameOf(m),
@@ -333,9 +349,34 @@ func (n *NotifyServer) ServeNotify(ctx context.Context, w dns.ResponseWriter, m 
 		slog.Debug("writing a notify reply failed", "peer", peer, "err", err)
 	}
 
-	// The throttle is on the work, never on the reply above.
-	if !n.admit(z.ID) {
-		slog.Debug("notify throttled", "zone", z.Name, "peer", peer)
+	// The throttle is on the work, never on the reply above. A NOTIFY it
+	// suppresses is deferred rather than dropped — see notifyThrottle — and the
+	// first one suppressed in a window is the one that puts a pass on the end
+	// of it. Every later one inside that window adds nothing, because the pass
+	// is already owed.
+	run, deferred := n.admit(z.ID)
+	switch {
+	case run:
+	case deferred:
+		slog.Debug("notify deferred to the end of the throttle window",
+			"zone", z.Name, "peer", peer)
+		// Not ctx, and not the request's goroutine: this waits out the rest of
+		// the window before it does anything, and the request is long gone by
+		// then. See startWork.
+		if !n.startWork(func(workCtx context.Context) {
+			if !n.claimDeferred(workCtx, z.ID) {
+				return
+			}
+			n.pass(workCtx, z)
+		}) {
+			n.dropDeferred(z.ID)
+			slog.Debug("notify work skipped: the server is shutting down",
+				"zone", z.Name, "peer", peer)
+		}
+		return
+	default:
+		slog.Debug("notify throttled: a pass is already owed for this window",
+			"zone", z.Name, "peer", peer)
 		return
 	}
 
@@ -344,17 +385,23 @@ func (n *NotifyServer) ServeNotify(ctx context.Context, w dns.ResponseWriter, m 
 	// reasoning recordAttempt uses for its own write. startWork's context
 	// comes from this server's own lifetime instead, so the work outlives
 	// the request and nothing else.
-	if !n.startWork(func(workCtx context.Context) {
-		row, err := n.zs.Zone(workCtx, z.ID)
-		if err != nil {
-			slog.Warn("reading a zone after a notify failed", "zone", z.Name, "err", err)
-			return
-		}
-		n.act(workCtx, row)
-	}) {
+	if !n.startWork(func(workCtx context.Context) { n.pass(workCtx, z) }) {
+		n.abandonWindow(z.ID)
 		slog.Debug("notify work skipped: the server is shutting down",
 			"zone", z.Name, "peer", peer)
 	}
+}
+
+// pass is the work one admitted NOTIFY causes. The zone is read again rather
+// than taken from the served snapshot the gate decided on: act compares
+// serials and hands the row to a transfer, and both want the row as it is now.
+func (n *NotifyServer) pass(ctx context.Context, z *Zone) {
+	row, err := n.zs.Zone(ctx, z.ID)
+	if err != nil {
+		slog.Warn("reading a zone after a notify failed", "zone", z.Name, "err", err)
+		return
+	}
+	n.act(ctx, row)
 }
 
 // Run is this server's lifetime, in the shape App gives every other
@@ -421,19 +468,20 @@ func (n *NotifyServer) act(ctx context.Context, z store.Zone) {
 	// created through the API starts at soa_serial 1, so a primary also at 1
 	// would make every comparison say "not newer" and leave the zone
 	// permanently empty while reporting nothing wrong.
-	// n.probes != nil is not defensive padding: WithNotifyProbes is optional,
-	// every Task 6 test omits it, and production does not wire it until
-	// Task 10 — so without this guard act panics on a nil interface.
+	// n.probes != nil is not defensive padding: WithNotifyProbes is optional
+	// and some of this package's own tests omit it, so without this guard act
+	// panics on a nil interface.
 	//
 	// The fallback is to transfer unconditionally, which is the pre-probe
 	// behaviour and errs the safe way: an unnecessary AXFR costs bandwidth,
 	// a skipped one leaves a secondary serving stale data. It is logged
 	// rather than silent, because a NotifyServer running without probes has
-	// lost the whole point of this task and nothing else would say so.
+	// lost the whole point of the probe and nothing else would say so.
 	if n.probes == nil {
 		// Not silent. A NotifyServer without probes transfers on every
-		// admitted NOTIFY — this task's whole protection, gone — and the
-		// only other evidence would be a load graph nobody is watching.
+		// admitted NOTIFY — the whole protection the probe exists to give,
+		// gone — and the only other evidence would be a load graph nobody is
+		// watching.
 		// See NewNotifyServer, which says the same thing once at startup.
 		slog.Warn("notify: no SOA probe configured, transferring unconditionally",
 			"zone", z.Name)
@@ -459,18 +507,186 @@ func (n *NotifyServer) act(ctx context.Context, z store.Zone) {
 	}
 }
 
-// admit reports whether this zone may do the work now, and records that it
-// did. The lock is held only across the check — the probe and the transfer
-// happen well outside it, so a slow primary cannot serialise other zones.
-func (n *NotifyServer) admit(zoneID int64) bool {
+// notifyState is what this server remembers between NOTIFYs for one zone: the
+// throttle window, whether a NOTIFY was suppressed inside it, and the last
+// resolution of a hostname primary.
+//
+// All of it is process-local and none of it is correctness-bearing: losing it
+// costs one extra probe or one extra lookup. Entries are never dropped, for
+// the reason Refresher.stateFor gives — they are small, one per zone, and a
+// map that forgot an open window while its worker still owned it would let the
+// next NOTIFY open a second one.
+type notifyState struct {
+	// opened is when the current throttle window began; deferred records that
+	// a NOTIFY arrived while it was open.
+	opened   time.Time
+	deferred bool
+	// primaries is the last resolution of this zone's primaries, and when it
+	// was made; see primariesFor. An empty list is a resolution that failed,
+	// remembered exactly like one that succeeded — a name that will not
+	// resolve is the case a flood would otherwise turn into one lookup per
+	// packet.
+	primaries   []netip.AddrPort
+	primariesAt time.Time
+}
+
+// stateFor returns the zone's state, creating it on first sight. The caller
+// holds n.mu.
+func (n *NotifyServer) stateFor(zoneID int64) *notifyState {
+	st, ok := n.states[zoneID]
+	if !ok {
+		st = &notifyState{}
+		n.states[zoneID] = st
+	}
+	return st
+}
+
+// admit decides what an arriving NOTIFY's work is allowed to do.
+//
+// run is a pass now, and opens a window. deferred is "this NOTIFY is the one
+// that owes the window a pass when it closes" — true for the first NOTIFY
+// suppressed in a window and false for every later one, because the window
+// already owes exactly one pass and ten suppressed NOTIFYs are worth no more
+// than that. Both false is a NOTIFY that cost nothing at all.
+//
+// The lock is held only across the decision: the probe and the transfer happen
+// well outside it, so a slow primary cannot serialise other zones.
+func (n *NotifyServer) admit(zoneID int64) (run, deferred bool) {
 	now := n.now()
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	if last, ok := n.lastAct[zoneID]; ok && now.Sub(last) < notifyThrottle {
+	st := n.stateFor(zoneID)
+	if !st.opened.IsZero() && now.Sub(st.opened) < notifyThrottle {
+		if st.deferred {
+			return false, false
+		}
+		st.deferred = true
+		return false, true
+	}
+	st.opened = now
+	st.deferred = false
+	return true, false
+}
+
+// abandonWindow drops the window admit just opened, for the caller that was
+// given one and then could not use it: a NOTIFY admitted after Run has already
+// stopped the server. Leaving it standing would throttle the zone against a
+// pass that never happened.
+func (n *NotifyServer) abandonWindow(zoneID int64) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	st := n.stateFor(zoneID)
+	st.opened, st.deferred = time.Time{}, false
+}
+
+// dropDeferred forgets the pass a suppressed NOTIFY put on the end of the
+// window, for the same reason abandonWindow exists: nothing is going to make
+// it. The window itself is left alone — it belongs to whichever pass opened
+// it, which is not this caller's to close.
+func (n *NotifyServer) dropDeferred(zoneID int64) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.stateFor(zoneID).deferred = false
+}
+
+// claimDeferred waits out the rest of the zone's window and then takes the
+// pass it owes, opening the next window as it does.
+//
+// False means the pass is not this goroutine's to make: ctx ended first — on
+// this path the server is shutting down, and a probe nobody is waiting for is
+// not worth holding shutdown open for — or an ordinary NOTIFY was admitted in
+// the meantime and has already claimed it.
+func (n *NotifyServer) claimDeferred(ctx context.Context, zoneID int64) bool {
+	if !n.waitOutWindow(ctx, zoneID) {
 		return false
 	}
-	n.lastAct[zoneID] = now
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	st := n.stateFor(zoneID)
+	if !st.deferred {
+		return false
+	}
+	st.opened = n.now()
+	st.deferred = false
 	return true
+}
+
+// waitOutWindow blocks until the zone's current throttle window has closed,
+// and reports whether it got there rather than being cut short by ctx.
+func (n *NotifyServer) waitOutWindow(ctx context.Context, zoneID int64) bool {
+	for {
+		n.mu.Lock()
+		opened := n.stateFor(zoneID).opened
+		n.mu.Unlock()
+		left := notifyThrottle - n.now().Sub(opened)
+		if left <= 0 {
+			return true
+		}
+		if left > deferredProbeTick {
+			left = deferredProbeTick
+		}
+		t := time.NewTimer(left)
+		select {
+		case <-ctx.Done():
+			t.Stop()
+			return false
+		case <-t.C:
+		}
+	}
+}
+
+// primariesFor is the address list decidePeer matches an arriving NOTIFY's
+// source against.
+//
+// It answers from the column alone whenever it can. A zone whose primaries are
+// IP literals — with or without a hostname beside them — needs no lookup at
+// all for a source that is one of them, which is the ordinary case and the one
+// a mixed list produces. Only a source matching no literal is worth a live
+// lookup, and then only once per throttle window: uncached, one trivially
+// source-spoofable UDP packet drives one outbound recursive query, which is a
+// flood amplifier with a NOTIFY on the near end.
+//
+// Reusing a resolution for one window costs a primary that has just moved a
+// few seconds of refusals, which RFC 1996 §3.6's retransmission covers. A
+// failed resolution is remembered too, and for the same reason: a name that
+// will not resolve is exactly the one a flood would otherwise re-ask on every
+// packet.
+func (n *NotifyServer) primariesFor(ctx context.Context, z *Zone, peer netip.Addr) []netip.AddrPort {
+	literals, names, err := PrimaryLiterals(z.Primaries)
+	if err != nil {
+		// Fails closed: an unparseable list matches nobody. The API validates
+		// on write, so reaching this means a hand-edited row.
+		slog.Debug("a zone's primaries will not parse; refusing every notify for it",
+			"zone", z.Name, "err", err)
+		return nil
+	}
+	if !names || notifyPeerAllowed(literals, peer) {
+		return literals
+	}
+	now := n.now()
+	n.mu.Lock()
+	if st := n.stateFor(z.ID); !st.primariesAt.IsZero() && now.Sub(st.primariesAt) < notifyThrottle {
+		cached := st.primaries
+		n.mu.Unlock()
+		return cached
+	}
+	n.mu.Unlock()
+
+	aps, err := ParsePrimaries(ctx, n.dnsRes, z.Primaries)
+	if err != nil {
+		// Debug, not Warn: this runs once per arriving packet, so a Warn here
+		// is one log line per packet from any source that can spell the zone's
+		// name. The zone's own transfers report the same failure against the
+		// attempt that suffered it, which is where it is actionable.
+		slog.Debug("resolving a zone's primaries for a notify failed",
+			"zone", z.Name, "err", err)
+		aps = literals
+	}
+	n.mu.Lock()
+	st := n.stateFor(z.ID)
+	st.primaries, st.primariesAt = aps, now
+	n.mu.Unlock()
+	return aps
 }
 
 // writeRefusal sends the one message a refused NOTIFY consists of.

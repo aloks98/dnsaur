@@ -2,6 +2,7 @@ package zones
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
@@ -9,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/aloks98/dnsaur/internal/dnssrv"
 	"github.com/aloks98/dnsaur/internal/store"
 )
 
@@ -121,7 +123,14 @@ type zoneState struct {
 	// Per zone rather than one lock for all of them: a global lock would put
 	// every secondary in the process behind whichever one is currently
 	// waiting out a dead primary's dial timeout.
-	xfer sync.Mutex
+	//
+	// A one-slot channel rather than a sync.Mutex, because the caller that
+	// *waits* for it has to be able to stop waiting. Refresh is reached from
+	// an HTTP handler and from a NOTIFY's own work, both of which carry a
+	// context that ends; a Mutex offers no way to wait on one, so a transfer
+	// dripping bytes from a half-dead primary would hold every later caller
+	// for as long as it lasted, request cancelled or server stopping.
+	xfer chan struct{}
 
 	// notBefore is the earliest, in unix ms, the next attempt may be made. It
 	// carries the retry back-off and the startup spread; a successful
@@ -132,12 +141,13 @@ type zoneState struct {
 	fails       int
 	lastErr     string
 
-	// lastFailLog and expiredLogged are the noise controls; clampLogged makes
-	// the "your SOA asks for something we will not do" warning once-per-zone
-	// rather than once-per-attempt.
-	lastFailLog   int64
-	expiredLogged bool
-	clampLogged   bool
+	// lastFailLog and expiredLogged are the noise controls; clampLogged and
+	// shortExpiryLogged make the two "your SOA asks for something we will not
+	// do" warnings once-per-zone rather than once-per-attempt.
+	lastFailLog       int64
+	expiredLogged     bool
+	clampLogged       bool
+	shortExpiryLogged bool
 }
 
 // RefreshOption configures a Refresher at construction.
@@ -230,8 +240,9 @@ func (r *Refresher) pass(ctx context.Context) {
 	}
 }
 
-// RefreshDue transfers every secondary zone the schedule says is due, and
-// returns once they have all finished.
+// RefreshDue makes one attempt at every zone the schedule says is due — a
+// secondary's transfer, a stub's delegation fetch — and returns once they have
+// all finished.
 //
 // The zones of one pass run concurrently, one goroutine each, because they
 // are independent and a primary that is refusing connections costs a dial
@@ -263,17 +274,28 @@ func (r *Refresher) RefreshDue(ctx context.Context) error {
 		}
 		st := r.stateFor(z, nowMs)
 		r.warnIfClamped(z, st)
+		r.warnIfExpiryBeatsRefresh(z, st)
 		if !r.due(z, nowMs, st) {
 			continue
 		}
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if !st.xfer.TryLock() {
+			select {
+			case st.xfer <- struct{}{}:
+			default:
 				slog.Debug("zone transfer still running, skipping this pass", "zone", z.Name)
 				return
 			}
-			defer st.xfer.Unlock()
+			defer func() { <-st.xfer }()
+			// One attempt, bounded. transferReadTimeout bounds each individual
+			// read and nothing bounds their sum, so a primary dripping an
+			// envelope every twenty seconds holds this zone's lock — and the
+			// manual refresh and NOTIFY work queued behind it — for as long as
+			// it cares to. The same two minutes dnssrv gives a transfer it is
+			// serving, for the same reason.
+			ctx, cancel := context.WithTimeout(ctx, dnssrv.TransferTimeout)
+			defer cancel()
 			// Read the zone again under the lock, exactly as Refresh does.
 			// The copy above was read before the lock, and what a transfer
 			// does with a zone row — which primaries it contacts, which key it
@@ -287,7 +309,7 @@ func (r *Refresher) RefreshDue(ctx context.Context) error {
 				}
 				return
 			}
-			_, _ = r.transfer(ctx, fresh, st)
+			_, _ = r.transfer(ctx, fresh, st, scheduled)
 		}()
 	}
 	wg.Wait()
@@ -304,8 +326,16 @@ func (r *Refresher) Refresh(ctx context.Context, zoneID int64) (TransferResult, 
 		return TransferResult{}, err
 	}
 	st := r.stateFor(z, r.now().UnixMilli())
-	st.xfer.Lock()
-	defer st.xfer.Unlock()
+	// Waits, but not past its caller. A transfer already in flight may have
+	// two minutes of a stalling primary left in it, and the dashboard tab that
+	// asked for this — or the NOTIFY work whose own context is the server's
+	// lifetime — must be able to give up on it.
+	select {
+	case st.xfer <- struct{}{}:
+	case <-ctx.Done():
+		return TransferResult{}, fmt.Errorf("zone %q: waiting for the transfer already in flight: %w", z.Name, ctx.Err())
+	}
+	defer func() { <-st.xfer }()
 	// Read again under the lock. If a transfer of this zone was running when
 	// this call arrived, the copy read above is the one it has just
 	// overwritten, and Transfer writes the whole zone row back — from a stale
@@ -313,8 +343,21 @@ func (r *Refresher) Refresh(ctx context.Context, zoneID int64) (TransferResult, 
 	if z, err = r.zs.Zone(ctx, zoneID); err != nil {
 		return TransferResult{}, err
 	}
-	return r.transfer(ctx, z, st)
+	return r.transfer(ctx, z, st, forced)
 }
+
+// attempt says which of the two ways into this scheduler asked for the work,
+// because they want different things of a primary that has not changed.
+type attempt bool
+
+const (
+	// scheduled is the SOA's own refresh timer coming round: check the serial
+	// first, and transfer only if it moved (Transferrer.Sync).
+	scheduled attempt = false
+	// forced is a person pressing Refresh, or a NOTIFY that has already probed
+	// and found the primary ahead: fetch the zone, whatever the serial says.
+	forced attempt = true
+)
 
 // pull runs the one attempt z's type calls for: a secondary's AXFR, or a
 // stub's two ordinary queries.
@@ -330,10 +373,17 @@ func (r *Refresher) Refresh(ctx context.Context, zoneID int64) (TransferResult, 
 // zone. ExpiresAt stays zero for a stub, and that is not a gap: a stub is
 // never given an expiry, because it does not expire (§9.11.8, and see
 // StubFetcher.install).
-func (r *Refresher) pull(ctx context.Context, z store.Zone) (TransferResult, error) {
+func (r *Refresher) pull(ctx context.Context, z store.Zone, how attempt) (TransferResult, error) {
 	if !isStub(z) {
-		return r.tr.Transfer(ctx, z)
+		if how == forced {
+			return r.tr.Transfer(ctx, z)
+		}
+		return r.tr.Sync(ctx, z)
 	}
+	// A stub is not given the same treatment, and the asymmetry is the point.
+	// Its fetch is two ordinary queries, one of which is already the SOA a
+	// probe would ask for, so checking the serial first would cost exactly
+	// what it saved.
 	if r.sf == nil {
 		// Recorded as a failed attempt rather than skipped, so it lands in
 		// last_error where somebody asking why the zone is not routing will
@@ -362,18 +412,26 @@ func (r *Refresher) pull(ctx context.Context, z store.Zone) (TransferResult, err
 // StubFetcher.Fetch. Their job is to fetch and install a zone; deciding that
 // an attempt happened, and that this one was the latest, is scheduling, and
 // it belongs with the rest of the scheduling state this type already keeps.
-func (r *Refresher) transfer(ctx context.Context, z store.Zone, st *zoneState) (TransferResult, error) {
-	res, err := r.pull(ctx, z)
+func (r *Refresher) transfer(ctx context.Context, z store.Zone, st *zoneState, how attempt) (TransferResult, error) {
+	res, err := r.pull(ctx, z, how)
 	nowMs := r.now().UnixMilli()
 	if err != nil {
-		if ctx.Err() != nil {
+		// Cancelled, not timed out. The two arrive at the same place —
+		// ctx.Err() is non-nil for both — and mean opposite things: a
+		// cancellation is this process stopping, or the operator's own request
+		// going away, neither of which is the zone's fault; a deadline is the
+		// attempt itself running out of time, which is exactly the primary
+		// failing and has to be recorded as one. Counted together, a zone
+		// whose every transfer timed out would show an empty last_error and no
+		// back-off, and an operator would have nothing at all to read.
+		if ctx.Err() != nil && !errors.Is(ctx.Err(), context.DeadlineExceeded) {
 			// The attempt was cut short by shutdown, not by the primary.
 			// Counting it would log a failure on every stop and push the
 			// zone's next attempt a retry interval into a process that no
 			// longer exists — and, now that the outcome is persisted, would
 			// leave "connection closed" sitting in the database as this
 			// zone's last known state across the whole downtime.
-			slog.Debug("zone transfer abandoned", "zone", z.Name, "err", err)
+			slog.Debug("zone transfer abandoned by shutdown", "zone", z.Name, "err", err)
 			return TransferResult{}, err
 		}
 		r.noteFailure(ctx, z, st, nowMs, err)
@@ -421,7 +479,7 @@ func (r *Refresher) due(z store.Zone, nowMs int64, st *zoneState) bool {
 		// (Zone.Serving) and has been since it was created.
 		return true
 	}
-	return nowMs >= z.RefreshedAt+intervalMs(z.SOARefresh)
+	return nowMs >= z.RefreshedAt+refreshIntervalMs(z)
 }
 
 // stateFor returns the scheduler's state for z, creating it on first sight —
@@ -440,7 +498,7 @@ func (r *Refresher) stateFor(z store.Zone, nowMs int64) *zoneState {
 	if st, ok := r.zones[z.ID]; ok {
 		return st
 	}
-	st := &zoneState{notBefore: r.firstAttempt(z, nowMs)}
+	st := &zoneState{xfer: make(chan struct{}, 1), notBefore: r.firstAttempt(z, nowMs)}
 	r.zones[z.ID] = st
 	return st
 }
@@ -485,7 +543,7 @@ func (r *Refresher) firstAttempt(z store.Zone, nowMs int64) int64 {
 	if isStub(z) && z.RefreshedAt == 0 {
 		return 0
 	}
-	if nowMs < z.RefreshedAt+intervalMs(z.SOARefresh) {
+	if nowMs < z.RefreshedAt+refreshIntervalMs(z) {
 		// Not overdue at all — the ordinary schedule already says when, and a
 		// spread on top of it would only ever delay it further.
 		return 0
@@ -519,16 +577,28 @@ func (r *Refresher) noteSuccess(ctx context.Context, z store.Zone, st *zoneState
 	st.expiredLogged = false
 	r.mu.Unlock()
 
-	if fails > 0 {
+	// Four lines rather than one with a conditional field, because each says
+	// something an operator reads differently, and a "records" count on an
+	// attempt that installed nothing is a number that is simply not true.
+	switch {
+	case fails > 0 && res.Unchanged:
 		// The other half of the first-failure warning. Without it, an outage
-		// has a beginning in the log and no end.
+		// has a beginning in the log and no end — and a primary that comes
+		// back with nothing new to say has still come back.
+		slog.Info("zone transfer recovered: the primary answered and the zone is already current",
+			"zone", z.Name, "primary", res.Primary.String(), "serial", res.Serial,
+			"failed_attempts", fails)
+	case fails > 0:
 		slog.Info("zone transfer recovered",
 			"zone", z.Name, "primary", res.Primary.String(), "serial", res.Serial,
 			"records", res.Records, "failed_attempts", fails)
-		return
+	case res.Unchanged:
+		slog.Debug("zone checked and already current",
+			"zone", z.Name, "primary", res.Primary.String(), "serial", res.Serial)
+	default:
+		slog.Debug("zone transferred",
+			"zone", z.Name, "primary", res.Primary.String(), "serial", res.Serial, "records", res.Records)
 	}
-	slog.Debug("zone transferred",
-		"zone", z.Name, "primary", res.Primary.String(), "serial", res.Serial, "records", res.Records)
 }
 
 // noteFailure records a failed attempt and schedules the retry.
@@ -629,6 +699,28 @@ func (r *Refresher) warnIfClamped(z store.Zone, st *zoneState) {
 		"floor_seconds", int64(minInterval.Seconds()))
 }
 
+// warnIfExpiryBeatsRefresh tells an operator, once per zone, that this server
+// will poll ahead of the schedule their SOA published — and why.
+//
+// See refreshIntervalMs for the rule. The two numbers are quoted in seconds,
+// the SOA's own units, so they can be compared against the primary's zone file
+// without arithmetic.
+func (r *Refresher) warnIfExpiryBeatsRefresh(z store.Zone, st *zoneState) {
+	if !expiryBeatsRefresh(z) {
+		return
+	}
+	r.mu.Lock()
+	first := !st.shortExpiryLogged
+	st.shortExpiryLogged = true
+	r.mu.Unlock()
+	if !first {
+		return
+	}
+	slog.Warn("zone's SOA expires sooner than it asks to be refreshed; polling at half the expiry instead",
+		"zone", z.Name, "soa_refresh", z.SOARefresh, "soa_expire", z.SOAExpire,
+		"polling_seconds", refreshIntervalMs(z)/1000)
+}
+
 // Status reports what the scheduler knows about one zone's transfers, or
 // false if it has not seen that zone yet. Everything it returns is the part
 // of a zone's transfer state that has no column: when the next attempt is
@@ -664,6 +756,39 @@ type RefreshStatus struct {
 	Failures int
 	// LastError is the most recent failure's message, cleared by a success.
 	LastError string
+}
+
+// refreshIntervalMs is how long after a successful attempt the next one is
+// due: the SOA's refresh, or half its expire when that is sooner.
+//
+// The two SOA timers can contradict each other, and a primary publishing
+// expire < refresh is publishing "stop answering, and do not check". Followed
+// literally, the secondary stamps expires_at at now+expire, waits out the
+// longer refresh, and spends the difference SERVFAILing every query for a zone
+// whose primary is up and answering — 55 minutes of every hour for an expire
+// of 300 against a refresh of 3600, with nothing anywhere saying why.
+//
+// Half the expiry is the standard margin (BIND's own retry-until-expiry has
+// the same shape): it leaves room for one failed attempt and its retry before
+// the zone would actually go dark, without polling a primary appreciably
+// harder than it asked for. minInterval still floors it, so no SOA can turn
+// this into a busy loop. warnIfExpiryBeatsRefresh says so once per zone, since
+// an operator comparing their primary's SOA against this server's behaviour is
+// owed the reason for the difference.
+//
+// A secondary only. A stub has no expiry at all (§9.11.8), so its refresh has
+// nothing to contradict.
+func refreshIntervalMs(z store.Zone) int64 {
+	if expiryBeatsRefresh(z) {
+		return intervalMs(z.SOAExpire / 2)
+	}
+	return intervalMs(z.SOARefresh)
+}
+
+// expiryBeatsRefresh reports whether z's SOA would take it off the air before
+// the schedule came back to it. See refreshIntervalMs.
+func expiryBeatsRefresh(z store.Zone) bool {
+	return isSecondary(z) && z.SOAExpire > 0 && intervalMs(z.SOAExpire/2) < intervalMs(z.SOARefresh)
 }
 
 // intervalMs converts an SOA timer in seconds to the milliseconds the

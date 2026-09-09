@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/netip"
 	"strings"
@@ -71,6 +72,21 @@ func ValidatePrimaries(s string) error {
 // primaries exists so that one being unreachable is survivable, and that
 // argument does not stop applying at the boundary between two names.
 //
+// **An entry that will not resolve is skipped, not fatal**, and the same
+// argument is why: the list is written with more than one entry so that one
+// of them being unusable is survivable, and resolving is one more way to be
+// unusable. All-or-nothing here meant a name-server outage took a perfectly
+// dialable IP literal written beside the name out of service with it — no
+// primary contacted at all, and every NOTIFY for the zone refused for want of
+// a source to match against. Only a list where *nothing* resolved is an
+// error, and it names every entry that failed.
+//
+// The skipped entries are logged at debug rather than warned about, because
+// this runs on the NOTIFY gate's path, once per arriving packet: a warning
+// there is a log line per packet from any source that can spell the zone's
+// name. The attempt that suffers a genuinely unusable list reports it as an
+// error, which is where an operator meets it.
+//
 // res is the resolver to look names up through; nil means
 // net.DefaultResolver, which is what a caller with no reason to care should
 // pass. It is a parameter rather than a hard-wired default because a test
@@ -84,15 +100,57 @@ func ParsePrimaries(ctx context.Context, res *net.Resolver, s string) ([]netip.A
 	if res == nil {
 		res = net.DefaultResolver
 	}
-	var out []netip.AddrPort
+	var (
+		out      []netip.AddrPort
+		failures []error
+	)
 	for _, p := range ps {
 		aps, err := p.resolve(ctx, res)
 		if err != nil {
-			return nil, err
+			failures = append(failures, err)
+			continue
 		}
 		out = append(out, aps...)
 	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("no primary resolved: %w", errors.Join(failures...))
+	}
+	if len(failures) > 0 {
+		slog.Debug("some of a zone's primaries did not resolve; using the rest",
+			"primaries", s, "err", errors.Join(failures...))
+	}
 	return out, nil
+}
+
+// PrimaryLiterals returns the entries of s that are already IP addresses,
+// resolving nothing, and reports whether any entry is a hostname that only a
+// lookup could answer for.
+//
+// It exists for the one caller that has to decide *whether to resolve at all*:
+// the NOTIFY gate matches an arriving packet's source against this list, and
+// for the common configuration — a literal, or a literal beside a name — the
+// answer is already here. Reaching for ParsePrimaries first would make one
+// unauthenticated, trivially source-spoofable UDP packet drive an outbound
+// recursive lookup, which is the hazard that ordering the gate's checks was
+// meant to remove rather than relocate.
+func PrimaryLiterals(s string) ([]netip.AddrPort, bool, error) {
+	ps, err := splitPrimaries(s)
+	if err != nil {
+		return nil, false, err
+	}
+	var (
+		out   []netip.AddrPort
+		names bool
+	)
+	for _, p := range ps {
+		addr, err := netip.ParseAddr(p.host)
+		if err != nil {
+			names = true
+			continue
+		}
+		out = append(out, netip.AddrPortFrom(addr.Unmap(), p.port))
+	}
+	return out, names, nil
 }
 
 // FormatPrimaries writes addresses back in the format ParsePrimaries reads,

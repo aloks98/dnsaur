@@ -239,18 +239,24 @@ components:
             only, 0 on every other type. A stub is never given one, and that
             is deliberate rather than an omission: its NS set is routing
             information, not data held on loan, and an old-but-working
-            nameserver beats a self-inflicted SERVFAIL. Only a transfer
-            writes this, so unlike refreshed_at below it does not widen to
-            the stub — and a row retyped from secondary to stub still carries
-            whatever value it had, which is why a client must not read it for
-            any type but secondary.
+            nameserver beats a self-inflicted SERVFAIL. Only a secondary's own
+            attempt writes this — a transfer, or a scheduled check whose SOA
+            probe found the primary already at this zone's serial, which RFC
+            1034 section 4.3.5 restarts the expire timer for either way — so
+            unlike refreshed_at below it does not widen to the stub, and a row
+            retyped from secondary to stub still carries whatever value it
+            had, which is why a client must not read it for any type but
+            secondary.
         refreshed_at:
           type: integer
           format: int64
           description: >
-            unix ms of the last pull from a master that succeeded — a
-            secondary's transfer or a stub's NS fetch; 0 = never. Written
-            by both, unlike expires_at, which only a transfer writes.
+            unix ms of the last attempt against a master that succeeded — a
+            secondary's transfer, a stub's NS fetch, or a scheduled check
+            whose SOA probe found the secondary already current, which is
+            the primary confirming what the zone holds and counts as the
+            refresh it is; 0 = never. Written by both types, unlike
+            expires_at, which is a secondary's alone.
             Distinct from last_attempt, which dates the last pull that was
             tried. Written for a secondary and a stub; 0 on a type that has
             never pulled. Like expires_at, a retyped row keeps whatever it

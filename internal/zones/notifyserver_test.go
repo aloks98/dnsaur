@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"net/netip"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -57,6 +58,60 @@ func (f *fakeRefresher) count() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return len(f.calls)
+}
+
+// fakeProbe stands in for *Transferrer's SOA probe: it answers whatever
+// serial the test has last put on the primary, and counts how many times it
+// was asked. The count is the assertion the throttle tests actually turn on —
+// "one probe per window" is a statement about this number, not about how many
+// packets arrived.
+type fakeProbe struct {
+	mu     sync.Mutex
+	serial uint32
+	calls  int
+}
+
+func (p *fakeProbe) ProbeSerial(context.Context, store.Zone) (uint32, netip.AddrPort, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.calls++
+	return p.serial, netip.MustParseAddrPort("10.0.0.1:53"), nil
+}
+
+func (p *fakeProbe) setSerial(s uint32) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.serial = s
+}
+
+func (p *fakeProbe) count() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.calls
+}
+
+// fakeClock is a clock a test can move while the server's own goroutines are
+// reading it. A plain variable closed over by WithNotifyServerNow was enough
+// while only the request goroutine read the clock; the work a deferred NOTIFY
+// waits out reads it from a goroutine of its own, so anything a test moves
+// under it has to be synchronised or it is a data race rather than a test.
+type fakeClock struct {
+	mu sync.Mutex
+	t  time.Time
+}
+
+func newFakeClock(t time.Time) *fakeClock { return &fakeClock{t: t} }
+
+func (c *fakeClock) now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.t
+}
+
+func (c *fakeClock) advance(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.t = c.t.Add(d)
 }
 
 // notifyFixture builds a NotifyServer over a real store and resolver, the
@@ -473,10 +528,14 @@ func TestNotifyWorkOutlivesTheRequestContext(t *testing.T) {
 // sends ten — and each gets its own immediate NOERROR while they collapse to
 // one probe. Without this, "NOTIFY is cheap" is a probe amplifier pointed at
 // our own primary.
+//
+// The window closing is part of the same property and is asserted here rather
+// than left to the trailing-edge test below: the collapse is to one probe *per
+// window*, so a throttle that never reopened would satisfy the first half of
+// this test and starve the zone.
 func TestNotifyThrottlesTheWorkNotTheReply(t *testing.T) {
-	clock := time.Date(2026, 9, 2, 12, 0, 0, 0, time.UTC)
-	f := newNotifyFixture(t, notifyZone(),
-		zones.WithNotifyServerNow(func() time.Time { return clock }))
+	clock := newFakeClock(time.Date(2026, 9, 2, 12, 0, 0, 0, time.UTC))
+	f := newNotifyFixture(t, notifyZone(), zones.WithNotifyServerNow(clock.now))
 
 	const sent = 5
 	for i := 0; i < sent; i++ {
@@ -496,6 +555,75 @@ func TestNotifyThrottlesTheWorkNotTheReply(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 	if got := f.rf.count(); got != 1 {
 		t.Errorf("%d NOTIFYs inside the window caused %d refreshes, want 1", sent, got)
+	}
+
+	// The window closes, and the suppressed NOTIFYs are worth exactly one more
+	// round between them — never one per packet.
+	clock.advance(6 * time.Second)
+	deadline = time.Now().Add(2 * time.Second)
+	for f.rf.count() < 2 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if got := f.rf.count(); got != 2 {
+		t.Errorf("%d NOTIFYs inside one window caused %d refreshes in total, want 2 "+
+			"(one inside the window and one when it closed)", sent, got)
+	}
+}
+
+// The defect the trailing edge exists for. A primary edits at t=0 (serial N)
+// and again at t=2s (N+1). The first NOTIFY is admitted, probes, and finds
+// nothing new — we were already at N. The second lands inside the window; a
+// throttle that *drops* it loses N+1 until the SOA refresh fires, which for a
+// default soa_refresh is fifteen minutes of serving records the primary has
+// already replaced, with the peer told NOERROR so it stops retransmitting
+// (RFC 1996 §3.6).
+//
+// So the window remembers a suppressed NOTIFY and runs one more probe when it
+// closes: two probes and one transfer, not one probe and a stale zone.
+func TestNotifyDefersASuppressedNotifyToTheEndOfTheWindow(t *testing.T) {
+	clock := newFakeClock(time.Date(2026, 9, 2, 12, 0, 0, 0, time.UTC))
+	// notifyZone() is at serial 10, so a primary also at 10 is "already
+	// current" and the first NOTIFY must transfer nothing.
+	probe := &fakeProbe{serial: 10}
+	f := newNotifyFixture(t, notifyZone(),
+		zones.WithNotifyServerNow(clock.now), zones.WithNotifyProbes(probe))
+
+	f.notify(t, notifyApex, dns.TypeSOA, "10.0.0.1", "", nil)
+	deadline := time.Now().Add(2 * time.Second)
+	for probe.count() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := probe.count(); got != 1 {
+		t.Fatalf("the first NOTIFY caused %d probe(s), want 1", got)
+	}
+	if got := f.rf.count(); got != 0 {
+		t.Fatalf("a NOTIFY for a serial we already hold caused %d transfer(s), want 0", got)
+	}
+
+	// The primary edits again and notifies, two seconds into the window.
+	clock.advance(2 * time.Second)
+	probe.setSerial(11)
+	f.notify(t, notifyApex, dns.TypeSOA, "10.0.0.1", "", nil)
+	time.Sleep(50 * time.Millisecond)
+	if got := probe.count(); got != 1 {
+		t.Fatalf("a NOTIFY inside the window caused %d probe(s) in total, want 1 — "+
+			"the throttle must still collapse the work", got)
+	}
+
+	// The window closes. Nothing else arrives: the deferred NOTIFY is the only
+	// thing that can make the newer serial appear.
+	clock.advance(4 * time.Second)
+	deadline = time.Now().Add(3 * time.Second)
+	for f.rf.count() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := f.rf.count(); got != 1 {
+		t.Fatalf("the serial bump carried by a throttled NOTIFY caused %d transfer(s), want 1 — "+
+			"it was dropped rather than deferred", got)
+	}
+	if got := probe.count(); got != 2 {
+		t.Errorf("probes = %d, want 2: one per window, and the window that closed owes one", got)
 	}
 }
 
@@ -532,8 +660,8 @@ func TestNotifyThrottleIsPerZone(t *testing.T) {
 		t.Fatalf("Reload: %v", err)
 	}
 	rf := &fakeRefresher{}
-	clock := time.Date(2026, 9, 2, 12, 0, 0, 0, time.UTC)
-	ns := zones.NewNotifyServer(res, st.Zones(), rf, zones.WithNotifyServerNow(func() time.Time { return clock }))
+	clock := newFakeClock(time.Date(2026, 9, 2, 12, 0, 0, 0, time.UTC))
+	ns := zones.NewNotifyServer(res, st.Zones(), rf, zones.WithNotifyServerNow(clock.now))
 
 	for _, apex := range []string{zoneA.Name, zoneB.Name} {
 		m := new(dns.Msg).SetNotify(dns.Fqdn(apex))
@@ -558,9 +686,8 @@ func TestNotifyThrottleIsPerZone(t *testing.T) {
 // would pass every other throttle test in this file; only moving the clock
 // past it and observing a second admitted refresh catches that.
 func TestNotifyThrottleWindowExpires(t *testing.T) {
-	clock := time.Date(2026, 9, 2, 12, 0, 0, 0, time.UTC)
-	f := newNotifyFixture(t, notifyZone(),
-		zones.WithNotifyServerNow(func() time.Time { return clock }))
+	clock := newFakeClock(time.Date(2026, 9, 2, 12, 0, 0, 0, time.UTC))
+	f := newNotifyFixture(t, notifyZone(), zones.WithNotifyServerNow(clock.now))
 
 	reply := f.notify(t, notifyApex, dns.TypeSOA, "10.0.0.1", "", nil)
 	if reply.Rcode != dns.RcodeSuccess {
@@ -575,7 +702,7 @@ func TestNotifyThrottleWindowExpires(t *testing.T) {
 	}
 
 	// Past notifyThrottle (5s, notifyserver.go), with a margin.
-	clock = clock.Add(6 * time.Second)
+	clock.advance(6 * time.Second)
 	reply = f.notify(t, notifyApex, dns.TypeSOA, "10.0.0.1", "", nil)
 	if reply.Rcode != dns.RcodeSuccess {
 		t.Fatalf("second notify: rcode = %s, want NOERROR", dns.RcodeToString[reply.Rcode])
@@ -663,6 +790,68 @@ func TestNotifyResolvesPrimariesOnlyAfterTheZoneChecksPass(t *testing.T) {
 	})
 }
 
+// Ordering the gate's checks removed the lookup for a NOTIFY that was going to
+// be refused anyway; it left it in place for every NOTIFY that reaches a zone
+// with a hostname primary, which is the ordinary configuration a mixed
+// `primaries` list produces. A source that is one of the zone's IP literals is
+// already answerable from the column, so it must cost no lookup at all.
+func TestNotifyMatchesALiteralPrimaryWithoutResolvingAHostnameBesideIt(t *testing.T) {
+	dialer := &countingDialer{}
+	z := notifyZone()
+	z.Primaries = "10.0.0.1, ns1.primary.invalid"
+	f := newNotifyFixture(t, z,
+		zones.WithNotifyServerResolver(&net.Resolver{PreferGo: true, Dial: dialer.Dial}))
+
+	reply := f.notify(t, notifyApex, dns.TypeSOA, "10.0.0.1", "", nil)
+	if reply.Rcode != dns.RcodeSuccess {
+		t.Fatalf("rcode = %s, want NOERROR: the literal primary is the source", dns.RcodeToString[reply.Rcode])
+	}
+	if got := dialer.calls.Load(); got != 0 {
+		t.Errorf("a NOTIFY from a literal primary made %d resolver call(s), want 0", got)
+	}
+}
+
+// The other half: a zone whose primaries are only hostnames does have to
+// resolve, and a source that matches none of them is exactly the flood this
+// bound exists for — one trivially spoofable UDP packet per outbound recursive
+// lookup, throttled by nothing. The resolution is reused for the same window
+// the work throttle uses, so a flood costs one lookup rather than one each.
+func TestNotifyResolvesAHostnamePrimaryOncePerWindow(t *testing.T) {
+	dialer := &countingDialer{}
+	clock := newFakeClock(time.Date(2026, 9, 2, 12, 0, 0, 0, time.UTC))
+	z := notifyZone()
+	z.Primaries = "ns1.primary.invalid"
+	f := newNotifyFixture(t, z,
+		zones.WithNotifyServerResolver(&net.Resolver{PreferGo: true, Dial: dialer.Dial}),
+		zones.WithNotifyServerNow(clock.now))
+
+	reply := f.notify(t, notifyApex, dns.TypeSOA, "10.9.9.9", "", nil)
+	if reply.Rcode != dns.RcodeRefused {
+		t.Fatalf("rcode = %s, want REFUSED: the source is not a primary", dns.RcodeToString[reply.Rcode])
+	}
+	// One lookup is several dials (A and AAAA, and a retry apiece), so the
+	// count of the first is the baseline rather than a number to write down.
+	first := dialer.calls.Load()
+	if first == 0 {
+		t.Fatal("the first NOTIFY never resolved the hostname primary — the stub is not wired up")
+	}
+
+	for range 4 {
+		f.notify(t, notifyApex, dns.TypeSOA, "10.9.9.9", "", nil)
+	}
+	if got := dialer.calls.Load(); got != first {
+		t.Errorf("four more NOTIFYs inside one window made %d resolver call(s) in total, want the first lookup's %d", got, first)
+	}
+
+	// And the reuse expires with the window, or a primary that moved would
+	// never be matched again.
+	clock.advance(6 * time.Second)
+	f.notify(t, notifyApex, dns.TypeSOA, "10.9.9.9", "", nil)
+	if got := dialer.calls.Load(); got == first {
+		t.Error("a NOTIFY past the window reused the previous resolution: it never expires")
+	}
+}
+
 // The work a NOTIFY starts outlives the request (the test above), which used
 // to mean it outlived everything: the goroutine was `go func()` with nothing
 // holding a reference to it, so a NOTIFY admitted moments before shutdown
@@ -692,9 +881,8 @@ func TestNotifyResolvesPrimariesOnlyAfterTheZoneChecksPass(t *testing.T) {
 // apart.
 func TestNotifyServerRunWaitsForTheWorkItAdmitted(t *testing.T) {
 	logs := captureLogs(t)
-	clock := time.Date(2026, 9, 5, 12, 0, 0, 0, time.UTC)
-	f := newNotifyFixture(t, notifyZone(),
-		zones.WithNotifyServerNow(func() time.Time { return clock }))
+	clock := newFakeClock(time.Date(2026, 9, 5, 12, 0, 0, 0, time.UTC))
+	f := newNotifyFixture(t, notifyZone(), zones.WithNotifyServerNow(clock.now))
 	f.rf.entered = make(chan struct{}, 4)
 	f.rf.gate = make(chan struct{})
 
@@ -733,7 +921,7 @@ func TestNotifyServerRunWaitsForTheWorkItAdmitted(t *testing.T) {
 	// A NOTIFY after the lifetime has ended. The clock moves past the
 	// throttle so that a server which *would* have worked is not excused by
 	// admit() instead.
-	clock = clock.Add(time.Minute)
+	clock.advance(time.Minute)
 	if rc := f.notify(t, notifyApex, dns.TypeSOA, "10.0.0.1", "", nil).Rcode; rc != dns.RcodeSuccess {
 		t.Fatalf("rcode after shutdown = %s, want NOERROR", dns.RcodeToString[rc])
 	}

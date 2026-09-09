@@ -184,17 +184,40 @@ func TestParsePrimariesResolvesAHostname(t *testing.T) {
 	}
 }
 
-// A name that does not resolve is a transfer-time failure, and the error has
-// to name which primary failed — the whole point of the list is that some of
-// them can.
+// A list with nothing resolvable in it is a transfer-time failure, and the
+// error has to name every primary that failed — the whole point of the list is
+// that some of them can.
 func TestParsePrimariesReportsWhichHostFailedToResolve(t *testing.T) {
 	res := resolverAt(mockNameserver(t, oneHost("primary.test.", "10.0.0.1", "2001:db8::1")))
-	_, err := zones.ParsePrimaries(t.Context(), res, "primary.test., gone.test.")
+	_, err := zones.ParsePrimaries(t.Context(), res, "gone.test., also-gone.test.")
 	if err == nil {
-		t.Fatal("ParsePrimaries = nil error for a name that does not resolve")
+		t.Fatal("ParsePrimaries = nil error for a list where no name resolves")
 	}
-	if !strings.Contains(err.Error(), "gone.test.") {
-		t.Fatalf("error = %q; it must name the primary that failed", err)
+	for _, want := range []string{"gone.test.", "also-gone.test."} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error = %q; it must name the primary %q that failed", err, want)
+		}
+	}
+}
+
+// One entry that will not resolve must not take the rest of the list with it.
+// A list is written with more than one entry precisely so one of them being
+// unusable is survivable, and an all-or-nothing resolution turned a resolver
+// outage into "the literal beside it is never dialled and every NOTIFY for the
+// zone is REFUSED".
+func TestParsePrimariesSkipsAnEntryThatWillNotResolve(t *testing.T) {
+	res := resolverAt(mockNameserver(t, oneHost("primary.test.", "10.0.0.1", "2001:db8::1")))
+
+	got, err := zones.ParsePrimaries(t.Context(), res, "gone.test., 10.0.0.5")
+	if err != nil {
+		t.Fatalf("ParsePrimaries: %v", err)
+	}
+	var gotStr []string
+	for _, ap := range got {
+		gotStr = append(gotStr, ap.String())
+	}
+	if want := []string{"10.0.0.5:53"}; !slices.Equal(gotStr, want) {
+		t.Fatalf("ParsePrimaries = %v, want %v: the literal beside an unresolvable name must still be dialled", gotStr, want)
 	}
 }
 

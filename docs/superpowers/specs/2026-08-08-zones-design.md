@@ -1185,6 +1185,17 @@ In this order.
    `transferStateThrottle`'s, which already exists for the same class of
    problem on the transfer path.
 
+   **Amended 2026-09-09: the collapse is trailing-edge.** "Collapse to one
+   probe" was implemented as *drop* — a NOTIFY inside the window was discarded
+   — and that loses a serial bump which lands after the window's own probe has
+   already asked. A primary editing at t=0 and again at t=2s gets two NOERRORs
+   and stops retransmitting (§3.6), while the second edit waits out the SOA
+   `refresh`: fifteen minutes of a stale secondary reporting nothing wrong.
+   The window now remembers that a NOTIFY was suppressed and runs one more
+   probe when it closes. The bound this row exists for is unchanged, because
+   what is remembered is "something arrived" rather than how much: ten
+   suppressed NOTIFYs are still worth one probe between them.
+
 2. **`refreshed_at == 0` transfers unconditionally, with no probe.** A
    secondary created through the API starts at `soa_serial = 1`
    (`zones_handlers.go:285`). A primary that is also at serial 1 would make
@@ -1220,6 +1231,21 @@ without probing. Probing there too would be less wasteful on large zones and
 is what BIND does, but it changes behaviour that has shipped and pulls D2's
 scheduling tests into a NOTIFY milestone. Recorded here as a candidate, not
 taken.
+
+**Taken 2026-09-09.** The candidate above is now implemented
+(`Transferrer.Sync`): a scheduled refresh probes the SOA first and transfers
+only if the serial moved, which is what RFC 1034 §4.3.5 describes the refresh
+timer as doing. Left as it was, every secondary spent a whole AXFR, a record
+diff, a whole-store snapshot rebuild and a NOTIFY pass per `refresh` interval
+on a zone nobody had touched. Two rules from this section carry over
+unchanged, because they are the same rules: `refreshed_at == 0` transfers
+without probing (row 2 above), and a probe that fails falls through to the
+transfer rather than failing the attempt — the mirror of "an unnecessary AXFR
+costs bandwidth, a skipped one leaves a secondary stale". A successful check
+stamps both `refreshed_at` and `expires_at`, since §4.3.5 restarts the expire
+timer when the primary answers rather than when it answers with something new.
+`Refresher.Refresh` — the manual path and the one this section's step 4 calls —
+still transfers unconditionally.
 
 #### 9.10.4 `serialNewer`, and the pair RFC 1982 leaves undefined
 

@@ -2,8 +2,10 @@ package zones_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -139,6 +141,242 @@ func TestSchedulerWaitsOutTheSOARefresh(t *testing.T) {
 	}
 	if z := f.zone(t); z.RefreshedAt != f.now.UnixMilli() {
 		t.Errorf("refreshed_at = %d after the second transfer, want %d", z.RefreshedAt, f.now.UnixMilli())
+	}
+}
+
+// RFC 1034 §4.3.5's refresh timer is "check to see if the zone has been
+// updated" — an SOA query, and a transfer only if the serial says so. The
+// schedule used to transfer unconditionally, which on a default soa_refresh
+// meant a whole zone on the wire, a record diff, a whole-store snapshot
+// rebuild and a NOTIFY pass every fifteen minutes, per secondary, for a zone
+// nobody had touched.
+//
+// The primary here is a dnsaur one (newXFRFixture with the resolving
+// pipeline), because a probe is an ordinary SOA query and a fake that only
+// speaks AXFR cannot answer one. It loses a record *without* moving its
+// serial, which is what makes "did it transfer" observable rather than
+// inferred: a refresh that pulled the zone would carry the loss across.
+func TestAScheduledRefreshOfAnUnchangedZoneDoesNotTransfer(t *testing.T) {
+	ctx := context.Background()
+	primary := newXFRFixture(t, loopbackPrimaryZone("127.0.0.0/8"), loopbackRecords(), withResolvingPipeline())
+	f := newTransferFixture(t, primary.addr, 0)
+	ref := f.refresher()
+
+	// The first pass: never transferred, so nothing to compare against and no
+	// probe at all.
+	f.refreshDue(t, ref)
+	if z := f.zone(t); z.RefreshedAt != f.now.UnixMilli() {
+		t.Fatalf("the first pass did not transfer: refreshed_at = %d", z.RefreshedAt)
+	}
+	before := f.records(t)
+	if len(before) == 0 {
+		t.Fatal("the first transfer installed nothing")
+	}
+
+	// A record disappears from the primary and the serial does not move.
+	dropped := primaryRecord(t, primary, "bifrost")
+	if err := primary.st.Zones().DeleteRecord(ctx, dropped.ID); err != nil {
+		t.Fatalf("DeleteRecord: %v", err)
+	}
+	if err := primary.res.Reload(ctx); err != nil {
+		t.Fatalf("primary Reload: %v", err)
+	}
+
+	f.advance(primaryRefresh * time.Second)
+	f.refreshDue(t, ref)
+
+	z := f.zone(t)
+	// A successful check restarts both timers: RFC 1034 §4.3.5 does that when
+	// the primary *answers*, not only when it answers with something new. A
+	// secondary that probed successfully and stamped nothing would expire on
+	// schedule with its primary reachable the whole time.
+	if z.RefreshedAt != f.now.UnixMilli() {
+		t.Errorf("refreshed_at = %d, want %d: a successful check is a refresh", z.RefreshedAt, f.now.UnixMilli())
+	}
+	if want := f.now.UnixMilli() + int64(z.SOAExpire)*1000; z.ExpiresAt != want {
+		t.Errorf("expires_at = %d, want %d: the expire timer restarts on a successful check", z.ExpiresAt, want)
+	}
+	if got := len(f.records(t)); got != len(before) {
+		t.Errorf("the zone holds %d records, want the %d it had: the pass transferred a zone whose serial had not moved",
+			got, len(before))
+	}
+	if primary.probeQueries.Load() == 0 {
+		t.Error("the pass never asked the primary for its SOA")
+	}
+	// And the zone still answers, from the copy it already had.
+	if m := f.ask(t, "bifrost."+transferApex, dns.TypeA); m.Rcode != dns.RcodeSuccess {
+		t.Errorf("after the check: rcode = %s, want NOERROR", dns.RcodeToString[m.Rcode])
+	}
+}
+
+// primaryRecord returns one of the primary fixture's records by relative name.
+func primaryRecord(t *testing.T, f *xfrFixture, name string) store.ZoneRecord {
+	t.Helper()
+	recs, err := f.st.Zones().Records(context.Background(), f.zoneID)
+	if err != nil {
+		t.Fatalf("Records: %v", err)
+	}
+	for _, r := range recs {
+		if r.Name == name {
+			return r
+		}
+	}
+	t.Fatalf("the primary holds no record named %q", name)
+	return store.ZoneRecord{}
+}
+
+// A probe that fails must not fail the attempt. The probe is one UDP exchange
+// and the transfer is TCP, so a primary — or a middlebox — that answers one
+// and not the other is an ordinary misconfiguration, and of the two ways to be
+// wrong about it, an AXFR nobody needed costs bandwidth while an attempt
+// abandoned over a probe leaves a secondary stale and then expired with its
+// primary answering the whole time.
+//
+// startTestPrimary is exactly that shape: it serves AXFR over TCP and listens
+// on no UDP port at all, so every probe against it fails.
+func TestAScheduledRefreshTransfersWhenTheProbeFails(t *testing.T) {
+	primary := startTestPrimary(t, transferApex, primaryZoneRRs(t))
+	f := newTransferFixture(t, primary.addr, 0)
+	ref := f.refresher()
+
+	f.refreshDue(t, ref)
+	f.advance(primaryRefresh * time.Second)
+	f.refreshDue(t, ref)
+
+	if got := primary.requests(); got != 2 {
+		t.Errorf("the primary was asked for the zone %d times, want 2: a failed probe must not skip the transfer", got)
+	}
+	if z := f.zone(t); z.RefreshedAt != f.now.UnixMilli() {
+		t.Errorf("refreshed_at = %d, want %d", z.RefreshedAt, f.now.UnixMilli())
+	}
+	st, ok := ref.Status(f.zoneID)
+	if !ok {
+		t.Fatal("the scheduler kept no state for the zone")
+	}
+	if st.Failures != 0 {
+		t.Errorf("failures = %d, want 0: the probe failed, the attempt did not", st.Failures)
+	}
+}
+
+// An SOA whose expire is below its refresh takes the secondary dark on a
+// schedule: expires_at lands before the next attempt is even due, so the zone
+// SERVFAILs everything in between with nothing wrong anywhere. The schedule
+// is the SOA's, but it is not obliged to honour a value that means "stop
+// answering and do not check" — so the attempt happens at half the expiry
+// instead, and the operator is told once which of their two numbers this
+// server is not following.
+func TestSchedulerPollsAheadOfAnExpiryBelowTheRefresh(t *testing.T) {
+	logs := captureLogs(t)
+	const (
+		refresh = 3600
+		expire  = 600
+	)
+	soa := mustRR(t, fmt.Sprintf("%s. 900 IN SOA ns1.%s. hostadmin.%s. %d %d 300 %d 900",
+		transferApex, transferApex, transferApex, primarySerial, refresh, expire))
+	primary := startTestPrimary(t, transferApex, []dns.RR{
+		soa,
+		mustRR(t, fmt.Sprintf("%s. 3600 IN NS ns1.%s.", transferApex, transferApex)),
+		soa,
+	})
+	f := newTransferFixture(t, primary.addr, 0)
+	ref := f.refresher()
+
+	f.refreshDue(t, ref)
+	if got := primary.requests(); got != 1 {
+		t.Fatalf("the first pass asked %d times, want 1", got)
+	}
+
+	// One second short of half the expiry: still nothing due.
+	f.advance((expire/2)*time.Second - time.Second)
+	f.refreshDue(t, ref)
+	if got := primary.requests(); got != 1 {
+		t.Fatalf("the primary was asked %d times before half the expiry had passed, want 1", got)
+	}
+
+	f.advance(time.Second)
+	f.refreshDue(t, ref)
+	if got := primary.requests(); got != 2 {
+		t.Errorf("the primary was asked %d times at half the expiry, want 2: the zone would have gone dark "+
+			"for %ds of every %ds waiting out a refresh longer than its own expiry", got, refresh-expire, refresh)
+	}
+	if z := f.zone(t); z.ExpiresAt <= f.now.UnixMilli() {
+		t.Error("the zone expired before the schedule came back to it")
+	}
+
+	warned := 0
+	for _, r := range logs() {
+		if strings.Contains(r.Message, "expire") && r.Level >= slog.LevelWarn {
+			warned++
+		}
+	}
+	if warned != 1 {
+		t.Errorf("the SOA's expire-below-refresh was warned about %d times, want exactly 1 per zone", warned)
+	}
+}
+
+// A manual refresh waits for a transfer already in flight, which is what a
+// person who pressed the button meant — but the button is an HTTP request, and
+// a request that has gone away must not leave its handler parked on a lock
+// behind a primary that has stopped talking. The same wait is what a NOTIFY's
+// own work takes, under a context that ends when the server stops.
+func TestAManualRefreshStopsWaitingWhenItsCallerDoes(t *testing.T) {
+	hold := newOneShotHold()
+	defer hold.free()
+	primary := startTestPrimary(t, transferApex, primaryZoneRRs(t), withHold(hold.hold))
+	f := newTransferFixture(t, primary.addr, 0)
+	ref := f.refresher()
+
+	// One transfer, held inside the primary, owning the zone's lock.
+	go func() { _, _ = ref.Refresh(context.Background(), f.zoneID) }()
+	hold.wait(t, "the primary")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	waited := make(chan error, 1)
+	go func() { _, err := ref.Refresh(ctx, f.zoneID); waited <- err }()
+	// Nothing can make the second refresh proceed: the first still holds the
+	// lock. Cancelling is what must end the wait.
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+
+	select {
+	case err := <-waited:
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("the waiting refresh returned %v, want a context cancellation", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("a manual refresh whose caller gave up is still waiting for the lock")
+	}
+	hold.free()
+}
+
+// A transfer that runs out of its own time is the primary's failure and has to
+// be recorded as one: a zone whose transfers all time out would otherwise show
+// a clean last_error and no back-off, and an operator would have nothing to
+// read. It is only a shutdown that is not counted — see the test above, which
+// is the case this must not swallow.
+func TestATransferThatRunsOutOfTimeIsCountedAsAFailure(t *testing.T) {
+	hold := newOneShotHold()
+	defer hold.free()
+	primary := startTestPrimary(t, transferApex, primaryZoneRRs(t), withHold(hold.hold))
+	f := newTransferFixture(t, primary.addr, 0)
+	ref := f.refresher()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	if _, err := ref.Refresh(ctx, f.zoneID); err == nil {
+		t.Fatal("a transfer that ran past its deadline reported success")
+	}
+	hold.free()
+
+	st, ok := ref.Status(f.zoneID)
+	if !ok {
+		t.Fatal("the scheduler kept no state for the zone it tried")
+	}
+	if st.Failures != 1 {
+		t.Errorf("failures = %d, want 1: a deadline is the attempt failing, not the process stopping", st.Failures)
+	}
+	if z := f.zone(t); z.LastError == "" {
+		t.Error("last_error is empty: nothing anywhere says why this zone is not updating")
 	}
 }
 

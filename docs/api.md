@@ -191,8 +191,9 @@ Full parameter/response detail lives in `internal/api/openapi.yaml`
   type; it's an ordinary `primary` zone whose `name` ends in
   `in-addr.arpa` or `ip6.arpa` (e.g. `168.192.in-addr.arpa`).
 - **Secondary zones** — a `secondary` is a copy of a zone held elsewhere,
-  pulled over AXFR and kept fresh on the schedule its own SOA publishes, or
-  sooner if one of its `primaries` sends it a DNS NOTIFY — see
+  pulled over AXFR and kept fresh on the schedule its own SOA publishes — the
+  scheduled attempt asks for the primary's serial first and transfers only if
+  it has moved — or sooner if one of its `primaries` sends it a DNS NOTIFY. See
   [`docs/architecture.md`](architecture.md) for the accept/refuse rules and
   what each rcode means. Creating one requires `primaries` —
   comma-separated `host[:port]`, port 53 by default, stored as written and
@@ -216,9 +217,12 @@ Full parameter/response detail lives in `internal/api/openapi.yaml`
   so neither has a master to ask, and both get `400 only secondary and stub
   zones pull from a master`.
   Three read-only fields on the zone describe all of this. `refreshed_at`
-  is the last transfer that **succeeded**; `last_attempt` is the last one
-  **tried**, successful or not; and `last_error` is why that attempt failed,
-  in the transfer's own words, or `""` when it succeeded. The last two are
+  is the last attempt that **succeeded** — a transfer that landed, or a
+  scheduled check whose SOA probe found the primary already at this zone's
+  serial, which RFC 1034 §4.3.5 treats alike, since both are the primary
+  confirming what this zone holds; `last_attempt` is the last one **tried**,
+  successful or not; and `last_error` is why that attempt failed, in the
+  transfer's own words, or `""` when it succeeded. The last two are
   written together and survive a restart — the scheduler's own view of a
   failure does not — so they are the honest answer to "is this zone
   working", and `last_error` should always be read beside `last_attempt`.
@@ -290,7 +294,9 @@ Full parameter/response detail lives in `internal/api/openapi.yaml`
 - **Zone transfers (outbound)** — any zone dnsaur holds, `primary` or
   `secondary`, can be transferred to another nameserver over AXFR (and
   IXFR, answered with a full AXFR — there is no journal yet to compute a
-  delta from). `allow_transfer` on `POST /zones` and `PATCH /zones/{id}` is
+  delta from — unless the requesting client's own serial is already this
+  server's or newer, which RFC 1995 §2 answers with a single SOA and this
+  server does). `allow_transfer` on `POST /zones` and `PATCH /zones/{id}` is
   the ACL: a comma-separated list where each entry is an IP address
   (`192.168.1.5`), a CIDR prefix (`10.0.0.0/24`), or `key:<tsig-name>` (the
   request must carry a TSIG that verified under that key) — e.g.

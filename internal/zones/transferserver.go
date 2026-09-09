@@ -198,6 +198,33 @@ func (t *TransferServer) serve(ctx context.Context, w dns.ResponseWriter, q *dns
 		return answerSOAOnly(w, q, z, key, tsigErr)
 	}
 
+	// RFC 1995 §2: "If an IXFR query with the same or newer version number
+	// than that of the server is received, it is replied to with a single SOA
+	// record of the server's current version."
+	//
+	// §4's permission to answer an IXFR with a whole AXFR — which is what this
+	// server does for a client that is genuinely behind, having no journal to
+	// compute a delta from — is about a client that needs the data. A
+	// secondary that is already current asks again on every refresh timer it
+	// has, and answering each of those with the entire zone spends exactly the
+	// bandwidth IXFR exists to save, on the peer that needed nothing.
+	//
+	// A query with no readable SOA of this zone in its authority section is
+	// not this case and falls through to the whole zone: §3 is where the
+	// client's serial goes, and without one there is nothing to compare.
+	if q.Question[0].Qtype == dns.TypeIXFR {
+		if serial, ok := clientSerial(q); ok && !SerialNewer(z.SOASerial, serial) {
+			slog.Info("zone transfer answered with a serial",
+				"zone", z.Name, "peer", peer, "key", key, "serial", z.SOASerial,
+				"transport", "tcp", "client_serial", serial)
+			// Recorded like any other transfer request that arrived over TCP:
+			// a peer asked and was answered, which is what last_xfr_at and
+			// last_xfr_peer say (§9.5.8).
+			t.note(context.WithoutCancel(ctx), z, peer, "")
+			return answerSOAOnly(w, q, z, key, tsigErr)
+		}
+	}
+
 	// The slot is taken here, after both UDP branches above have already
 	// returned, and nowhere earlier. A UDP AXFR is answered NOTIMP and a UDP
 	// IXFR with a single SOA, neither streaming anything; taking the slot
@@ -269,7 +296,22 @@ func (t *TransferServer) serve(ctx context.Context, w dns.ResponseWriter, q *dns
 	}
 
 	start := t.now()
+	// The deadline reaches a write that has already blocked only through here.
+	// stream checks ctx between envelopes, which catches a peer that is merely
+	// slow; a peer that has stopped reading blocks *inside* WriteMsg, where
+	// there is no deadline the library will ever apply (see slots). Closing the
+	// writer closes the connection under it, which is what makes that write
+	// fail — the same lever Transferrer.fetch pulls from the client side of a
+	// transfer. Without it the cap is a bound on nothing: four such peers hold
+	// all four slots until their TCP connections die on their own, which for a
+	// peer that is simply not reading may be never.
+	stopWatchdog := watchStalledWrite(ctx, w)
 	envelopes, err := stream(ctx, w, q, answer, key, tsigErr)
+	// Before freeSlot, and unconditionally: past this point the stream is over
+	// and the connection is the server's to keep, so a ctx that ends a moment
+	// later (dnssrv cancels it the instant ServeTransfer returns) must not
+	// close a connection that is no longer being written to.
+	stopWatchdog()
 	// The slot bounds a stalled WriteMsg (§9.5.7); it has nothing to do with
 	// the bookkeeping below, which is a synchronous database write. Freeing
 	// it here, the instant the wire work is done, is what keeps a slow
@@ -348,7 +390,19 @@ func (t *TransferServer) refuse(ctx context.Context, w dns.ResponseWriter, q *dn
 	} else {
 		attrs = append([]any{"qname", qnameOf(q)}, attrs...)
 	}
-	slog.Warn("zone transfer refused", attrs...)
+	// Warn is for the refusal an operator is hunting: a peer the ACL turned
+	// away from a zone this server holds, which is what "ns2 has stopped
+	// updating" nearly always is. The other two rows are not that. An apex
+	// this server holds no zone for, and a transfer arriving over UDP, are
+	// both one unauthenticated packet away for any source on the network — so
+	// warning about them is a log line per packet that somebody else decides
+	// to write. The NOTIFY gate's twin already reads its refusals out at debug
+	// for exactly this reason.
+	level := slog.LevelWarn
+	if z == nil || isUDP {
+		level = slog.LevelDebug
+	}
+	slog.Log(ctx, level, "zone transfer refused", attrs...)
 	return t.writeRefusal(w, q, ref, key, tsigErr)
 }
 
@@ -956,6 +1010,48 @@ func peerAddr(w dns.ResponseWriter) netip.Addr {
 		ip, _ = netip.AddrFromSlice(a.IP)
 	}
 	return ip.Unmap()
+}
+
+// clientSerial reads the serial an IXFR query says the client already holds.
+//
+// RFC 1995 §3: "the authority section carries the SOA record of client's
+// version of the zone." The owner name is checked because an SOA naming some
+// other zone says nothing about this one, and believing it would answer a
+// peer that is behind with a single SOA — a secondary told it is current when
+// it is not, which is the one mistake here that does not heal on the next
+// timer.
+func clientSerial(q *dns.Msg) (uint32, bool) {
+	want := dns.CanonicalName(q.Question[0].Name)
+	for _, rr := range q.Ns {
+		soa, ok := rr.(*dns.SOA)
+		if !ok || !strings.EqualFold(dns.CanonicalName(soa.Hdr.Name), want) {
+			continue
+		}
+		return soa.Serial, true
+	}
+	return 0, false
+}
+
+// watchStalledWrite closes w when ctx ends, and returns the function that
+// stands the watch down. See its call site for why closing is the only lever
+// there is.
+//
+// The returned function is safe to call once, on the one path that calls it:
+// the stream returning, however it returned.
+func watchStalledWrite(ctx context.Context, w dns.ResponseWriter) func() {
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			// The peer receives whatever the kernel already accepted and then
+			// a closed connection, which is what a transfer that ran out of
+			// time looks like from the far end. It retries on its own SOA
+			// schedule.
+			_ = w.Close()
+		case <-done:
+		}
+	}()
+	return func() { close(done) }
 }
 
 // qnameOf is the queried name for a log line, for a message that may have no
