@@ -42,7 +42,7 @@ import { parseUpstreams } from "../lib/upstreams";
 
 // --- field model -------------------------------------------------------
 // One row per key in internal/api/settings_handlers.go's editableSettings
-// map — 17 keys, no more, no less (see the exhaustiveness note by
+// map — 18 keys, no more, no less (see the exhaustiveness note by
 // SETTING_GROUPS below). Each field's `schema` mirrors that map's check
 // function exactly, so a value accepted here is one PUT /settings will
 // also accept, and nothing rejected here would have been rejected there
@@ -182,9 +182,11 @@ const nonNegIntSchema = z
   });
 
 /** Mirrors editableSettings' positiveInt(...), which is nonNegInt with zero
- * refused. Only lists.refresh_hours uses it: the interval becomes a ticker,
- * and 0 is not a slower schedule but one that cannot be built. Saying so in
- * the form saves a round trip to the same rejection. */
+ * refused. Two keys use it: lists.refresh_hours, whose interval becomes a
+ * ticker, and 0 is not a slower schedule but one that cannot be built; and
+ * stats.retention_days, where 0 would have the next prune delete every hourly
+ * bucket there is. Saying so in the form saves a round trip to the same
+ * rejection. */
 const positiveIntSchema = z
   .string()
   .trim()
@@ -252,6 +254,7 @@ const SETTING_DEFAULTS: Record<string, string> = {
   "lists.refresh_hours": "24",
   "qlog.retention_days": "90",
   "qlog.privacy": "full",
+  "stats.retention_days": "365",
   "serve.dot.enabled": "false",
   "serve.dot.listen": ":853",
   "serve.doh.enabled": "false",
@@ -260,7 +263,7 @@ const SETTING_DEFAULTS: Record<string, string> = {
   "serve.tls.key": "",
 };
 
-// Exhaustiveness: this must list exactly the 17 keys in
+// Exhaustiveness: this must list exactly the 18 keys in
 // internal/api/settings_handlers.go's editableSettings — no fewer (an
 // editable setting the admin can't reach) and no more (a PUT the server
 // would 400 with "setting not editable").
@@ -378,7 +381,7 @@ const SETTING_GROUPS: SettingGroup[] = [
   },
   {
     title: "Query log",
-    description: "What gets recorded per query, and for how long.",
+    description: "What gets recorded per query, and how long it and its statistics are kept.",
     icon: ScrollText,
     fields: [
       {
@@ -404,6 +407,16 @@ const SETTING_GROUPS: SettingGroup[] = [
         label: "Retention (days)",
         description: "How long query log rows are kept before the pruner deletes them.",
         schema: nonNegIntSchema,
+      },
+      {
+        key: "stats.retention_days",
+        kind: "int",
+        // Named apart from the query log's "Retention (days)" above it:
+        // two fields on one card, and an admin setting one of them has to
+        // be able to tell which number they are looking at.
+        label: "Statistics retention (days)",
+        description: "How long the hourly totals behind the dashboard are kept.",
+        schema: positiveIntSchema,
       },
     ],
   },
@@ -543,7 +556,7 @@ function buildDefaults(settings: Settings): SettingsFormValues {
 // One schema for the whole form, keyed the same way the form is (sanitized
 // names, not API keys) so the resolver's issue paths land on the right
 // fields. Assembled from the field definitions rather than written out
-// again, which keeps the "exactly editableSettings' 17 keys" guarantee
+// again, which keeps the "exactly editableSettings' 18 keys" guarantee
 // above the single thing to maintain.
 const SETTINGS_SCHEMA = z.object(
   Object.fromEntries(ALL_FIELDS.map((field) => [rhfName(field.key), field.schema])),
@@ -977,7 +990,7 @@ function SettingsForm({ settings }: { settings: Settings }) {
 // --- page ------------------------------------------------------------------
 
 /**
- * Settings — the 17 keys in internal/api/settings_handlers.go's
+ * Settings — the 18 keys in internal/api/settings_handlers.go's
  * editableSettings, saved together rather than one at a time.
  */
 export function SettingsPage() {

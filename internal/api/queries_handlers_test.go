@@ -10,8 +10,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aloks98/dnsaur/internal/dnssrv"
 	"github.com/aloks98/dnsaur/internal/qlog"
 	"github.com/aloks98/dnsaur/internal/store"
+	"github.com/miekg/dns"
 )
 
 func seedAPIQlog(t *testing.T, s store.Store) {
@@ -83,6 +85,54 @@ func TestStatsEndpoints(t *testing.T) {
 	}
 	if w := doReq(t, srv.Handler(), "GET", "/api/v1/stats/top?metric=passwords", "", cookie); w.Code != 400 {
 		t.Fatalf("bad metric accepted: %d", w.Code)
+	}
+}
+
+// TestStatsOverviewReportsDropped: entries the query-log buffer discarded
+// were counted and never shown anywhere, so a dashboard built on a log with
+// holes in it looked complete. The overview carries the count — 0 when
+// nothing was lost, and 0 as well on a server with no query logger at all,
+// which has lost nothing.
+func TestStatsOverviewReportsDropped(t *testing.T) {
+	srv, s, _ := testServer(t)
+	cookie := login(t, srv, s)
+
+	w := doReq(t, srv.Handler(), "GET", "/api/v1/stats/overview", "", cookie)
+	var ov map[string]int64
+	if err := json.Unmarshal(w.Body.Bytes(), &ov); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := ov["dropped"]; !ok {
+		t.Fatalf("no dropped field with no logger installed: %v", ov)
+	}
+	if ov["dropped"] != 0 {
+		t.Fatalf("dropped = %d with no logger installed", ov["dropped"])
+	}
+
+	// A logger whose buffer overflowed: four entries emitted into room for
+	// two, so two were dropped.
+	logger := qlog.New(&nullQLStore{}, qlog.Options{InstanceID: "i", Buffer: 2, BatchSize: 100, FlushEvery: time.Hour})
+	h := logger.Middleware()(dnssrv.HandlerFunc(func(ctx context.Context, req *dnssrv.Request) (*dnssrv.Response, error) {
+		m := new(dns.Msg)
+		m.SetReply(req.Msg)
+		return &dnssrv.Response{Msg: m, Decision: dnssrv.DecisionForwarded}, nil
+	}))
+	for i := 0; i < 4; i++ {
+		m := new(dns.Msg)
+		m.SetQuestion(fmt.Sprintf("q%d.example.", i), dns.TypeA)
+		if _, err := h.ServeDNS(t.Context(), &dnssrv.Request{Msg: m}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	srv.deps.Logger = logger
+
+	w = doReq(t, srv.Handler(), "GET", "/api/v1/stats/overview", "", cookie)
+	ov = map[string]int64{}
+	if err := json.Unmarshal(w.Body.Bytes(), &ov); err != nil {
+		t.Fatal(err)
+	}
+	if ov["dropped"] != 2 {
+		t.Fatalf("dropped = %d, want 2", ov["dropped"])
 	}
 }
 

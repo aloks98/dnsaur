@@ -700,6 +700,13 @@ Planned, not yet present: `internal/dhcp` (Phase 2), `internal/sync`
   without a restart. See [`docs/configuration.md`](configuration.md) for the
   full settings list and the handful of exceptions that still require a
   restart.
+- The two tables that grow with traffic are both bounded: `query_log` by
+  `qlog.retention_days` and the hourly rollups in `stats_hourly` by
+  `stats.retention_days`, pruned together by one daily pass. Both prunes
+  delete in bounded chunks rather than one statement, because SQLite runs on
+  a single connection and a multi-million-row `DELETE` would hold it long
+  enough for the query log's own buffered writes to time out and be
+  discarded.
 - The DNS cache and the compiled filter trie are memory-only — never
   persisted to the DB. Downloaded blocklist files are cached on disk so a
   restart doesn't force a re-download.

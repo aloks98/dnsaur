@@ -29,6 +29,10 @@ type Logger struct {
 	dropped atomic.Int64
 	privacy atomic.Value // string
 	hub     subHub
+	// reported and lastReport are the drop warning's rate limit. Plain
+	// fields, no atomics: only Run's goroutine touches them.
+	reported   int64
+	lastReport time.Time
 }
 
 func New(qs store.QueryLogStore, o Options) *Logger {
@@ -52,7 +56,32 @@ func New(qs store.QueryLogStore, o Options) *Logger {
 	return l
 }
 
+// Dropped is how many entries the buffer has discarded since start. It is
+// also reported on GET /api/v1/stats/overview, because a query log with
+// holes in it that looks complete is worse than one that says so.
 func (l *Logger) Dropped() int64 { return l.dropped.Load() }
+
+// dropWarnEvery bounds how often the buffer's losses are logged. The
+// condition that causes them — a burst arriving while the database is busy
+// — lasts for as long as it lasts, and a warning per flush would bury the
+// storage error that is usually the actual cause.
+const dropWarnEvery = time.Minute
+
+// reportDropped warns when entries have been discarded since the last
+// warning, at most once per dropWarnEvery. Called from the flush loop, so
+// the count is reported by the same goroutine that is failing to keep up
+// rather than from the query path.
+func (l *Logger) reportDropped(now time.Time) {
+	n := l.dropped.Load()
+	if n == l.reported {
+		return
+	}
+	if !l.lastReport.IsZero() && now.Sub(l.lastReport) < dropWarnEvery {
+		return
+	}
+	slog.Warn("query log entries dropped, buffer full", "dropped", n-l.reported, "total", n)
+	l.reported, l.lastReport = n, now
+}
 
 // SetPrivacy updates the privacy mode read by Middleware on every query,
 // letting qlog.privacy be changed live (e.g. via settings hot-reload)
@@ -218,17 +247,25 @@ func (l *Logger) Run(ctx context.Context) {
 			}
 		case <-t.C:
 			flush()
+			l.reportDropped(l.o.Now())
 		}
 	}
 }
 
+// Pruner enforces retention on the two tables that grow with traffic: the
+// query log itself and the hourly counters derived from it. They keep
+// separate retentions — the log answers "what happened at 14:02 yesterday"
+// and is the bulky one, the rollups answer "how did last March compare" and
+// are small enough to keep far longer — but one daily pass covers both.
 type Pruner struct {
-	qs            store.QueryLogStore
-	retentionDays func() int64
+	qs                 store.QueryLogStore
+	ss                 store.StatsStore
+	retentionDays      func() int64
+	statsRetentionDays func() int64
 }
 
-func NewPruner(qs store.QueryLogStore, retentionDays func() int64) *Pruner {
-	return &Pruner{qs: qs, retentionDays: retentionDays}
+func NewPruner(qs store.QueryLogStore, ss store.StatsStore, retentionDays, statsRetentionDays func() int64) *Pruner {
+	return &Pruner{qs: qs, ss: ss, retentionDays: retentionDays, statsRetentionDays: statsRetentionDays}
 }
 
 func (p *Pruner) pruneOnce(ctx context.Context, now time.Time) {
@@ -237,6 +274,13 @@ func (p *Pruner) pruneOnce(ctx context.Context, now time.Time) {
 		slog.Warn("query log prune failed", "err", err)
 	} else if n > 0 {
 		slog.Info("query log pruned", "rows", n)
+	}
+	// stats_hourly.bucket is a unix second, so this cutoff is in seconds.
+	statsCutoff := now.Unix() - p.statsRetentionDays()*24*3600
+	if n, err := p.ss.PruneBefore(ctx, statsCutoff); err != nil {
+		slog.Warn("stats prune failed", "err", err)
+	} else if n > 0 {
+		slog.Info("stats pruned", "rows", n)
 	}
 }
 

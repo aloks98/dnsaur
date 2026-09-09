@@ -582,7 +582,7 @@ moment you save.
 | **Upstreams** | Where queries are forwarded, and how those upstreams are chosen |
 | **Blocking** | How a blocked query is answered, and for how long that answer may be cached |
 | **Cache** | TTL floor/ceiling, size, and stale-serving |
-| **Query log** | How much per-query detail is recorded, and for how long |
+| **Query log** | How much per-query detail is recorded, how long the rows are kept, and how long the hourly totals behind the dashboard outlive them |
 | **Lists** | How often subscriptions refresh |
 | **Protocols** | Whether clients can reach dnsaur over DNS-over-TLS / DNS-over-HTTPS, and the certificate both present |
 

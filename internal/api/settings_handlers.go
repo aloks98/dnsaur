@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aloks98/dnsaur/internal/store"
 	"github.com/aloks98/dnsaur/internal/upstream"
 )
 
@@ -32,6 +33,7 @@ var editableSettings = map[string]func(string) error{
 	"lists.refresh_hours":   positiveInt,
 	"qlog.retention_days":   nonNegInt,
 	"qlog.privacy":          oneOf("full", "anon", "none"),
+	"stats.retention_days":  positiveInt,
 	"serve.dot.enabled":     boolean,
 	"serve.dot.listen":      listenAddr,
 	"serve.doh.enabled":     boolean,
@@ -199,8 +201,12 @@ func (s *Server) handleSettingsGet(w http.ResponseWriter, r *http.Request) {
 		storeErr(w, err)
 		return
 	}
+	// The rollup's watermark is bookkeeping, not configuration, and nothing
+	// may edit it — but it is named by key, not by prefix: stats.* also
+	// holds stats.retention_days, which is an ordinary setting the screen
+	// has to be able to read.
 	for k := range all {
-		if strings.HasPrefix(k, "instance.") || strings.HasPrefix(k, "stats.") {
+		if strings.HasPrefix(k, "instance.") || k == store.StatsWatermarkKey {
 			delete(all, k)
 		}
 	}

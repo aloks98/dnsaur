@@ -104,12 +104,13 @@ Full parameter/response detail lives in `internal/api/openapi.yaml`
   `POST /auth/totp/start`, `POST /auth/totp/confirm`,
   `POST /auth/totp/disable`.
 - **Settings** — `GET /settings` (flat key→string map of all editable
-  settings; `instance.*`/`stats.*` keys are internal and omitted),
+  settings; `instance.*` keys and `stats.watermark` are internal and
+  omitted),
   `PUT /settings` (`{key, value}`, one key per call; editable keys:
   `upstreams`, `upstream.strategy`, `blocking.mode`, `blocking.ttl`,
   `cache.min_ttl`, `cache.max_ttl`, `cache.max_entries`,
   `cache.serve_stale_for`, `lists.refresh_hours`, `qlog.retention_days`,
-  `qlog.privacy`, `serve.dot.enabled`, `serve.dot.listen`,
+  `qlog.privacy`, `stats.retention_days`, `serve.dot.enabled`, `serve.dot.listen`,
   `serve.doh.enabled`, `serve.doh.listen`, `serve.tls.cert`,
   `serve.tls.key` — see [`docs/configuration.md`](configuration.md) for
   what each means and which require a restart to take effect). Enabling
@@ -122,7 +123,9 @@ Full parameter/response detail lives in `internal/api/openapi.yaml`
   whatever is free and reports an address no client was ever told. The
   integer keys take zero and up, except `lists.refresh_hours`, which takes
   1 and up: it becomes the refresh timer's interval, and `0` is not a
-  slower schedule but one no timer can be built from. **One
+  slower schedule but one no timer can be built from; and
+  `stats.retention_days`, also 1 and up, because `0` would have the next
+  prune delete every hourly bucket the dashboard reads. **One
   key per call is not incidental**: each write is validated against the
   values already stored, so a client changing several dependent keys has to
   order them — certificate paths before the `enabled` flags that check
@@ -505,7 +508,9 @@ Full parameter/response detail lives in `internal/api/openapi.yaml`
   1000], `offset`), `GET /queries/tail` (live tail as Server-Sent Events,
   `text/event-stream`; `503` if query logging is disabled).
 - **Stats** — `GET /stats/overview?hours=` (totals: `total`, `blocked`,
-  `cached`, `forwarded`, `clients`), `GET /stats/timeline?hours=`
+  `cached`, `forwarded`, `clients`, plus `dropped` — query log entries
+  discarded since start because the write buffer was full, so a non-zero
+  value means the totals beside it are undercounts), `GET /stats/timeline?hours=`
   (decision counts bucketed over time), `GET /stats/top?metric=&n=&hours=`
   (top-N by `domain`, `blocked_domain`, or `client`).
 - **Tokens** — `GET /tokens` (list this user's API tokens; session tokens

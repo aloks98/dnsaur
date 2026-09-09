@@ -49,6 +49,42 @@ func TestSettingsGetPut(t *testing.T) {
 	}
 }
 
+// stats.retention_days shares a prefix with stats.watermark, which
+// GET /settings hides — the two must not be hidden together. One is the
+// rollup's own bookkeeping and no operator can edit it; the other is a
+// setting like any other, and a settings screen that cannot read it cannot
+// show what it is set to. Zero is refused: it would delete every bucket on
+// the next prune, leaving the dashboard permanently empty.
+func TestStatsRetentionIsEditableAndVisible(t *testing.T) {
+	srv, s, _ := testServer(t)
+	cookie := login(t, srv, s)
+	h := srv.Handler()
+	_ = s.Settings().SetInternal(t.Context(), "stats.retention_days", "365")
+	_ = s.Settings().SetInternal(t.Context(), "stats.watermark", "4711")
+
+	w := doReq(t, h, "GET", "/api/v1/settings", "", cookie)
+	var m map[string]string
+	_ = json.Unmarshal(w.Body.Bytes(), &m)
+	if m["stats.retention_days"] != "365" {
+		t.Fatalf("stats.retention_days not returned: %v", m)
+	}
+	if _, leaked := m["stats.watermark"]; leaked {
+		t.Fatal("the rollup watermark leaked into GET /settings")
+	}
+	if w := doReq(t, h, "PUT", "/api/v1/settings", `{"key":"stats.retention_days","value":"30"}`, cookie); w.Code != 204 {
+		t.Fatalf("put: %d %s", w.Code, w.Body.String())
+	}
+	if v, _, _ := s.Settings().Get(t.Context(), "stats.retention_days"); v != "30" {
+		t.Fatalf("not persisted: %s", v)
+	}
+	if w := doReq(t, h, "PUT", "/api/v1/settings", `{"key":"stats.retention_days","value":"0"}`, cookie); w.Code != 400 {
+		t.Fatalf("zero retention accepted: %d", w.Code)
+	}
+	if w := doReq(t, h, "PUT", "/api/v1/settings", `{"key":"stats.watermark","value":"0"}`, cookie); w.Code != 400 {
+		t.Fatalf("watermark accepted as editable: %d", w.Code)
+	}
+}
+
 // lists.refresh_hours is the one interval that becomes a time.Ticker, and 0
 // panics one. The setting is restart-required, so a stored 0 does not fail
 // the write that made it — it fails the next start, and the one after that,

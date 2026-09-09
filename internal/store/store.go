@@ -235,9 +235,13 @@ type QueryLogStore interface {
 	Search(ctx context.Context, f QueryLogFilter) ([]QueryLogEntry, error)
 }
 
-// StatsStore manages query statistics and hourly aggregations.
+// StatsStore manages query statistics and hourly aggregations. Rollup also
+// records how far it counted, under StatsWatermarkKey, in the transaction
+// that writes the counters; PruneBefore is the retention half, deleting
+// buckets older than a cutoff.
 type StatsStore interface {
 	Rollup(ctx context.Context, afterID int64) (lastID int64, err error)
+	PruneBefore(ctx context.Context, bucketBeforeSec int64) (int64, error)
 	Counter(ctx context.Context, bucketFromSec int64, metric string) (map[string]int64, error)
 	Timeline(ctx context.Context, fromSec int64) (map[int64]map[string]int64, error)
 }

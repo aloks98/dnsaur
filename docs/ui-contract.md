@@ -174,8 +174,8 @@ sessions.
 
 #### `GET /api/v1/settings`
 A flat object; **every value is a string**, including numbers. Keys prefixed
-`instance.` or `stats.` are stripped, which hides `instance.id` and
-`stats.watermark`.
+`instance.` are stripped, as is `stats.watermark` by name — the rollup's own
+bookkeeping. `stats.retention_days` is an ordinary setting and is returned.
 
 ```json
 {
@@ -188,6 +188,7 @@ A flat object; **every value is a string**, including numbers. Keys prefixed
   "lists.refresh_hours": "24",
   "qlog.privacy": "full",
   "qlog.retention_days": "90",
+  "stats.retention_days": "365",
   "upstream.strategy": "race",
   "upstreams": "1.1.1.1:53,1.0.0.1:53,9.9.9.9:53"
 }
@@ -658,13 +659,17 @@ Shared param:
 
 #### `GET /stats/overview`
 ```json
-{"blocked":2,"cached":0,"clients":1,"forwarded":10,"total":14}
+{"blocked":2,"cached":0,"clients":1,"dropped":0,"forwarded":10,"total":14}
 ```
 - `total` = the sum of **every** decision bucket, including `authoritative`
   and `error`.
 - `cached` = `cached` + `stale`.
 - `clients` = distinct `client_ip` keys in the window — **not** a count of
   configured client rows.
+- `dropped` = query log entries discarded since **process start** because the
+  write buffer was full (§5). The only field here that ignores `hours`, and
+  the only one that is not a count of queries: it says the others are
+  undercounts.
 
 **`blocked + cached + forwarded ≤ total`**, and the gap is `authoritative` +
 `error`. Any UI computing "allowed = total − blocked" will be wrong.
@@ -1111,11 +1116,13 @@ Full editable allowlist. Values are always strings on the wire.
 | `lists.refresh_hours` | `24` | int ≥ 1 | **restart** for the cadence — but any settings change triggers one immediate refresh |
 | `qlog.retention_days` | `90` | int ≥ 0 | **hot, delayed** — re-read per prune run, so it lands on the next 24h tick |
 | `qlog.privacy` | `full` | `full` \| `anon` \| `none` | **hot**, read per query |
+| `stats.retention_days` | `365` | int ≥ 1 | **hot, delayed** — same prune run as `qlog.retention_days` |
 
-No upper bound on any integer key. `lists.refresh_hours` is the only one
-with a lower bound above zero: it becomes a tick interval, and `0` is
-rejected with `invalid value for lists.refresh_hours: must be a whole number,
-one or more`. `blocking.mode` treats **anything ≠ `nxdomain`** as null-ip.
+No upper bound on any integer key. Two have a lower bound above zero, and
+both are rejected with `must be a whole number, one or more`:
+`lists.refresh_hours`, which becomes a tick interval, and
+`stats.retention_days`, where `0` would delete every hourly bucket on the
+next prune. `blocking.mode` treats **anything ≠ `nxdomain`** as null-ip.
 
 Non-editable keys that exist but are stripped from `GET /settings`:
 `instance.id`, `stats.watermark`.
@@ -1194,22 +1201,31 @@ sources: retention pruning racing the rollup (only with a very small
 on Postgres a concurrent insert holding a lower id than the `MAX(id)` read at
 transaction start.
 
-**`stats_hourly` is never pruned** — it grows unbounded, independent of
-`qlog.retention_days`. **TODO.**
+**`stats_hourly` has its own retention**, `stats.retention_days` (default
+**365**), applied by the same daily pass that prunes the query log: buckets
+starting before the cutoff are deleted, in chunks. It is deliberately far
+longer than `qlog.retention_days` — hourly totals are small, and they are
+all that is left of a month once its per-query rows are gone.
 
 ---
 
 ## 5. Query log: retention, buffering, page size
 
 **Retention** — `qlog.retention_days`, default **90**, unit days. Pruning runs
-**once at startup, then every 24 hours**, deleting `WHERE at < cutoff`. The value
-is re-read from the DB on every prune, so a change lands on the next tick
-without a restart. `0` is a valid value and means "delete everything".
+**once at startup, then every 24 hours**, deleting `WHERE at < cutoff` in
+batches of 10000 rows with a short pause between them, so lowering retention
+on a large log does not hold the database long enough to time out the log's
+own buffered writes. The value is re-read from the DB on every prune, so a
+change lands on the next tick without a restart. `0` is a valid value and
+means "delete everything". The same pass prunes `stats_hourly` on
+`stats.retention_days` (§3.9).
 
 **Write path is buffered**: channel capacity **10000**, batch size **1000**,
 flush every **1 second**, 5s DB timeout. **Overflow drops the oldest entry and
-never blocks.** A drop counter exists but **nothing exposes it** — the UI cannot
-tell that entries were lost. Flush failures discard the batch with no retry.
+never blocks.** The drop counter is reported two ways: a `WARN` from the flush
+loop, at most once a minute, and `dropped` on `GET /stats/overview` (§2.8) —
+a running total since process start, not since the window the other figures
+cover. Flush failures discard the batch with no retry.
 
 **Visible latency:**
 
@@ -1332,7 +1348,7 @@ The client distinguishes two error cases, and the distinction is load-bearing:
 | Clients | 4 skeletons | `No clients yet` | `Couldn't load clients` | stale banner |
 | Zones | 4 skeletons | `No zones yet` | `Couldn't load zones` | stale banner |
 | Zone detail | 4 skeletons (zone), then 4 more (records) | filtered: `No records match this filter.` Unfiltered, a four-way switch on type (`detail.tsx`): **secondary** → `Nothing transferred yet. The records will arrive with the first transfer from the primary.`; **stub with a recorded failure** → `No NS set yet.`; **stub without one** → `Fetching the NS set from ${primaries}`; **otherwise** → `No records yet. Add one above and dnsaur will answer for this zone directly.` A **forwarder** has no empty state at all — it renders no records grid | `Couldn't load this zone` (zone) / `Couldn't load records` (records) | stale banner on **records only** — a background zone refetch failing has no banner of its own |
-| Settings | layout-shaped skeleton | n/a (fixed 11 fields) | `Couldn't load settings` | stale banner, "Any edits below are untouched." |
+| Settings | layout-shaped skeleton | n/a (fixed 12 fields) | `Couldn't load settings` | stale banner, "Any edits below are untouched." |
 | TSIG keys | 3 skeletons | `No TSIG keys yet.` with a **New key** action — suppressed entirely while the create row is open, since the row is already the answer | `Couldn't load TSIG keys` | stale banner |
 | Account | 2-card skeleton | `No API tokens yet` | **two**: `Couldn't load your account` (the account card, first load failed) and `Couldn't load API tokens` (the token card, independently) | stale banner |
 
@@ -1417,7 +1433,7 @@ typing in an input.
 | **Filtering → Groups & Clients** | CRUD works, but the per-group "Lists (n)" menu has **no error state**: it's disabled only while `isPending`, not on `isError`, and its toggle rebuilds the assignment set from `groupLists.data ?? []`. If that read failed, clicking one list PUTs `[thatOne]` and **silently drops every other assignment**. |
 | **Filtering → Lists** | The table leads with the list's `name`; the URL is a muted second line and stays in the row's `title`. Actions (toggle, rename, delete) are labelled by name. The **Status** column replaces the old "Last refreshed" one and carries the badge plus a plain-language line per `last_status`. |
 | **Dashboard health** | Reduced to the shell's two row-1 readouts (blocking state, and `DNS OK`/`DNS down` from `GET /health`). Filter-list freshness moved off the dashboard with the redesign and now lives only on Filtering → Lists. The spec's "upstreams healthy" signal **has no code at all** — there is no upstream-health endpoint. |
-| **Settings** | 11 keys work. The spec's "storage (read-only info)" section is absent, with a code comment noting no endpoint exists to source it. |
+| **Settings** | 12 keys work. The spec's "storage (read-only info)" section is absent, with a code comment noting no endpoint exists to source it. |
 | **Account** | TOTP and tokens are complete. **Change password is not implemented**; the page says so: *"Password changes aren't available yet — that's planned for a future update."* |
 | **Command palette** | Navigates to the 9 leaf pages only, grouped by nav section. The spec's "quick actions (pause, block a domain)" don't exist. |
 

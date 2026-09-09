@@ -44,6 +44,7 @@ func defaultSettings() map[string]string {
 		"lists.refresh_hours":   "24",
 		"qlog.retention_days":   "90",
 		"qlog.privacy":          "full",
+		"stats.retention_days":  "365",
 		"serve.dot.enabled":     "false",
 		"serve.dot.listen":      ":853",
 		"serve.doh.enabled":     "false",
@@ -801,7 +802,14 @@ func (a *App) Start(ctx context.Context) error {
 	// prune, so it has to read under the context that ends when the app
 	// stops rather than under the caller's, which in cmd/dnsaur is cancelled
 	// by SIGTERM and would make the last prune read nothing.
-	pruner := qlog.NewPruner(a.st.QueryLog(), func() int64 { return a.getInt(runCtx, "qlog.retention_days", 90) })
+	//
+	// It prunes stats_hourly on the same pass, on its own retention: the
+	// rollups are a row per hour per name and per client, small enough to
+	// keep for a year against the query log's ninety days, but not small
+	// enough to keep forever.
+	pruner := qlog.NewPruner(a.st.QueryLog(), a.st.Stats(),
+		func() int64 { return a.getInt(runCtx, "qlog.retention_days", 90) },
+		func() int64 { return a.getInt(runCtx, "stats.retention_days", 365) })
 	rollups := stats.NewRunner(a.st.Stats(), a.st.Settings(), time.Minute)
 	refreshEvery := time.Duration(a.getInt(ctx, "lists.refresh_hours", 24)) * time.Hour
 	changes := a.st.Settings().Changes()

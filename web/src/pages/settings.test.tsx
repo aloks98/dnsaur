@@ -25,6 +25,7 @@ function fullSettings(overrides: Partial<Settings> = {}): Settings {
     "lists.refresh_hours": "24",
     "qlog.retention_days": "90",
     "qlog.privacy": "full",
+    "stats.retention_days": "365",
     "serve.dot.enabled": "false",
     "serve.dot.listen": ":853",
     "serve.doh.enabled": "false",
@@ -165,6 +166,34 @@ test("changing one field PUTs only that key and toasts success", async () => {
   await waitFor(() => expect(requestBody).toEqual({ key: "blocking.ttl", value: "45" }));
   expect(putCount).toBe(1);
   await waitFor(() => expect(successSpy).toHaveBeenCalledWith("1 setting updated"));
+});
+
+// stats.retention_days sits beside the query log's own retention, which is
+// a different number for a different table: the log is per-query rows, this
+// is the hourly totals the dashboard reads. Two fields with the same label
+// would be unusable, so the labels differ and each has to save its own key.
+test("statistics retention shows its stored value and PUTs its own key", async () => {
+  const user = userEvent.setup();
+  let requestBody: unknown;
+  mockSettings(fullSettings());
+  server.use(
+    http.put("/api/v1/settings", async ({ request }) => {
+      requestBody = await request.json();
+      return new HttpResponse(null, { status: 204 });
+    }),
+  );
+
+  renderWithProviders(<SettingsPage />);
+  await screen.findByText("Upstreams");
+
+  expect(screen.getByLabelText(/^retention \(days\)$/i)).toHaveValue("90");
+  const statsInput = screen.getByLabelText(/^statistics retention \(days\)$/i);
+  expect(statsInput).toHaveValue("365");
+  await user.clear(statsInput);
+  await user.type(statsInput, "30");
+  await user.click(screen.getAllByRole("button", { name: /^save changes$/i })[0]);
+
+  await waitFor(() => expect(requestBody).toEqual({ key: "stats.retention_days", value: "30" }));
 });
 
 // The FormItem wrapping one labelled field — the badge, label, control,

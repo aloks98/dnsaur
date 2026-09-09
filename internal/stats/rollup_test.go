@@ -22,6 +22,10 @@ func (f *fakeStatsStore) Rollup(ctx context.Context, afterID int64) (int64, erro
 	return f.lastID, nil
 }
 
+func (f *fakeStatsStore) PruneBefore(ctx context.Context, bucketBeforeSec int64) (int64, error) {
+	return 0, nil
+}
+
 func (f *fakeStatsStore) Counter(ctx context.Context, bucketFromSec int64, metric string) (map[string]int64, error) {
 	return nil, nil
 }
@@ -33,6 +37,7 @@ func (f *fakeStatsStore) Timeline(ctx context.Context, fromSec int64) (map[int64
 // fakeSettingsStore holds in-memory settings and records SetInternal calls.
 type fakeSettingsStore struct {
 	values           map[string]string
+	getErr           error
 	setInternalErr   error
 	setInternalCalls []struct {
 		key   string
@@ -45,6 +50,9 @@ func newFakeSettingsStore() *fakeSettingsStore {
 }
 
 func (f *fakeSettingsStore) Get(ctx context.Context, key string) (string, bool, error) {
+	if f.getErr != nil {
+		return "", false, f.getErr
+	}
 	v, ok := f.values[key]
 	return v, ok, nil
 }
@@ -83,7 +91,9 @@ func (f *fakeSettingsStore) All(ctx context.Context) (map[string]string, error) 
 }
 
 func TestRunnerHappyPath(t *testing.T) {
-	// Watermark 0 → Rollup(0) → watermark written with returned lastID
+	// No watermark stored → Rollup(0). The watermark itself is written by
+	// the store, inside the rollup transaction — see
+	// TestRunnerLeavesTheWatermarkToTheStore.
 	ctx := context.Background()
 	ss := &fakeStatsStore{lastID: 42}
 	settings := newFakeSettingsStore()
@@ -94,16 +104,10 @@ func TestRunnerHappyPath(t *testing.T) {
 	if len(ss.calls) != 1 || ss.calls[0] != 0 {
 		t.Fatalf("rollup not called with 0: %v", ss.calls)
 	}
-	if len(settings.setInternalCalls) != 1 {
-		t.Fatalf("setInternal not called: %d calls", len(settings.setInternalCalls))
-	}
-	if settings.setInternalCalls[0].key != "stats.watermark" || settings.setInternalCalls[0].value != "42" {
-		t.Fatalf("watermark not set correctly: %v", settings.setInternalCalls[0])
-	}
 }
 
 func TestRunnerNoOp(t *testing.T) {
-	// Rollup returns afterID → SetInternal NOT called
+	// A stored watermark is where the next rollup starts.
 	ctx := context.Background()
 	settings := newFakeSettingsStore()
 	settings.values["stats.watermark"] = "42"
@@ -114,9 +118,6 @@ func TestRunnerNoOp(t *testing.T) {
 
 	if len(ss.calls) != 1 || ss.calls[0] != 42 {
 		t.Fatalf("rollup not called with 42: %v", ss.calls)
-	}
-	if len(settings.setInternalCalls) != 0 {
-		t.Fatalf("setInternal should not be called when no new data: %d calls", len(settings.setInternalCalls))
 	}
 }
 
@@ -135,21 +136,71 @@ func TestRunnerCorruptWatermark(t *testing.T) {
 	}
 }
 
-func TestRunnerSetInternalFailure(t *testing.T) {
-	// Rollup called, but SetInternal fails → warning logged, no panic
+// TestRunnerLeavesTheWatermarkToTheStore: the counts and the record of how
+// far they got are one fact and must be written once. When the runner wrote
+// the watermark itself, a failed write after a committed rollup left the
+// batch counted and the progress unrecorded, and the next tick added the
+// same rows on top — permanently, since the hourly counters are additive.
+// The store now writes it inside the rollup transaction, so there is no
+// second write left to fail: a SetInternal that would error is never called.
+func TestRunnerLeavesTheWatermarkToTheStore(t *testing.T) {
 	ctx := context.Background()
 	ss := &fakeStatsStore{lastID: 100}
 	settings := newFakeSettingsStore()
 	settings.setInternalErr = fmt.Errorf("disk full")
 
 	runner := NewRunner(ss, settings, 100*time.Millisecond)
-	// Should not panic
 	runner.once(ctx)
 
 	if len(ss.calls) != 1 || ss.calls[0] != 0 {
 		t.Fatalf("rollup should be called: %v", ss.calls)
 	}
-	if len(settings.setInternalCalls) != 1 {
-		t.Fatalf("setInternal should be attempted: %d calls", len(settings.setInternalCalls))
+	if len(settings.setInternalCalls) != 0 {
+		t.Fatalf("runner wrote the watermark outside the rollup transaction: %v", settings.setInternalCalls)
+	}
+}
+
+// TestRunnerWatermarkReadFailure: a watermark the store cannot read is not a
+// watermark of 0. Rolling up from 0 re-adds every query_log row still in
+// retention onto the hourly counters, which are additive, so one failed read
+// doubles every dashboard number for as long as those rows are kept — and
+// the same tick would then record the new watermark, so nothing ever
+// corrects it. The tick has to be skipped, exactly as a corrupt watermark
+// skips it.
+func TestRunnerWatermarkReadFailure(t *testing.T) {
+	ctx := context.Background()
+	settings := newFakeSettingsStore()
+	settings.values["stats.watermark"] = "42"
+	settings.getErr = fmt.Errorf("database is locked")
+	ss := &fakeStatsStore{lastID: 100}
+
+	runner := NewRunner(ss, settings, 100*time.Millisecond)
+	runner.once(ctx)
+
+	if len(ss.calls) != 0 {
+		t.Fatalf("rollup should not be called when the watermark cannot be read: %v", ss.calls)
+	}
+	if len(settings.setInternalCalls) != 0 {
+		t.Fatalf("watermark written after a failed read: %v", settings.setInternalCalls)
+	}
+}
+
+// TestRunnerRollupFailureKeepsWatermark: a rollup that failed counted
+// nothing, so the watermark must stay where it was — advancing it would skip
+// the rows the failed tick was supposed to count.
+func TestRunnerRollupFailureKeepsWatermark(t *testing.T) {
+	ctx := context.Background()
+	settings := newFakeSettingsStore()
+	settings.values["stats.watermark"] = "42"
+	ss := &fakeStatsStore{lastID: 100, returnError: fmt.Errorf("disk full")}
+
+	runner := NewRunner(ss, settings, 100*time.Millisecond)
+	runner.once(ctx)
+
+	if len(ss.calls) != 1 || ss.calls[0] != 42 {
+		t.Fatalf("rollup not called from the stored watermark: %v", ss.calls)
+	}
+	if settings.values["stats.watermark"] != "42" {
+		t.Fatalf("watermark moved to %q", settings.values["stats.watermark"])
 	}
 }

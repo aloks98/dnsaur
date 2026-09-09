@@ -162,7 +162,7 @@ func sortedKeys[V any](m map[string]V) []string {
 //
 // The list is prose, hand-maintained, and sits beside a route/method
 // cross-check that has been automated since it was written — which is
-// exactly where drift lands. It is in sync today (17/17); nothing kept it
+// exactly where drift lands. It is in sync today (18/18); nothing kept it
 // that way, and an operator reading the document is entitled to a list that
 // is neither short nor long.
 //

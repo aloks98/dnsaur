@@ -19,9 +19,25 @@ func NewRunner(ss store.StatsStore, settings store.SettingsStore, every time.Dur
 	return &Runner{ss: ss, settings: settings, every: every}
 }
 
+// once rolls up whatever query_log holds beyond the stored watermark. The
+// watermark is only read here: the store records the new one inside the
+// rollup transaction (see store.StatsStore.Rollup), so counting a batch and
+// remembering it cannot come apart.
+//
+// A watermark that cannot be read is not a watermark of zero. Rolling up
+// from zero re-adds every row still within query-log retention onto counters
+// that are additive, doubling every figure the dashboard shows, and the tick
+// that did it records a fresh watermark, so it never corrects itself. A read
+// failure therefore skips the tick, exactly as an unparseable value does —
+// stats lag by a minute, which is the cheap half of that trade.
 func (r *Runner) once(ctx context.Context) {
 	var after int64
-	if v, ok, _ := r.settings.Get(ctx, "stats.watermark"); ok {
+	v, ok, err := r.settings.Get(ctx, store.StatsWatermarkKey)
+	if err != nil {
+		slog.Warn("stats watermark unreadable, skipping rollup tick", "err", err)
+		return
+	}
+	if ok {
 		n, err := strconv.ParseInt(v, 10, 64)
 		if err != nil {
 			slog.Warn("stats watermark corrupt, skipping rollup tick", "value", v, "err", err)
@@ -29,15 +45,8 @@ func (r *Runner) once(ctx context.Context) {
 		}
 		after = n
 	}
-	last, err := r.ss.Rollup(ctx, after)
-	if err != nil {
+	if _, err := r.ss.Rollup(ctx, after); err != nil {
 		slog.Warn("stats rollup failed", "err", err)
-		return
-	}
-	if last != after {
-		if err := r.settings.SetInternal(ctx, "stats.watermark", strconv.FormatInt(last, 10)); err != nil {
-			slog.Warn("stats watermark write failed", "err", err)
-		}
 	}
 }
 

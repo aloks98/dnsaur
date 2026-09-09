@@ -3,6 +3,8 @@ package qlog
 import (
 	"context"
 	"fmt"
+	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -90,13 +92,49 @@ func TestAnonPrivacy(t *testing.T) {
 	}
 }
 
+// fakeStatsStore records the bucket cutoff the prune asked for. The rest of
+// the interface is unreachable from the Pruner.
+type fakeStatsStore struct {
+	mu     sync.Mutex
+	cutoff int64
+	called bool
+}
+
+func (f *fakeStatsStore) Rollup(ctx context.Context, afterID int64) (int64, error) {
+	return afterID, nil
+}
+
+func (f *fakeStatsStore) PruneBefore(ctx context.Context, bucketBeforeSec int64) (int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.cutoff, f.called = bucketBeforeSec, true
+	return 0, nil
+}
+
+func (f *fakeStatsStore) Counter(ctx context.Context, bucketFromSec int64, metric string) (map[string]int64, error) {
+	return nil, nil
+}
+
+func (f *fakeStatsStore) Timeline(ctx context.Context, fromSec int64) (map[int64]map[string]int64, error) {
+	return nil, nil
+}
+
 func TestPrunerUsesRetention(t *testing.T) {
 	fs := &fakeQLStore{}
-	p := NewPruner(fs, func() int64 { return 90 })
-	p.pruneOnce(context.Background(), time.UnixMilli(100*24*3600*1000))
-	want := int64((100 - 90) * 24 * 3600 * 1000)
+	st := &fakeStatsStore{}
+	p := NewPruner(fs, st, func() int64 { return 90 }, func() int64 { return 365 })
+	p.pruneOnce(context.Background(), time.UnixMilli(1000*24*3600*1000))
+	want := int64((1000 - 90) * 24 * 3600 * 1000)
 	if fs.cutoff != want {
 		t.Fatalf("cutoff %d want %d", fs.cutoff, want)
+	}
+	// stats_hourly.bucket is a unix *second*, not a millisecond.
+	wantStats := int64((1000 - 365) * 24 * 3600)
+	if !st.called {
+		t.Fatal("stats_hourly was not pruned")
+	}
+	if st.cutoff != wantStats {
+		t.Fatalf("stats cutoff %d want %d", st.cutoff, wantStats)
 	}
 }
 
@@ -136,6 +174,114 @@ func TestDropOldestKeepsNewest(t *testing.T) {
 			t.Fatalf("entry %d: QName = %s, want %s", i, e.QName, want)
 		}
 	}
+}
+
+// dropCounter counts the warnings the drop report writes, so a test can
+// assert both that one was written and that the next minute's worth were
+// not.
+type dropCounter struct {
+	mu sync.Mutex
+	n  int
+}
+
+func (h *dropCounter) Enabled(context.Context, slog.Level) bool { return true }
+
+func (h *dropCounter) Handle(_ context.Context, r slog.Record) error {
+	if strings.Contains(r.Message, "query log entries dropped") {
+		h.mu.Lock()
+		h.n++
+		h.mu.Unlock()
+	}
+	return nil
+}
+
+func (h *dropCounter) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *dropCounter) WithGroup(string) slog.Handler      { return h }
+
+func (h *dropCounter) count() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.n
+}
+
+// countDrops installs the counter as the default logger for one test.
+func countDrops(t *testing.T) *dropCounter {
+	t.Helper()
+	h := &dropCounter{}
+	prev := slog.Default()
+	slog.SetDefault(slog.New(h))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	return h
+}
+
+// TestDroppedEntriesWarnRateLimited: a full buffer discards queries, and
+// until now it did so in total silence — the counter existed and nothing
+// read it. The flush loop reports it instead, but at most once a minute:
+// the burst that fills a 10k buffer would otherwise write a warning per
+// second for as long as it lasts, which is a log nobody can read at the
+// moment it matters most.
+func TestDroppedEntriesWarnRateLimited(t *testing.T) {
+	warnings := countDrops(t)
+	l := New(&fakeQLStore{}, Options{Buffer: 2, BatchSize: 100, FlushEvery: time.Hour})
+	h := l.Middleware()(blockedHandler())
+	for i := 0; i < 5; i++ {
+		m := new(dns.Msg)
+		m.SetQuestion(dns.Fqdn(fmt.Sprintf("q%d.example", i)), dns.TypeA)
+		_, _ = h.ServeDNS(context.Background(), &dnssrv.Request{Msg: m})
+	}
+	if l.Dropped() != 3 {
+		t.Fatalf("Dropped() = %d, want 3", l.Dropped())
+	}
+
+	start := time.Unix(1700000000, 0)
+	l.reportDropped(start)
+	if warnings.count() != 1 {
+		t.Fatalf("%d warnings after the first report, want 1", warnings.count())
+	}
+	// More drops, still inside the same minute: counted, not logged.
+	for i := 0; i < 3; i++ {
+		m := new(dns.Msg)
+		m.SetQuestion("more.example.", dns.TypeA)
+		_, _ = h.ServeDNS(context.Background(), &dnssrv.Request{Msg: m})
+	}
+	l.reportDropped(start.Add(30 * time.Second))
+	if warnings.count() != 1 {
+		t.Fatalf("%d warnings inside the rate-limit window, want 1", warnings.count())
+	}
+	l.reportDropped(start.Add(61 * time.Second))
+	if warnings.count() != 2 {
+		t.Fatalf("%d warnings after the window, want 2", warnings.count())
+	}
+	// Nothing new dropped since: silence, however long we wait.
+	l.reportDropped(start.Add(10 * time.Minute))
+	if warnings.count() != 2 {
+		t.Fatalf("%d warnings with no new drops, want 2", warnings.count())
+	}
+}
+
+// TestRunReportsDrops: the report has to be wired into the flush loop, not
+// merely available — a burst that fills the buffer while the store is busy
+// is exactly when nobody is calling anything by hand.
+func TestRunReportsDrops(t *testing.T) {
+	warnings := countDrops(t)
+	l := New(&fakeQLStore{}, Options{Buffer: 2, BatchSize: 100, FlushEvery: 5 * time.Millisecond})
+	h := l.Middleware()(blockedHandler())
+	for i := 0; i < 5; i++ {
+		m := new(dns.Msg)
+		m.SetQuestion(dns.Fqdn(fmt.Sprintf("q%d.example", i)), dns.TypeA)
+		_, _ = h.ServeDNS(context.Background(), &dnssrv.Request{Msg: m})
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go l.Run(ctx)
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if warnings.count() > 0 {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("the flush loop never reported the dropped entries")
 }
 
 // TestSetPrivacyHotReload verifies privacy is a live setting: flipping it

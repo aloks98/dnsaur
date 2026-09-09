@@ -107,12 +107,23 @@ func (s *Server) handleStatsOverview(w http.ResponseWriter, r *http.Request) {
 	for _, n := range decisions {
 		total += n
 	}
+	// Entries the query-log buffer discarded because it was full, since
+	// this process started. It belongs beside the counts rather than in a
+	// corner of the log: every figure here is derived from the query log,
+	// and a non-zero value is what says they are undercounts. Deps.Logger
+	// is nil on a server with no query logging at all, which has dropped
+	// nothing.
+	var dropped int64
+	if s.deps.Logger != nil {
+		dropped = s.deps.Logger.Dropped()
+	}
 	writeJSON(w, http.StatusOK, map[string]int64{
 		"total":     total,
 		"blocked":   decisions["blocked"],
 		"cached":    decisions["cached"] + decisions["stale"],
 		"forwarded": decisions["forwarded"],
 		"clients":   int64(len(clients)),
+		"dropped":   dropped,
 	})
 }
 
