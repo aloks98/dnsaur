@@ -56,6 +56,33 @@ document.addEventListener(
   true,
 );
 
+// jsdom does not implement IntersectionObserver, and — having no layout —
+// could not answer the question it asks. The zones list defers a per-row
+// record count until the row is on screen (RecordsCell), so the default here
+// is the answer that keeps every other test describing a page whose rows are
+// all visible: observing an element reports it as intersecting at once. A
+// test about the *deferral* installs its own observer over this one (see
+// pages/zones/list.test.tsx).
+if (typeof window.IntersectionObserver !== "function") {
+  window.IntersectionObserver = class IntersectionObserver {
+    constructor(private readonly callback: IntersectionObserverCallback) {}
+    observe(target: Element) {
+      this.callback(
+        [{ target, isIntersecting: true } as IntersectionObserverEntry],
+        this as unknown as globalThis.IntersectionObserver,
+      );
+    }
+    unobserve() {}
+    disconnect() {}
+    takeRecords(): IntersectionObserverEntry[] {
+      return [];
+    }
+    readonly root = null;
+    readonly rootMargin = "";
+    readonly thresholds = [];
+  } as unknown as typeof window.IntersectionObserver;
+}
+
 // jsdom does not implement ResizeObserver. rnui's InputOTP (via the
 // input-otp library) observes its container to size itself, so stub it out
 // under test.

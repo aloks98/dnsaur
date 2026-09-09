@@ -247,15 +247,16 @@ test("a parser error from the API lands on the data field", async () => {
   // The parser's own text, rendered mono — not rewritten into friendly prose.
   expect(message).toHaveClass("font-mono");
   expect(screen.getByLabelText(/^data$/i)).toHaveAttribute("aria-invalid", "true");
+  // Announced, not merely on screen: the message carries the id the Data
+  // field's own aria-describedby points at.
+  expect(screen.getByLabelText(/^data$/i)).toHaveAccessibleDescription(/dns: bad MX Mx/);
 
-  // …and it renders *under Data*, which takes holding the three quiet
-  // columns open: FormMessage renders null when its field has no error, so
-  // without a cell of their own the row would have two children and grid
-  // auto-placement would slide this message left under Name.
-  const cell = message.parentElement;
-  const errorRow = cell?.parentElement;
-  expect(errorRow?.children).toHaveLength(5);
-  expect(Array.from(errorRow?.children ?? []).indexOf(cell as Element)).toBe(3);
+  // …and it renders *under Data*: the message lives inside that column's own
+  // grid cell, so nothing can place it under Name.
+  const cell = message.parentElement?.parentElement;
+  const row = cell?.parentElement;
+  expect(row?.children).toHaveLength(5);
+  expect(Array.from(row?.children ?? []).indexOf(cell as Element)).toBe(3);
 });
 
 // One text input serves nine record types; the DNS parser (not a per-type
@@ -512,9 +513,168 @@ test("editing a record seeds the row and PUTs the update", async () => {
   await user.click(screen.getByRole("button", { name: /^save$/i }));
 
   await waitFor(() =>
-    expect(body).toEqual({ name: "bifrost", type: "A", ttl: 300, rdata: "10.0.0.9" }),
+    expect(body).toEqual({
+      name: "bifrost",
+      type: "A",
+      ttl: 300,
+      rdata: "10.0.0.9",
+      enabled: true,
+      comment: "",
+    }),
   );
   expect(requestUrl).toMatch(/\/api\/v1\/zones\/1\/records\/7$/);
+});
+
+// PUT is a full replace and zones.BuildRecord defaults an absent `enabled`
+// to true and an absent `comment` to "", so a payload carrying neither
+// re-enables a disabled record and wipes its comment — for an edit that only
+// touched the TTL.
+test("editing a disabled, commented record keeps both in the PUT body", async () => {
+  const user = userEvent.setup();
+  let body: unknown;
+  mockZone(zone({ id: 1 }));
+  mockRecords(1, [
+    record({
+      id: 7,
+      name: "bifrost",
+      type: "A",
+      ttl: 300,
+      rdata: "10.0.0.1",
+      enabled: false,
+      comment: "parked until the move",
+    }),
+  ]);
+  server.use(
+    http.put("/api/v1/zones/1/records/7", async ({ request }) => {
+      body = await request.json();
+      return new HttpResponse(null, { status: 204 });
+    }),
+  );
+
+  renderDetail();
+  await waitFor(() => expect(recordRows()).toHaveLength(1));
+
+  await user.click(screen.getByRole("button", { name: /edit bifrost a 10\.0\.0\.1/i }));
+  await waitFor(() => expect(screen.getByLabelText(/zone record name/i)).toHaveValue("bifrost"));
+
+  const ttlField = screen.getByLabelText(/^ttl$/i);
+  await user.clear(ttlField);
+  await user.type(ttlField, "600");
+  await user.click(screen.getByRole("button", { name: /^save$/i }));
+
+  await waitFor(() =>
+    expect(body).toEqual({
+      name: "bifrost",
+      type: "A",
+      ttl: 600,
+      rdata: "10.0.0.1",
+      enabled: false,
+      comment: "parked until the move",
+    }),
+  );
+});
+
+// A disabled record is dropped when the served snapshot is built, so a grid
+// that draws it like every other row claims it is being answered.
+test("a disabled record's row says so", async () => {
+  mockZone(zone({ id: 1 }));
+  mockRecords(1, [
+    record({ id: 7, name: "bifrost", enabled: false }),
+    record({ id: 8, name: "nas", enabled: true }),
+  ]);
+
+  renderDetail();
+  const rows = await waitFor(() => {
+    const found = recordRows();
+    expect(found).toHaveLength(2);
+    return found;
+  });
+
+  expect(within(rows[0]).getByText("Disabled")).toBeInTheDocument();
+  expect(rows[0].dataset.enabled).toBe("false");
+  expect(within(rows[1]).queryByText("Disabled")).not.toBeInTheDocument();
+  expect(rows[1].dataset.enabled).toBe("true");
+});
+
+// The server takes any type dns.NewRR parses, so a zone imported from
+// elsewhere can hold one the select has no option for. Without a passthrough
+// option the browser shows the first option instead ("A"), and saving would
+// rewrite the record's type to it.
+test("a record of an unlisted type can be edited without changing its type", async () => {
+  const user = userEvent.setup();
+  let body: unknown;
+  mockZone(zone({ id: 1 }));
+  mockRecords(1, [
+    record({ id: 7, name: "_443._tcp", type: "TLSA", ttl: 300, rdata: "3 1 1 abc" }),
+  ]);
+  server.use(
+    http.put("/api/v1/zones/1/records/7", async ({ request }) => {
+      body = await request.json();
+      return new HttpResponse(null, { status: 204 });
+    }),
+  );
+
+  renderDetail();
+  await waitFor(() => expect(recordRows()).toHaveLength(1));
+
+  await user.click(screen.getByRole("button", { name: /edit _443\._tcp tlsa 3 1 1 abc/i }));
+  await waitFor(() => expect(screen.getByLabelText(/^record type$/i)).toHaveValue("TLSA"));
+
+  const ttlField = screen.getByLabelText(/^ttl$/i);
+  await user.clear(ttlField);
+  await user.type(ttlField, "900");
+  await user.click(screen.getByRole("button", { name: /^save$/i }));
+
+  await waitFor(() =>
+    expect(body).toEqual({
+      name: "_443._tcp",
+      type: "TLSA",
+      ttl: 900,
+      rdata: "3 1 1 abc",
+      enabled: true,
+      comment: "",
+    }),
+  );
+});
+
+// Adding one record is usually adding several of the same kind, and the two
+// fields that repeat are exactly the two that were being cleared.
+test("a successful Add clears name and data but keeps type and TTL", async () => {
+  const user = userEvent.setup();
+  mockZone(zone({ id: 1 }));
+  mockRecords(1, []);
+  server.use(http.post("/api/v1/zones/1/records", () => HttpResponse.json({ id: 9 })));
+
+  renderDetail();
+  await openAddRow(user);
+
+  await user.selectOptions(screen.getByLabelText(/^record type$/i), "AAAA");
+  const ttlField = screen.getByLabelText(/^ttl$/i);
+  await user.clear(ttlField);
+  await user.type(ttlField, "900");
+  await user.type(screen.getByLabelText(/zone record name/i), "bifrost");
+  await user.type(screen.getByLabelText(/^data$/i), "fd00::28");
+  await user.click(screen.getByRole("button", { name: /^add$/i }));
+
+  await waitFor(() => expect(screen.getByLabelText(/zone record name/i)).toHaveValue(""));
+  expect(screen.getByLabelText(/^data$/i)).toHaveValue("");
+  expect(screen.getByLabelText(/^record type$/i)).toHaveValue("AAAA");
+  expect(screen.getByLabelText(/^ttl$/i)).toHaveValue("900");
+});
+
+// A 2048-bit DKIM key in a single-line input is one long unreadable ribbon.
+test("TXT rdata gets a textarea, other types a single-line input", async () => {
+  const user = userEvent.setup();
+  mockZone(zone({ id: 1 }));
+  mockRecords(1, []);
+
+  renderDetail();
+  await openAddRow(user);
+
+  expect(screen.getByLabelText(/^data$/i).tagName).toBe("INPUT");
+
+  await user.selectOptions(screen.getByLabelText(/^record type$/i), "TXT");
+  expect(screen.getByLabelText(/^data$/i).tagName).toBe("TEXTAREA");
 });
 
 // ── Editing happens in the record's own row ───────────────────────────────
@@ -1243,6 +1403,43 @@ test("a dry run still in flight shows progress and cannot be fired twice", async
   expect(posted).toHaveLength(1);
 });
 
+// Cancelling closes the dialog, and the dry run it was waiting on is still in
+// flight: without a token to compare against, its onSuccess set phase = diff
+// and the dialog reopened by itself seconds after being dismissed.
+test("Cancel during the dry run keeps the dialog closed when the result lands", async () => {
+  const user = userEvent.setup();
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  server.use(
+    http.post("/api/v1/zones/1/file", async () => {
+      await held;
+      return HttpResponse.json({
+        add: [record({ id: 3, name: "nas", rdata: "10.0.0.3" })],
+        change: [],
+        delete: [],
+        errors: [],
+      });
+    }),
+  );
+
+  renderZoneDetail({ zone: zone({ id: 1, name: "e412.in" }) });
+  await chooseFile(user);
+  expect(await screen.findByText(/checking what this file would change/i)).toBeInTheDocument();
+
+  await user.click(screen.getByRole("button", { name: /^cancel$/i }));
+  await waitFor(() =>
+    expect(screen.queryByText(/checking what this file would change/i)).not.toBeInTheDocument(),
+  );
+
+  release();
+  // Long enough for the settled mutation to run its onSuccess.
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  expect(screen.queryByText(/1 record/i)).not.toBeInTheDocument();
+});
+
 // An over-cap body is a 413 carrying only the flat `{"error": …}` envelope —
 // no `errors` array to render — so this is the path where zoneFileErrors'
 // fallback to the summary is what keeps the dialog from coming up blank.
@@ -1359,11 +1556,23 @@ test("the transfer band names the TSIG key, resolving it from its id", async () 
   expect(await screen.findByText("xfer.e412.in.")).toBeInTheDocument();
 });
 
-test("a secondary with no TSIG key says none rather than showing a zero", async () => {
+test("a secondary with no TSIG key says unsigned rather than showing a zero", async () => {
   renderZoneDetail({ zone: secondary({ tsig_key_id: 0 }) });
   await screen.findByText("e412.in");
 
-  expect(screen.getByText("none")).toBeInTheDocument();
+  expect(await screen.findByText("unsigned")).toBeInTheDocument();
+  expect(screen.queryByText("0")).not.toBeInTheDocument();
+});
+
+// The other half of the same mapping: an id the loaded list has no key for
+// is a key deleted out from under the zone, and saying so takes the list
+// having actually arrived.
+test("an id the loaded key list cannot name is marked missing", async () => {
+  server.use(http.get("/api/v1/tsig-keys", () => HttpResponse.json([])));
+  renderZoneDetail({ zone: secondary({ tsig_key_id: 3 }) });
+  await screen.findByText("e412.in");
+
+  expect(await screen.findByText("#3 (missing)")).toBeInTheDocument();
 });
 
 // The badge an `enabled` flag alone gets most wrong: this zone is enabled in
@@ -1554,12 +1763,12 @@ test("a disabled secondary does not claim to be retrying or serving", async () =
   expect(screen.queryByText(/still serving the copy/i)).not.toBeInTheDocument();
   expect(screen.getByText("not while disabled")).toBeInTheDocument();
   // And it must not claim to answer nothing either. A disabled zone is
-  // skipped by Index.Find, so names under it are *forwarded* — the zone stops
-  // being consulted rather than starting to refuse. Saying "answers nothing"
-  // would describe the one behaviour it does not have, and would hide the
-  // thing worth knowing: an internal name is now resolved by a public server.
+  // skipped by Index.Find, so names under it fall through upstream — the zone
+  // stops being consulted rather than starting to refuse, and "answers
+  // nothing" is the one behaviour it does not have. What that costs a
+  // split-horizon zone is docs/dashboard.md's to explain, not this line's.
   expect(screen.queryByText(/answers nothing/i)).not.toBeInTheDocument();
-  expect(screen.getByText(/forwarded upstream/i)).toBeInTheDocument();
+  expect(screen.getByText("Nothing transfers while this zone is disabled.")).toBeInTheDocument();
 });
 
 // A disabled zone that had failed before it was switched off keeps that
@@ -1577,7 +1786,7 @@ test("a disabled secondary keeps its recorded failure but not the failure's cons
 
   expect(await screen.findByTestId("transfer-error")).toHaveTextContent("connection refused");
   expect(screen.queryByText(/still serving the copy/i)).not.toBeInTheDocument();
-  expect(screen.getByText(/forwarded upstream/i)).toBeInTheDocument();
+  expect(screen.getByText("Nothing transfers while this zone is disabled.")).toBeInTheDocument();
 });
 
 // `overdue` is the state added beyond the design boards: the refresh deadline
@@ -2192,13 +2401,13 @@ test("a forwarder shows its upstreams in the FORWARD TO row, counted", async () 
 // load. It is also the single most surprising thing about the type: a
 // claimed suffix does *not* fall back to the default resolvers, so a
 // forwarder whose upstreams are all down takes its whole suffix down with
-// it. §9.11.5, and the reason the sentence is on screen rather than in docs/.
+// it. §9.11.5 — stated, with the reasoning left to docs/dashboard.md.
 test("a forwarder states the SERVFAIL consequence of claiming its suffix", async () => {
   renderZoneDetail({ zone: forwarder() });
   await screen.findByText("Forward to");
 
   expect(
-    screen.getByText(/queries for it get SERVFAIL — they do not fall through/i),
+    screen.getByText(/claimed outright: with no upstream reachable, queries for it get SERVFAIL/i),
   ).toBeInTheDocument();
 });
 
@@ -2300,7 +2509,7 @@ test("one upstream is counted in the singular", async () => {
 // A stub claims a suffix and routes it too, but fetches the addresses rather
 // than being told them: an SOA and an NS query with glue against its master,
 // not an AXFR. So it keeps the records grid — a fetched NS set is worth
-// seeing — read-only, and its MASTER row carries the state of the fetch.
+// seeing — read-only, and its primaries row carries the state of the fetch.
 // Every one of its states carries its own date: an error with no date is a
 // claim about the present made by an unknown past.
 
@@ -2327,9 +2536,9 @@ test("a stub shows its master and dates the NS set it fetched", async () => {
   renderZoneDetail({ zone: stub(), records: NS_SET });
   await screen.findByText("ad.corp.example");
 
-  expect(screen.getByText("Master")).toBeInTheDocument();
+  expect(screen.getByText("Primaries")).toBeInTheDocument();
   expect(screen.getByText("10.0.0.9:53")).toBeInTheDocument();
-  expect(screen.getByText("NS set fetched 26m ago")).toBeInTheDocument();
+  expect(screen.getByText("fetched 26m ago")).toBeInTheDocument();
 });
 
 // The NS set is the whole point of the type, so it is listed — but it came
@@ -2429,10 +2638,10 @@ test("a failed stub fetch shows the error verbatim, dated, beside what is still 
 
   expect(screen.getByText("Last fetch · 12m ago")).toBeInTheDocument();
   expect(screen.getByTestId("stub-fetch-error")).toHaveTextContent("i/o timeout");
-  expect(screen.getByText("serving the NS set from 3d ago")).toBeInTheDocument();
+  expect(screen.getByText("serving what arrived 3d ago")).toBeInTheDocument();
   // The note beside the value goes with it: the set is old, and saying only
-  // "NS set fetched 3d ago" would read as a healthy schedule.
-  expect(screen.getByText("NS set from 3d ago")).toBeInTheDocument();
+  // "fetched 3d ago" would read as a healthy schedule.
+  expect(screen.getByText("from 3d ago")).toBeInTheDocument();
 });
 
 // The one case where "still serving" would be a lie: nothing has ever been
@@ -2454,10 +2663,10 @@ test("a stub that has never fetched does not claim to be serving an NS set", asy
     "dial udp 10.0.0.9:53: connect: connection refused",
   );
   expect(screen.getByText("Answering nothing until the first fetch succeeds.")).toBeInTheDocument();
-  expect(screen.queryByText(/serving the NS set/i)).not.toBeInTheDocument();
+  expect(screen.queryByText(/serving what arrived/i)).not.toBeInTheDocument();
   // …and the empty grid does not claim to be fetching either. "Fetching the
   // NS set from …" is present tense, and this stub is not fetching — its last
-  // attempt failed, which the MASTER row above states with its date. The
+  // attempt failed, which the primaries row above states with its date. The
   // artboard draws the present-tense line unconditionally; this is the one
   // place this page departs from it, and without this assertion the departure
   // could be undone with the whole suite green.
@@ -2483,10 +2692,10 @@ test("a stale expires_at left on a stub is never rendered as an expiry", async (
   expect(screen.getByText("Enabled")).toBeInTheDocument();
   expect(screen.queryByText("Not answering")).not.toBeInTheDocument();
   expect(screen.queryByText(/expired/i)).not.toBeInTheDocument();
-  expect(screen.getByText("NS set fetched 26m ago")).toBeInTheDocument();
+  expect(screen.getByText("fetched 26m ago")).toBeInTheDocument();
 });
 
-test("editing the MASTER row PATCHes primaries and returns to read mode", async () => {
+test("editing a stub's primaries row PATCHes primaries and returns to read mode", async () => {
   const user = userEvent.setup();
   let body: unknown;
   renderZoneDetail({ zone: stub(), records: NS_SET });
@@ -2498,21 +2707,23 @@ test("editing the MASTER row PATCHes primaries and returns to read mode", async 
   );
   await screen.findByText("ad.corp.example");
 
-  await user.click(screen.getByRole("button", { name: /^edit master$/i }));
-  const field = screen.getByLabelText(/^master$/i);
+  await user.click(screen.getByRole("button", { name: /^edit primaries$/i }));
+  const field = screen.getByLabelText(/^primaries$/i);
   expect(field).toHaveValue("10.0.0.9:53");
   await user.clear(field);
   await user.type(field, "10.0.0.10");
   await user.click(screen.getByRole("button", { name: /^save$/i }));
 
-  await waitFor(() => expect(body).toEqual({ primaries: "10.0.0.10" }));
-  await waitFor(() => expect(screen.queryByLabelText(/^master$/i)).not.toBeInTheDocument());
+  // A stub signs its SOA/NS queries with the same key column a secondary
+  // signs its transfers with, so the row carries both and sends both.
+  await waitFor(() => expect(body).toEqual({ primaries: "10.0.0.10", tsig_key_id: 0 }));
+  await waitFor(() => expect(screen.queryByLabelText(/^primaries$/i)).not.toBeInTheDocument());
 });
 
 // The server 400s a stub with no primaries — it would never fetch, so it
 // would claim its suffix and SERVFAIL it forever. Caught here only to save
 // the round trip, which is the same reason the create row catches it.
-test("a stub's master cannot be cleared, and the empty value is never sent", async () => {
+test("a stub cannot be saved with no primaries, and the empty value is never sent", async () => {
   const user = userEvent.setup();
   let patched = false;
   renderZoneDetail({ zone: stub(), records: NS_SET });
@@ -2524,8 +2735,8 @@ test("a stub's master cannot be cleared, and the empty value is never sent", asy
   );
   await screen.findByText("ad.corp.example");
 
-  await user.click(screen.getByRole("button", { name: /^edit master$/i }));
-  await user.clear(screen.getByLabelText(/^master$/i));
+  await user.click(screen.getByRole("button", { name: /^edit primaries$/i }));
+  await user.clear(screen.getByLabelText(/^primaries$/i));
   await user.click(screen.getByRole("button", { name: /^save$/i }));
 
   expect(await screen.findByText(/where to fetch from/i)).toBeInTheDocument();
@@ -2589,11 +2800,307 @@ test("a stub's page keeps asking, because its NS set arrives on a schedule", asy
   vi.useFakeTimers({ shouldAdvanceTime: true });
   const paths = trackFetchedPaths();
   renderZoneDetail({ zone: stub({ refreshed_at: 0 }), records: [] });
-  await screen.findByText("Master");
+  await screen.findByText("Primaries");
 
   await act(async () => {
     await vi.advanceTimersByTimeAsync(5 * 60_000);
   });
 
   expect(paths.filter((p) => p === "/api/v1/zones/1").length).toBeGreaterThan(1);
+});
+
+// ── A secondary's primaries and key are editable ──────────────────────────
+// PATCH /zones/{id} takes both on a secondary, but the page only ever
+// printed them: a primary that changed address meant deleting the secondary
+// and building it again, losing allow_transfer and notify_to with it.
+
+test("a secondary's primaries can be edited, and the PATCH carries them", async () => {
+  const user = userEvent.setup();
+  let body: unknown;
+  renderZoneDetail({ zone: secondary({ primaries: "203.0.113.9" }) });
+  server.use(
+    http.patch("/api/v1/zones/1", async ({ request }) => {
+      body = await request.json();
+      return new HttpResponse(null, { status: 204 });
+    }),
+  );
+  await screen.findByText("e412.in");
+
+  await user.click(await screen.findByRole("button", { name: /^edit primaries$/i }));
+  const field = await screen.findByLabelText(/^primaries$/i);
+  await user.clear(field);
+  await user.type(field, "203.0.113.10, ns2.example.net:5353");
+  await user.click(screen.getByRole("button", { name: /^save$/i }));
+
+  await waitFor(() =>
+    expect(body).toEqual({
+      primaries: "203.0.113.10, ns2.example.net:5353",
+      tsig_key_id: 0,
+    }),
+  );
+});
+
+test("a secondary's TSIG key is chosen by name and PATCHed by id", async () => {
+  const user = userEvent.setup();
+  let body: unknown;
+  server.use(
+    http.get("/api/v1/tsig-keys", () =>
+      HttpResponse.json([
+        {
+          id: 4,
+          name: "xfer.e412.in.",
+          algorithm: "hmac-sha256.",
+          secret: "Sh5ZuulpjcmcJuN6VwMQCVEhTJyUmlPTSHexvePtaWo=",
+          created_at: Date.now(),
+        },
+      ]),
+    ),
+    http.patch("/api/v1/zones/1", async ({ request }) => {
+      body = await request.json();
+      return new HttpResponse(null, { status: 204 });
+    }),
+  );
+  renderZoneDetail({ zone: secondary({ primaries: "203.0.113.9", tsig_key_id: 0 }) });
+  await screen.findByText("e412.in");
+
+  await user.click(await screen.findByRole("button", { name: /^edit primaries$/i }));
+  await user.selectOptions(await screen.findByLabelText(/^tsig key$/i), "4");
+  await user.click(screen.getByRole("button", { name: /^save$/i }));
+
+  await waitFor(() => expect(body).toEqual({ primaries: "203.0.113.9", tsig_key_id: 4 }));
+});
+
+// An empty primaries is what checkZoneTransferConfig refuses, so the row
+// mirrors that refusal rather than spending a round trip on it.
+test("a secondary cannot be saved with no primaries", async () => {
+  const user = userEvent.setup();
+  let patched = false;
+  renderZoneDetail({ zone: secondary({ primaries: "203.0.113.9" }) });
+  server.use(
+    http.patch("/api/v1/zones/1", () => {
+      patched = true;
+      return new HttpResponse(null, { status: 204 });
+    }),
+  );
+  await screen.findByText("e412.in");
+
+  await user.click(await screen.findByRole("button", { name: /^edit primaries$/i }));
+  await user.clear(await screen.findByLabelText(/^primaries$/i));
+  await user.click(screen.getByRole("button", { name: /^save$/i }));
+
+  expect(await screen.findByText(/where to fetch from/i)).toBeInTheDocument();
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  expect(patched).toBe(false);
+});
+
+// A failed key fetch is not evidence that the key is gone. Saying "(missing)"
+// for one accused the store of something only the request did.
+test("a failed TSIG key fetch does not claim the zone's key is missing", async () => {
+  server.use(
+    http.get("/api/v1/tsig-keys", () => HttpResponse.json({ error: "boom" }, { status: 500 })),
+  );
+  renderZoneDetail({ zone: secondary({ tsig_key_id: 3 }) });
+  await screen.findByText("e412.in");
+
+  expect(await screen.findByText("#3")).toBeInTheDocument();
+  expect(screen.queryByText(/missing/i)).not.toBeInTheDocument();
+});
+
+// ── What a failed load actually says ──────────────────────────────────────
+
+// A zone deleted from another tab is not a page that failed to load, and
+// "try refreshing" is advice that cannot work — the refresh 404s again.
+test("a zone that no longer exists says so, with the way back", async () => {
+  server.use(
+    http.get("/api/v1/zones/1", () => HttpResponse.json({ error: "not found" }, { status: 404 })),
+  );
+
+  renderDetail();
+
+  expect(
+    await screen.findByText("This zone no longer exists", undefined, { timeout: 3000 }),
+  ).toBeInTheDocument();
+  expect(screen.getByRole("link", { name: /zones/i })).toHaveAttribute("href", "/zones");
+  expect(screen.queryByText(/try refreshing/i)).not.toBeInTheDocument();
+});
+
+// /zones/NaN is a URL that never named a zone, so it is the catch-all's
+// question rather than a failed fetch — and nothing is requested for it.
+test("a non-numeric id is the not-found screen, and asks the API for nothing", async () => {
+  const paths = trackFetchedPaths();
+
+  renderDetail("/zones/wat");
+
+  expect(await screen.findByText("NXDOMAIN")).toBeInTheDocument();
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  expect(paths.filter((p) => p.startsWith("/api/v1/zones"))).toHaveLength(0);
+});
+
+// A record deleted from another tab: the DELETE 404s, and with nothing
+// invalidated the row it is about stayed on screen looking live.
+test("a 404 on delete drops the row rather than leaving it", async () => {
+  const user = userEvent.setup();
+  let listReads = 0;
+  let gone = false;
+  server.use(
+    http.get("/api/v1/zones/1/records", () => {
+      listReads += 1;
+      return HttpResponse.json(gone ? [] : [record({ id: 7, name: "bifrost" })]);
+    }),
+    http.delete("/api/v1/zones/1/records/7", () => {
+      gone = true;
+      return HttpResponse.json({ error: "record not found" }, { status: 404 });
+    }),
+  );
+  mockZone(zone({ id: 1 }));
+  renderDetail();
+  await waitFor(() => expect(recordRows()).toHaveLength(1));
+  const before = listReads;
+
+  await user.click(screen.getByRole("button", { name: /delete bifrost a 10\.0\.0\.1/i }));
+  await user.click(screen.getByRole("button", { name: /^delete$/i }));
+
+  await waitFor(() => expect(recordRows()).toHaveLength(0));
+  expect(listReads).toBeGreaterThan(before);
+});
+
+// The same record, edited rather than deleted: "record not found" is not a
+// complaint about the rdata that was typed, and leaving the form open on it
+// invited retyping a record that no longer exists.
+test("a 404 on save closes the edit and refetches instead of blaming the data", async () => {
+  const user = userEvent.setup();
+  let gone = false;
+  server.use(
+    http.get("/api/v1/zones/1/records", () =>
+      HttpResponse.json(gone ? [] : [record({ id: 7, name: "bifrost" })]),
+    ),
+    http.put("/api/v1/zones/1/records/7", () => {
+      gone = true;
+      return HttpResponse.json({ error: "record not found" }, { status: 404 });
+    }),
+  );
+  mockZone(zone({ id: 1 }));
+  renderDetail();
+  await waitFor(() => expect(recordRows()).toHaveLength(1));
+
+  await user.click(screen.getByRole("button", { name: /edit bifrost a 10\.0\.0\.1/i }));
+  const data = await screen.findByLabelText(/^data$/i);
+  await user.clear(data);
+  await user.type(data, "10.0.0.9");
+  await user.click(screen.getByRole("button", { name: /^save$/i }));
+
+  await waitFor(() => expect(screen.queryByTestId("record-form-row")).not.toBeInTheDocument());
+  expect(screen.queryByText("record not found")).not.toBeInTheDocument();
+  await waitFor(() => expect(recordRows()).toHaveLength(0));
+});
+
+// ── Errors the screen reader never heard ──────────────────────────────────
+
+test("a rejected SOA field is announced, not only coloured", async () => {
+  const user = userEvent.setup();
+  renderZoneDetail({ zone: zone({ id: 1, name: "e412.in" }) });
+  await screen.findByText("e412.in");
+
+  await user.click(screen.getByRole("button", { name: /^soa$/i }));
+  const refresh = await screen.findByLabelText("Refresh");
+  await user.clear(refresh);
+  await user.type(refresh, "abc");
+  await user.click(screen.getByRole("button", { name: /save soa/i }));
+
+  expect(await screen.findByText("Whole number of seconds")).toBeInTheDocument();
+  expect(refresh).toHaveAttribute("aria-invalid", "true");
+  expect(refresh).toHaveAccessibleDescription(/whole number of seconds/i);
+});
+
+test("a rejected allow transfer is announced on the field itself", async () => {
+  const user = userEvent.setup();
+  renderZoneDetail({ zone: zone({ id: 1, allow_transfer: "" }) });
+  await screen.findByText("example.com");
+
+  await user.click(await screen.findByRole("button", { name: /^edit allow transfer$/i }));
+  const field = await screen.findByLabelText(/^allow transfer$/i);
+  await user.type(field, "not-an-ip");
+  await user.click(screen.getByRole("button", { name: /^save$/i }));
+
+  await screen.findByText(/expected an IP address/i);
+  expect(field).toHaveAttribute("aria-invalid", "true");
+  expect(field).toHaveAccessibleDescription(/expected an IP address/i);
+});
+
+// ── The sizes the grid actually meets ─────────────────────────────────────
+
+// A real zone is not five records. Nothing here is virtualised, so this is
+// the assertion that the whole set is rendered rather than silently capped.
+test("a zone with hundreds of records renders all of them, and the filter narrows them", async () => {
+  const many = Array.from({ length: 250 }, (_, i) =>
+    record({ id: i + 1, name: `host${i}`, rdata: `10.0.${Math.floor(i / 256)}.${i % 256}` }),
+  );
+  mockZone(zone({ id: 1 }));
+  mockRecords(1, many);
+
+  renderDetail();
+  await waitFor(() => expect(recordRows()).toHaveLength(250), { timeout: 10_000 });
+  expect(screen.getByText("250 records")).toBeInTheDocument();
+
+  // Set in one go rather than typed: six keystrokes across 400 rows is six
+  // full re-renders, and what is under test is the filtering, not the
+  // typing.
+  fireEvent.change(screen.getByLabelText(/filter by name/i), { target: { value: "host24" } });
+  // host24, host240..host249 — eleven names carry that prefix.
+  await waitFor(() => expect(recordRows()).toHaveLength(11));
+});
+
+// A DKIM key is longer than the column will ever be. The row truncates it
+// and keeps the whole value reachable, rather than wrapping the grid.
+test("a very long TXT value stays on one row with the full value in reach", async () => {
+  const long = `"v=DKIM1; k=rsa; p=${"A".repeat(392)}"`;
+  mockZone(zone({ id: 1 }));
+  mockRecords(1, [record({ id: 1, name: "mail._domainkey", type: "TXT", rdata: long })]);
+
+  renderDetail();
+  const [row] = await waitFor(() => {
+    const found = recordRows();
+    expect(found).toHaveLength(1);
+    return found;
+  });
+
+  const cell = within(row).getByTitle(long);
+  expect(cell).toHaveTextContent(long);
+  expect(cell).toHaveClass("truncate");
+});
+
+// Save is disabled for the whole flight of the request, which is the only
+// thing standing between an impatient double-click and two writes.
+test("a double-clicked Save sends one request", async () => {
+  const user = userEvent.setup();
+  let puts = 0;
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  mockZone(zone({ id: 1 }));
+  mockRecords(1, [record({ id: 7, name: "bifrost" })]);
+  server.use(
+    http.put("/api/v1/zones/1/records/7", async () => {
+      puts += 1;
+      await held;
+      return new HttpResponse(null, { status: 204 });
+    }),
+  );
+
+  renderDetail();
+  await waitFor(() => expect(recordRows()).toHaveLength(1));
+  await user.click(screen.getByRole("button", { name: /edit bifrost a 10\.0\.0\.1/i }));
+  const data = await screen.findByLabelText(/^data$/i);
+  await user.clear(data);
+  await user.type(data, "10.0.0.9");
+
+  const save = screen.getByRole("button", { name: /^save$/i });
+  await user.click(save);
+  await waitFor(() => expect(save).toBeDisabled());
+  fireEvent.click(save);
+
+  release();
+  await waitFor(() => expect(screen.queryByTestId("record-form-row")).not.toBeInTheDocument());
+  expect(puts).toBe(1);
 });

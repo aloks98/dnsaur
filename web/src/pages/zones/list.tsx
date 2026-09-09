@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { Link } from "react-router";
 import {
   ArrowDownToLine,
@@ -48,7 +48,6 @@ import {
   Tooltip,
   TooltipContent,
   TooltipTrigger,
-  type BadgeProps,
 } from "@e412/rnui-react";
 import { ApiError } from "../../api/client";
 import type { Zone } from "../../api/types";
@@ -64,18 +63,9 @@ import {
 import { useTSIGKeys } from "../../hooks/use-tsig-keys";
 import { StaleDataAlert } from "../../components/stale-data-alert";
 import { relativeTime } from "../../lib/format";
+import { dnsNameSchema } from "../../lib/dns-name";
 import { lastTransferError, pullsFromAMaster, pullState, transferErrorLead } from "../../lib/zones";
-
-// A category tag, not a verdict. Exact mapping from the artboard —
-// deliberately not "each type gets a fresh colour": stub shares its badge
-// with the neutral `secondary` variant rather than getting one of its own.
-const TYPE_VARIANT: Record<Zone["type"], NonNullable<BadgeProps["variant"]>> = {
-  primary: "primary-light",
-  secondary: "info-light",
-  stub: "secondary",
-  forwarder: "warning-light",
-  internal: "secondary",
-};
+import { ZONE_TYPE_VARIANT } from "./zone-type-variant";
 
 /**
  * The types the create row's select offers, which is exactly the set the API
@@ -98,23 +88,11 @@ const CREATABLE_TYPES = [
   "forwarder",
 ] as const satisfies readonly Zone["type"][];
 
-/** Mirrors the server's own check (internal/api/zones_handlers.go's
- * normalizeZoneName) closely enough that a name accepted here round-trips —
- * lowercasing and the trailing-dot strip happen server-side regardless, so
- * this only has to catch what would otherwise be a wasted request: blank,
- * whitespace/path characters, or an empty label (e.g. "e412..in"). */
-const zoneNameSchema = z
-  .string()
-  .trim()
-  .refine((value) => {
-    const name = value.replace(/\.$/, "");
-    if (name === "" || /[ \t\r\n/\\]/.test(name)) return false;
-    return !name.split(".").some((label) => label === "");
-  }, "Enter a domain name, e.g. example.com");
-
 const addZoneSchema = z
   .object({
-    name: zoneNameSchema,
+    // Both ends of this check are the server's `dns.CanonicalName` — see
+    // lib/dns-name.ts.
+    name: dnsNameSchema("Enter a domain name, e.g. example.com"),
     type: z.enum(CREATABLE_TYPES),
     /**
      * Comma-separated `host[:port]`. Deliberately free text beyond "not
@@ -372,18 +350,50 @@ function pullWarning(zone: Zone): {
   }
 }
 
-/** The Records column: a per-zone request rather than a field on Zone
- * itself (the API has no record-count field — see api/types.ts). Same
- * shape as filtering/groups-clients.tsx's GroupListsCell, which reads a
- * per-group query the same way for the same reason: the list endpoint
- * doesn't carry it, and the count is still worth showing without turning
- * this page into a records browser. Grouped with `.toLocaleString()`,
- * unlike Serial beside it — the artboard draws that distinction
- * deliberately (a serial is an opaque counter, not a quantity). */
+/**
+ * The Records column: a per-zone request rather than a field on Zone itself
+ * (the API has no record-count field — see api/types.ts). Same shape as
+ * filtering/groups-clients.tsx's GroupListsCell, which reads a per-group
+ * query the same way for the same reason: the list endpoint doesn't carry
+ * it, and the count is still worth showing without turning this page into a
+ * records browser. Grouped with `.toLocaleString()`, unlike Serial beside it
+ * — the artboard draws that distinction deliberately (a serial is an opaque
+ * counter, not a quantity).
+ *
+ * **Asked for only once the row is on screen.** Eighty zones meant eighty
+ * requests on load, for a number most of them are scrolled past without ever
+ * being read — and every record write invalidates the whole `zoneRecords`
+ * tree, so each one cost eighty more. Deferring to an IntersectionObserver
+ * keeps the column (dropping it to a lighter signal would mean dropping the
+ * count, and there is no lighter signal on the row to replace it with) while
+ * paying for it only where it is actually read. The real fix is
+ * `record_count` on `GET /zones`, which is a server change and not this
+ * one's to make.
+ *
+ * A browser without IntersectionObserver falls back to asking immediately:
+ * the count is the point, and "on screen" is a question that environment
+ * cannot answer.
+ */
 function RecordsCell({ zoneId }: { zoneId: number }) {
-  const records = useZoneRecords(zoneId);
+  const cell = useRef<HTMLSpanElement>(null);
+  const [onScreen, setOnScreen] = useState(false);
+  useEffect(() => {
+    if (onScreen) return;
+    const el = cell.current;
+    if (!el || typeof IntersectionObserver === "undefined") {
+      setOnScreen(true);
+      return;
+    }
+    const observer = new IntersectionObserver((entries) => {
+      if (entries.some((entry) => entry.isIntersecting)) setOnScreen(true);
+    });
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [onScreen]);
+
+  const records = useZoneRecords(zoneId, { enabled: onScreen });
   return (
-    <span className="text-right font-mono text-sm">
+    <span ref={cell} className="text-right font-mono text-sm">
       {records.data ? records.data.length.toLocaleString() : "—"}
     </span>
   );
@@ -866,7 +876,14 @@ function StatusCell({
  * outright (`BUILT-IN`) rather than merely omitting the control, so an admin
  * scanning the column never wonders whether it failed to render.
  */
-function ZoneRow({ zone, onDelete }: { zone: Zone; onDelete: () => void }) {
+function ZoneRow({
+  zone,
+  onDelete,
+}: {
+  zone: Zone;
+  /** Absent for a built-in zone, which has no menu to hold the action. */
+  onDelete?: () => void;
+}) {
   const isInternal = zone.type === "internal";
   const status = zoneStatus(zone);
   const warning = pullWarning(zone);
@@ -963,7 +980,7 @@ function ZoneRow({ zone, onDelete }: { zone: Zone; onDelete: () => void }) {
           </span>
         )}
         <span>
-          <Badge variant={TYPE_VARIANT[zone.type]}>{zone.type}</Badge>
+          <Badge variant={ZONE_TYPE_VARIANT[zone.type]}>{zone.type}</Badge>
         </span>
         <StatusCell zone={zone} status={status} warning={warning} />
         {/* No thousands grouping — a serial is an opaque counter, not a
@@ -1090,10 +1107,9 @@ function BuiltinsDisclosure({ zones }: { zones: Zone[] }) {
       </CollapsibleTrigger>
       <CollapsibleContent>
         {zones.map((zone) => (
-          // Built-ins never take onDelete (ZoneRow omits the button
-          // entirely for `internal` zones — see its own comment), so this
-          // is never actually called.
-          <ZoneRow key={zone.id} zone={zone} onDelete={() => {}} />
+          // No onDelete: ZoneRow draws no menu at all for an `internal`
+          // zone (see its own comment), so there is nothing to hand it.
+          <ZoneRow key={zone.id} zone={zone} />
         ))}
       </CollapsibleContent>
     </Collapsible>

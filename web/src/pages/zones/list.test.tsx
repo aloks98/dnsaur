@@ -1893,3 +1893,53 @@ test("the hint cell shows a validation error for whichever upstream field the ty
   expect(screen.getByText("bad forward target")).toBeInTheDocument();
   expect(screen.queryByText("Upstream servers, comma separated.")).not.toBeInTheDocument();
 });
+
+// Eighty zones used to mean eighty record requests the moment the page
+// loaded, for a number most of those rows are scrolled past without anyone
+// reading — and every record write invalidates the whole zoneRecords tree,
+// so each write cost eighty more. The count is now asked for per row, when
+// the row is actually on screen.
+test("a row's record count is not requested until the row is on screen", async () => {
+  // Over setup.ts's own stub, which reports everything visible at once: this
+  // one hands the callback back so the test decides when a row appears.
+  const shown: (() => void)[] = [];
+  vi.stubGlobal(
+    "IntersectionObserver",
+    class {
+      constructor(private readonly callback: IntersectionObserverCallback) {}
+      observe(target: Element) {
+        shown.push(() =>
+          this.callback(
+            [{ target, isIntersecting: true } as IntersectionObserverEntry],
+            this as unknown as IntersectionObserver,
+          ),
+        );
+      }
+      unobserve() {}
+      disconnect() {}
+    },
+  );
+
+  const paths = trackFetchedPaths();
+  mockZones([zone({ id: 1, name: "a.example" }), zone({ id: 2, name: "b.example" })]);
+  mockZoneRecords(1, [zoneRecord(1, 1), zoneRecord(1, 2)]);
+  mockZoneRecords(2, [zoneRecord(2, 3)]);
+
+  renderWithProviders(<ZonesList />);
+  await screen.findByText("a.example");
+
+  // Both rows are in the document and neither count has been asked for.
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  expect(reads(paths, "/api/v1/zones/1/records")).toBe(0);
+  expect(reads(paths, "/api/v1/zones/2/records")).toBe(0);
+  expect(screen.getAllByText("—").length).toBeGreaterThan(0);
+
+  // The first row scrolls into view; only its own count is fetched.
+  act(() => shown[0]());
+  await waitFor(() => expect(screen.getByText("2")).toBeInTheDocument());
+  expect(reads(paths, "/api/v1/zones/1/records")).toBe(1);
+  expect(reads(paths, "/api/v1/zones/2/records")).toBe(0);
+
+  act(() => shown[1]());
+  await waitFor(() => expect(reads(paths, "/api/v1/zones/2/records")).toBe(1));
+});

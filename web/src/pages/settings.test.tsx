@@ -1,8 +1,9 @@
 import { delay, http, HttpResponse } from "msw";
 import { toast } from "sonner";
 import { expect, test, vi } from "vitest";
-import { fireEvent, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { Link, Route, Routes } from "react-router";
 import { server } from "../test/msw-server";
 import { renderWithProviders } from "../test/render";
 import type { Settings } from "../api/types";
@@ -612,4 +613,234 @@ test("saving a serve.* setting keeps the status polling until the reconcile land
       "listening on :853",
     ),
   ).toBeInTheDocument();
+});
+
+// --- the dirty count, the baseline, and leaving with unsaved work ----------
+
+// The bar counted raw watched values while the submit diffed zod-trimmed
+// ones, so a trailing space read as "1 unsaved change" and Save then found
+// nothing to send and returned in silence.
+test("a whitespace-only edit is not counted as a change", async () => {
+  const user = userEvent.setup();
+  mockSettings(fullSettings());
+  let puts = 0;
+  server.use(
+    http.put("/api/v1/settings", () => {
+      puts += 1;
+      return new HttpResponse(null, { status: 204 });
+    }),
+  );
+
+  renderWithProviders(<SettingsPage />);
+  await screen.findByText("Upstreams");
+
+  await user.type(screen.getByLabelText(/^blocked response ttl/i), " ");
+
+  expect(screen.getByText("All changes saved")).toBeInTheDocument();
+  expect(screen.getAllByRole("button", { name: /^save changes$/i })[0]).toBeDisabled();
+  expect(puts).toBe(0);
+});
+
+// The baseline was seeded once and never moved, so a refetch carrying
+// another tab's save was read and discarded: this tab kept showing the old
+// value, called itself saved, and could not even write the old value back.
+test("a refetch with a new value moves a clean field and leaves a dirty one alone", async () => {
+  const user = userEvent.setup();
+  let current = fullSettings();
+  server.use(http.get("/api/v1/settings", () => HttpResponse.json(current)));
+
+  const { queryClient } = renderWithProviders(<SettingsPage />);
+  await screen.findByText("Upstreams");
+
+  const ttl = screen.getByLabelText(/^blocked response ttl/i);
+  await user.clear(ttl);
+  await user.type(ttl, "45");
+  expect(screen.getByText("1 unsaved change")).toBeInTheDocument();
+
+  // Another tab saves two keys: one this form has not touched, one it has.
+  current = fullSettings({ "qlog.retention_days": "30", "blocking.ttl": "90" });
+  await act(async () => {
+    await queryClient.invalidateQueries({ queryKey: ["settings"] });
+  });
+
+  // The untouched field takes the server's value…
+  await waitFor(() => expect(screen.getByLabelText(/^retention \(days\)/i)).toHaveValue("30"));
+  // …and the one being edited keeps what was typed, still unsaved.
+  expect(ttl).toHaveValue("45");
+  expect(screen.getByText("1 unsaved change")).toBeInTheDocument();
+});
+
+// A field the server moved underneath a clean form has to become saveable
+// again: with the baseline stuck on the old value, editing it back to what
+// the server now holds produced an empty diff and a Save that did nothing.
+test("a clean field the server moved is saved back from its new value", async () => {
+  const user = userEvent.setup();
+  let current = fullSettings();
+  const puts: { key: string; value: string }[] = [];
+  server.use(
+    http.get("/api/v1/settings", () => HttpResponse.json(current)),
+    http.put("/api/v1/settings", async ({ request }) => {
+      puts.push((await request.json()) as { key: string; value: string });
+      return new HttpResponse(null, { status: 204 });
+    }),
+  );
+
+  const { queryClient } = renderWithProviders(<SettingsPage />);
+  await screen.findByText("Upstreams");
+
+  current = fullSettings({ "qlog.retention_days": "30" });
+  await act(async () => {
+    await queryClient.invalidateQueries({ queryKey: ["settings"] });
+  });
+  const retention = await screen.findByLabelText(/^retention \(days\)/i);
+  await waitFor(() => expect(retention).toHaveValue("30"));
+
+  await user.clear(retention);
+  await user.type(retention, "60");
+  await user.click(screen.getAllByRole("button", { name: /^save changes$/i })[0]);
+
+  await waitFor(() => expect(puts).toEqual([{ key: "qlog.retention_days", value: "60" }]));
+});
+
+/** Settings under a route, with somewhere else to navigate to — the blocker
+ * only has something to block when a navigation is actually attempted. */
+function renderSettingsWithNav() {
+  return renderWithProviders(
+    <>
+      <Link to="/zones">Zones</Link>
+      <Routes>
+        <Route path="/settings" element={<SettingsPage />} />
+        <Route path="/zones" element={<p>the zones page</p>} />
+      </Routes>
+    </>,
+    { route: "/settings" },
+  );
+}
+
+// Three changed settings and a click on any nav item used to discard all
+// three without a word.
+test("leaving with unsaved changes asks first, and Stay keeps them", async () => {
+  const user = userEvent.setup();
+  mockSettings(fullSettings());
+
+  renderSettingsWithNav();
+  await screen.findByText("Upstreams");
+
+  const ttl = screen.getByLabelText(/^blocked response ttl/i);
+  await user.clear(ttl);
+  await user.type(ttl, "45");
+
+  await user.click(screen.getByRole("link", { name: "Zones" }));
+
+  expect(await screen.findByText("Leave without saving?")).toBeInTheDocument();
+  await user.click(screen.getByRole("button", { name: /^stay$/i }));
+
+  await waitFor(() => expect(screen.queryByText("Leave without saving?")).not.toBeInTheDocument());
+  expect(screen.queryByText("the zones page")).not.toBeInTheDocument();
+  expect(screen.getByLabelText(/^blocked response ttl/i)).toHaveValue("45");
+});
+
+test("Leave goes on to the page that was asked for", async () => {
+  const user = userEvent.setup();
+  mockSettings(fullSettings());
+
+  renderSettingsWithNav();
+  await screen.findByText("Upstreams");
+
+  const ttl = screen.getByLabelText(/^blocked response ttl/i);
+  await user.clear(ttl);
+  await user.type(ttl, "45");
+
+  await user.click(screen.getByRole("link", { name: "Zones" }));
+  await screen.findByText("Leave without saving?");
+  await user.click(screen.getByRole("button", { name: /^leave$/i }));
+
+  expect(await screen.findByText("the zones page")).toBeInTheDocument();
+});
+
+test("a form with nothing unsaved navigates without asking", async () => {
+  const user = userEvent.setup();
+  mockSettings(fullSettings());
+
+  renderSettingsWithNav();
+  await screen.findByText("Upstreams");
+
+  await user.click(screen.getByRole("link", { name: "Zones" }));
+
+  expect(await screen.findByText("the zones page")).toBeInTheDocument();
+  expect(screen.queryByText("Leave without saving?")).not.toBeInTheDocument();
+});
+
+// The two certificate phases are ordered so the second request is the one
+// that sees a complete pair — which is also what makes it the one that can
+// fail on its own, with the first already written.
+test("a cert path that saves and a key path that is rejected keeps only the key dirty", async () => {
+  const user = userEvent.setup();
+  mockSettings(fullSettings());
+  const errorSpy = vi.spyOn(toast, "error");
+  server.use(
+    http.put("/api/v1/settings", async ({ request }) => {
+      const body = (await request.json()) as { key: string };
+      return body.key === "serve.tls.key"
+        ? HttpResponse.json(
+            { error: "tls: private key does not match public key" },
+            { status: 400 },
+          )
+        : new HttpResponse(null, { status: 204 });
+    }),
+  );
+
+  renderWithProviders(<SettingsPage />);
+  await screen.findByText("Protocols");
+
+  await user.type(screen.getByLabelText("Certificate"), "/etc/dnsaur/tls.crt");
+  await user.type(screen.getByLabelText("Private key"), "/etc/dnsaur/other.key");
+  await user.click(screen.getAllByRole("button", { name: /^save changes$/i })[0]);
+
+  await waitFor(() =>
+    expect(errorSpy).toHaveBeenCalledWith(expect.stringMatching(/serve\.tls\.key/)),
+  );
+  // The rejected half stays dirty and retryable; the half that landed does
+  // not, so the bar counts one rather than two.
+  expect(await screen.findByText("1 unsaved change")).toBeInTheDocument();
+  expect(screen.getByLabelText("Private key")).toHaveValue("/etc/dnsaur/other.key");
+  expect(screen.getByText("tls: private key does not match public key")).toBeInTheDocument();
+});
+
+// Discard resets to the baseline, and after a partial save the baseline is
+// no longer what was loaded: the keys that landed have moved to their new
+// values and must not be rolled back with the one that failed.
+test("Discard after a partial failure keeps what was saved", async () => {
+  const user = userEvent.setup();
+  mockSettings(fullSettings());
+  server.use(
+    http.put("/api/v1/settings", async ({ request }) => {
+      const body = (await request.json()) as { key: string };
+      return body.key === "qlog.retention_days"
+        ? HttpResponse.json({ error: "nope" }, { status: 400 })
+        : new HttpResponse(null, { status: 204 });
+    }),
+  );
+  vi.spyOn(toast, "error");
+
+  renderWithProviders(<SettingsPage />);
+  await screen.findByText("Upstreams");
+
+  const ttl = screen.getByLabelText(/^blocked response ttl/i);
+  await user.clear(ttl);
+  await user.type(ttl, "45");
+  const retention = screen.getByLabelText(/^retention \(days\)/i);
+  await user.clear(retention);
+  await user.type(retention, "7");
+  await user.click(screen.getAllByRole("button", { name: /^save changes$/i })[0]);
+
+  expect(await screen.findByText("1 unsaved change")).toBeInTheDocument();
+
+  await user.click(screen.getAllByRole("button", { name: /^discard$/i })[0]);
+
+  expect(screen.getByText("All changes saved")).toBeInTheDocument();
+  // The blocked TTL landed, so Discard leaves it at 45 rather than putting
+  // the loaded 30 back.
+  expect(screen.getByLabelText(/^blocked response ttl/i)).toHaveValue("45");
+  expect(screen.getByLabelText(/^retention \(days\)/i)).toHaveValue("90");
 });

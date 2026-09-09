@@ -1,6 +1,6 @@
 import { QueryClientProvider, type QueryClient } from "@tanstack/react-query";
 import { render, type RenderResult } from "@testing-library/react";
-import { MemoryRouter } from "react-router";
+import { createMemoryRouter, RouterProvider } from "react-router";
 import type { ReactElement } from "react";
 import { TooltipProvider } from "@e412/rnui-react";
 import { makeQueryClient } from "../lib/query-client";
@@ -18,6 +18,10 @@ export function renderWithProviders(
   { route = "/" } = {},
 ): RenderResult & { queryClient: QueryClient } {
   const client = makeQueryClient();
+  // A data router with one catch-all route, exactly as main.tsx mounts one:
+  // descendant <Routes> still resolve, and useBlocker — which only a data
+  // router provides — works here the same way it works in the app.
+  const router = createMemoryRouter([{ path: "*", element: ui }], { initialEntries: [route] });
   return Object.assign(
     render(
       <QueryClientProvider client={client}>
@@ -25,7 +29,7 @@ export function renderWithProviders(
           test that waited out Base UI's own default instead would be timing
           something the app never does. */}
         <TooltipProvider delay={TOOLTIP_DELAY_MS}>
-          <MemoryRouter initialEntries={[route]}>{ui}</MemoryRouter>
+          <RouterProvider router={router} />
         </TooltipProvider>
       </QueryClientProvider>,
     ),

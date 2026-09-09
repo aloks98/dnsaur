@@ -218,10 +218,16 @@ transfer requests with (see the TSIG keys page). A hostname is stored as
 written and resolved at transfer time, so a primary that moves keeps
 working.
 
-The transfer band across the top says where the zone comes from and how
-current it is: its primaries, its key, the serial it last adopted, when it
-last refreshed and when it next will. **Refresh now** pulls immediately
-rather than waiting for the schedule.
+The transfer band across the top says how current the copy is: the serial it
+last adopted, when it last refreshed and when it next will. **Refresh now**
+pulls immediately rather than waiting for the schedule.
+
+Underneath it, **Primaries** is where the zone pulls from, with the TSIG key
+it signs with beside it — both editable in place. A primary that changes
+address is one edit, not a delete and a rebuild: recreating the zone would
+take its `allow_transfer` and `notify_to` with it. Clearing the field is
+refused, here and by the server: a secondary with nowhere to pull from
+claims its suffix and answers SERVFAIL for it forever.
 
 Status on a secondary is not the same question as enabled/disabled, and the
 list says so:
@@ -340,7 +346,8 @@ It asks its master two ordinary questions — the zone's SOA, for the serial
 and the schedule, and its NS records, with the nameservers' addresses in the
 reply — and routes to the nameservers that come back, re-asking on the
 schedule that SOA publishes. The master is typed into **Primary servers** in
-the create row, and the zone page calls the same field **Master**.
+the create row, and the zone page calls the same field **Primaries** —
+editable there, with the TSIG key beside it.
 
 **It is not a transfer**, and that is the reason to use one: the master
 needs no `allow-transfer` entry for dnsaur, so a stub works against a server
@@ -357,11 +364,11 @@ renders the NS set as a zone file. A forwarder has neither: nothing to
 fetch, and no records to export.
 
 Three states. Two carry a date, because a date is what makes them mean
-anything: **the NS set fetched *n* minutes ago**, and, on a failure, **the
-error in the server's own words under when it was attempted**, with what is
-still being served beside it. The third — **no NS set yet** — has no date
-and needs none: nothing has landed for a date to be about, and the master
-row above it already carries the failure's own date if there has been one.
+anything: **fetched *n* minutes ago**, and, on a failure, **the error in the
+server's own words under when it was attempted**, with what is still being
+served beside it. The third — **no NS set yet** — has no date and needs
+none: nothing has landed for a date to be about, and the primaries row above
+it already carries the failure's own date if there has been one.
 
 In the zones list a stub reads the same column a secondary does, in the
 words its own mechanism needs: **Fetched 5d ago**, **Fetch failing** — the
@@ -444,9 +451,15 @@ loaded somewhere else.
 The upshot is that the saved value is worth reading back — it is what the
 record actually is.
 
+**Otherwise a name in a value is absolute.** `nas` in a CNAME's value is the
+name `nas.`, not `nas.<zone>` — the record's own name is relative to the zone
+and its value is not, which is why the name-valued types carry a `FULL NAME`
+marker beside the value.
+
 **`@` in a value is the zone itself.** `10 @` on an MX is the zone apex, the
-same as in a zone file, and saves as `10 home.lan.`. In a value that is text
-rather than a name — a TXT — `@` is just the character.
+same as in a zone file, and saves as `10 home.lan.` — so pointing at the apex
+does not mean spelling the zone name out. In a value that is text rather than
+a name — a TXT — `@` is just the character.
 
 **The SOA belongs to the zone, not to its records.** It is edited on the
 zone, and a record of type `SOA` is refused: a zone has exactly one, and a
@@ -457,6 +470,16 @@ file unloadable.
 form for a type it does not know. Anything the DNS parser understands works
 — that list already runs well past what a homelab needs.
 
+**The type list is not a limit either.** The select offers the nine types
+most zones are made of, but a zone imported from elsewhere can hold an
+`SSHFP`, `HTTPS` or `TLSA`. Editing one of those keeps its type: the record's
+own type is offered as an extra option rather than the row silently rewriting
+it to `A`.
+
+An empty zone says **No records yet** and nothing more. **Add record** opens
+the row that fills it; until then the zone answers `NXDOMAIN` for every name
+beneath it, authoritatively, which is the whole point of holding the suffix.
+
 **Quote TXT values.** Presentation format is not a free-text field: spaces
 separate values and `;` starts a comment. Pasted raw, `v=spf1 -all` is
 stored as two strings — it reads back `"v=spf1" "-all"` — and
@@ -465,6 +488,14 @@ reading back as just `"v=DKIM1"`. Wrapped in quotes — `"v=spf1 -all"` — the
 whole thing is one value, which is what a TXT record almost always means.
 Anything over 255 bytes, like a 2048-bit DKIM key, is written as adjacent
 quoted strings that the reader joins back together: `"part one" "part two"`.
+
+**A disabled record is shown as one.** A record can be disabled through the
+API or by importing a zone file that leaves it out of its enabled set; it is
+dropped when the zone's served snapshot is built, so it answers nothing —
+indistinguishable from never having been written. Its row is muted and
+marked `DISABLED` for exactly that reason. Editing one from the grid leaves
+it disabled, and leaves its comment alone: neither is editable here, and
+both survive a change to the name, type, TTL or value.
 
 Three writes are refused, all `409`:
 
@@ -697,6 +728,26 @@ The three states that mean something is wrong — a failed bind, an expiring
 certificate, and the upstream-encryption downgrade — also appear as banners
 across the top of every screen, not just this one.
 
+### Saving
+
+Nothing on this page is written until **Save changes**. The bar at the top
+counts what is unsaved and says whether it applies on save or waits for a
+restart; **Discard** puts every field back to what the server last said.
+
+Because a save is explicit, leaving is the one action that can lose work —
+so navigating away with unsaved changes asks first: **Leave without saving?**,
+with **Stay** and **Leave**.
+
+A save writes one key per request, and they can fail one at a time. A key
+that saved stops being counted as unsaved; one that was rejected keeps the
+value that was typed, stays marked unsaved and can be retried, and the toast
+names which. **Discard** after a partial save puts back what the server now
+holds, not what it held before the save.
+
+The page also re-reads the settings in the background, so a key saved from
+another tab arrives here on its own. A field you are editing is never taken
+away by one of those: only the fields you have not touched move.
+
 ### What needs a restart
 
 Everything hot-reloads **except** the five settings read once at startup:
@@ -750,13 +801,20 @@ file can too.
 Changes take effect on the next signed message; nothing here needs a
 restart.
 
-**Used by** counts the secondary zones that sign their transfers with each
-key. A key nothing uses reads `—` and can be deleted; a key some zone still
-depends on cannot, and the delete confirmation says how many zones to
+**Used by** counts the zones that name each key — the secondaries and stubs
+that sign with it, plus any zone naming it in `allow_transfer` or
+`notify_to`. A key nothing uses reads `—` and can be deleted; a key some zone
+still depends on cannot, and the delete confirmation says how many zones to
 release it from first. Deleting it would leave those secondaries unable to
 authenticate their transfers with nothing on the zone to say why, so the
 server refuses it outright — the disabled button is only the polite version
 of the same answer.
+
+**A key in use cannot be renamed either.** `allow_transfer` and `notify_to`
+name a key by its name rather than its id, so a rename detaches it from every
+zone that named it. The name field is disabled on those rows, with the count
+beside it; the algorithm and the secret stay editable, which is what rotating
+a secret needs.
 
 ---
 

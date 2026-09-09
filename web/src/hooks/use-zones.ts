@@ -144,7 +144,7 @@ interface ZoneCreateInput {
  * soa_ttl is deliberately absent: it's fixed at 900 in Milestone A and
  * there is no request field to set it (see openapi.yaml).
  */
-type ZoneUpdateInput = Partial<ZoneCreateInput>;
+export type ZoneUpdateInput = Partial<ZoneCreateInput>;
 
 interface ZoneRecordInput {
   name?: string;
@@ -239,10 +239,15 @@ export function useDeleteZone() {
  * double the request rate to learn one fact, and would learn it no sooner.
  * `useRecordsFollowTransfers` is the other half of that bargain.
  */
-export function useZoneRecords(zoneId: number) {
+export function useZoneRecords(zoneId: number, { enabled = true }: { enabled?: boolean } = {}) {
   return useQuery({
     queryKey: zoneRecordKeys.list(zoneId),
     queryFn: () => api.get<ZoneRecord[]>(`/zones/${zoneId}/records`),
+    // The zones list asks for a count per row and there is no record_count
+    // on GET /zones to read it from, so it holds this back until the row is
+    // actually on screen — see RecordsCell (pages/zones/list.tsx). The detail
+    // page, which is the records, never passes it.
+    enabled,
   });
 }
 
@@ -432,12 +437,27 @@ export function useCreateZoneRecord() {
   });
 }
 
+/**
+ * A write addressed to a record the server no longer has.
+ *
+ * 404 is the one failure that says the *list on screen* is wrong rather than
+ * the value that was sent: the record was deleted from another tab or by
+ * another admin, and nothing else would refetch, so its row stayed on screen
+ * looking live and every retry against it 404s again. Refetching is the
+ * whole of the fix; what the screen says about it is the caller's own
+ * (see detail.tsx).
+ */
+function refetchIfGone(qc: ReturnType<typeof useQueryClient>, err: unknown, zoneId: number): void {
+  if (err instanceof ApiError && err.status === 404) invalidateZoneAndRecords(qc, zoneId);
+}
+
 export function useUpdateZoneRecord() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: ({ zoneId, id, ...v }: ZoneRecordInput & { zoneId: number; id: number }) =>
       api.put<void>(`/zones/${zoneId}/records/${id}`, v),
     onSuccess: (_data, { zoneId }) => invalidateZoneAndRecords(qc, zoneId),
+    onError: (err, { zoneId }) => refetchIfGone(qc, err, zoneId),
   });
 }
 
@@ -447,6 +467,7 @@ export function useDeleteZoneRecord() {
     mutationFn: ({ zoneId, id }: { zoneId: number; id: number }) =>
       api.del<void>(`/zones/${zoneId}/records/${id}`),
     onSuccess: (_data, { zoneId }) => invalidateZoneAndRecords(qc, zoneId),
+    onError: (err, { zoneId }) => refetchIfGone(qc, err, zoneId),
   });
 }
 

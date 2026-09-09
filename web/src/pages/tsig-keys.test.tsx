@@ -654,3 +654,100 @@ test("a failed load says so rather than showing an empty list", async () => {
   ).toBeInTheDocument();
   expect(screen.queryByText("No TSIG keys yet.")).not.toBeInTheDocument();
 });
+
+// Zones name a key by its *name* in allow_transfer and notify_to, so a
+// rename breaks every one of them — the server refuses it with 409, and
+// this is the screen not letting the click reach that.
+test("a key a zone names cannot be renamed, and the row says why", async () => {
+  const user = userEvent.setup();
+  mockKeys([key({ id: 5, name: "xfer.e412.in." })]);
+  mockZones([zone({ id: 10, tsig_key_id: 5 })]);
+  renderWithProviders(<TSIGKeys />);
+  await waitFor(() => expect(rows()).toHaveLength(1));
+
+  await user.click(screen.getByRole("button", { name: /edit xfer\.e412\.in\./i }));
+
+  expect(await screen.findByLabelText(/key name/i)).toBeDisabled();
+  expect(screen.getByText("In use by 1 zone. The name can't change.")).toBeInTheDocument();
+  // The secret is the thing anyone edits a used key for, and it stays open.
+  expect(screen.getByLabelText(/^secret$/i)).toBeEnabled();
+});
+
+test("a key nothing names can still be renamed", async () => {
+  const user = userEvent.setup();
+  let body: unknown;
+  mockKeys([key({ id: 5, name: "solo.e412.in." })]);
+  mockZones([]);
+  server.use(
+    http.put("/api/v1/tsig-keys/5", async ({ request }) => {
+      body = await request.json();
+      return new HttpResponse(null, { status: 204 });
+    }),
+  );
+  renderWithProviders(<TSIGKeys />);
+  await waitFor(() => expect(rows()).toHaveLength(1));
+
+  await user.click(screen.getByRole("button", { name: /edit solo\.e412\.in\./i }));
+  const name = await screen.findByLabelText(/key name/i);
+  expect(name).toBeEnabled();
+  await user.clear(name);
+  await user.type(name, "renamed.e412.in");
+  await user.click(screen.getByRole("button", { name: /^save$/i }));
+
+  await waitFor(() =>
+    expect(body).toEqual({
+      name: "renamed.e412.in",
+      algorithm: "hmac-sha256.",
+      secret: SECRET_256,
+    }),
+  );
+});
+
+// The guard above reads the zones list, so it is blind whenever that list
+// failed to load — the same hole the delete guard has. The server's own
+// refusal is what covers it, and it lands on the field that caused it.
+test("a 409 on save lands on the name field in the server's own words", async () => {
+  const user = userEvent.setup();
+  mockKeys([key({ id: 5, name: "xfer.e412.in." })]);
+  server.use(
+    http.get("/api/v1/zones", () => HttpResponse.json({ error: "boom" }, { status: 500 })),
+    http.put("/api/v1/tsig-keys/5", () =>
+      HttpResponse.json({ error: "renaming a key a zone names is refused" }, { status: 409 }),
+    ),
+  );
+  renderWithProviders(<TSIGKeys />);
+  await waitFor(() => expect(rows()).toHaveLength(1));
+
+  await user.click(screen.getByRole("button", { name: /edit xfer\.e412\.in\./i }));
+  const name = await screen.findByLabelText(/key name/i);
+  await user.clear(name);
+  await user.type(name, "renamed.e412.in");
+  await user.click(screen.getByRole("button", { name: /^save$/i }));
+
+  expect(await screen.findByText("renaming a key a zone names is refused")).toBeInTheDocument();
+  // The row stays open on the attempted value, so it can be corrected.
+  expect(screen.getByLabelText(/key name/i)).toHaveValue("renamed.e412.in");
+});
+
+// pointer-events-none only stops the pointer: the buttons kept their place
+// in the tab order, still fired on Enter, and told assistive tech nothing.
+test("a dimmed row's Edit and Delete are disabled, not merely unclickable", async () => {
+  const user = userEvent.setup();
+  mockKeys([key({ id: 1, name: "xfer.e412.in." }), key({ id: 2, name: "other.e412.in." })]);
+  mockZones([]);
+  renderWithProviders(<TSIGKeys />);
+  await waitFor(() => expect(rows()).toHaveLength(2));
+
+  await user.click(screen.getByRole("button", { name: /edit xfer\.e412\.in\./i }));
+  await screen.findByLabelText(/key name/i);
+
+  const edit = screen.getByRole("button", { name: /edit other\.e412\.in\./i });
+  const del = screen.getByRole("button", { name: /delete other\.e412\.in\./i });
+  expect(edit).toBeDisabled();
+  expect(del).toBeDisabled();
+
+  // Keyboard activation is what pointer-events could never stop.
+  edit.focus();
+  await user.keyboard("{Enter}");
+  expect(screen.queryByRole("button", { name: /stop editing other\.e412\.in\./i })).toBeNull();
+});

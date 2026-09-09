@@ -1,22 +1,20 @@
-import { useEffect, useId, useMemo, useRef, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { Link, useNavigate, useParams } from "react-router";
 import {
   AlertCircle,
   ArrowDownToLine,
   ChevronLeft,
   ChevronRight,
-  Download,
   Lock,
   Pencil,
   Plus,
   RotateCw,
   Trash2,
   TriangleAlert,
-  Upload,
   X,
 } from "lucide-react";
 import { toast } from "sonner";
-import { useForm } from "react-hook-form";
+import { useForm, type Control, type UseFormReturn } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { z } from "zod";
 import {
@@ -37,13 +35,10 @@ import {
   Collapsible,
   CollapsibleContent,
   CollapsibleTrigger,
-  Dialog,
-  DialogClose,
-  DialogContent,
-  DialogDescription,
-  DialogTitle,
+  CopyButton,
   Form,
   FormControl,
+  FormDescription,
   FormField,
   FormItem,
   FormMessage,
@@ -51,6 +46,8 @@ import {
   NativeSelect,
   NativeSelectOption,
   Skeleton,
+  Textarea,
+  useFormField,
   type BadgeProps,
 } from "@e412/rnui-react";
 import { ApiError } from "../../api/client";
@@ -61,8 +58,6 @@ import {
   useCreateZoneRecord,
   useDeleteZone,
   useDeleteZoneRecord,
-  useExportZoneFile,
-  useImportZoneFile,
   useRecordsFollowTransfers,
   useRefreshZone,
   useUpdateZone,
@@ -70,14 +65,15 @@ import {
   useZone,
   useZoneNotifies,
   useZoneRecords,
-  zoneFileErrors,
-  type ZoneFileDiff,
   type ZoneNotify,
-  type ZoneRecordChange,
+  type ZoneUpdateInput,
 } from "../../hooks/use-zones";
 import { useTSIGKeys } from "../../hooks/use-tsig-keys";
 import { StaleDataAlert } from "../../components/stale-data-alert";
-import { formatBytes, formatDuration, relativeTime } from "../../lib/format";
+import { NotFound } from "../not-found";
+import { ZONE_TYPE_VARIANT } from "./zone-type-variant";
+import { formatDuration, relativeTime } from "../../lib/format";
+import { ZoneFileActions } from "./zone-file-actions";
 import {
   forwardTargets,
   isServing,
@@ -95,6 +91,31 @@ import {
 // DATA_PLACEHOLDER's own comment for why.
 const RECORD_TYPES = ["A", "AAAA", "CNAME", "TXT", "MX", "SRV", "NS", "CAA", "PTR"] as const;
 type RecordType = (typeof RECORD_TYPES)[number];
+
+/**
+ * Everything the type select must be able to show for `current`: the nine
+ * above plus — when the record already holds something else — that value.
+ *
+ * The server takes any type `dns.NewRR` parses, so a zone imported from
+ * another server can hold an SSHFP, HTTPS or TLSA this list has never heard
+ * of. Without its own option a native select shows (and submits) the first
+ * one instead, so opening such a record and pressing Save would rewrite its
+ * type to A. The same passthrough the TSIG key row uses for an algorithm it
+ * doesn't recognise (lib/tsig.ts's algorithmOptions), for the same reason.
+ */
+function recordTypeOptions(current: string | undefined): string[] {
+  const known: string[] = [...RECORD_TYPES];
+  if (current === undefined || current === "" || known.includes(current)) return known;
+  return [...known, current];
+}
+
+/**
+ * The types whose rdata gets a growing textarea rather than a single-line
+ * input: the two whose values are routinely longer than the column. A DKIM
+ * key is 400-odd characters of base64 and a DNSKEY's is the same shape, and
+ * in one line either is a ribbon nobody can read back.
+ */
+const LONG_RDATA_TYPES = new Set(["TXT", "DNSKEY"]);
 
 /**
  * One text input serves every record type because the server validates
@@ -134,11 +155,17 @@ const DATA_PLACEHOLDER: Record<RecordType, string> = {
  *
  * The two columns read their names under different origins, and nothing on
  * screen used to say so. Name is relative to the zone ("bifrost" under
- * e412.in is bifrost.e412.in), but rdata is parsed by ToRR under *no*
- * origin (see buildZoneRecord in internal/api/zonerecords_handlers.go), so
- * a dotless target there is already absolute — "nas" is the name `nas.`,
- * not nas.e412.in. Cloudflare and Route 53 accept the dotless spelling and
- * resolve it against the zone, so that is the habit users arrive with.
+ * e412.in is bifrost.e412.in), but rdata is parsed by ToRR with no origin
+ * to resolve against (see buildZoneRecord in
+ * internal/api/zonerecords_handlers.go), so a dotless target there is
+ * already absolute — "nas" is the name `nas.`, not nas.e412.in. Cloudflare
+ * and Route 53 accept the dotless spelling and resolve it against the zone,
+ * so that is the habit users arrive with.
+ *
+ * The one exception is a bare `@`, which BuildRecord resolves to the zone's
+ * apex before parsing — the same thing it means in an imported zone file, so
+ * a hand-written record and an imported one store the same value. `@` is
+ * therefore worth typing, and the apex does not have to be spelled out.
  *
  * The chip is a label, not a rule: the server stores whatever either
  * spelling parses to, and both are valid records. Nothing here validates.
@@ -211,17 +238,6 @@ const RECORD_TYPE_VARIANT: Record<RecordType, NonNullable<BadgeProps["variant"]>
   PTR: "secondary",
 };
 
-/** The header band's zone-type badge. Mirrors list.tsx's TYPE_VARIANT (kept
- * as a separate copy rather than imported — that map is scoped to the zones
- * list's own create-row narrowing comments, which don't apply here). */
-const ZONE_TYPE_VARIANT: Record<Zone["type"], NonNullable<BadgeProps["variant"]>> = {
-  primary: "primary-light",
-  secondary: "info-light",
-  stub: "secondary",
-  forwarder: "warning-light",
-  internal: "secondary",
-};
-
 /** One declaration of the column geometry, shared by the records header,
  * the create/edit row and every record row — matching the artboard's grid
  * exactly. TTL and Actions are the two right-aligned columns; Data is 1fr. */
@@ -238,7 +254,11 @@ const recordFormSchema = z.object({
   // name to "@" (normalizeRecordName) — so this is deliberately
   // unconstrained rather than "required".
   name: z.string(),
-  type: z.enum(RECORD_TYPES),
+  // Free-form rather than z.enum(RECORD_TYPES): the select's own options are
+  // what constrain this, and an enum would reject the passthrough option
+  // recordTypeOptions adds for a stored type this build doesn't list —
+  // turning "edit this record's TTL" into a form that cannot be submitted.
+  type: z.string().min(1),
   ttl: z
     .string()
     .trim()
@@ -254,25 +274,50 @@ type RecordFormValues = z.infer<typeof recordFormSchema>;
 function recordFormDefaults(record: ZoneRecord | null): RecordFormValues {
   return {
     name: record?.name ?? "",
-    type: (record?.type as RecordType | undefined) ?? "A",
+    type: record?.type ?? "A",
     ttl: String(record?.ttl ?? 300),
     rdata: record?.rdata ?? "",
   };
 }
 
 /** Mono, with `@` and any wildcard name (`*`, `*.nexus`) picked out in
- * primary/600 — the two shapes worth scanning for in a long record list. */
-function RecordName({ name }: { name: string }) {
+ * primary/600 — the two shapes worth scanning for in a long record list.
+ * A disabled record's name is muted instead: the highlight says "scan for
+ * this", and a record that is not being served is not what to scan for. */
+function RecordName({ name, dimmed = false }: { name: string; dimmed?: boolean }) {
   const highlighted = name === "@" || name.startsWith("*");
   return (
     <span
       className={cn(
         "truncate font-mono text-sm",
-        highlighted ? "font-semibold text-primary" : "font-normal text-foreground",
+        highlighted ? "font-semibold" : "font-normal",
+        dimmed ? "text-muted-foreground" : highlighted ? "text-primary" : "text-foreground",
       )}
       title={name}
     >
       {name}
+    </span>
+  );
+}
+
+/**
+ * The rejected rdata, in the DNS parser's own words — mono, with an
+ * alert-circle, rather than the plain FormMessage every other column gets.
+ *
+ * Its own component only so it can read `useFormField()` from *inside* the
+ * FormItem: the id FormControl points `aria-describedby` at is generated by
+ * that FormItem, and a message rendered anywhere else carries a different one
+ * (or none), which is a message no screen reader ever reaches.
+ */
+function RdataErrorLine({ message }: { message: string }) {
+  const { formMessageId } = useFormField();
+  return (
+    <span
+      id={formMessageId}
+      className="flex items-start gap-1.5 text-xs text-pretty text-destructive-foreground"
+    >
+      <AlertCircle className="mt-0.5 size-3.5 shrink-0" aria-hidden="true" />
+      <span className="font-mono">{message}</span>
     </span>
   );
 }
@@ -347,10 +392,8 @@ function RecordFormRow({
   const atApex = form.watch("name").trim() === "@";
   const suffixFull = atApex ? apex : `.${apex}`;
   const suffixShown = atApex ? clipApex(apex) : `.${clipApex(apex)}`;
-  const dataIsName = NAME_VALUED_TYPES.has(type);
-  const fieldId = useId();
-  const nameSuffixId = `${fieldId}-name-suffix`;
-  const dataSuffixId = `${fieldId}-data-suffix`;
+  const dataIsName = NAME_VALUED_TYPES.has(type as RecordType);
+  const longRdata = LONG_RDATA_TYPES.has(type);
 
   function onSubmit(values: RecordFormValues) {
     const payload = {
@@ -358,12 +401,27 @@ function RecordFormRow({
       type: values.type,
       ttl: Number(values.ttl.trim()),
       rdata: values.rdata.trim(),
+      // PUT is a full replace and BuildRecord defaults an absent `enabled`
+      // to true and an absent `comment` to "", so an edit that carried
+      // neither would re-enable a disabled record and drop its comment.
+      // Neither is editable here; both are carried through untouched.
+      ...(editing !== null ? { enabled: editing.enabled, comment: editing.comment } : {}),
     };
     // The server's own text (dns.NewRR's parser message, or an RFC-conflict
     // message) is more precise than anything this form could invent — it
     // lands on the rdata field itself rather than a toast, aria-invalid and
     // all, via setError below.
     const onError = (err: unknown) => {
+      // A 404 is not a complaint about the value that was typed: the record
+      // this row is bound to has been deleted from somewhere else, so there
+      // is nothing to correct and the form has nothing left to edit. The
+      // mutation has already asked for the list again (see
+      // refetchIfGone in use-zones.ts).
+      if (isEdit && err instanceof ApiError && err.status === 404) {
+        toast.error("That record no longer exists");
+        onDone();
+        return;
+      }
       const message =
         err instanceof ApiError ? err.message : `Couldn't ${isEdit ? "update" : "add"} the record`;
       form.setError("rdata", { type: "server", message });
@@ -386,7 +444,10 @@ function RecordFormRow({
       {
         onSuccess: () => {
           toast.success("Record added");
-          form.reset(recordFormDefaults(null));
+          // Only what identifies the record just written. Adding one record
+          // is usually adding several of the same kind, and type and TTL are
+          // exactly the two that repeat.
+          form.reset({ ...values, name: "", rdata: "" });
           form.setFocus("name");
         },
         onError,
@@ -394,18 +455,13 @@ function RecordFormRow({
     );
   }
 
-  // name and rdata carry no client-side rule (see recordFormSchema's own
-  // comments) so their FormMessage is always null in practice; type and ttl
-  // do, and — per Task 12's fix round 1 — a zod failure must never be a
-  // silent no-op: the button blocking submit with nothing on screen to say
-  // why. rdata's *server* error still gets its own distinct rendering below
-  // (mono, alert-circle) rather than a plain FormMessage, since that one is
-  // the DNS parser's own text, not a client-authored message.
-  const nameError = form.formState.errors.name?.message;
-  const typeError = form.formState.errors.type?.message;
-  const ttlError = form.formState.errors.ttl?.message;
+  // ttl is the one field carrying a client-side rule (see recordFormSchema's
+  // own comments), and a zod failure there must never be a silent no-op: the
+  // button blocking submit with nothing on screen to say why. rdata's
+  // *server* error gets its own distinct rendering below (mono,
+  // alert-circle) rather than a plain FormMessage, since that one is the DNS
+  // parser's own text, not a client-authored message.
   const rdataError = form.formState.errors.rdata?.message;
-  const hasRowError = Boolean(nameError || typeError || ttlError || rdataError);
 
   return (
     <Form {...form}>
@@ -421,12 +477,19 @@ function RecordFormRow({
         // out as the one being written.
         className="shrink-0 border-b border-border bg-card shadow-[inset_3px_0_0_var(--primary)]"
       >
-        <div className={cn(GRID, "py-2.5")}>
+        {/* One grid, and every column's message sits inside that column's own
+            FormItem rather than on a second grid row of its own. A message in
+            a separate FormItem gets a separate generated id, so the
+            `aria-describedby` FormControl writes onto the input pointed at
+            nothing and a screen reader heard no error at all. `items-start`
+            in place of the shared GRID's `items-center` is what keeps every
+            control on one line while a message grows the row below it. */}
+        <div className={cn(GRID, "items-start py-2.5")}>
           <FormField
             control={form.control}
             name="name"
             render={({ field }) => (
-              <FormItem>
+              <FormItem className="gap-1">
                 {/* The shell sits inside FormItem rather than replacing it,
                     so FormControl still slots onto the input itself — the
                     id, the label association and aria-invalid all stay
@@ -436,12 +499,6 @@ function RecordFormRow({
                     <Input
                       {...field}
                       aria-label="Zone record name"
-                      // The suffix is context, not part of the value being
-                      // typed, so it reaches assistive tech as this field's
-                      // *description* — the accessible name is untouched.
-                      // This replaces FormControl's own describedby, which
-                      // points at a FormDescription this row never renders.
-                      aria-describedby={nameSuffixId}
                       placeholder="@ or bifrost"
                       autoComplete="off"
                       className={cn(FIELD_INPUT, atApex && "text-muted-foreground")}
@@ -459,10 +516,15 @@ function RecordFormRow({
                   >
                     {suffixShown}
                   </span>
-                  <span id={nameSuffixId} className="sr-only">
-                    {suffixFull}
-                  </span>
+                  {/* The suffix is context, not part of the value being
+                      typed, so it reaches assistive tech as this field's
+                      *description* — the accessible name is untouched. A
+                      FormDescription rather than a hand-written id, so it is
+                      the one FormControl's own describedby already points
+                      at. */}
+                  <FormDescription className="sr-only">{suffixFull}</FormDescription>
                 </div>
+                <FormMessage className="text-xs" />
               </FormItem>
             )}
           />
@@ -470,16 +532,17 @@ function RecordFormRow({
             control={form.control}
             name="type"
             render={({ field }) => (
-              <FormItem>
+              <FormItem className="gap-1">
                 <FormControl>
                   <NativeSelect {...field} aria-label="Record type">
-                    {RECORD_TYPES.map((t) => (
+                    {recordTypeOptions(editing?.type).map((t) => (
                       <NativeSelectOption key={t} value={t}>
                         {t}
                       </NativeSelectOption>
                     ))}
                   </NativeSelect>
                 </FormControl>
+                <FormMessage className="text-xs" />
               </FormItem>
             )}
           />
@@ -487,10 +550,11 @@ function RecordFormRow({
             control={form.control}
             name="ttl"
             render={({ field }) => (
-              <FormItem>
+              <FormItem className="gap-1">
                 <FormControl>
                   <Input {...field} aria-label="TTL" inputMode="numeric" />
                 </FormControl>
+                <FormMessage className="text-xs" />
               </FormItem>
             )}
           />
@@ -498,38 +562,68 @@ function RecordFormRow({
             control={form.control}
             name="rdata"
             render={({ field }) => (
-              <FormItem>
-                <div className={cn(FIELD_SHELL, rdataError && FIELD_SHELL_INVALID)}>
+              <FormItem className="gap-1">
+                <div
+                  className={cn(
+                    FIELD_SHELL,
+                    longRdata && "h-auto",
+                    rdataError && FIELD_SHELL_INVALID,
+                  )}
+                >
                   <FormControl>
-                    <Input
-                      {...field}
-                      onChange={(e) => {
-                        field.onChange(e);
-                        // A fresh attempt deserves a fresh read of the parser,
-                        // not last submit's stale rejection sitting under it.
-                        if (form.formState.errors.rdata) form.clearErrors("rdata");
-                      }}
-                      aria-label="Data"
-                      // Described by the chip itself, not a hidden twin: this
-                      // one is never clipped, so its own text is the whole of
-                      // what it says. Types without the chip fall back to no
-                      // description at all.
-                      aria-describedby={dataIsName ? dataSuffixId : undefined}
-                      placeholder={DATA_PLACEHOLDER[type]}
-                      autoComplete="off"
-                      className={FIELD_INPUT}
-                    />
+                    {longRdata ? (
+                      <Textarea
+                        {...field}
+                        rows={1}
+                        onChange={(e) => {
+                          field.onChange(e);
+                          if (form.formState.errors.rdata) form.clearErrors("rdata");
+                        }}
+                        aria-label="Data"
+                        placeholder={DATA_PLACEHOLDER[type as RecordType]}
+                        autoComplete="off"
+                        spellCheck={false}
+                        // field-sizing-content comes with rnui's Textarea, so
+                        // the box grows with a DKIM key instead of scrolling
+                        // it; min-h-16 does not belong on a grid row.
+                        className={cn(FIELD_INPUT, "min-h-8 resize-none py-1.5 text-sm")}
+                      />
+                    ) : (
+                      <Input
+                        {...field}
+                        onChange={(e) => {
+                          field.onChange(e);
+                          // A fresh attempt deserves a fresh read of the parser,
+                          // not last submit's stale rejection sitting under it.
+                          if (form.formState.errors.rdata) form.clearErrors("rdata");
+                        }}
+                        aria-label="Data"
+                        placeholder={DATA_PLACEHOLDER[type as RecordType]}
+                        autoComplete="off"
+                        className={FIELD_INPUT}
+                      />
+                    )}
                   </FormControl>
                   {dataIsName && (
-                    <span
-                      id={dataSuffixId}
+                    // Described by the chip itself, not a hidden twin: this
+                    // one is never clipped, so its own text is the whole of
+                    // what it says. Types without the chip fall back to no
+                    // description at all.
+                    <FormDescription
                       data-testid="record-data-suffix"
                       className={cn(FIELD_CHIP, "text-xs tracking-widest uppercase")}
                     >
                       Full name
-                    </span>
+                    </FormDescription>
                   )}
                 </div>
+                {/* Data's error is the DNS parser's own output (or the
+                    server's RFC-conflict text) — rendered distinctly, mono
+                    with an alert-circle icon, rather than as a plain
+                    FormMessage; see the artboard's own note on not rewriting
+                    parser errors. It still carries FormMessage's own id, so
+                    the input announces it. */}
+                {rdataError && <RdataErrorLine message={rdataError} />}
               </FormItem>
             )}
           />
@@ -551,47 +645,6 @@ function RecordFormRow({
             </Button>
           </div>
         </div>
-
-        {/* The error line: each column's own message sits under it, mirroring
-            list.tsx's CreateRowHint (see its own comment). When the only
-            problem is a rejected Data value — the common case, per the
-            artboard — columns 1-3 stay empty and this is exactly the
-            artboard's "second line under the DATA column only" state. A
-            client-side name/type/ttl failure is not a silent no-op: it has
-            to land somewhere, or the Add/Save button just looks dead. */}
-        {hasRowError && (
-          <div className={cn(GRID, "items-start pb-2.5 text-xs text-pretty")}>
-            {/* Each cell is a real element even when its column has nothing
-                to say, because FormMessage renders *null* when there is no
-                error. Left bare, the three quiet columns would contribute no
-                grid children at all and auto-placement would slide Data's
-                error left into the Name column — which is where it used to
-                land, the common case being a rejected Data value and nothing
-                else. The span is what holds the column open. */}
-            <span>
-              <FormField control={form.control} name="name" render={() => <FormMessage />} />
-            </span>
-            <span>
-              <FormField control={form.control} name="type" render={() => <FormMessage />} />
-            </span>
-            <span>
-              <FormField control={form.control} name="ttl" render={() => <FormMessage />} />
-            </span>
-            {/* Data's error is the DNS parser's own output (or the server's
-                RFC-conflict text) — rendered distinctly, mono with an
-                alert-circle icon, rather than as a plain FormMessage; see
-                the artboard's own note on not rewriting parser errors. */}
-            <span className="flex items-start gap-1.5 text-destructive-foreground">
-              {rdataError && (
-                <>
-                  <AlertCircle className="mt-0.5 size-3.5 shrink-0" aria-hidden="true" />
-                  <span className="font-mono">{rdataError}</span>
-                </>
-              )}
-            </span>
-            <span />
-          </div>
-        )}
       </form>
     </Form>
   );
@@ -615,16 +668,38 @@ function RecordRow({
 }) {
   const variant = RECORD_TYPE_VARIANT[record.type as RecordType] ?? "secondary";
   const label = `${record.name} ${record.type} ${record.rdata}`;
+  /**
+   * A disabled record is dropped when the zone's served snapshot is built
+   * (NewZone), so it is not being answered — indistinguishable from never
+   * having been written. Drawn like every other row it claimed the opposite,
+   * and nothing on the grid said otherwise. The word carries it; the fade is
+   * only what stops the row competing with the ones that are live.
+   */
+  const off = !record.enabled;
   return (
-    <div data-testid="zone-record-row" className={cn(GRID, "border-b border-border-muted py-2")}>
-      <RecordName name={record.name} />
+    <div
+      data-testid="zone-record-row"
+      data-enabled={record.enabled ? "true" : "false"}
+      className={cn(GRID, "border-b border-border-muted py-2", off && "bg-muted/30")}
+    >
+      <span className="flex min-w-0 items-center gap-2">
+        <RecordName name={record.name} dimmed={off} />
+        {off && (
+          <span className="shrink-0 font-mono text-[9.5px] tracking-[0.12em] text-muted-foreground uppercase">
+            Disabled
+          </span>
+        )}
+      </span>
       <span>
-        <Badge variant={variant}>{record.type}</Badge>
+        <Badge variant={off ? "secondary" : variant}>{record.type}</Badge>
       </span>
       <span className="text-right font-mono text-sm text-muted-foreground">
         {record.ttl.toLocaleString()}
       </span>
-      <span className="truncate font-mono text-sm" title={record.rdata}>
+      <span
+        className={cn("truncate font-mono text-sm", off && "text-muted-foreground")}
+        title={record.rdata}
+      >
         {record.rdata}
       </span>
       {/* A built-in zone's records are readable but not editable — the
@@ -715,6 +790,52 @@ function SoaFieldShell({
       </span>
       {children}
     </div>
+  );
+}
+
+/**
+ * One editable SOA field: its caption, its control and its message inside a
+ * single FormItem, so the id FormControl writes into `aria-describedby` is
+ * the id the message on screen actually carries. Rendered outside FormItem —
+ * as all seven of these were — the input was never marked invalid and the
+ * message it pointed at did not exist.
+ *
+ * `contents` on the FormItem so SoaFieldShell keeps owning the layout; the
+ * FormItem is here for its context, not for a box.
+ */
+function SoaField({
+  control,
+  name,
+  label,
+  unit,
+}: {
+  control: Control<SoaFormValues>;
+  name: keyof SoaFormValues;
+  label: string;
+  /** Present on the four interval fields, all of which are seconds — which
+   * is also what makes them the numeric ones. */
+  unit?: string;
+}) {
+  return (
+    <FormField
+      control={control}
+      name={name}
+      render={({ field }) => (
+        <FormItem className="contents">
+          <SoaFieldShell label={label} unit={unit}>
+            <FormControl>
+              <Input
+                {...field}
+                aria-label={label}
+                inputMode={unit === undefined ? undefined : "numeric"}
+                className="font-mono"
+              />
+            </FormControl>
+            <FormMessage />
+          </SoaFieldShell>
+        </FormItem>
+      )}
+    />
   );
 }
 
@@ -832,26 +953,8 @@ function SoaBand({ zone }: { zone: Zone }) {
                   </Button>
                 </div>
                 <div className="grid grid-cols-4 gap-x-[18px] gap-y-4 pb-4">
-                  <FormField
-                    control={form.control}
-                    name="soa_ns"
-                    render={({ field }) => (
-                      <SoaFieldShell label="Primary NS">
-                        <Input {...field} aria-label="Primary NS" className="font-mono" />
-                        <FormMessage />
-                      </SoaFieldShell>
-                    )}
-                  />
-                  <FormField
-                    control={form.control}
-                    name="soa_mbox"
-                    render={({ field }) => (
-                      <SoaFieldShell label="Responsible">
-                        <Input {...field} aria-label="Responsible" className="font-mono" />
-                        <FormMessage />
-                      </SoaFieldShell>
-                    )}
-                  />
+                  <SoaField control={form.control} name="soa_ns" label="Primary NS" />
+                  <SoaField control={form.control} name="soa_mbox" label="Responsible" />
                   {/* Not editable, but the value IS shown (Task 12 fix round 1:
                   an earlier draft of the artboard notes said only "AUTO",
                   omitting the number — corrected). The serial itself is the
@@ -867,66 +970,10 @@ function SoaBand({ zone }: { zone: Zone }) {
                       </span>
                     </div>
                   </SoaFieldShell>
-                  <FormField
-                    control={form.control}
-                    name="soa_refresh"
-                    render={({ field }) => (
-                      <SoaFieldShell label="Refresh" unit="s">
-                        <Input
-                          {...field}
-                          aria-label="Refresh"
-                          inputMode="numeric"
-                          className="font-mono"
-                        />
-                        <FormMessage />
-                      </SoaFieldShell>
-                    )}
-                  />
-                  <FormField
-                    control={form.control}
-                    name="soa_retry"
-                    render={({ field }) => (
-                      <SoaFieldShell label="Retry" unit="s">
-                        <Input
-                          {...field}
-                          aria-label="Retry"
-                          inputMode="numeric"
-                          className="font-mono"
-                        />
-                        <FormMessage />
-                      </SoaFieldShell>
-                    )}
-                  />
-                  <FormField
-                    control={form.control}
-                    name="soa_expire"
-                    render={({ field }) => (
-                      <SoaFieldShell label="Expire" unit="s">
-                        <Input
-                          {...field}
-                          aria-label="Expire"
-                          inputMode="numeric"
-                          className="font-mono"
-                        />
-                        <FormMessage />
-                      </SoaFieldShell>
-                    )}
-                  />
-                  <FormField
-                    control={form.control}
-                    name="soa_minimum"
-                    render={({ field }) => (
-                      <SoaFieldShell label="Minimum" unit="s">
-                        <Input
-                          {...field}
-                          aria-label="Minimum"
-                          inputMode="numeric"
-                          className="font-mono"
-                        />
-                        <FormMessage />
-                      </SoaFieldShell>
-                    )}
-                  />
+                  <SoaField control={form.control} name="soa_refresh" label="Refresh" unit="s" />
+                  <SoaField control={form.control} name="soa_retry" label="Retry" unit="s" />
+                  <SoaField control={form.control} name="soa_expire" label="Expire" unit="s" />
+                  <SoaField control={form.control} name="soa_minimum" label="Minimum" unit="s" />
                 </div>
               </CollapsibleContent>
             </div>
@@ -964,7 +1011,6 @@ function SoaBand({ zone }: { zone: Zone }) {
  * four days ago, and only one of those is worth acting on now.
  */
 function TransferBand({ zone }: { zone: Zone }) {
-  const keys = useTSIGKeys();
   const state = transferState(zone);
   const failure = lastTransferError(zone);
   /**
@@ -977,24 +1023,14 @@ function TransferBand({ zone }: { zone: Zone }) {
    * being served*, and a band that reported its transfer state would say both
    * — while the badge one row above said Disabled.
    *
-   * Its transfer state is still true and still shown: primaries, key, serial
-   * and the last refresh are all facts, and a recorded failure is a dated
-   * account of the last thing that actually happened. What changes is the two
+   * Its transfer state is still true and still shown: the serial and the
+   * last refresh are facts, and a recorded failure is a dated account of the
+   * last thing that actually happened. What changes is the two
    * forward-looking claims, which are consequences of the switch rather than
    * of the transfer.
    */
   const disabled = !zone.enabled;
   const serving = !disabled && state !== "never" && state !== "expired";
-
-  // The key's own name, which is what the peer's config calls it and so the
-  // only useful thing to show. An id that resolves to nothing — a key deleted
-  // out from under the zone, which the API refuses but a hand-written row
-  // could still produce — says so rather than rendering a bare number.
-  let tsigLabel = "none";
-  if (zone.tsig_key_id !== 0) {
-    const key = keys.data?.find((k) => k.id === zone.tsig_key_id);
-    tsigLabel = key ? key.name : `#${zone.tsig_key_id} (missing)`;
-  }
 
   /**
    * When the schedule next comes round.
@@ -1025,9 +1061,10 @@ function TransferBand({ zone }: { zone: Zone }) {
   const bad = !disabled && (state === "never" || state === "expired");
   const warn = !disabled && (state === "failing" || state === "overdue");
 
+  // Where it pulls from and what it signs with are not here: they are
+  // editable, and live in the row below this band (UpstreamRow) rather than
+  // being printed twice.
   const fields: { label: string; value: string; strong?: boolean; tone?: string }[] = [
-    { label: "Primaries", value: zone.primaries || "none" },
-    { label: "TSIG key", value: tsigLabel },
     { label: "Serial", value: String(zone.soa_serial) },
     {
       label: "Last refresh",
@@ -1047,13 +1084,10 @@ function TransferBand({ zone }: { zone: Zone }) {
   // words.
   const note = disabled
     ? // Not "answers nothing", which is the one behaviour a disabled zone does
-      // not have. Index.Find skips it entirely (internal/zones/zone.go), so
-      // the zone stops being *consulted* rather than starting to refuse, and
-      // names under it fall through to the forwarder — which for a
-      // split-horizon zone means an internal name is now resolved by a public
-      // server, the very leak the zone was holding closed. That is worth a
-      // sentence, and "answers nothing" would have hidden it.
-      "This zone is disabled: nothing transfers, and names under it are forwarded upstream."
+      // not have: Index.Find skips it entirely (internal/zones/zone.go), so
+      // names under it fall through upstream. What that costs a
+      // split-horizon zone is docs/dashboard.md's to explain.
+      "Nothing transfers while this zone is disabled."
     : serving
       ? `Still serving the copy from ${relativeTime(zone.refreshed_at)}.`
       : state === "never"
@@ -1073,8 +1107,8 @@ function TransferBand({ zone }: { zone: Zone }) {
         ? "Overdue"
         : state;
   // A disabled zone always explains itself, whatever its transfer state:
-  // "nothing is happening here" is the one thing the five fields above cannot
-  // say on their own.
+  // "nothing is happening here" is the one thing the fields above cannot say
+  // on their own.
   const showNote = disabled || state !== "fresh";
   // One tone for the whole note line, so the icon, the label, the error and
   // the tint cannot disagree. Muted is the disabled case and is deliberately
@@ -1091,10 +1125,10 @@ function TransferBand({ zone }: { zone: Zone }) {
 
   return (
     <div
-      // No trailing border: AllowTransferBand always follows a secondary's
-      // TransferBand (the gate is `isSecondary` alone — see its own
-      // comment) and supplies the group's bottom rule itself, the same
-      // reason SoaBand's own border is conditional.
+      // No trailing border: the primaries row always follows a secondary's
+      // TransferBand and the allow-transfer band follows that, so the rule
+      // that closes the group is theirs — the same reason SoaBand's own
+      // border is conditional.
       className={cn(
         "shrink-0",
         bad
@@ -1104,7 +1138,7 @@ function TransferBand({ zone }: { zone: Zone }) {
             : "bg-card",
       )}
     >
-      <div className="grid grid-cols-5 gap-[18px] px-4 py-3">
+      <div className="grid grid-cols-3 gap-[18px] px-4 py-3">
         {fields.map((field) => (
           <div key={field.label} className="flex min-w-0 flex-col gap-1">
             <span className="font-mono text-[9.5px] font-semibold tracking-[0.14em] text-muted-foreground uppercase">
@@ -1129,7 +1163,7 @@ function TransferBand({ zone }: { zone: Zone }) {
           note beside it with nothing between them, and neither line shared a
           left edge with anything. The icon now has a column of its own, so
           both lines start where the fields above do, and the rule closes the
-          five-column grid off rather than letting the error look like a sixth
+          grid off rather than letting the error look like one more
           field. */}
       {showNote && (
         <div className="grid grid-cols-[14px_1fr] gap-x-2 border-t border-border-muted px-4 pt-[9px] pb-2.5">
@@ -1193,9 +1227,253 @@ function TransferBand({ zone }: { zone: Zone }) {
   );
 }
 
+// ── The inline value rows ─────────────────────────────────────────────────
+
+/**
+ * Three rows on this page — who may transfer this zone out, where it pulls
+ * from or forwards to, and who it notifies — are the same machine with a
+ * different caption, a different PATCH key and a different thing to say
+ * while not being edited.
+ *
+ * That machine is: hold one string, reset it when the *saved* value changes
+ * (never on an unrelated refetch, which would wipe an edit in progress),
+ * focus the field the moment editing opens, PATCH the trimmed value, toast
+ * either way, and close on success. Written out three times it drifted three
+ * ways and carried the same accessibility gap three times over.
+ *
+ * The field is called `value` whatever the column is, so one schema shape
+ * and one `<FormField>` serve all three; the caller says which key the value
+ * is PATCHed under.
+ */
+interface InlineFormValues {
+  value: string;
+}
+
+interface InlineValueEdit {
+  form: UseFormReturn<InlineFormValues>;
+  editing: boolean;
+  pending: boolean;
+  start: () => void;
+  cancel: () => void;
+  onSubmit: (event: React.FormEvent<HTMLFormElement>) => void;
+}
+
+function useInlineValueEdit({
+  zoneId,
+  saved,
+  schema,
+  payload,
+  savedMessage,
+  failedMessage,
+}: {
+  zoneId: number;
+  /** The stored value this row edits — the one the form resets to. */
+  saved: string;
+  schema: z.ZodType<InlineFormValues, InlineFormValues>;
+  /** What a successful Save sends, built from the trimmed field. Called at
+   * submit time, so a row carrying a second control (the key select beside
+   * a secondary's primaries) can fold that control's value in here. */
+  payload: (value: string) => ZoneUpdateInput;
+  savedMessage: string;
+  failedMessage: string;
+}): InlineValueEdit {
+  const [editing, setEditing] = useState(false);
+  const updateZone = useUpdateZone();
+  const form = useForm<InlineFormValues>({
+    resolver: zodResolver(schema),
+    defaultValues: { value: saved },
+  });
+
+  // Reset only when the *saved* value changes — initial load, or the refetch
+  // that follows a successful save. An unrelated refetch (the transfer poll,
+  // a record write bumping the serial) must not wipe an unsaved edit.
+  useEffect(() => {
+    form.reset({ value: saved });
+  }, [saved, form]);
+
+  // Focus the field the moment editing opens — RecordFormRow's own habit for
+  // a form that has just appeared.
+  useEffect(() => {
+    if (editing) form.setFocus("value");
+  }, [editing, form]);
+
+  function start() {
+    // Always the saved value, never a previous attempt's abandoned draft —
+    // the pencil opens onto what is actually set, every time.
+    form.reset({ value: saved });
+    setEditing(true);
+  }
+
+  function cancel() {
+    form.reset({ value: saved });
+    setEditing(false);
+  }
+
+  function submit(values: InlineFormValues) {
+    updateZone.mutate(
+      { id: zoneId, ...payload(values.value.trim()) },
+      {
+        onSuccess: () => {
+          toast.success(savedMessage);
+          setEditing(false);
+        },
+        // The server's own words wherever it has any: for the values these
+        // rows carry it is the only account of what was wrong with one.
+        onError: (err) => toast.error(err instanceof ApiError ? err.message : failedMessage),
+      },
+    );
+  }
+
+  return {
+    form,
+    editing,
+    pending: updateZone.isPending,
+    start,
+    cancel,
+    onSubmit: (event) => void form.handleSubmit(submit)(event),
+  };
+}
+
+/**
+ * The shell those three rows share: SoaBand's own 152px label gutter, a
+ * caption in it, and one line that is either the saved value with a pencil
+ * or the field with Save and X.
+ *
+ * The gutter is what makes every caption on this page ("SOA", "Transfers
+ * out", "Primaries", "Notify out") land on one edge; the blank first cell of
+ * the caption's inner grid is what lines its text up with SOA's chevron.
+ *
+ * `read` is the row's own answer to "what is set here"; `footer` is whatever
+ * it has to show underneath in both states (a failed fetch, the delivery
+ * state of each notify target). The FormItem spans the field *and* the
+ * message, which is what makes FormControl's `aria-describedby` point at the
+ * message actually on screen — three separately hand-written copies of this
+ * row each linked nothing.
+ */
+function InlineValueRow({
+  edit,
+  caption,
+  inputLabel,
+  editLabel,
+  cancelLabel,
+  placeholder,
+  inputClassName,
+  read,
+  editExtra,
+  footer,
+  topRule = false,
+  closesGroup = true,
+}: {
+  edit: InlineValueEdit;
+  caption: ReactNode;
+  inputLabel: string;
+  editLabel: string;
+  cancelLabel: string;
+  placeholder: string;
+  inputClassName?: string;
+  read: ReactNode;
+  /** A second control beside the field, saved by the same button. */
+  editExtra?: ReactNode;
+  footer?: ReactNode;
+  /** An internal divider from the band above, where one sits above. */
+  topRule?: boolean;
+  /** Whether this row carries the header group's bottom rule — false when
+   * the row below it supplies one, which would otherwise double it. */
+  closesGroup?: boolean;
+}) {
+  return (
+    <Form {...edit.form}>
+      <form
+        onSubmit={edit.onSubmit}
+        noValidate
+        className={cn(
+          "grid shrink-0 grid-cols-[152px_1fr] bg-card",
+          topRule && "border-t border-border-muted",
+          closesGroup && "border-b border-border",
+        )}
+      >
+        <div className="flex items-start border-r border-border-muted px-3.5 py-[9px]">
+          <span className="grid grid-cols-[12px_auto] items-center gap-[7px] font-mono text-[9.5px] leading-[1.3] font-semibold tracking-[0.14em] text-muted-foreground uppercase">
+            <span aria-hidden="true" />
+            <span>{caption}</span>
+          </span>
+        </div>
+        <FormField
+          control={edit.form.control}
+          name="value"
+          render={({ field }) => (
+            <div className="min-w-0">
+              {/* `contents` so the FormItem provides its id to both the
+                  control and the message without adding a box between them
+                  and this column's own layout. */}
+              <FormItem className="contents">
+                <div className="flex min-w-0 items-center gap-2.5 px-4 py-2">
+                  {edit.editing ? (
+                    <>
+                      <FormControl>
+                        <Input
+                          {...field}
+                          aria-label={inputLabel}
+                          placeholder={placeholder}
+                          autoComplete="off"
+                          spellCheck={false}
+                          className={cn("h-7 font-mono", inputClassName)}
+                        />
+                      </FormControl>
+                      {editExtra}
+                      <div className="ml-auto flex shrink-0 items-center gap-1.5">
+                        <Button type="submit" size="sm" disabled={edit.pending}>
+                          {edit.pending ? "Saving…" : "Save"}
+                        </Button>
+                        <Button
+                          type="button"
+                          size="icon-sm"
+                          variant="ghost"
+                          aria-label={cancelLabel}
+                          onClick={edit.cancel}
+                        >
+                          <X />
+                        </Button>
+                      </div>
+                    </>
+                  ) : (
+                    <>
+                      {read}
+                      <Button
+                        type="button"
+                        size="icon-sm"
+                        variant="ghost"
+                        title={editLabel}
+                        aria-label={editLabel}
+                        className="ml-auto shrink-0"
+                        onClick={edit.start}
+                      >
+                        <Pencil />
+                      </Button>
+                    </>
+                  )}
+                </div>
+                {/* The artboard has no slot for this — a malformed entry has
+                    to say where it was typed regardless of the one-line
+                    layout above, so it gets its own line under the row. */}
+                {edit.editing && (
+                  <div className="px-4 pb-2">
+                    <FormMessage />
+                  </div>
+                )}
+              </FormItem>
+              {footer}
+            </div>
+          )}
+        />
+      </form>
+    </Form>
+  );
+}
+
 // ── The allow-transfer band ───────────────────────────────────────────────
 
-const allowTransferFormSchema = z.object({
+const allowTransferSchema = z.object({
   // No static shape (regex, length, …): "valid" here means "parses as an
   // ACL", which only parseACL itself can answer — the same reason
   // recordFormSchema's rdata carries no client-side rule (see that field's
@@ -1203,12 +1481,11 @@ const allowTransferFormSchema = z.object({
   // grammar is small and stable enough to be worth the client-side port
   // (see lib/acl.ts's own comment on why, and on the server remaining the
   // one that actually decides).
-  allow_transfer: z.string().superRefine((value, ctx) => {
+  value: z.string().superRefine((value, ctx) => {
     const result = parseACL(value);
     if (!result.ok) ctx.addIssue({ code: "custom", message: result.error });
   }),
 });
-type AllowTransferFormValues = z.infer<typeof allowTransferFormSchema>;
 
 /**
  * What the last inbound transfer *request* did, as one line — this band's
@@ -1230,22 +1507,12 @@ function xfrServedLine(zone: Zone): string {
 }
 
 /**
- * Who may take this zone from here, and who last did — a row of the SOA
- * band's own gutter rather than a band of its own: unlike every SOA field,
- * allow_transfer is one value, so it rides the SOA row instead of owning a
- * band. The 152px label column is SoaBand's (see its own comment); this row
- * shares it rather than inventing a second one, so the two captions ("SOA"
- * above, "TRANSFERS OUT" here) land on one edge.
+ * Who may take this zone from here, and who last did.
  *
  * Serving transfers applies to both a primary and a secondary — a secondary
  * re-serves what it pulled (§9.5.3) — so it cannot live inside SoaBand
  * (primary-only) or TransferBand (secondary-only, and about the transfers
- * *this* zone pulls, not the ones it serves). Mounted directly below
- * whichever one is showing: SoaBand (or, for a secondary, TransferBand)
- * says what this zone's copy of itself is and how current it is; this row
- * says who is allowed to take a copy of it and who last did. Its own
- * "TRANSFERS OUT" caption (SoaBand's "SOA" is the model) keeps the two from
- * blurring into one continuous section.
+ * *this* zone pulls, not the ones it serves).
  *
  * Mounted only for a primary or a secondary — never internal, stub or
  * forwarder. §9.5.3 refuses those with NOTAUTH regardless of their ACL, and
@@ -1254,306 +1521,161 @@ function xfrServedLine(zone: Zone): string {
  * header above already omits rather than lets fail on click. See the call
  * site's own comment on why the gate is the positive set.
  *
- * Read is the default and the state almost every zone shows: the saved ACL
- * (or, muted, the fact that none is set) beside the one-line result of the
- * last inbound request. Editing is opt-in behind its own pencil, rather than
- * a permanently open input — `allow_transfer` is default-deny and rarely
- * touched, so an always-live field was more control surface than the value
- * earns. `allow_transfer` itself is default-deny: a zone created with none
- * set answers every transfer request REFUSED, and this row is the only
- * place in the app that opens it up. The field's own client-side check
- * (allowTransferFormSchema) is a convenience, not the gate — the server
- * validates independently and is what a real request is ever matched
- * against (see lib/acl.ts's own comment).
+ * `allow_transfer` is default-deny: a zone created with none set answers
+ * every transfer request REFUSED, and this row is the only place in the app
+ * that opens it up. The field's own client-side check is a convenience, not
+ * the gate — the server validates independently and is what a real request
+ * is ever matched against (see lib/acl.ts's own comment).
  */
 function AllowTransferBand({ zone }: { zone: Zone }) {
-  const [editing, setEditing] = useState(false);
-  const updateZone = useUpdateZone();
-  const form = useForm<AllowTransferFormValues>({
-    resolver: zodResolver(allowTransferFormSchema),
-    defaultValues: { allow_transfer: zone.allow_transfer },
+  const edit = useInlineValueEdit({
+    zoneId: zone.id,
+    saved: zone.allow_transfer,
+    schema: allowTransferSchema,
+    payload: (value) => ({ allow_transfer: value }),
+    savedMessage: "Allow transfer saved",
+    failedMessage: "Couldn't save allow transfer",
   });
-
-  // Reset only when the *saved* value changes — SoaBand's own rule, and for
-  // the same reason: an unrelated refetch (the transfer poll, a record
-  // write bumping the serial) must not wipe an in-progress, unsaved edit.
-  const { allow_transfer } = zone;
-  useEffect(() => {
-    form.reset({ allow_transfer });
-  }, [allow_transfer, form]);
-
-  // Focus the field the moment editing opens — RecordFormRow's own habit
-  // for a form that has just appeared.
-  useEffect(() => {
-    if (editing) form.setFocus("allow_transfer");
-  }, [editing, form]);
-
-  function onStartEdit() {
-    // Always the saved value, never a previous attempt's abandoned draft —
-    // the pencil opens onto what is actually set, every time.
-    form.reset({ allow_transfer: zone.allow_transfer });
-    setEditing(true);
-  }
-
-  function onCancelEdit() {
-    form.reset({ allow_transfer: zone.allow_transfer });
-    setEditing(false);
-  }
-
-  function onSubmit(values: AllowTransferFormValues) {
-    updateZone.mutate(
-      { id: zone.id, allow_transfer: values.allow_transfer.trim() },
-      {
-        onSuccess: () => {
-          toast.success("Allow transfer saved");
-          setEditing(false);
-        },
-        onError: (err) =>
-          toast.error(err instanceof ApiError ? err.message : "Couldn't save allow transfer"),
-      },
-    );
-  }
-
   const hasAcl = zone.allow_transfer !== "";
 
   return (
-    <Form {...form}>
-      <form
-        onSubmit={(e) => void form.handleSubmit(onSubmit)(e)}
-        noValidate
-        // No trailing border of its own: this row always closes off
-        // whichever band sits above it (SoaBand or TransferBand, whose own
-        // bottom border is conditional/removed for exactly this reason), so
-        // its bottom rule is the group's, and its top rule the internal
-        // divider between the two.
-        className="grid shrink-0 grid-cols-[152px_1fr] border-t border-border-muted border-b border-border bg-card"
-      >
-        {/* Distinct from SoaBand's "SOA", so this row reads as its own
-            question rather than a continuation of the band above it. The
-            blank first cell of the inner grid is what lines the caption's
-            text up with SOA's own chevron, not a caret this row lacks. */}
-        <div className="flex items-center border-r border-border-muted px-3.5 py-[9px]">
-          <span className="grid grid-cols-[12px_auto] items-center gap-[7px] font-mono text-[9.5px] leading-[1.3] font-semibold tracking-[0.14em] text-muted-foreground uppercase">
-            <span aria-hidden="true" />
-            <span>
-              Transfers
-              <br />
-              out
-            </span>
+    <InlineValueRow
+      edit={edit}
+      caption={
+        <>
+          Transfers
+          <br />
+          out
+        </>
+      }
+      inputLabel="Allow transfer"
+      editLabel="Edit allow transfer"
+      cancelLabel="Cancel editing allow transfer"
+      placeholder="10.0.0.0/24, key:ns2"
+      inputClassName="w-[236px] shrink-0"
+      topRule
+      read={
+        <>
+          {/* The saved value, mono — muted when there is none, so an empty
+              ACL reads as a stated fact rather than a blank field waiting to
+              be filled in. */}
+          <span
+            className={cn(
+              "min-w-0 shrink truncate font-mono text-[12.5px]",
+              hasAcl ? "text-foreground" : "text-muted-foreground",
+            )}
+            title={hasAcl ? zone.allow_transfer : undefined}
+          >
+            {hasAcl ? zone.allow_transfer : "No peer may transfer this zone."}
           </span>
-        </div>
-        <FormField
-          control={form.control}
-          name="allow_transfer"
-          render={({ field }) => (
-            <div className="min-w-0">
-              <div className="flex min-w-0 items-center gap-2.5 px-4 py-2">
-                {editing ? (
-                  <>
-                    <Input
-                      {...field}
-                      aria-label="Allow transfer"
-                      placeholder="10.0.0.0/24, key:ns2"
-                      autoComplete="off"
-                      spellCheck={false}
-                      className="h-7 w-[236px] shrink-0 font-mono"
-                    />
-                    <div className="ml-auto flex shrink-0 items-center gap-1.5">
-                      <Button type="submit" size="sm" disabled={updateZone.isPending}>
-                        {updateZone.isPending ? "Saving…" : "Save"}
-                      </Button>
-                      <Button
-                        type="button"
-                        size="icon-sm"
-                        variant="ghost"
-                        aria-label="Cancel editing allow transfer"
-                        onClick={onCancelEdit}
-                      >
-                        <X />
-                      </Button>
-                    </div>
-                  </>
-                ) : (
-                  <>
-                    {/* The saved value, mono — muted when there is none, so
-                        an empty ACL reads as a stated fact rather than a
-                        blank field waiting to be filled in. */}
-                    <span
-                      className={cn(
-                        "min-w-0 shrink truncate font-mono text-[12.5px]",
-                        hasAcl ? "text-foreground" : "text-muted-foreground",
-                      )}
-                      title={hasAcl ? zone.allow_transfer : undefined}
-                    >
-                      {hasAcl ? zone.allow_transfer : "No peer may transfer this zone."}
-                    </span>
-                    {/* What the last inbound *request* did — independent of
-                        the ACL beside it: a peer can be refused today under
-                        a value that used to admit it, so the history stays
-                        on screen either way. Long, it truncates rather than
-                        pushing the pencil off the row; `title` keeps the
-                        full text reachable. */}
-                    <span
-                      className="min-w-0 shrink truncate font-mono text-[11px] text-muted-foreground"
-                      title={xfrServedLine(zone)}
-                    >
-                      {xfrServedLine(zone)}
-                    </span>
-                    <Button
-                      type="button"
-                      size="icon-sm"
-                      variant="ghost"
-                      title="Edit allow transfer"
-                      aria-label="Edit allow transfer"
-                      className="ml-auto shrink-0"
-                      onClick={onStartEdit}
-                    >
-                      <Pencil />
-                    </Button>
-                  </>
-                )}
-              </div>
-              {/* The artboard has no slot for this — a malformed entry has
-                  to say where the user typed it regardless of the one-line
-                  layout above, so it gets its own line under the row rather
-                  than being dropped. */}
-              {editing && (
-                <div className="px-4 pb-2">
-                  <FormMessage />
-                </div>
-              )}
-            </div>
-          )}
-        />
-      </form>
-    </Form>
+          {/* What the last inbound *request* did — independent of the ACL
+              beside it: a peer can be refused today under a value that used
+              to admit it, so the history stays on screen either way. */}
+          <span
+            className="min-w-0 shrink truncate font-mono text-[11px] text-muted-foreground"
+            title={xfrServedLine(zone)}
+          >
+            {xfrServedLine(zone)}
+          </span>
+        </>
+      }
+    />
   );
 }
 
-// ── The upstream row: FORWARD TO for a forwarder, MASTER for a stub ───────
+// ── The upstream row: PRIMARIES for a pulling zone, FORWARD TO for a
+//    forwarder ─────────────────────────────────────────────────────────────
 
 /**
- * Where a routing zone sends the queries it claims — one row serving both
- * types the milestone adds, with its caption switching.
+ * Where this zone's queries go, and — for one that pulls — what it signs
+ * the asking with.
  *
- * A forwarder and a stub are the same mechanism with two sources for the
- * addresses. Both claim a suffix outright and route everything beneath it;
- * a forwarder's targets are typed into `forward_to` by the operator, a
+ * A forwarder, a stub and a secondary are one question with three sources
+ * for the addresses. A forwarder's targets are typed into `forward_to` by
+ * the operator and every query beneath its suffix is routed to them; a
  * stub's are *derived from an NS set it fetches* from the masters in
  * `primaries` (an SOA and an NS query with glue, deliberately not an AXFR —
- * see internal/zones/stub.go). One row rather than two, because the question
- * it answers is one question: where do this zone's queries go, and is that
- * still working.
+ * see internal/zones/stub.go); a secondary pulls the whole zone from them
+ * over AXFR. One row rather than three, because the question it answers is
+ * one question: where does this zone go to get what it serves.
  *
- * It shares SoaBand's 152px label column, the same way TRANSFERS OUT and
- * NOTIFY OUT do, so every caption on this page lands on one edge — and it
- * is a *row* rather than a band for the same reason AllowTransferBand is:
- * the value is one string, not a form.
- *
- * Read is the default, editing behind the pencil. The grammar is not checked
- * here at all: `zones.ValidateForwardTo`/`ValidatePrimaries` are the real
- * checks and a second implementation of `host[:port]` in this file would only
- * drift from them, so the server's own message is what a malformed entry
- * gets. The one client-side rule is a stub's master being required, which
- * exists only to save a round trip that would always 400.
+ * The grammar is not checked here at all: `zones.ValidateForwardTo` and
+ * `ValidatePrimaries` are the real checks and a second implementation of
+ * `host[:port]` in this file would only drift from them, so a malformed
+ * entry gets the server's own message. The one client-side rule is that a
+ * zone that pulls must name somewhere to pull from, which exists only to
+ * save a round trip that would always 400.
  */
 function upstreamSchema(required: boolean, message: string) {
   return z.object({
-    upstreams: z.string().superRefine((value, ctx) => {
+    value: z.string().superRefine((value, ctx) => {
       if (required && value.trim() === "") ctx.addIssue({ code: "custom", message });
     }),
   });
 }
-type UpstreamFormValues = { upstreams: string };
 
 function UpstreamRow({ zone }: { zone: Zone }) {
   const forwarder = zone.type === "forwarder";
-  // The field this row edits, and the only difference between the two shapes
+  /**
+   * Whether this zone signs what it asks for, and so whether the row carries
+   * a key select beside the addresses. `tsig_key_id` is accepted on exactly
+   * the two types that pull (checkZoneTransferConfig), and refused on a
+   * forwarder, which signs nothing.
+   */
+  const signs = zone.type === "secondary" || zone.type === "stub";
+  const keys = useTSIGKeys();
+  /**
+   * The key while the row is being edited. Held here rather than in the form
+   * because it is a choice over a fixed set with nothing to validate; the
+   * value that is saved is read at submit time.
+   */
+  const [keyId, setKeyId] = useState(zone.tsig_key_id);
+  useEffect(() => setKeyId(zone.tsig_key_id), [zone.tsig_key_id]);
+
+  // The field this row edits, and the only difference between the shapes
   // that reaches the wire. They are separate columns because they are
   // separate things: the server 400s `primaries` on a forwarder and
   // `forward_to` on anything else, so one shared column would be refused by
   // whichever type it was not written for.
   const saved = forwarder ? zone.forward_to : zone.primaries;
-  const label = forwarder ? "Forward to" : "Master";
-  // A stub with no master can never fetch, so it would claim its suffix and
-  // SERVFAIL it forever — checkZoneTransferConfig refuses it, and this
-  // mirrors that refusal rather than inventing one. A forwarder's empty
-  // `forward_to` is the opposite case: the server accepts it deliberately
-  // (the zone still claims the suffix, and every query beneath it becomes a
-  // SERVFAIL rather than a fall-through), so there is no rule to mirror.
+  const label = forwarder ? "Forward to" : "Primaries";
+  // A zone that pulls and names nowhere to pull from can never fetch, so it
+  // would claim its suffix and SERVFAIL it forever — checkZoneTransferConfig
+  // refuses it, and this mirrors that refusal rather than inventing one. A
+  // forwarder's empty `forward_to` is the opposite case: the server accepts
+  // it deliberately (the zone still claims the suffix, and every query
+  // beneath it becomes a SERVFAIL rather than a fall-through), so there is
+  // no rule to mirror.
   const schema = useMemo(
     () => upstreamSchema(!forwarder, "Where to fetch from, e.g. 192.168.150.1"),
     [forwarder],
   );
 
-  const [editing, setEditing] = useState(false);
-  const updateZone = useUpdateZone();
-  const form = useForm<UpstreamFormValues>({
-    resolver: zodResolver(schema),
-    defaultValues: { upstreams: saved },
+  const edit = useInlineValueEdit({
+    zoneId: zone.id,
+    saved,
+    schema,
+    payload: (value) =>
+      forwarder ? { forward_to: value } : { primaries: value, tsig_key_id: keyId },
+    savedMessage: forwarder ? "Upstreams saved" : "Primaries saved",
+    failedMessage: forwarder ? "Couldn't save the upstreams" : "Couldn't save the primaries",
   });
 
-  // Reset only when the *saved* value changes — AllowTransferBand's own rule,
-  // and for the same reason: an unrelated refetch (a stub's own fetch poll
-  // landing, say) must not wipe an in-progress, unsaved edit.
-  useEffect(() => {
-    form.reset({ upstreams: saved });
-  }, [saved, form]);
-
-  useEffect(() => {
-    if (editing) form.setFocus("upstreams");
-  }, [editing, form]);
-
-  function onStartEdit() {
-    form.reset({ upstreams: saved });
-    setEditing(true);
-  }
-
-  function onCancelEdit() {
-    form.reset({ upstreams: saved });
-    setEditing(false);
-  }
-
-  function onSubmit(values: UpstreamFormValues) {
-    const trimmed = values.upstreams.trim();
-    updateZone.mutate(
-      { id: zone.id, ...(forwarder ? { forward_to: trimmed } : { primaries: trimmed }) },
-      {
-        onSuccess: () => {
-          toast.success(forwarder ? "Upstreams saved" : "Master saved");
-          setEditing(false);
-        },
-        // The server's own words — it is the only account of what was wrong
-        // with the value, since nothing here parses it.
-        onError: (err) =>
-          toast.error(
-            err instanceof ApiError
-              ? err.message
-              : forwarder
-                ? "Couldn't save the upstreams"
-                : "Couldn't save the master",
-          ),
-      },
-    );
-  }
-
   /**
-   * The note beside the value, and for a stub it is the state of the fetch.
+   * The note beside the value, and for a zone that pulls it is the state of
+   * the last fetch.
    *
-   * **Never a date-less state where a date exists to be shown.** Two of a
-   * stub's three carry one: the set it holds and when it arrived, and —
-   * under a failure — the age of the set it is still routing to. The third,
-   * "no NS set yet", carries none and must not be given one: nothing has
-   * ever landed for a date to be about, and the grid below names the master
-   * being asked. The rule is that a date is never *withheld*, not that
-   * every state has one.
+   * **Never a date-less state where a date exists to be shown.** Two of the
+   * three carry one: the set it holds and when it arrived, and — under a
+   * failure — the age of what it is still serving. The third, "nothing
+   * fetched yet", carries none and must not be given one: nothing has ever
+   * landed for a date to be about.
    *
    * Deliberately **not** derived through transferState: that function's
    * `expired` branch reads `expires_at`, which a stub is never given
    * (§9.11.8) but a row retyped from secondary can still carry — running one
    * through it would put a zone that is routing perfectly well on screen as
-   * expired. `refreshed_at` and `lastTransferError` are the whole of what
-   * this needs, and neither involves an expiry.
+   * expired.
    */
   const failure = forwarder ? null : lastTransferError(zone);
   const upstreams = forwardTargets(saved);
@@ -1564,148 +1686,146 @@ function UpstreamRow({ zone }: { zone: Zone }) {
         ? ""
         : `${upstreams.length} upstream${upstreams.length === 1 ? "" : "s"}`;
   } else if (zone.refreshed_at === 0) {
-    note = "no NS set yet";
+    note = zone.type === "stub" ? "no NS set yet" : "nothing pulled yet";
   } else if (failure) {
-    // The age of the set, not of the fetch that failed to replace it: this
-    // line is about what is being served, and the failure's own date is on
-    // the line below.
-    note = `NS set from ${relativeTime(zone.refreshed_at)}`;
+    // The age of what is being served, not of the fetch that failed to
+    // replace it: the failure's own date is on the line below.
+    note = `from ${relativeTime(zone.refreshed_at)}`;
   } else {
-    note = `NS set fetched ${relativeTime(zone.refreshed_at)}`;
+    note = `fetched ${relativeTime(zone.refreshed_at)}`;
   }
 
   return (
-    <Form {...form}>
-      <form
-        onSubmit={(e) => void form.handleSubmit(onSubmit)(e)}
-        noValidate
-        // The last row of the header group either way — for both types every
-        // band above it is dropped, so it carries the group's bottom rule
-        // itself.
-        className="grid shrink-0 grid-cols-[152px_1fr] border-b border-border bg-card"
-      >
-        <div className="flex items-start border-r border-border-muted px-3.5 py-[9px]">
-          {/* The blank first cell is what lines this caption's text up with
-              SOA's own chevron on every other zone type's page. */}
-          <span className="grid grid-cols-[12px_auto] items-center gap-[7px] font-mono text-[9.5px] leading-[1.3] font-semibold tracking-[0.14em] text-muted-foreground uppercase">
-            <span aria-hidden="true" />
-            <span>{label}</span>
+    <InlineValueRow
+      edit={edit}
+      caption={label}
+      inputLabel={label}
+      editLabel={forwarder ? "Edit upstreams" : "Edit primaries"}
+      cancelLabel={forwarder ? "Cancel editing upstreams" : "Cancel editing primaries"}
+      placeholder={forwarder ? "10.0.0.1, 10.0.0.2:5353" : "192.168.150.1:53"}
+      inputClassName="w-[280px] shrink-0"
+      // A secondary's row is followed by the allow-transfer band, which
+      // supplies the group's bottom rule itself; for the two routing types
+      // this row is the last of the header group and carries it.
+      closesGroup={zone.type !== "secondary"}
+      editExtra={signs && <TSIGKeySelect keys={keys} value={keyId} onChange={setKeyId} />}
+      read={
+        <>
+          <span
+            className={cn(
+              "min-w-0 shrink truncate font-mono text-[12.5px]",
+              saved === "" ? "text-muted-foreground" : "text-foreground",
+            )}
+            title={saved === "" ? undefined : saved}
+          >
+            {saved === "" ? "none" : saved}
           </span>
-        </div>
-        <FormField
-          control={form.control}
-          name="upstreams"
-          render={({ field }) => (
-            <div className="min-w-0">
-              <div className="flex min-w-0 items-center gap-2.5 px-4 py-2">
-                {editing ? (
-                  <>
-                    <Input
-                      {...field}
-                      aria-label={label}
-                      placeholder={forwarder ? "10.0.0.1, 10.0.0.2:5353" : "192.168.150.1:53"}
-                      autoComplete="off"
-                      spellCheck={false}
-                      className="h-7 w-[280px] shrink-0 font-mono"
-                    />
-                    <div className="ml-auto flex shrink-0 items-center gap-1.5">
-                      <Button type="submit" size="sm" disabled={updateZone.isPending}>
-                        {updateZone.isPending ? "Saving…" : "Save"}
-                      </Button>
-                      <Button
-                        type="button"
-                        size="icon-sm"
-                        variant="ghost"
-                        aria-label={
-                          forwarder ? "Cancel editing upstreams" : "Cancel editing master"
-                        }
-                        onClick={onCancelEdit}
-                      >
-                        <X />
-                      </Button>
-                    </div>
-                  </>
-                ) : (
-                  <>
-                    <span
-                      className={cn(
-                        "min-w-0 shrink truncate font-mono text-[12.5px]",
-                        saved === "" ? "text-muted-foreground" : "text-foreground",
-                      )}
-                      title={saved === "" ? undefined : saved}
-                    >
-                      {saved === "" ? "none" : saved}
-                    </span>
-                    {note !== "" && (
-                      <span
-                        data-testid="upstream-note"
-                        className={cn(
-                          "shrink-0 font-mono text-[11px]",
-                          // A stale set is a warning about what is being
-                          // routed to, not a neutral fact about it.
-                          failure && zone.refreshed_at !== 0
-                            ? "text-warning-foreground"
-                            : "text-muted-foreground",
-                        )}
-                      >
-                        {note}
-                      </span>
-                    )}
-                    <Button
-                      type="button"
-                      size="icon-sm"
-                      variant="ghost"
-                      title={forwarder ? "Edit upstreams" : "Edit master"}
-                      aria-label={forwarder ? "Edit upstreams" : "Edit master"}
-                      className="ml-auto shrink-0"
-                      onClick={onStartEdit}
-                    >
-                      <Pencil />
-                    </Button>
-                  </>
-                )}
-              </div>
-              {editing && (
-                <div className="px-4 pb-2">
-                  <FormMessage />
-                </div>
+          {saved !== "" && <CopyButton value={saved} label={`Copy ${label.toLowerCase()}`} />}
+          {signs && <TSIGKeyReadout keys={keys} keyId={zone.tsig_key_id} />}
+          {note !== "" && (
+            <span
+              data-testid="upstream-note"
+              className={cn(
+                "shrink-0 font-mono text-[11px]",
+                // A stale set is a warning about what is being routed to,
+                // not a neutral fact about it.
+                failure && zone.refreshed_at !== 0
+                  ? "text-warning-foreground"
+                  : "text-muted-foreground",
               )}
-              {/* The failed fetch, in the fetcher's own words, with the date
-                  of the attempt that produced it and the age of the set still
-                  being routed to. All three or none: an error with no date is
-                  a claim about the present made by an unknown past, and a
-                  failure with no account of what is still being served does
-                  not say whether the suffix is down. */}
-              {failure && !editing && (
-                <div className="grid grid-cols-[13px_1fr] gap-x-2 border-t border-border-muted px-4 pt-[7px] pb-2">
-                  <AlertCircle
-                    aria-hidden="true"
-                    className="mt-0.5 size-3.5 text-warning-foreground"
-                  />
-                  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2.5">
-                    <span className="shrink-0 font-mono text-[9.5px] font-semibold tracking-[0.14em] text-warning-foreground uppercase">
-                      Last fetch · {relativeTime(failure.at)}
-                    </span>
-                    <span
-                      data-testid="stub-fetch-error"
-                      title={failure.message}
-                      className="min-w-0 truncate font-mono text-[12.5px] text-warning-foreground"
-                    >
-                      {failure.message}
-                    </span>
-                    <span className="shrink-0 font-mono text-[11.5px] text-muted-foreground">
-                      {zone.refreshed_at === 0
-                        ? "Answering nothing until the first fetch succeeds."
-                        : `serving the NS set from ${relativeTime(zone.refreshed_at)}`}
-                    </span>
-                  </div>
-                </div>
-              )}
-            </div>
+            >
+              {note}
+            </span>
           )}
-        />
-      </form>
-    </Form>
+        </>
+      }
+      footer={
+        /* The failed fetch, in the fetcher's own words, with the date of the
+           attempt that produced it and the age of what is still being
+           served. All three or none: an error with no date is a claim about
+           the present made by an unknown past, and a failure with no account
+           of what is still being served does not say whether the suffix is
+           down. */
+        failure && !edit.editing ? (
+          <div className="grid grid-cols-[13px_1fr] gap-x-2 border-t border-border-muted px-4 pt-[7px] pb-2">
+            <AlertCircle aria-hidden="true" className="mt-0.5 size-3.5 text-warning-foreground" />
+            <div className="flex min-w-0 flex-wrap items-baseline gap-x-2.5">
+              <span className="shrink-0 font-mono text-[9.5px] font-semibold tracking-[0.14em] text-warning-foreground uppercase">
+                Last fetch · {relativeTime(failure.at)}
+              </span>
+              <span
+                data-testid="stub-fetch-error"
+                title={failure.message}
+                className="min-w-0 truncate font-mono text-[12.5px] text-warning-foreground"
+              >
+                {failure.message}
+              </span>
+              <span className="shrink-0 font-mono text-[11.5px] text-muted-foreground">
+                {zone.refreshed_at === 0
+                  ? "Answering nothing until the first fetch succeeds."
+                  : `serving what arrived ${relativeTime(zone.refreshed_at)}`}
+              </span>
+            </div>
+          </div>
+        ) : null
+      }
+    />
+  );
+}
+
+/**
+ * The key a pulling zone signs with, at rest.
+ *
+ * The key's own *name* is what the peer's config calls it and so the only
+ * useful thing to show. An id this list cannot name is only evidence of a
+ * key deleted out from under the zone — which the API refuses, but a
+ * hand-written row could still produce — when the list actually arrived. A
+ * request that failed, or one still in flight, says nothing about the store,
+ * so it gets the bare id rather than an accusation.
+ */
+function TSIGKeyReadout({ keys, keyId }: { keys: ReturnType<typeof useTSIGKeys>; keyId: number }) {
+  if (keyId === 0) return <span className="shrink-0 font-mono text-[11px]">unsigned</span>;
+  const named = keys.data?.find((k) => k.id === keyId);
+  const label = named ? named.name : keys.isSuccess ? `#${keyId} (missing)` : `#${keyId}`;
+  return (
+    <span className="flex min-w-0 shrink items-center gap-1.5">
+      <span className="min-w-0 truncate font-mono text-[11px]" title={label}>
+        {label}
+      </span>
+      {named && <CopyButton value={named.name} label="Copy the TSIG key name" />}
+    </span>
+  );
+}
+
+/** The same choice as the zones list's create row: every key by name, plus
+ * "unsigned". A stored id the list cannot name keeps an option of its own,
+ * so saving an unrelated edit never silently unsigns the zone. */
+function TSIGKeySelect({
+  keys,
+  value,
+  onChange,
+}: {
+  keys: ReturnType<typeof useTSIGKeys>;
+  value: number;
+  onChange: (id: number) => void;
+}) {
+  const known = keys.data ?? [];
+  const unlisted = value !== 0 && !known.some((k) => k.id === value);
+  return (
+    <NativeSelect
+      aria-label="TSIG key"
+      value={String(value)}
+      onChange={(e) => onChange(Number(e.target.value))}
+      className="h-7 w-[172px] shrink-0 font-mono"
+    >
+      <NativeSelectOption value="0">unsigned</NativeSelectOption>
+      {known.map((k) => (
+        <NativeSelectOption key={k.id} value={String(k.id)}>
+          {k.name}
+        </NativeSelectOption>
+      ))}
+      {unlisted && <NativeSelectOption value={String(value)}>#{value}</NativeSelectOption>}
+    </NativeSelect>
   );
 }
 
@@ -1716,20 +1836,16 @@ function UpstreamRow({ zone }: { zone: Zone }) {
  *
  * A claimed suffix is claimed *outright*: §9.11.5 makes a query beneath it
  * with no reachable upstream a SERVFAIL rather than a fall-through past
- * dnsaur to the default resolvers. That is the surprising half of the type —
- * an operator who expects a forwarder to be an override will expect the
- * fall-through — and it is the half that turns a broken upstream into a dead
- * suffix. Explanation belongs in docs/; this is a consequence, and it belongs
- * on screen.
+ * dnsaur to the default resolvers. Why that is so is docs/dashboard.md's
+ * job; that it is so belongs on screen.
  */
 function ForwarderConsequence({ zone }: { zone: Zone }) {
   return (
     <div className="grid shrink-0 grid-cols-[13px_1fr] gap-x-2 px-4 py-2.5">
       <AlertCircle aria-hidden="true" className="mt-0.5 size-3.5 text-muted-foreground" />
       <span className="text-[12.5px] leading-normal text-pretty text-muted-foreground">
-        This zone claims <span className="font-mono text-foreground">{zone.name}</span> outright.
-        With every upstream unreachable, queries for it get SERVFAIL — they do not fall through to
-        the default resolvers.
+        <span className="font-mono text-foreground">{zone.name}</span> is claimed outright: with no
+        upstream reachable, queries for it get SERVFAIL.
       </span>
     </div>
   );
@@ -1737,17 +1853,16 @@ function ForwarderConsequence({ zone }: { zone: Zone }) {
 
 // ── The notify-out band ───────────────────────────────────────────────────
 
-const notifyToFormSchema = z.object({
+const notifyToSchema = z.object({
   // Same reasoning as allow_transfer's own schema above: "valid" means
   // "parses as notify_to", which only parseNotifyTo can answer — see
   // lib/notify.ts's own top comment on why the client-side port is worth
   // having and why it is never the last word.
-  notify_to: z.string().superRefine((value, ctx) => {
+  value: z.string().superRefine((value, ctx) => {
     const result = parseNotifyTo(value);
     if (!result.ok) ctx.addIssue({ code: "custom", message: result.error });
   }),
 });
-type NotifyToFormValues = z.infer<typeof notifyToFormSchema>;
 
 /**
  * Presentation for one target's delivery state — the state column is the
@@ -1873,8 +1988,7 @@ function NotifyTargetRow({ row }: { row: ZoneNotify }) {
  * Who this zone tells when it changes, and how each of them is doing — the
  * outbound twin of AllowTransferBand's row, sharing its 152px label gutter
  * so the two captions ("Transfers out" there, "Notify out" here) land on
- * one edge, exactly as that component's own comment describes for the band
- * above it.
+ * one edge.
  *
  * The read line is the saved `notify_to` value plus a roll-up — "no
  * targets" / "all 4 current" / "3 of 4 current, 1 never notified" / "2 of 4
@@ -1900,50 +2014,15 @@ function NotifyTargetRow({ row }: { row: ZoneNotify }) {
  */
 function NotifyBand({ zone }: { zone: Zone }) {
   const [showAll, setShowAll] = useState(false);
-  const [editing, setEditing] = useState(false);
-  const updateZone = useUpdateZone();
   const notifies = useZoneNotifies(zone.id);
-  const form = useForm<NotifyToFormValues>({
-    resolver: zodResolver(notifyToFormSchema),
-    defaultValues: { notify_to: zone.notify_to },
+  const edit = useInlineValueEdit({
+    zoneId: zone.id,
+    saved: zone.notify_to,
+    schema: notifyToSchema,
+    payload: (value) => ({ notify_to: value }),
+    savedMessage: "Notify targets saved",
+    failedMessage: "Couldn't save notify targets",
   });
-
-  // Reset only when the *saved* value changes — AllowTransferBand's own
-  // rule, and for the same reason: an unrelated refetch (the notify poll
-  // below, a record write bumping the serial) must not wipe an in-progress,
-  // unsaved edit.
-  const { notify_to } = zone;
-  useEffect(() => {
-    form.reset({ notify_to });
-  }, [notify_to, form]);
-
-  useEffect(() => {
-    if (editing) form.setFocus("notify_to");
-  }, [editing, form]);
-
-  function onStartEdit() {
-    form.reset({ notify_to: zone.notify_to });
-    setEditing(true);
-  }
-
-  function onCancelEdit() {
-    form.reset({ notify_to: zone.notify_to });
-    setEditing(false);
-  }
-
-  function onSubmit(values: NotifyToFormValues) {
-    updateZone.mutate(
-      { id: zone.id, notify_to: values.notify_to.trim() },
-      {
-        onSuccess: () => {
-          toast.success("Notify targets saved");
-          setEditing(false);
-        },
-        onError: (err) =>
-          toast.error(err instanceof ApiError ? err.message : "Couldn't save notify targets"),
-      },
-    );
-  }
 
   const hasValue = zone.notify_to !== "";
   const rows = notifies.data ?? [];
@@ -1961,717 +2040,98 @@ function NotifyBand({ zone }: { zone: Zone }) {
   const restRows = rows.filter((r) => !isNotifyBehind(r.state));
 
   return (
-    <Form {...form}>
-      <form
-        onSubmit={(e) => void form.handleSubmit(onSubmit)(e)}
-        noValidate
-        // No trailing border of its own, same reasoning as AllowTransferBand:
-        // this row always closes off whichever band sits above it.
-        className="grid shrink-0 grid-cols-[152px_1fr] border-t border-border-muted border-b border-border bg-card"
-      >
-        <div className="flex items-start border-r border-border-muted px-3.5 py-[9px]">
-          <span className="grid grid-cols-[12px_auto] items-center gap-[7px] font-mono text-[9.5px] leading-[1.3] font-semibold tracking-[0.14em] text-muted-foreground uppercase">
-            <span aria-hidden="true" />
-            <span>
-              Notify
-              <br />
-              out
-            </span>
+    <InlineValueRow
+      edit={edit}
+      caption={
+        <>
+          Notify
+          <br />
+          out
+        </>
+      }
+      inputLabel="Notify to"
+      editLabel="Edit notify targets"
+      cancelLabel="Cancel editing notify targets"
+      placeholder="10.0.0.2, 10.0.0.3 key:ns2"
+      inputClassName="flex-1"
+      topRule
+      read={
+        <>
+          <span
+            className={cn(
+              "min-w-0 shrink truncate font-mono text-[12.5px]",
+              hasValue ? "text-foreground" : "text-muted-foreground",
+            )}
+            title={hasValue ? zone.notify_to : undefined}
+          >
+            {hasValue ? zone.notify_to : "No targets are notified."}
           </span>
-        </div>
-        <FormField
-          control={form.control}
-          name="notify_to"
-          render={({ field }) => (
-            <div className="min-w-0 px-4 py-2">
-              <div className="flex min-w-0 items-center gap-2.5">
-                {editing ? (
-                  <>
-                    <Input
-                      {...field}
-                      aria-label="Notify to"
-                      placeholder="10.0.0.2, 10.0.0.3 key:ns2"
-                      autoComplete="off"
-                      spellCheck={false}
-                      className="h-7 flex-1 font-mono"
-                    />
-                    <div className="ml-auto flex shrink-0 items-center gap-1.5">
-                      <Button type="submit" size="sm" disabled={updateZone.isPending}>
-                        {updateZone.isPending ? "Saving…" : "Save"}
-                      </Button>
-                      <Button
-                        type="button"
-                        size="icon-sm"
-                        variant="ghost"
-                        aria-label="Cancel editing notify targets"
-                        onClick={onCancelEdit}
-                      >
-                        <X />
-                      </Button>
-                    </div>
-                  </>
-                ) : (
-                  <>
-                    <span
-                      className={cn(
-                        "min-w-0 shrink truncate font-mono text-[12.5px]",
-                        hasValue ? "text-foreground" : "text-muted-foreground",
-                      )}
-                      title={hasValue ? zone.notify_to : undefined}
-                    >
-                      {hasValue ? zone.notify_to : "No targets are notified."}
-                    </span>
-                    {/* Doubles as the disclosure: with anything to expand it
-                        is a real button (Enter/Space-operable, aria-expanded
-                        carries the state); with nothing to show it is inert
-                        text rather than a control that does nothing on
-                        click. */}
-                    {rollup.total > 0 ? (
-                      <button
-                        type="button"
-                        onClick={() => setShowAll((v) => !v)}
-                        aria-expanded={showAll}
-                        title={showAll ? "Show only targets behind" : "Show every target"}
-                        className={cn(
-                          "flex shrink-0 cursor-pointer items-center gap-1 font-mono text-[11px] whitespace-nowrap hover:text-foreground",
-                          rollup.behind > 0 ? "text-warning-foreground" : "text-muted-foreground",
-                        )}
-                      >
-                        <ChevronRight
-                          aria-hidden="true"
-                          className={cn(
-                            "size-2.5 shrink-0 transition-transform",
-                            showAll && "rotate-90",
-                          )}
-                        />
-                        {summaryLabel}
-                      </button>
-                    ) : (
-                      <span className="shrink-0 font-mono text-[11px] whitespace-nowrap text-muted-foreground">
-                        {summaryLabel}
-                      </span>
-                    )}
-                    <Button
-                      type="button"
-                      size="icon-sm"
-                      variant="ghost"
-                      title="Edit notify targets"
-                      aria-label="Edit notify targets"
-                      className="ml-auto shrink-0"
-                      onClick={onStartEdit}
-                    >
-                      <Pencil />
-                    </Button>
-                  </>
-                )}
-              </div>
-              {editing && (
-                <div className="pt-2">
-                  <FormMessage />
-                </div>
+          {/* Doubles as the disclosure: with anything to expand it is a real
+              button (Enter/Space-operable, aria-expanded carries the state);
+              with nothing to show it is inert text rather than a control
+              that does nothing on click. */}
+          {rollup.total > 0 ? (
+            <button
+              type="button"
+              onClick={() => setShowAll((v) => !v)}
+              aria-expanded={showAll}
+              title={showAll ? "Show only targets behind" : "Show every target"}
+              className={cn(
+                "flex shrink-0 cursor-pointer items-center gap-1 font-mono text-[11px] whitespace-nowrap hover:text-foreground",
+                rollup.behind > 0 ? "text-warning-foreground" : "text-muted-foreground",
               )}
-              {/* Behind targets always show; the rest sit behind the caret
-                  above. Independent of read/edit — the delivery state of
-                  the *saved* targets stays worth showing while a new value
-                  is being typed, same as the artboard draws it. */}
-              {behindRows.length > 0 && (
-                <div className="mt-1.5 border-t border-border-muted pt-1">
-                  {behindRows.map((row) => (
-                    <NotifyTargetRow key={row.target} row={row} />
-                  ))}
-                  {!showAll && restRows.length > 0 && (
-                    <button
-                      type="button"
-                      onClick={() => setShowAll(true)}
-                      className="cursor-pointer py-[3px] font-mono text-[11px] text-muted-foreground hover:text-foreground"
-                    >
-                      {notifyRestLabel(restRows)}
-                    </button>
-                  )}
-                </div>
-              )}
-              {showAll && restRows.length > 0 && (
-                <div
-                  className={cn(
-                    behindRows.length === 0 && "mt-1.5 border-t border-border-muted pt-1",
-                  )}
+            >
+              <ChevronRight
+                aria-hidden="true"
+                className={cn("size-2.5 shrink-0 transition-transform", showAll && "rotate-90")}
+              />
+              {summaryLabel}
+            </button>
+          ) : (
+            <span className="shrink-0 font-mono text-[11px] whitespace-nowrap text-muted-foreground">
+              {summaryLabel}
+            </span>
+          )}
+        </>
+      }
+      footer={
+        /* Behind targets always show; the rest sit behind the caret above.
+           Independent of read/edit — the delivery state of the *saved*
+           targets stays worth showing while a new value is being typed. */
+        <div className="px-4">
+          {behindRows.length > 0 && (
+            <div className="mt-1.5 border-t border-border-muted pt-1 pb-2">
+              {behindRows.map((row) => (
+                <NotifyTargetRow key={row.target} row={row} />
+              ))}
+              {!showAll && restRows.length > 0 && (
+                <button
+                  type="button"
+                  onClick={() => setShowAll(true)}
+                  className="cursor-pointer py-[3px] font-mono text-[11px] text-muted-foreground hover:text-foreground"
                 >
-                  {restRows.map((row) => (
-                    <NotifyTargetRow key={row.target} row={row} />
-                  ))}
-                </div>
+                  {notifyRestLabel(restRows)}
+                </button>
               )}
             </div>
           )}
-        />
-      </form>
-    </Form>
-  );
-}
-
-/** The most rows any one diff group lists before the rest collapse into a
- * "+ N more" line — the artboard's own truncation. A whole-zone replace can
- * delete hundreds of records, and a dialog that scrolls for a minute to show
- * them makes the counts strip above it the only thing anyone actually reads.
- * The point of the list is to recognise *what kind* of thing is going, which
- * a handful of examples does. */
-const MAX_DIFF_ROWS = 5;
-
-/** What the dialog's header band needs to name the file, known synchronously
- * from the File itself — before its bytes have been read, which is what lets
- * the dialog open the instant a file is chosen. */
-interface FileMeta {
-  name: string;
-  size: number;
-}
-
-/** The file the admin picked, held as text because that's what gets posted:
- * the endpoint takes the master file in a JSON field, not a multipart upload,
- * so the bytes are read once here and sent twice — dry run, then commit. */
-interface ChosenFile extends FileMeta {
-  content: string;
-}
-
-/**
- * Idle is "no dialog"; choosing a file is what opens it.
- *
- * `checking` exists because the dry run is not instant — the server re-parses
- * and re-diffs the entire file, seconds of work on a large zone. Waiting for
- * it before opening anything left the page looking frozen for that whole
- * time. Only `diff` carries the file's content, because Apply is the one
- * thing that needs to send the bytes again.
- */
-type ImportPhase =
-  | { kind: "idle" }
-  | { kind: "checking"; file: FileMeta }
-  | { kind: "diff"; file: ChosenFile; diff: ZoneFileDiff }
-  | { kind: "rejected"; file: FileMeta; errors: string[] };
-
-/** Per-bucket presentation. Spelled out per tone rather than composed from a
- * token name because Tailwind resolves class names statically — a
- * `text-${tone}-foreground` would compile to nothing. */
-const DIFF_TONES = {
-  add: {
-    label: "Added",
-    sign: "+",
-    text: "text-success-foreground",
-    mark: "shadow-[inset_3px_0_0_var(--success)]",
-  },
-  change: {
-    label: "Changed",
-    sign: "~",
-    text: "text-warning-foreground",
-    mark: "shadow-[inset_3px_0_0_var(--warning)]",
-  },
-  delete: {
-    label: "Deleted",
-    // U+2212 MINUS SIGN, not a hyphen: it sits at the same width and height
-    // as the "+" above it, which a hyphen does not, and these three counts
-    // are read as a column.
-    sign: "−",
-    text: "text-destructive-foreground",
-    mark: "shadow-[inset_3px_0_0_var(--destructive)]",
-  },
-} as const;
-
-/**
- * What actually moved on a changed record.
- *
- * The server pairs `from` and `to` by name, type *and* rdata together, so
- * those three are equal by construction and rendering "rdata → rdata" would
- * print the same value twice on every row. What a change can carry is a new
- * TTL or a new enabled state, so that is what gets shown.
- */
-function changeTransition(change: ZoneRecordChange): string {
-  const moved: string[] = [];
-  if (change.from.ttl !== change.to.ttl) moved.push(`ttl ${change.from.ttl} → ${change.to.ttl}`);
-  if (change.from.enabled !== change.to.enabled) {
-    moved.push(change.to.enabled ? "disabled → enabled" : "enabled → disabled");
-  }
-  return moved.join(" · ");
-}
-
-/** One line of the diff: the record, plus what moved if anything did. */
-interface DiffRow {
-  key: string;
-  name: string;
-  type: string;
-  rdata: string;
-  transition: string;
-}
-
-function DiffGroup({
-  tone,
-  rows,
-  total,
-}: {
-  tone: keyof typeof DIFF_TONES;
-  rows: DiffRow[];
-  total: number;
-}) {
-  if (total === 0) return null;
-  const { label, sign, text, mark } = DIFF_TONES[tone];
-  const hidden = total - rows.length;
-  return (
-    <div>
-      <div
-        className={cn(
-          "sticky top-0 flex items-center gap-2.5 border-b border-border-muted bg-muted px-4 py-1.5",
-          mark,
-        )}
-      >
-        <span
-          className={cn("font-mono text-[9.5px] font-semibold tracking-[0.14em] uppercase", text)}
-        >
-          {label}
-        </span>
-        <span className="font-mono text-[11px] text-muted-foreground">
-          {total} {total === 1 ? "record" : "records"}
-        </span>
-      </div>
-      {rows.map((row) => (
-        <div
-          key={row.key}
-          className="grid grid-cols-[16px_196px_64px_1fr] items-baseline gap-3 border-b border-border-muted px-4 py-[5px]"
-        >
-          <span className={cn("font-mono text-[12.5px] font-semibold", text)}>{sign}</span>
-          <span className="truncate font-mono text-[12.5px]" title={row.name}>
-            {row.name}
-          </span>
-          <span className="font-mono text-[11.5px] text-muted-foreground">{row.type}</span>
-          <span className="truncate font-mono text-[12.5px]" title={row.rdata}>
-            <span className="text-muted-foreground">{row.rdata}</span>
-            {row.transition && <span className="text-foreground"> {row.transition}</span>}
-          </span>
+          {showAll && restRows.length > 0 && (
+            <div
+              className={cn(
+                "pb-2",
+                behindRows.length === 0 && "mt-1.5 border-t border-border-muted pt-1",
+              )}
+            >
+              {restRows.map((row) => (
+                <NotifyTargetRow key={row.target} row={row} />
+              ))}
+            </div>
+          )}
         </div>
-      ))}
-      {hidden > 0 && (
-        <div className="border-b border-border-muted py-1.5 pr-4 pl-11 font-mono text-[11px] text-muted-foreground">
-          + {hidden} more
-        </div>
-      )}
-    </div>
+      }
+    />
   );
 }
-
-/**
- * The import dialog's footer, shared by the dry run's wait and the diff.
- *
- * One component rather than two copies so the two states cannot drift apart
- * — they are meant to be the same bar with a different label on the primary
- * action, which is also what stops anything shifting under the pointer when
- * the diff arrives. The warning is stated in both: it is equally true of the
- * file being checked as of the diff already on screen.
- *
- * `onApply` is optional because the pending state has nothing to apply yet;
- * that button is disabled there, so it can carry no handler at all.
- */
-function ImportFooter({
-  applyLabel,
-  applyDisabled,
-  onApply,
-  onCancel,
-}: {
-  applyLabel: string;
-  applyDisabled: boolean;
-  onApply?: () => void;
-  onCancel: () => void;
-}) {
-  return (
-    <div className="flex shrink-0 items-center gap-3 border-t border-border px-4 py-3">
-      <span className="flex items-center gap-1.5 text-[12.5px] text-destructive-foreground">
-        <TriangleAlert className="size-3.5 shrink-0" aria-hidden="true" />
-        Anything not in the file is deleted.
-      </span>
-      <div className="ml-auto flex items-center gap-2">
-        <Button type="button" size="sm" variant="ghost" onClick={onCancel}>
-          Cancel
-        </Button>
-        <Button
-          type="button"
-          size="sm"
-          variant="destructive"
-          onClick={onApply}
-          disabled={applyDisabled}
-        >
-          {applyLabel}
-        </Button>
-      </div>
-    </div>
-  );
-}
-
-/**
- * Export and import for one zone: the two header buttons, the file input
- * behind Import, and the dialog that makes a destructive replace legible
- * before it happens.
- *
- * Import is a whole-zone replace — anything the zone has that the file
- * doesn't is deleted — so choosing a file never writes. It posts
- * `dry_run: true`, shows the diff that comes back, and only the explicit
- * Apply posts again with `dry_run: false`. The second post sends the same
- * bytes rather than a diff to replay, because the endpoint has no handle for
- * one: the server re-reads and re-diffs the file at apply time. A zone that
- * changed in between therefore applies against its current state, not the
- * state that was previewed — the preview is advisory, which is inherent to
- * the shipped API rather than a choice made here.
- *
- * `zone` rather than an id alone because the export filename falls back to
- * the zone's own name when a response arrives without a Content-Disposition.
- */
-function ZoneFileActions({ zone }: { zone: Zone }) {
-  const [phase, setPhase] = useState<ImportPhase>({ kind: "idle" });
-  const fileInput = useRef<HTMLInputElement>(null);
-  const exportFile = useExportZoneFile();
-  const importFile = useImportZoneFile();
-
-  /**
-   * A primary is the only zone whose records are authored here, so it is the
-   * only one an import means anything for. Gated on that *positive* set
-   * rather than on the set the server 409s, which keeps the two independent:
-   * recordWriteRefusal covers `internal`, `secondary` and `stub`, so every
-   * type this hides the control from is also refused server-side, and the
-   * gate stays right if that set changes again.
-   *
-   * The stub case was added late (it had been accepted, then thrown away by
-   * the next fetch's whole-set replace — and worse, read back by
-   * StubUpstreams into the routing table in between). Do not infer from that
-   * history that this gate is load-bearing for correctness: it is not, and
-   * must not become the only thing standing between a write and the store.
-   *
-   * Export is offered for a stub, a secondary and a built-in alike: reading
-   * is never refused. The exception is a forwarder, which holds nothing to
-   * render into a file — see the header's own gate.
-   */
-  const canImport = zone.type === "primary";
-
-  // A dry run or a commit is actually on the wire. This is the window in
-  // which a second file selection would buy a second full parse-and-diff of
-  // the whole file — the most expensive request this page makes.
-  //
-  // Deliberately not `phase.kind !== "idle"`: the rejected state has to keep
-  // accepting a file, because "Choose file" is how that state is escaped.
-  const requestInFlight = phase.kind === "checking" || importFile.isPending;
-
-  function onExport() {
-    exportFile.mutate(
-      { id: zone.id, name: zone.name },
-      { onError: () => toast.error(`Couldn't export ${zone.name}`) },
-    );
-  }
-
-  function onFileChosen(event: React.ChangeEvent<HTMLInputElement>) {
-    // The guard belongs here, at the point the work is actually started, not
-    // only on the Import button: the button is the visible affordance, but
-    // the input is what fires the request, and it can be reached without the
-    // button — programmatically, or if the dialog's focus handling ever
-    // changes. The `disabled` attribute below is the affordance; this is the
-    // backstop that holds when something dispatches the event anyway.
-    if (requestInFlight) return;
-
-    const picked = event.target.files?.[0];
-    // Re-choosing the same file has to re-fire this, and a file input whose
-    // value still holds that path won't emit `change` again. Cleared here,
-    // before any await, so it happens whether or not the read succeeds.
-    event.target.value = "";
-    if (!picked) return;
-
-    // Opened here, before the read and before the request, so the wait is
-    // visible for all of it. Name and size come off the File itself, so the
-    // header band is complete from the first frame.
-    const meta: FileMeta = { name: picked.name, size: picked.size };
-    setPhase({ kind: "checking", file: meta });
-
-    void picked.text().then(
-      (content) => {
-        importFile.mutate(
-          { id: zone.id, content, dryRun: true },
-          {
-            onSuccess: (diff) => setPhase({ kind: "diff", file: { ...meta, content }, diff }),
-            onError: (err) =>
-              setPhase({ kind: "rejected", file: meta, errors: zoneFileErrors(err) }),
-          },
-        );
-      },
-      () => {
-        setPhase({ kind: "idle" });
-        toast.error(`Couldn't read ${picked.name}`);
-      },
-    );
-  }
-
-  function onApply() {
-    if (phase.kind !== "diff") return;
-    const { file } = phase;
-    importFile.mutate(
-      { id: zone.id, content: file.content, dryRun: false },
-      {
-        onSuccess: (diff) => {
-          toast.success(
-            `Zone replaced — ${diff.add.length} added, ${diff.change.length} changed, ${diff.delete.length} deleted.`,
-          );
-          setPhase({ kind: "idle" });
-        },
-        // A file that passed the dry run can still be refused now: the zone
-        // may have moved underneath it. The same rejected view says so.
-        onError: (err) => setPhase({ kind: "rejected", file, errors: zoneFileErrors(err) }),
-      },
-    );
-  }
-
-  const applying = importFile.isPending && phase.kind === "diff";
-
-  // A forwarder holds no records at all — it claims a suffix and routes it —
-  // so the file it would export is an SOA and nothing else. The endpoint
-  // renders it happily; the button is omitted because the download is
-  // meaningless, not because the server refuses it.
-  const canExport = zone.type !== "forwarder";
-
-  return (
-    <>
-      {canExport && (
-        <Button
-          type="button"
-          size="sm"
-          variant="outline"
-          onClick={onExport}
-          disabled={exportFile.isPending}
-        >
-          <Download />
-          Export
-        </Button>
-      )}
-
-      {canImport && (
-        <>
-          {/* Disabled for as long as the dialog is up, which now starts the
-              moment a file is chosen. Without it a second click during the
-              dry run buys a second full parse-and-diff of the whole file —
-              the most expensive request this page can make. */}
-          <Button
-            type="button"
-            size="sm"
-            variant="outline"
-            onClick={() => fileInput.current?.click()}
-            disabled={phase.kind !== "idle"}
-          >
-            <Upload />
-            Import
-          </Button>
-          {/* Visually hidden rather than `display:none`: the button above is
-              what's seen and clicked, but the input stays a real, focusable,
-              labelled control so it is reachable without a pointer. */}
-          <input
-            ref={fileInput}
-            type="file"
-            accept=".zone,text/dns,text/plain"
-            aria-label="Zone file"
-            className="sr-only"
-            disabled={requestInFlight}
-            onChange={onFileChosen}
-          />
-        </>
-      )}
-
-      <Dialog
-        open={phase.kind !== "idle"}
-        onOpenChange={(open) => {
-          if (!open) setPhase({ kind: "idle" });
-        }}
-      >
-        {/*
-         * The artboard's panel: 900px, inset 40px from every edge, one 1px
-         * border and a drop shadow.
-         *
-         * Three of these classes exist to undo an rnui base class rather
-         * than to state something new, because `cn()`'s tailwind-merge only
-         * drops a base class when the override lands in the *same* scope:
-         *
-         * - `sm:max-w-*` — the base ships `sm:max-w-sm`, which lives in the
-         *   `sm:` variant scope and so survives an unprefixed
-         *   `max-w-[…]`. Left alone it caps this panel at 384px on any
-         *   viewport ≥640px, which is a third of its designed width and
-         *   collapses the whole diff layout. Pinned by an e2e width
-         *   assertion (e2e/smoke.spec.ts) — jsdom cannot see it, since the
-         *   DOM is identical either way and only the cascade differs.
-         * - `ring-0` — the base pairs `ring-1 ring-foreground/10` with its
-         *   own border; `border` is a different scope, so both would draw
-         *   and the panel would carry 2px of edge where the design has 1.
-         * - `rounded-none` — belt and braces. `--radius: 0` already makes
-         *   the base `rounded-xl` resolve flat, but stating it here means
-         *   this panel keeps hard corners even if that token ever moves.
-         */}
-        <DialogContent
-          showCloseButton={false}
-          className="flex max-h-[calc(100%-5rem)] w-[900px] max-w-[calc(100%-5rem)] flex-col gap-0 rounded-none border border-border bg-card p-0 ring-0 shadow-[0_18px_50px_rgba(0,0,0,0.34)] sm:max-w-[calc(100%-5rem)]"
-        >
-          {phase.kind !== "idle" && (
-            <>
-              <div className="flex shrink-0 items-center gap-3 border-b border-border px-4 py-3">
-                <DialogTitle className="text-sm font-semibold">Import zone file</DialogTitle>
-                <span className="truncate font-mono text-xs text-muted-foreground">
-                  {phase.file.name} · {formatBytes(phase.file.size)}
-                </span>
-                <DialogClose
-                  render={
-                    <Button
-                      type="button"
-                      size="icon-sm"
-                      variant="ghost"
-                      aria-label="Close"
-                      className="ml-auto shrink-0"
-                    />
-                  }
-                >
-                  <X />
-                </DialogClose>
-              </div>
-              <DialogDescription className="sr-only">
-                Review what this file would change before applying it.
-              </DialogDescription>
-            </>
-          )}
-
-          {/* The dry run's wait. The artboard has no state for it — its
-              `applying` covers the commit only — so this borrows that state's
-              language rather than inventing a second one: the dialog stays
-              open, and the primary action sits disabled with an ellipsis
-              label. Keeping the same footer also means nothing jumps when the
-              diff arrives and the label becomes "Apply". */}
-          {phase.kind === "checking" && (
-            <>
-              <div className="min-h-0 flex-1 overflow-y-auto">
-                {/* <output> rather than a <p role="status">: it carries that
-                    role implicitly, so the wait is announced rather than
-                    passing silently for anyone not watching the dialog.
-                    `block` because it is inline by default. */}
-                <output className="block p-6 text-center text-sm text-muted-foreground">
-                  Checking what this file would change…
-                </output>
-              </div>
-              <ImportFooter
-                applyLabel="Checking…"
-                applyDisabled
-                onCancel={() => setPhase({ kind: "idle" })}
-              />
-            </>
-          )}
-
-          {phase.kind === "diff" && (
-            <>
-              <div className="flex shrink-0 items-center gap-3.5 border-b border-border px-4 py-2.5 font-mono text-xs">
-                <span className="text-success-foreground">+{phase.diff.add.length} added</span>
-                <span className="text-warning-foreground">~{phase.diff.change.length} changed</span>
-                <span className="text-destructive-foreground">
-                  −{phase.diff.delete.length} deleted
-                </span>
-              </div>
-              <div className="min-h-0 flex-1 overflow-y-auto">
-                {/* Re-importing a file that was just exported is the ordinary
-                    way to reach this, and three empty groups under three
-                    zeroes would read as a failure to load rather than as the
-                    answer "nothing would change". */}
-                {phase.diff.add.length === 0 &&
-                  phase.diff.change.length === 0 &&
-                  phase.diff.delete.length === 0 && (
-                    <p className="p-6 text-center text-sm text-muted-foreground">
-                      This file matches the zone. Applying it would change nothing.
-                    </p>
-                  )}
-                <DiffGroup
-                  tone="add"
-                  total={phase.diff.add.length}
-                  rows={phase.diff.add.slice(0, MAX_DIFF_ROWS).map((r, i) => ({
-                    key: `add-${i}`,
-                    name: r.name,
-                    type: r.type,
-                    rdata: r.rdata,
-                    transition: "",
-                  }))}
-                />
-                <DiffGroup
-                  tone="change"
-                  total={phase.diff.change.length}
-                  rows={phase.diff.change.slice(0, MAX_DIFF_ROWS).map((c, i) => ({
-                    key: `change-${i}`,
-                    name: c.to.name,
-                    type: c.to.type,
-                    rdata: c.to.rdata,
-                    transition: changeTransition(c),
-                  }))}
-                />
-                <DiffGroup
-                  tone="delete"
-                  total={phase.diff.delete.length}
-                  rows={phase.diff.delete.slice(0, MAX_DIFF_ROWS).map((r, i) => ({
-                    key: `delete-${i}`,
-                    name: r.name,
-                    type: r.type,
-                    rdata: r.rdata,
-                    transition: "",
-                  }))}
-                />
-              </div>
-              <ImportFooter
-                applyLabel={applying ? "Applying…" : "Apply"}
-                applyDisabled={applying}
-                onApply={onApply}
-                onCancel={() => setPhase({ kind: "idle" })}
-              />
-            </>
-          )}
-
-          {phase.kind === "rejected" && (
-            <>
-              <div className="flex shrink-0 items-center gap-2.5 border-b border-border px-4 py-2.5 shadow-[inset_3px_0_0_var(--destructive)]">
-                <span className="text-[12.5px] font-medium text-destructive-foreground">
-                  File rejected — nothing was written.
-                </span>
-                <span className="font-mono text-[11.5px] text-muted-foreground">
-                  {phase.errors.length} {phase.errors.length === 1 ? "problem" : "problems"}
-                </span>
-              </div>
-              {/* Rendered exactly as they arrived, one per line. The server
-                  already phrases these — most name a line or the offending
-                  record, a file-wide problem names neither — so there is no
-                  prefix worth parsing and rewriting them would only lose
-                  what they say. */}
-              <div className="min-h-0 flex-1 overflow-y-auto">
-                {phase.errors.map((message, i) => (
-                  <p
-                    key={`${i}-${message}`}
-                    className="border-b border-border-muted px-4 py-[5px] font-mono text-[12.5px] leading-[1.35] text-destructive-foreground"
-                  >
-                    {message}
-                  </p>
-                ))}
-              </div>
-              <div className="flex shrink-0 items-center justify-end gap-2 border-t border-border px-4 py-3">
-                <Button
-                  type="button"
-                  size="sm"
-                  variant="ghost"
-                  onClick={() => setPhase({ kind: "idle" })}
-                >
-                  Close
-                </Button>
-                <Button
-                  type="button"
-                  size="sm"
-                  variant="outline"
-                  onClick={() => fileInput.current?.click()}
-                >
-                  Choose file
-                </Button>
-              </div>
-            </>
-          )}
-        </DialogContent>
-      </Dialog>
-    </>
-  );
-}
-
 /**
  * Zone detail — records, SOA editing, and the zone-level actions (enable
  * toggle, delete) the list page (Task 11) deliberately left off its own
@@ -2683,6 +2143,17 @@ function ZoneFileActions({ zone }: { zone: Zone }) {
 export function ZoneDetail() {
   const params = useParams<{ id: string }>();
   const zoneId = Number(params.id);
+  /**
+   * `/zones/wat` never named a zone, so it is the catch-all's question and
+   * not a zone that failed to load. Answered before any hook runs, which is
+   * also what keeps `GET /zones/NaN` — a 400 with nothing useful to render —
+   * off the wire.
+   */
+  if (!Number.isInteger(zoneId) || zoneId <= 0) return <NotFound />;
+  return <ZoneDetailFor zoneId={zoneId} />;
+}
+
+function ZoneDetailFor({ zoneId }: { zoneId: number }) {
   const navigate = useNavigate();
 
   const zone = useZone(zoneId);
@@ -2858,7 +2329,18 @@ export function ZoneDetail() {
           if (editingId === target.id) setEditingId(null);
           setDeleteRecordTarget(null);
         },
-        onError: () => toast.error(`Couldn't delete ${target.name}`),
+        onError: (err) => {
+          // Already gone — deleted from somewhere else. The row is stale
+          // rather than the delete being wrong, and the mutation has already
+          // asked for the list again (refetchIfGone, use-zones.ts).
+          if (err instanceof ApiError && err.status === 404) {
+            toast.error("That record no longer exists");
+            if (editingId === target.id) setEditingId(null);
+            setDeleteRecordTarget(null);
+            return;
+          }
+          toast.error(`Couldn't delete ${target.name}`);
+        },
       },
     );
   }
@@ -2874,12 +2356,27 @@ export function ZoneDetail() {
   }
 
   if (zone.data === undefined) {
+    // A 404 is a zone that was deleted — from another tab, or by another
+    // admin — rather than a page that failed to load, and "try refreshing"
+    // is advice that cannot work: the refresh 404s again. The way out is
+    // the list, so that is what this offers.
+    const deleted = zone.error instanceof ApiError && zone.error.status === 404;
     return (
       <div className="p-4">
         <Alert variant="destructive">
           <TriangleAlert />
-          <AlertTitle>Couldn&apos;t load this zone</AlertTitle>
-          <AlertDescription>Try refreshing the page.</AlertDescription>
+          <AlertTitle>
+            {deleted ? "This zone no longer exists" : "Couldn't load this zone"}
+          </AlertTitle>
+          <AlertDescription>
+            {deleted ? (
+              <Link to="/zones" className="underline underline-offset-2">
+                Back to zones
+              </Link>
+            ) : (
+              "Try refreshing the page."
+            )}
+          </AlertDescription>
         </Alert>
       </div>
     );
@@ -2962,16 +2459,18 @@ export function ZoneDetail() {
     // hold one — it is a zone whose first transfer has not landed, which is
     // the same fact the transfer band above states in more detail.
     const emptyMessage = isSecondary
-      ? "Nothing transferred yet. The records will arrive with the first transfer from the primary."
+      ? "Nothing transferred yet."
       : isStub
         ? // Present tense only while it is true. A stub with a recorded
-          // failure is not fetching, it has failed — and the MASTER row above
-          // already carries that error with its date, so this line says the
-          // one thing left: there is no set.
+          // failure is not fetching, it has failed — and the primaries row
+          // above already carries that error with its date, so this line says
+          // the one thing left: there is no set.
           lastTransferError(z)
           ? "No NS set yet."
           : `Fetching the NS set from ${z.primaries}`
-        : "No records yet. Add one above and dnsaur will answer for this zone directly.";
+        : // Not "add one above": the add band is closed until Add record
+          // opens it, so there is nothing above to point at.
+          "No records yet.";
     body = (
       <p className="p-6 text-center text-sm text-muted-foreground">
         {allRecords.length === 0 ? emptyMessage : "No records match this filter."}
@@ -3126,10 +2625,15 @@ export function ZoneDetail() {
           secondary's is. What they get instead is the upstream row below. */}
       {isSecondary ? <TransferBand zone={z} /> : isRouting ? null : <SoaBand zone={z} />}
 
-      {/* Where this zone's queries actually go — the one row a forwarder and
-          a stub share, its caption switching between FORWARD TO and MASTER.
-          See UpstreamRow's own comment. */}
-      {isRouting && <UpstreamRow zone={z} />}
+      {/* Where this zone goes to get what it serves, and what it signs the
+          asking with — one row for all three types that have somewhere to
+          go, its caption switching between FORWARD TO and PRIMARIES. A
+          secondary's belongs here rather than as read-only cells in the band
+          above: PATCH /zones/{id} takes `primaries` and `tsig_key_id` on
+          one, and a primary that changes address otherwise meant deleting
+          the secondary and rebuilding it, losing allow_transfer and
+          notify_to with it. See UpstreamRow's own comment. */}
+      {(isRouting || isSecondary) && <UpstreamRow zone={z} />}
 
       {/* …and, for a forwarder, what happens when none of them answers. Not
           decoration: see ForwarderConsequence. */}

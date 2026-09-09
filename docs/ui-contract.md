@@ -1062,11 +1062,16 @@ unmatched clients fall back to it.
 | `id` | int64 | |
 | `zone_id` | int64 | FK → `zones.id` |
 | `name` | string | relative to the zone apex: `@`, `bifrost`, `*`, `*.nexus` — never a fully-qualified name in storage, even if one was typed on write (§2.6) |
-| `type` | string | any DNS RR type `dns.NewRR` parses — not a closed enum on the server; the dashboard's create/edit form offers `A`, `AAAA`, `CNAME`, `TXT`, `MX`, `SRV`, `NS`, `CAA`, `PTR` (§8) |
+| `type` | string | any DNS RR type `dns.NewRR` parses — not a closed enum on the server; the dashboard's create/edit form offers `A`, `AAAA`, `CNAME`, `TXT`, `MX`, `SRV`, `NS`, `CAA`, `PTR` (§8), **plus the record's own stored type when it is outside that nine**, so editing an imported `SSHFP`/`HTTPS`/`TLSA` cannot silently rewrite it |
 | `ttl` | uint32 (seconds) | `0`–`2147483647` (RFC 2181 §8); every record in the same (`name`,`type`) RRSet must share one value (RFC 2181 §5.2, 409 on mismatch) |
 | `rdata` | string | DNS presentation format, rdata portion only — validated by `dns.NewRR`, not a per-type schema |
-| `enabled` | bool | a disabled record is dropped when the zone's served snapshot is built (`NewZone`) — indistinguishable from never having been written, so it can't turn an NXDOMAIN into a NODATA or suppress a wildcard that should otherwise match |
+| `enabled` | bool | a disabled record is dropped when the zone's served snapshot is built (`NewZone`) — indistinguishable from never having been written, so it can't turn an NXDOMAIN into a NODATA or suppress a wildcard that should otherwise match. The records grid draws one muted and marked `DISABLED` |
 | `comment` | string | free text, never interpreted |
+
+`PUT /zones/{id}/records/{rid}` is a **full replace**, and `zones.BuildRecord`
+defaults an absent `enabled` to `true` and an absent `comment` to `""` —
+neither is editable in the dashboard, so the edit row sends both back
+unchanged rather than resetting them.
 
 **Answering** (`internal/zones/answer.go`, `Zone.Answer`) — the zone cut is
 found first (deepest enabled zone whose apex suffixes the query name wins;
@@ -1367,8 +1372,9 @@ no `onMutate` and no `setQueryData` in the whole client.
 | Zones | Delete | `DELETE /zones/{id}` | `Couldn't delete ${target.name}` |
 | Zone detail | Enable / disable | `PATCH /zones/{id}` | `Couldn't ${enabled ? "disable" : "enable"} ${target.name}` |
 | Zone detail | Save SOA | `PATCH /zones/{id}` | server message, else `Couldn't save the SOA` |
-| Zone detail | Edit / Add record | `PUT\|POST /zones/{id}/records[/{rid}]` | server message, else `Couldn't ${update\|add} the record` |
-| Zone detail | Delete record | `DELETE /zones/{id}/records/{rid}` | `Couldn't delete ${target.name}` |
+| Zone detail | Edit primaries / upstreams | `PATCH /zones/{id}` (`primaries` + `tsig_key_id`, or `forward_to`) | server message, else `Couldn't save the ${primaries\|upstreams}` |
+| Zone detail | Edit / Add record | `PUT\|POST /zones/{id}/records[/{rid}]` | server message, else `Couldn't ${update\|add} the record`; a **404** is `That record no longer exists` and closes the row instead |
+| Zone detail | Delete record | `DELETE /zones/{id}/records/{rid}` | `Couldn't delete ${target.name}`; a **404** is `That record no longer exists` |
 | Account | Revoke token | `DELETE /tokens/{id}` | `Couldn't revoke ${token.name}` |
 | Account | Create token | `POST /tokens` | server message, else `Couldn't create the token` |
 | Account | Enable 2FA | `POST /auth/totp/start` | server message, else `Couldn't start setup — try again` |
@@ -1376,7 +1382,7 @@ no `onMutate` and no `setQueryData` in the whole client.
 | Shell | Pause blocking | `POST /blocking/pause` | `Couldn't pause blocking — try again` |
 | Shell | Resume blocking | `DELETE /blocking/pause` | `Couldn't resume blocking — try again` |
 | Shell | Log out | `POST /auth/logout` | `Couldn't sign out — try again` — **suppressed on 401**, which counts as logged out |
-| Settings | Save changes (bulk) | one `PUT /settings` per changed key | three branches, not one: all saved → **success** toast `${n} setting(s) updated`; some saved → `Saved ${n}, but couldn't save ${keys} — try again`; none saved → the first rejection's server message, else `Couldn't save settings — try again` |
+| Settings | Save changes (bulk) | one `PUT /settings` per changed key | three branches, not one: all saved → **success** toast `${n} setting(s) updated`; some saved → `Saved ${n}, but couldn't save ${keys} — try again`; none saved → the first rejection's server message, else `Couldn't save settings — try again`. Leaving the page with anything unsaved is blocked by a dialog first: `Leave without saving?` / **Stay** / **Leave** |
 
 > **Known gap — this table is missing eleven row actions.** The whole **TSIG
 > keys** screen is absent (Add, Save, Delete — the last being
@@ -1437,7 +1443,7 @@ greyed out if that state says there is nothing to resume.
 | Groups | 3 skeletons | `No groups yet` | `Couldn't load groups` | stale banner |
 | Clients | 4 skeletons | `No clients yet` | `Couldn't load clients` | stale banner |
 | Zones | 4 skeletons | `No zones yet` | `Couldn't load zones` | stale banner |
-| Zone detail | 4 skeletons (zone), then 4 more (records) | filtered: `No records match this filter.` Unfiltered, a four-way switch on type (`detail.tsx`): **secondary** → `Nothing transferred yet. The records will arrive with the first transfer from the primary.`; **stub with a recorded failure** → `No NS set yet.`; **stub without one** → `Fetching the NS set from ${primaries}`; **otherwise** → `No records yet. Add one above and dnsaur will answer for this zone directly.` A **forwarder** has no empty state at all — it renders no records grid | `Couldn't load this zone` (zone) / `Couldn't load records` (records) | stale banner on **records only** — a background zone refetch failing has no banner of its own |
+| Zone detail | 4 skeletons (zone), then 4 more (records) | filtered: `No records match this filter.` Unfiltered, a four-way switch on type (`detail.tsx`): **secondary** → `Nothing transferred yet.`; **stub with a recorded failure** → `No NS set yet.`; **stub without one** → `Fetching the NS set from ${primaries}`; **otherwise** → `No records yet.` A **forwarder** has no empty state at all — it renders no records grid | `Couldn't load this zone` (zone) / `Couldn't load records` (records); a **404** on the zone is `This zone no longer exists` with a link back to the list instead, and a non-numeric `:id` renders the not-found screen without requesting anything | stale banner on **records only** — a background zone refetch failing has no banner of its own |
 | Settings | layout-shaped skeleton | n/a (fixed 12 fields) | `Couldn't load settings` | stale banner, "Any edits below are untouched." |
 | TSIG keys | 3 skeletons | `No TSIG keys yet.` with a **New key** action — suppressed entirely while the create row is open, since the row is already the answer | `Couldn't load TSIG keys` | stale banner |
 | Account | 2-card skeleton | `No API tokens yet` | **two**: `Couldn't load your account` (the account card, first load failed) and `Couldn't load API tokens` (the token card, independently) | stale banner |
@@ -1652,7 +1658,10 @@ Collected because each one has already caused, or would cause, a wrong UI.
     dotless form against the zone, so that is the habit users arrive with, and
     a silently-wrong record is the result. The zone detail row (`/zones/{id}`)
     labels both columns for this reason: the apex sits in a chip beside Name,
-    and the name-valued types get a `FULL NAME` chip beside Data.
+    and the name-valued types get a `FULL NAME` chip beside Data. **A bare `@`
+    is the exception**: `BuildRecord` resolves it to the zone's apex before
+    parsing, the same as the import path does, so pointing an MX at the apex
+    does not mean spelling the zone name out.
 17. **The allow-transfer band shows four states**, not one. Shown on
     `/zones/{id}` for `primary` and `secondary` zones only —
     `internal`/`stub`/`forwarder` refuse every transfer outright and get no

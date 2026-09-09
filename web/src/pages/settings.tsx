@@ -1,4 +1,5 @@
-import { useRef, type ReactNode } from "react";
+import { useEffect, useRef, type ReactNode } from "react";
+import { useBlocker } from "react-router";
 import {
   Database,
   ListChecks,
@@ -16,6 +17,14 @@ import { z } from "zod";
 import {
   Alert,
   AlertDescription,
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
   AlertTitle,
   Badge,
   Button,
@@ -815,14 +824,58 @@ function SettingsForm({ settings }: { settings: Settings }) {
   // dirty against its *default*, which the save below deliberately moves
   // per-field on partial success. Comparing to the same baseline the submit
   // diffs against keeps the bar, the per-field dots and the payload
-  // agreeing with each other.
+  // agreeing with each other — trimmed the same way, because the submit
+  // sends a trimmed value and a bar counting the raw one calls a trailing
+  // space a change and then leaves Save with nothing to send.
   const values = form.watch();
   const baseline = defaultsRef.current;
   const changedFields = ALL_FIELDS.filter(
-    (f) => (values[rhfName(f.key)] ?? "") !== (baseline[rhfName(f.key)] ?? ""),
+    (f) => (values[rhfName(f.key)] ?? "").trim() !== (baseline[rhfName(f.key)] ?? ""),
   );
   const restartCount = changedFields.filter((f) => f.restartRequired).length;
   const hotCount = changedFields.length - restartCount;
+
+  /**
+   * Take what the server now says for every field nobody is editing.
+   *
+   * `settings` arrives again on every refetch, and this form is never
+   * remounted, so without this the baseline stayed whatever the first load
+   * said: a key saved from another tab was fetched, compared against a stale
+   * baseline, and discarded — leaving this tab showing the old value under
+   * "All changes saved", and unable to save even the old value back, since
+   * the diff against that baseline came out empty.
+   *
+   * Per field rather than a whole-form reset, and only where the field is
+   * clean: a value being typed here is the one thing a background refetch
+   * must not take away.
+   */
+  useEffect(() => {
+    const fromServer = buildDefaults(settings);
+    const moved: SettingsFormValues = { ...defaultsRef.current };
+    let any = false;
+    for (const field of ALL_FIELDS) {
+      const name = rhfName(field.key);
+      const now = fromServer[name] ?? "";
+      if ((moved[name] ?? "") === now) continue;
+      if ((form.getValues(name) ?? "").trim() !== (moved[name] ?? "")) continue;
+      moved[name] = now;
+      any = true;
+      form.resetField(name, { defaultValue: now });
+    }
+    if (any) defaultsRef.current = moved;
+  }, [settings, form]);
+
+  /**
+   * Nothing here is saved until Save is pressed, and every other screen in
+   * this app writes as you go — so leaving is the one action that can lose
+   * work, and it used to do it silently.
+   */
+  const blocker = useBlocker(changedFields.length > 0);
+  useEffect(() => {
+    // A save (or a Discard) empties the form while the question is on
+    // screen; the answer is then no longer anyone's to give.
+    if (blocker.state === "blocked" && changedFields.length === 0) blocker.reset();
+  }, [blocker, changedFields.length]);
 
   async function onSubmit(submitted: SettingsFormValues) {
     const base = defaultsRef.current;
@@ -983,6 +1036,29 @@ function SettingsForm({ settings }: { settings: Settings }) {
           })}
         </div>
       </form>
+
+      {/* The question, and only the question — what would be lost is on the
+          bar above, and the two buttons are the two answers. */}
+      <AlertDialog
+        open={blocker.state === "blocked"}
+        onOpenChange={(open) => {
+          if (!open) blocker.reset?.();
+        }}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Leave without saving?</AlertDialogTitle>
+            <AlertDialogDescription>
+              {changedFields.length} {changedFields.length === 1 ? "change" : "changes"} will be
+              discarded.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel onClick={() => blocker.reset?.()}>Stay</AlertDialogCancel>
+            <AlertDialogAction onClick={() => blocker.proceed?.()}>Leave</AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </Form>
   );
 }

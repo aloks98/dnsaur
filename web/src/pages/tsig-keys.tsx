@@ -43,6 +43,7 @@ import {
 import { useZones } from "../hooks/use-zones";
 import { StaleDataAlert } from "../components/stale-data-alert";
 import { aclKeyNames } from "../lib/acl";
+import { dnsNameSchema } from "../lib/dns-name";
 import { notifyKeyNames } from "../lib/notify";
 import {
   algorithmLabel,
@@ -71,26 +72,11 @@ export const MASK = "•".repeat(24);
  * row forever. D2 is what gives it something to count. */
 const GRID = "grid grid-cols-[1fr_132px_316px_108px_116px] items-center gap-3.5 px-4";
 
-/**
- * Mirrors the server's own check (normalizeTSIGName in
- * internal/api/tsigkeys_handlers.go) closely enough that a name accepted
- * here round-trips: lowercasing and the trailing dot are applied server-side
- * regardless, so this only has to catch what would otherwise be a wasted
- * request — blank, whitespace/path characters, or an empty label (e.g.
- * "e412..in"). Same schema as the zones list's name field, for the same
- * reason: both are `dns.CanonicalName` on the other side.
- */
-const keyNameSchema = z
-  .string()
-  .trim()
-  .refine((value) => {
-    const name = value.replace(/\.$/, "");
-    if (name === "" || /[ \t\r\n/\\]/.test(name)) return false;
-    return !name.split(".").some((label) => label === "");
-  }, "Enter a domain name, e.g. xfer.example.com");
-
 const keyFormSchema = z.object({
-  name: keyNameSchema,
+  // The same check the zones list's name field makes, and for the same
+  // reason: both are `dns.CanonicalName` on the other side — see
+  // lib/dns-name.ts.
+  name: dnsNameSchema("Enter a domain name, e.g. xfer.example.com"),
   // Free-form rather than a z.enum over TSIG_ALGORITHMS: the select's
   // options already constrain this to what the server accepts, and an enum
   // here would reject the passthrough option algorithmOptions() adds for a
@@ -122,11 +108,15 @@ function KeyFields({
   form,
   algorithms,
   secretPlaceholder,
+  nameFixed = false,
   onRegenerate,
 }: {
   form: UseFormReturn<KeyFormValues>;
   algorithms: string[];
   secretPlaceholder?: string;
+  /** A zone names this key, so its name is not this row's to change — see
+   * EditKeyRow. The other two fields stay editable. */
+  nameFixed?: boolean;
   onRegenerate: () => void;
 }) {
   return (
@@ -142,6 +132,7 @@ function KeyFields({
                 aria-label="Key name"
                 placeholder="xfer.e412.in"
                 autoComplete="off"
+                disabled={nameFixed}
                 className="font-mono"
               />
             </FormControl>
@@ -335,9 +326,19 @@ function NewKeyRow({ onClose }: { onClose: () => void }) {
   );
 }
 
-/** The same row, in place, for an existing key. PUT is a full replace — the
+/**
+ * The same row, in place, for an existing key. PUT is a full replace — the
  * server has no partial-patch shape for a TSIG key — so all three fields are
- * sent whether they were touched or not. */
+ * sent whether they were touched or not.
+ *
+ * The **name** is the exception once anything names this key. `allow_transfer`
+ * and `notify_to` reference a key by its canonical name rather than its id, so
+ * a rename silently detaches it from every zone that named it and the server
+ * refuses one outright. Disabled rather than left to fail on click, on the same
+ * terms as the delete confirm's own guard — and, like that guard, this is an
+ * affordance and not the enforcement: it reads the zones list, so it is blind
+ * whenever that list failed to load. The 409 below is what covers that.
+ */
 function EditKeyRow({
   tsigKey,
   usedBy,
@@ -356,6 +357,7 @@ function EditKeyRow({
       secret: tsigKey.secret,
     },
   });
+  const nameFixed = usedBy > 0;
 
   const nameError = form.formState.errors.name?.message;
   const secretError = form.formState.errors.secret?.message;
@@ -368,8 +370,17 @@ function EditKeyRow({
           toast.success("Key saved");
           onClose();
         },
-        onError: (err) =>
-          toast.error(err instanceof ApiError ? err.message : "Couldn't save the key"),
+        onError: (err) => {
+          // A 409 is the server refusing this rename because a zone names
+          // the key — so it belongs on the name field, in the server's own
+          // words, with the attempted value still there to correct. Every
+          // other failure is the whole row's and stays a toast.
+          if (err instanceof ApiError && err.status === 409) {
+            form.setError("name", { type: "server", message: err.message });
+            return;
+          }
+          toast.error(err instanceof ApiError ? err.message : "Couldn't save the key");
+        },
       },
     );
   }
@@ -383,6 +394,7 @@ function EditKeyRow({
             // The stored algorithm is always offered, even if this build
             // doesn't recognise it — see lib/tsig.ts's algorithmOptions.
             algorithms={algorithmOptions(tsigKey.algorithm)}
+            nameFixed={nameFixed}
             onRegenerate={() => {
               form.setValue("secret", generateSecret(), { shouldValidate: false });
               form.clearErrors("secret");
@@ -408,11 +420,18 @@ function EditKeyRow({
           </div>
         </div>
 
-        {(nameError !== undefined || secretError !== undefined) && (
+        {(nameError !== undefined || secretError !== undefined || nameFixed) && (
           <div className={cn(GRID, "items-start pb-2.5 text-xs text-pretty")}>
             <span>
-              {nameError && (
+              {nameError ? (
                 <FormField control={form.control} name="name" render={() => <FormMessage />} />
+              ) : (
+                nameFixed && (
+                  <span className="text-muted-foreground">
+                    In use by {usedBy} {usedBy === 1 ? "zone" : "zones"}. The name can&apos;t
+                    change.
+                  </span>
+                )
               )}
             </span>
             <span />
@@ -519,20 +538,21 @@ function KeyRow({
         <CopyButton value={tsigKey.secret} label={`Copy the secret for ${tsigKey.name}`} />
       </span>
       <UsedByCell count={usedBy} />
-      <span
-        className={cn(
-          "flex items-center justify-end gap-1",
-          // Exactly the artboard's `actionsOpacity`/`actionsEvents`: while
-          // one row is being written, the others' actions are visibly not
-          // the thing to click.
-          dimActions && "pointer-events-none opacity-30",
-        )}
-      >
+      {/* The artboard's `actionsOpacity`/`actionsEvents` — while one row is
+          being written, the others' actions are visibly not the thing to
+          click. Real `disabled` is what delivers that: `pointer-events-none`
+          on the wrapper stops the pointer and nothing else, so both buttons
+          kept their place in the tab order, still fired on Enter, and were
+          announced as available. `disabled:opacity-30` is the artboard's own
+          fade in place of rnui's 0.5. */}
+      <span className="flex items-center justify-end gap-1">
         <Button
           type="button"
           size="icon-sm"
           variant="ghost"
           aria-label={`Edit ${tsigKey.name}`}
+          className="disabled:opacity-30"
+          disabled={dimActions}
           onClick={onEdit}
         >
           <Pencil />
@@ -542,6 +562,8 @@ function KeyRow({
           size="icon-sm"
           variant="ghost"
           aria-label={`Delete ${tsigKey.name}`}
+          className="disabled:opacity-30"
+          disabled={dimActions}
           onClick={onDelete}
         >
           <Trash2 />
