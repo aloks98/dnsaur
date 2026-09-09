@@ -145,6 +145,41 @@ test("a successful add clears the pattern but keeps action and regex mode", asyn
   expect(screen.getByRole("switch", { name: /regular expression/i })).toBeChecked();
 });
 
+// The server compiles with Go's regexp, and `new RegExp` is only a stand-in
+// for it. Two constructs Go accepts throw in V8 — inline flags `(?i)` and
+// the `(?P<name>…)` capture spelling — so the pre-flight check was rejecting
+// patterns the resolver would have compiled happily. lib/schemas.ts states
+// the bias: a false accept costs one 400, a false reject silently blocks a
+// legitimate value.
+test.each([
+  ["(?i)ads", "case-insensitive inline flag"],
+  ["(?P<sub>ads)\\.example\\.com", "Go's named-capture spelling"],
+  ["(?is)^ads.*", "several inline flags at once"],
+])("a Go-valid pattern using %s is accepted, not rejected by the JS check", async (pattern) => {
+  const user = userEvent.setup();
+  let posted: unknown;
+  mockGroups([group()]);
+  server.use(
+    http.get("/api/v1/groups/:id/rules", () => HttpResponse.json([rule()])),
+    http.post("/api/v1/groups/:id/rules", async ({ request }) => {
+      posted = await request.json();
+      return HttpResponse.json({ id: 2 }, { status: 201 });
+    }),
+  );
+
+  renderWithProviders(<RulesTab />);
+  await screen.findByText("ads.example.com");
+
+  const field = await openAddRow(user);
+  await user.click(screen.getByRole("switch", { name: /regular expression/i }));
+  await user.type(field, pattern);
+  await user.click(screen.getByRole("button", { name: /^add$/i }));
+
+  // Sent verbatim: the normalisation exists only to let `new RegExp` judge
+  // the syntax, never to rewrite what the server compiles.
+  await waitFor(() => expect(posted).toEqual({ action: "block", pattern, is_regex: true }));
+});
+
 test("an invalid regex pattern shows an inline error and never posts", async () => {
   const user = userEvent.setup();
   let posted = false;
@@ -311,4 +346,20 @@ test("an empty group says lists still apply, and offers to add a rule", async ()
   expect(await screen.findByText(/no rules in default/i)).toBeInTheDocument();
   expect(screen.getByText(/lists still apply/i)).toBeInTheDocument();
   expect(screen.getAllByRole("button", { name: /^add rule$/i })).toHaveLength(2);
+});
+
+// GRID and FORM_GRID are fixed-pixel column templates inside a shell that is
+// h-screen/overflow-hidden (components/app-shell.tsx), so a narrow viewport
+// clipped the Type and Actions columns with nothing to scroll.
+test("the fixed-width grid sits in a horizontal scroll container", async () => {
+  mockGroups([group()]);
+  mockRulesByGroup({ 1: [rule()] });
+
+  renderWithProviders(<RulesTab />);
+  await screen.findByText("ads.example.com");
+
+  const scroller = document.querySelector('[data-slot="h-scroll"]');
+  expect(scroller).not.toBeNull();
+  expect(scroller!.className).toContain("overflow-x-auto");
+  expect(scroller!.contains(rows()[0]!)).toBe(true);
 });
