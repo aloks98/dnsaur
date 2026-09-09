@@ -30,9 +30,12 @@ export DNSAUR_DNS_LISTEN="127.0.0.1:8354"
 export DNSAUR_DATA_DIR="$work_dir/data"
 export DNSAUR_LOG_LEVEL="error"
 
-# -config points at a path that's guaranteed not to exist, so a stray
-# dnsaur.yaml at the repo root (if a developer has one for their own local
-# testing) can never leak unrelated settings into this run — config.Load
-# tolerates a missing file and falls back to defaults + the env overrides
-# above.
-exec "$bin" -config "$work_dir/unused-dnsaur.yaml"
+# -config points at an empty file of our own, so a stray dnsaur.yaml at the
+# repo root (if a developer has one for their own local testing) can never
+# leak unrelated settings into this run: everything comes from defaults plus
+# the env overrides above. The file has to exist — a named path that is
+# missing is refused at startup, deliberately, so a typo in -config cannot
+# start a server on defaults with nothing saying so.
+config="$work_dir/dnsaur-e2e.yaml"
+: > "$config"
+exec "$bin" -config "$config"
