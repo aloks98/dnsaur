@@ -804,6 +804,10 @@ paths:
                 properties:
                   secret: { type: string, description: base32 TOTP secret }
                   otpauth_url: { type: string, description: otpauth:// URL for QR-code enrollment }
+                  qr_png:
+                    type: string
+                    format: byte
+                    description: the otpauth_url rendered as a QR code, a base64 PNG ready for an img data URL
         "401":
           description: authentication required
           content:

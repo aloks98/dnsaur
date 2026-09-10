@@ -284,7 +284,7 @@ test("unmounting the page closes the live stream", async () => {
   expect(source.closed).toBe(true);
 });
 
-test("a fresh install is told the tail is listening rather than shown an empty table", async () => {
+test("a fresh install is told the tail is waiting rather than shown an empty table", async () => {
   renderQueryLog();
 
   const source = await firstSource();
@@ -292,7 +292,7 @@ test("a fresh install is told the tail is listening rather than shown an empty t
 
   // DataGridTableVirtual has its own empty branch, separate from the plain
   // grid's — the exact path that regressed twice on this branch.
-  expect(await screen.findByText(/listening — queries appear here/i)).toBeInTheDocument();
+  expect(await screen.findByText(/waiting for traffic/i)).toBeInTheDocument();
 });
 
 // --- seeding the tail with real history --------------------------------------

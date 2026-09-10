@@ -19,7 +19,7 @@
  *     what a field that applies a default port needs.
  */
 
-export interface HostPort {
+interface HostPort {
   host: string;
   /** "" only from `splitHostPortOptional`, and only when none was stated. */
   port: string;

@@ -17,9 +17,9 @@ export const WINDOWS = [
   { value: "7d", short: "7d", label: "Last 7 days", hours: 168 },
 ] as const;
 
-export type WindowValue = (typeof WINDOWS)[number]["value"];
+type WindowValue = (typeof WINDOWS)[number]["value"];
 
-export const DEFAULT_WINDOW: WindowValue = "24h";
+const DEFAULT_WINDOW: WindowValue = "24h";
 
 /** Anything unrecognised (absent, hand-edited, stale bookmark) is the
  * default — never an error state, and never an unvalidated `hours=` on the

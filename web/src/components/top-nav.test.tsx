@@ -92,7 +92,6 @@ afterEach(() => {
   restoreLocation?.();
   restoreLocation = null;
   // lib/live-tail.ts is a module-level store, so it outlives any one test.
-  setLiveTailPaused(false);
   resetLiveTailReport();
   vi.restoreAllMocks();
 });

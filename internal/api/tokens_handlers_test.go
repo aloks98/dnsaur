@@ -1,12 +1,16 @@
 package api
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"image/png"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/aloks98/dnsaur/internal/auth"
@@ -197,5 +201,40 @@ func TestTokenRevokeSeparatesNotOwnedFromStorageFailure(t *testing.T) {
 	flaky.fail = true
 	if w := doReq(t, h, "DELETE", "/api/v1/tokens/1", "", cookie); w.Code != http.StatusServiceUnavailable {
 		t.Fatalf("storage failure: %d %s, want 503 — a 404 here says the token is gone", w.Code, w.Body.String())
+	}
+}
+
+// The dashboard draws the enrolment QR from what this endpoint hands back, so
+// the response has to carry a decodable image and not only the otpauth:// URL
+// — the browser has no QR encoder left to fall back on.
+func TestTOTPStartReturnsAScannableQR(t *testing.T) {
+	srv, s, _ := testServer(t)
+	cookie := login(t, srv, s)
+
+	w := doReq(t, srv.Handler(), "POST", "/api/v1/auth/totp/start", "", cookie)
+	if w.Code != http.StatusOK {
+		t.Fatalf("start: %d %s", w.Code, w.Body.String())
+	}
+	var body struct {
+		Secret     string `json:"secret"`
+		OTPAuthURL string `json:"otpauth_url"`
+		QRPNG      string `json:"qr_png"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if body.Secret == "" || !strings.HasPrefix(body.OTPAuthURL, "otpauth://totp/") {
+		t.Fatalf("no enrolment returned: %+v", body)
+	}
+	raw, err := base64.StdEncoding.DecodeString(body.QRPNG)
+	if err != nil {
+		t.Fatalf("qr_png is not base64: %v", err)
+	}
+	img, err := png.Decode(bytes.NewReader(raw))
+	if err != nil {
+		t.Fatalf("qr_png is not a PNG: %v", err)
+	}
+	if got := img.Bounds().Dx(); got != qrPixels {
+		t.Fatalf("qr width = %d, want %d", got, qrPixels)
 	}
 }

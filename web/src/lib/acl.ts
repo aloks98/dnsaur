@@ -32,9 +32,9 @@ const MAX_LABEL_LENGTH = 63;
  * mirrors Go's `ACLEntry`, whose `Prefix`/`Key` fields are the same
  * either/or. `name`/`value` are already canonical (lowercase, trailing dot
  * for a key; masked for a prefix). */
-export type ACLEntry = { kind: "key"; name: string } | { kind: "prefix"; value: string };
+type ACLEntry = { kind: "key"; name: string } | { kind: "prefix"; value: string };
 
-export type ACLParseResult = { ok: true; entries: ACLEntry[] } | { ok: false; error: string };
+type ACLParseResult = { ok: true; entries: ACLEntry[] } | { ok: false; error: string };
 
 type EntryResult = { ok: true; entry: ACLEntry } | { ok: false; error: string };
 

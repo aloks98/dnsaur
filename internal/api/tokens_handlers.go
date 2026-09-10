@@ -1,7 +1,12 @@
 package api
 
 import (
+	"bytes"
+	"encoding/base64"
+	"image/png"
 	"net/http"
+
+	"github.com/pquerna/otp"
 
 	"github.com/aloks98/dnsaur/internal/store"
 )
@@ -73,6 +78,10 @@ func (s *Server) handleTokenRevoke(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// qrPixels is twice the 160px the dashboard displays the code at, so it
+// stays sharp on a hidpi screen.
+const qrPixels = 320
+
 func (s *Server) handleTOTPStart(w http.ResponseWriter, r *http.Request) {
 	u := userFrom(r)
 	secret, otpURL, err := s.deps.Auth.EnableTOTPStart(r.Context(), u.ID, u.Username)
@@ -80,7 +89,36 @@ func (s *Server) handleTOTPStart(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusInternalServerError, "totp generation failed")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"secret": secret, "otpauth_url": otpURL})
+	qr, err := totpQRPNG(otpURL)
+	if err != nil {
+		errJSON(w, http.StatusInternalServerError, "totp generation failed")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{
+		"secret":      secret,
+		"otpauth_url": otpURL,
+		"qr_png":      qr,
+	})
+}
+
+// totpQRPNG renders the enrollment URL as a base64 PNG. The otpauth:// URL
+// is returned alongside it either way; drawing the code here rather than in
+// the browser is what keeps a QR encoder out of the dashboard bundle for the
+// sake of one screen.
+func totpQRPNG(otpURL string) (string, error) {
+	key, err := otp.NewKeyFromURL(otpURL)
+	if err != nil {
+		return "", err
+	}
+	img, err := key.Image(qrPixels, qrPixels)
+	if err != nil {
+		return "", err
+	}
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, img); err != nil {
+		return "", err
+	}
+	return base64.StdEncoding.EncodeToString(buf.Bytes()), nil
 }
 
 type totpConfirm struct {

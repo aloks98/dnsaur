@@ -1451,11 +1451,11 @@ export function QueryLog() {
   if (filtered && paged.isError) {
     emptyMessage = "Couldn't load queries.";
   } else if (filtered) {
-    emptyMessage = "No queries match these filters.";
+    emptyMessage = "No matching queries";
   } else if (paused) {
     emptyMessage = "Paused. Resume the live tail to start appending rows.";
   } else {
-    emptyMessage = "Listening — queries appear here as dnsaur answers them.";
+    emptyMessage = "Waiting for traffic";
   }
 
   return (

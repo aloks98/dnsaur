@@ -66,18 +66,27 @@ function getSnapshot(): boolean {
   return paused;
 }
 
-function getStatus(): TailStatus {
-  return status;
-}
-
 function emit(): void {
   listeners.forEach((listener) => listener());
 }
 
 /**
- * Set the flag from outside React. The hook's setter is the normal way in;
- * this is also what tests use to put the module back to its default, since
- * a module-level store outlives the components in any one test case.
+ * Read the status without a component. Doubles as the store's own snapshot
+ * getter: the chrome is what renders this, so a page-level test asserting
+ * "the tail reported itself as failed" observes it here rather than looking
+ * for text the page no longer owns.
+ */
+export function getLiveTailStatus(): TailStatus {
+  return status;
+}
+
+// The four writers below are the store's primitives, and the hooks are the
+// only production callers. They stay exported as a test seam: this store
+// outlives the components in any one test case, so a suite has to be able to
+// reset it, and drive it, without mounting the chrome that normally owns it.
+
+/**
+ * Set the flag from outside React. The hook's setter is the normal way in.
  */
 export function setLiveTailPaused(next: boolean): void {
   if (next === paused) return;
@@ -119,18 +128,9 @@ export function resetLiveTailReport(): void {
   setLiveTailReport({ filtered: false, streamState: "closed", reconnect: () => {} });
 }
 
-/**
- * Read the status without a component. The chrome is what renders it, so a
- * page-level test asserting "the tail reported itself as failed" observes it
- * here rather than looking for text this page no longer owns.
- */
-export function getLiveTailStatus(): TailStatus {
-  return status;
-}
-
 /** Everything row 2 needs to render one readout and one toggle. */
 export function useLiveTailStatus(): TailStatus & { setPaused: (next: boolean) => void } {
-  const value = useSyncExternalStore(subscribe, getStatus);
+  const value = useSyncExternalStore(subscribe, getLiveTailStatus);
   const setPaused = useCallback((next: boolean) => setLiveTailPaused(next), []);
   return { ...value, setPaused };
 }

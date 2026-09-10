@@ -14,7 +14,7 @@ import type { CertificateStatus, ProtocolStatus, ResolverStatus } from "../api/t
  * "enabled but not listening" banner, so the two never drift on what
  * counts as broken.
  */
-export type ServingState = "off" | "listening" | "failed";
+type ServingState = "off" | "listening" | "failed";
 
 export function servingState(status: ProtocolStatus): ServingState {
   if (!status.enabled) return "off";

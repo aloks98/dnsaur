@@ -88,7 +88,9 @@ curl or any HTTP client.
   hashing anything, and no more than four argon2id computations run at
   once server-wide.
 - **Optional TOTP 2FA**: `POST /auth/totp/start` begins enrollment
-  (returns a base32 `secret` and an `otpauth_url` for a QR code);
+  (returns a base32 `secret`, an `otpauth_url`, and `qr_png` — that URL
+  already rendered as a base64 PNG, so a client can show the QR with an
+  `<img src="data:image/png;base64,…">` and needs no QR encoder of its own);
   `POST /auth/totp/confirm` (`{secret, code}`) verifies a code and enables
   it; `POST /auth/totp/disable` (`{code}`) turns it off. Once enabled,
   `totp_code` is required on every login. **A code logs in once**

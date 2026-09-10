@@ -1,103 +1,67 @@
-import { useCallback, useSyncExternalStore } from "react";
+import { useSyncExternalStore } from "react";
 
 export type Theme = "light" | "dark";
 
-// Key spelled as the design spec asks ("dnsaur.theme").
-export const THEME_STORAGE_KEY = "dnsaur.theme";
+// Key spelled as the design spec asks ("dnsaur.theme"). public/theme-boot.js
+// reads the same one before the bundle loads, so keep the two in step.
+const STORAGE_KEY = "dnsaur.theme";
 
-function isTheme(value: string | null): value is Theme {
-  return value === "light" || value === "dark";
-}
+// One MediaQueryList for the module's lifetime: window.matchMedia() hands
+// back a *new* object per call, so a fresh one per subscriber would attach
+// listeners to instances nothing can ever detach from.
+const darkMedia =
+  typeof window !== "undefined" && typeof window.matchMedia === "function"
+    ? window.matchMedia("(prefers-color-scheme: dark)")
+    : null;
 
-export function getStoredTheme(): Theme | null {
+function storedTheme(): Theme | null {
   try {
-    const stored = window.localStorage.getItem(THEME_STORAGE_KEY);
-    return isTheme(stored) ? stored : null;
+    const value = window.localStorage.getItem(STORAGE_KEY);
+    return value === "light" || value === "dark" ? value : null;
   } catch {
     // localStorage unavailable (private browsing, disabled storage, ...).
     return null;
   }
 }
 
-export function getPreferredTheme(): Theme {
-  if (typeof window === "undefined" || typeof window.matchMedia !== "function") {
-    return "light";
-  }
-  return window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
-}
+// A tiny external store (rather than plain useState) so every component that
+// calls useTheme() — ThemeToggle, AppShell's Toaster, etc. — observes the same
+// live value instead of drifting out of sync with each other.
+const listeners = new Set<() => void>();
+let currentTheme: Theme = storedTheme() ?? (darkMedia?.matches ? "dark" : "light");
 
-export function getInitialTheme(): Theme {
-  return getStoredTheme() ?? getPreferredTheme();
-}
-
-export function applyTheme(theme: Theme): void {
-  document.documentElement.classList.toggle("dark", theme === "dark");
-}
-
-export function persistTheme(theme: Theme): void {
-  try {
-    window.localStorage.setItem(THEME_STORAGE_KEY, theme);
-  } catch {
-    // localStorage unavailable; theme just won't persist across reloads.
-  }
-}
-
-// A tiny external store (rather than plain useState) so every component
-// that calls useTheme() — ThemeToggle, AppShell's Toaster, etc. — observes
-// the same live value instead of drifting out of sync with each other.
-type Listener = () => void;
-const listeners = new Set<Listener>();
-let currentTheme: Theme = getInitialTheme();
-applyTheme(currentTheme);
-
-function notify(): void {
+function apply(next: Theme): void {
+  currentTheme = next;
+  document.documentElement.classList.toggle("dark", next === "dark");
   listeners.forEach((listener) => listener());
 }
 
-function setThemeInternal(next: Theme): void {
-  currentTheme = next;
-  applyTheme(next);
-  persistTheme(next);
-  notify();
-}
+apply(currentTheme);
 
-// One MediaQueryList for the module's lifetime: window.matchMedia() hands
-// back a *new* object per call, so a fresh one per subscribe would attach
-// listeners to instances nothing can ever detach from.
-let darkModeMedia: MediaQueryList | null | undefined;
-
-function darkModeQuery(): MediaQueryList | null {
-  if (darkModeMedia === undefined) {
-    darkModeMedia =
-      typeof window === "undefined" || typeof window.matchMedia !== "function"
-        ? null
-        : window.matchMedia("(prefers-color-scheme: dark)");
-  }
-  return darkModeMedia;
-}
-
-// While the user has made no explicit choice, the app *follows* the OS
-// rather than sampling it once at import time and freezing: flipping the
-// system to dark at sunset used to leave dnsaur bright until a reload.
-// A stored theme is an explicit override and always wins.
-function handleSystemThemeChange(event: MediaQueryListEvent): void {
-  if (getStoredTheme() !== null) return;
+// While the user has made no explicit choice, the app *follows* the OS rather
+// than sampling it once at import time and freezing: flipping the system to
+// dark at sunset used to leave dnsaur bright until a reload. A stored theme is
+// an explicit override and always wins.
+darkMedia?.addEventListener("change", (event) => {
+  if (storedTheme() !== null) return;
   const next: Theme = event.matches ? "dark" : "light";
-  if (next === currentTheme) return;
-  currentTheme = next;
-  applyTheme(next);
-  notify();
+  if (next !== currentTheme) apply(next);
+});
+
+function setTheme(next: Theme): void {
+  try {
+    window.localStorage.setItem(STORAGE_KEY, next);
+  } catch {
+    // localStorage unavailable; theme just won't persist across reloads.
+  }
+  apply(next);
 }
 
-function subscribe(listener: Listener): () => void {
-  // Re-adding the same function reference is a no-op per the DOM spec, so
-  // this stays a single registration however many components subscribe. It
-  // is never removed: the store itself outlives every component, and the
-  // handler is a cheap no-op once an explicit theme is stored.
-  const media = darkModeQuery();
-  if (media && typeof media.addEventListener === "function") {
-    media.addEventListener("change", handleSystemThemeChange);
-  }
+function toggleTheme(): void {
+  setTheme(currentTheme === "dark" ? "light" : "dark");
+}
+
+function subscribe(listener: () => void): () => void {
   listeners.add(listener);
   return () => {
     listeners.delete(listener);
@@ -113,15 +77,5 @@ export function useTheme(): {
   setTheme: (theme: Theme) => void;
   toggleTheme: () => void;
 } {
-  const theme = useSyncExternalStore(subscribe, getSnapshot);
-
-  const setTheme = useCallback((next: Theme) => {
-    setThemeInternal(next);
-  }, []);
-
-  const toggleTheme = useCallback(() => {
-    setThemeInternal(currentTheme === "dark" ? "light" : "dark");
-  }, []);
-
-  return { theme, setTheme, toggleTheme };
+  return { theme: useSyncExternalStore(subscribe, getSnapshot), setTheme, toggleTheme };
 }

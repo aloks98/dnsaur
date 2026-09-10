@@ -15,7 +15,6 @@ import { toast } from "sonner";
 import { useForm, type Control } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { z } from "zod";
-import * as QRCode from "qrcode";
 import {
   Alert,
   AlertDescription,
@@ -47,13 +46,17 @@ import {
   InputOTPSeparator,
   InputOTPSlot,
   Skeleton,
-  Spinner,
 } from "@e412/rnui-react";
 import { ApiError } from "../api/client";
 import type { ApiToken } from "../api/types";
 import { useMe } from "../hooks/use-auth";
 import { useCreateToken, useRevokeToken, useTokens } from "../hooks/use-tokens";
-import { useTotpConfirm, useTotpDisable, useTotpStart } from "../hooks/use-totp";
+import {
+  useTotpConfirm,
+  useTotpDisable,
+  useTotpStart,
+  type TotpStartResult,
+} from "../hooks/use-totp";
 import { relativeTime } from "../lib/format";
 import { requiredText, totpCodeSchema } from "../lib/schemas";
 import { StaleDataAlert } from "../components/stale-data-alert";
@@ -81,37 +84,6 @@ function CopyableCode({ value, label }: { value: string; label: string }) {
 }
 
 // --- two-factor authentication -----------------------------------------
-
-/** otpauth:// URL -> an `<img>`-ready data URL, via `qrcode`'s pure string
- * SVG renderer (no canvas involved — jsdom doesn't implement 2D canvas
- * rasterization, see test/setup.ts, and SVG is also just crisper at any
- * zoom level than a rasterized PNG would be). The renderer's defaults
- * already paint an opaque white background behind the dark modules, so the
- * code stays scannable in dark mode without extra styling here beyond the
- * white card it sits in below. */
-function useQrDataUrl(text: string | null): string | null {
-  const [dataUrl, setDataUrl] = useState<string | null>(null);
-
-  useEffect(() => {
-    if (!text) {
-      setDataUrl(null);
-      return;
-    }
-    let cancelled = false;
-    QRCode.toString(text, { type: "svg", margin: 1, width: 160 })
-      .then((svg) => {
-        if (!cancelled) setDataUrl(`data:image/svg+xml;utf8,${encodeURIComponent(svg)}`);
-      })
-      .catch(() => {
-        if (!cancelled) setDataUrl(null);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [text]);
-
-  return dataUrl;
-}
 
 // Both TOTP dialogs (enable and disable) ask for the same six digits, so
 // they share one schema as well as one field component.
@@ -159,8 +131,8 @@ function CodeField({
 /**
  * Enrollment — opened only once useTotpStart has already returned a fresh
  * secret (see TotpCard.onStartEnroll), so this never has to render a
- * mid-flight loading state of its own for the secret itself, only for the
- * QR image derived from it. `enrollment.secret` is the "must live only in
+ * mid-flight loading state of its own — the server draws the QR and returns
+ * it alongside the secret. `enrollment.secret` is the "must live only in
  * component state" value the brief calls out, and it has *three* holders,
  * all of which TotpCard.onEnableOpenChange clears together the moment this
  * dialog closes for any reason:
@@ -184,7 +156,7 @@ function TotpEnrollRow({
   totpConfirm,
   onDone,
 }: {
-  enrollment: { secret: string; otpauth_url: string };
+  enrollment: TotpStartResult;
   totpConfirm: ReturnType<typeof useTotpConfirm>;
   onDone: () => void;
 }) {
@@ -192,7 +164,6 @@ function TotpEnrollRow({
     resolver: zodResolver(codeFormSchema),
     defaultValues: { code: "" },
   });
-  const qrDataUrl = useQrDataUrl(enrollment.otpauth_url);
 
   function onSubmit(values: CodeFormValues) {
     totpConfirm.mutate(
@@ -227,21 +198,13 @@ function TotpEnrollRow({
           {/* A fixed white surface regardless of theme — an inverted
               (light-on-dark) QR isn't reliably scannable by every reader, so
               this deliberately does not follow the app's dark background.
-              Sized to the 160px image plus its 12px padding each side, so
-              the Spinner reserves the same footprint and nothing jumps. */}
+              Sized to the 160px image plus its 12px padding each side. */}
           <div className="flex size-[184px] items-center justify-center border border-border bg-white p-3">
-            {qrDataUrl ? (
-              <img
-                src={qrDataUrl}
-                alt="QR code for two-factor setup — scan with your authenticator app"
-                className="size-40"
-              />
-            ) : (
-              // A fixed gray, not text-muted-foreground: that token is
-              // theme-relative and in dark mode resolves to a pale gray for
-              // dark surfaces — nearly invisible on an always-white box.
-              <Spinner className="size-6 text-gray-400" />
-            )}
+            <img
+              src={`data:image/png;base64,${enrollment.qr_png}`}
+              alt="QR code for two-factor setup — scan with your authenticator app"
+              className="size-40"
+            />
           </div>
           <span className="font-mono text-xs tracking-widest text-muted-foreground uppercase">
             Scan in your app
@@ -407,9 +370,7 @@ function TotpCard({ enabled }: { enabled: boolean }) {
   const totpStart = useTotpStart();
   const totpConfirm = useTotpConfirm();
   const totpDisable = useTotpDisable();
-  const [enrollment, setEnrollment] = useState<{ secret: string; otpauth_url: string } | null>(
-    null,
-  );
+  const [enrollment, setEnrollment] = useState<TotpStartResult | null>(null);
   const [enableOpen, setEnableOpen] = useState(false);
   const [disableOpen, setDisableOpen] = useState(false);
 

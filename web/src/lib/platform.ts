@@ -14,7 +14,7 @@
  */
 const APPLE_PLATFORM = /mac|iphone|ipad|ipod/i;
 
-export function isApplePlatform(): boolean {
+function isApplePlatform(): boolean {
   if (typeof navigator === "undefined") return false;
   return APPLE_PLATFORM.test(navigator.platform || navigator.userAgent);
 }

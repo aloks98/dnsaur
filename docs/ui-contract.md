@@ -211,12 +211,14 @@ either way. A bearer-authenticated logout revokes nothing but still 204s.
 #### TOTP
 | Endpoint | Body | Success | Errors |
 |---|---|---|---|
-| `POST /auth/totp/start` | — | **200** `{"secret","otpauth_url"}` | 500 `totp generation failed` |
+| `POST /auth/totp/start` | — | **200** `{"secret","otpauth_url","qr_png"}` | 500 `totp generation failed` |
 | `POST /auth/totp/confirm` | `{"secret","code"}` | **204** | 400 `invalid json`, 400 `invalid totp code` |
 | `POST /auth/totp/disable` | `{"code"}` | **204** | 400 `invalid json`, 400 `invalid totp code`, 400 `bad credentials` |
 
 `start` is **stateless** — nothing is persisted, the client holds the secret and
-passes it back to `confirm`. `confirm` and `disable` both **revoke every other
+passes it back to `confirm`. `qr_png` is `otpauth_url` already drawn as a QR
+code, base64-encoded, for `<img src="data:image/png;base64,…">`; the dashboard
+renders it as-is rather than shipping a QR encoder. `confirm` and `disable` both **revoke every other
 session** on the account; the session making the request survives, and API
 tokens are untouched. Any other tab is logged out on its next request with a
 plain 401.

@@ -15,7 +15,7 @@ export const DEFAULT_SEARCH_LIMIT = 100;
  *
  * The stream only ever carries queries answered *after* it was subscribed,
  * so on a server with a million logged queries the page used to open on
- * "Listening — queries appear here…" and stay there until the next lookup —
+ * "Waiting for traffic" and stay there until the next lookup —
  * which reads as a broken or empty install, not as a tail. One page of
  * `GET /queries` is enough to make the screen show what the box has actually
  * been doing; a fifth of the ring buffer leaves room for the stream to

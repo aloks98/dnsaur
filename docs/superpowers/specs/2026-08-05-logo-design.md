@@ -77,7 +77,8 @@ it in the asset header comment).
    Nunito ExtraBold; any OFL-licensed rounded sans is acceptable if
    Nunito can't be fetched at build time). Referenced
    from README via `<picture>` + `prefers-color-scheme` so GitHub/Forgejo
-   swap automatically.
+   swap automatically. The two SVGs are committed and hand-maintained —
+   the wordmark is already paths, so editing them needs no font toolchain.
 4. **Docs** — README gains the banner; `docs/` notes the logo assets and
    palette where relevant (per the keep-docs-updated convention).
 

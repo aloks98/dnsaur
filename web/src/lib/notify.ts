@@ -37,11 +37,9 @@ const MAX_LABEL_LENGTH = 63;
 /** One parsed target — mirrors Go's `NotifyTarget`. `port` always has the
  * default applied; `key` is `""` for an unsigned target, otherwise already
  * canonical (lowercase, trailing dot). */
-export type NotifyTarget = { host: string; port: number; key: string };
+type NotifyTarget = { host: string; port: number; key: string };
 
-export type NotifyToParseResult =
-  | { ok: true; targets: NotifyTarget[] }
-  | { ok: false; error: string };
+type NotifyToParseResult = { ok: true; targets: NotifyTarget[] } | { ok: false; error: string };
 
 type TargetResult = { ok: true; target: NotifyTarget } | { ok: false; error: string };
 
@@ -176,7 +174,7 @@ function isValidNotifyHost(host: string): boolean {
  * (`notifyStateOf`, internal/api/notifies_handlers.go) — never left to the
  * client to infer from the raw columns, so two clients can never disagree
  * about it. */
-export type NotifyState = "never" | "current" | "retrying" | "gave_up";
+type NotifyState = "never" | "current" | "retrying" | "gave_up";
 
 /**
  * Whether a target's state counts as *behind* — the roll-up's own count,
@@ -191,7 +189,7 @@ export function isNotifyBehind(state: NotifyState): boolean {
   return state === "retrying" || state === "gave_up";
 }
 
-export interface NotifyRollup {
+interface NotifyRollup {
   /** "no targets" / "all 4 current" / "3 of 4 current, 1 never notified" /
    * "2 of 4 behind". */
   label: string;

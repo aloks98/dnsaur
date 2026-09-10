@@ -29,7 +29,7 @@ export const QUERY_LOG_PATH = "/queries";
  * Lists; the chrome uses this to recognise the section and its tabs. */
 export const FILTERING_BASE = "/filtering";
 
-export interface NavItem {
+interface NavItem {
   to: string;
   label: string;
   icon: LucideIcon;
@@ -106,9 +106,6 @@ export const NAV_GROUPS: NavGroup[] = [
     ],
   },
 ];
-
-/** Every leaf page, flattened — what the command palette navigates to. */
-export const navItems: NavItem[] = NAV_GROUPS.flatMap((group) => group.items);
 
 export function isNavItemActive(pathname: string, item: NavItem): boolean {
   if (item.end) return pathname === item.to;

@@ -16,9 +16,12 @@ import { authKeys } from "./use-auth";
 // queryClient.getMutationCache().getAll() until the default 5-minute GC
 // timer fires. Same treatment for useTotpDisable's single-use code.
 
-interface TotpStartResult {
+export interface TotpStartResult {
   secret: string;
   otpauth_url: string;
+  /** The enrollment QR as a base64 PNG, drawn by the server (pquerna/otp
+   * already has the encoder) so the bundle carries no QR library. */
+  qr_png: string;
 }
 
 export function useTotpStart() {

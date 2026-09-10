@@ -12,6 +12,11 @@ import type { ApiToken, MeResponse } from "../api/types";
 import { Account } from "./account";
 
 const TOTP_SECRET = "JBSWY3DPEHPK3PXP";
+// The QR is drawn server-side (internal/api/tokens_handlers.go) and arrives
+// base64-encoded; a 1x1 PNG stands in for it here. jsdom never decodes it —
+// what matters is that the page puts it straight into the img's src.
+const TOTP_QR_PNG =
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
 
 /**
  * renderWithProviders() owns its QueryClient privately; this variant hands
@@ -144,6 +149,7 @@ test("TOTP enable: start then confirm with a code refetches me and flips the car
       HttpResponse.json({
         secret: "JBSWY3DPEHPK3PXP",
         otpauth_url: "otpauth://totp/dnsaur:admin?secret=JBSWY3DPEHPK3PXP&issuer=dnsaur",
+        qr_png: TOTP_QR_PNG,
       }),
     ),
     http.post("/api/v1/auth/totp/confirm", async ({ request }) => {
@@ -163,7 +169,12 @@ test("TOTP enable: start then confirm with a code refetches me and flips the car
   // Enrollment happens in the section itself, not a dialog — the QR, the
   // secret and the confirm field are all on the page at once.
   expect(await screen.findByText("JBSWY3DPEHPK3PXP")).toBeInTheDocument();
-  expect(await screen.findByRole("img", { name: /qr code/i })).toBeInTheDocument();
+  // The QR is whatever the server drew, shown as-is — nothing in the bundle
+  // re-encodes the otpauth:// URL.
+  expect(await screen.findByRole("img", { name: /qr code/i })).toHaveAttribute(
+    "src",
+    `data:image/png;base64,${TOTP_QR_PNG}`,
+  );
   expect(screen.getByText(/setting up/i)).toBeInTheDocument();
 
   await user.type(screen.getByLabelText(/verification code/i), "123456");
@@ -189,6 +200,7 @@ test("TOTP enable: dismissing without confirming clears the setup key and QR fro
       HttpResponse.json({
         secret: "JBSWY3DPEHPK3PXP",
         otpauth_url: "otpauth://totp/dnsaur:admin?secret=JBSWY3DPEHPK3PXP&issuer=dnsaur",
+        qr_png: TOTP_QR_PNG,
       }),
     ),
   );
@@ -227,6 +239,7 @@ test("TOTP enable: the shared secret is gone from mutation state once enrollment
       HttpResponse.json({
         secret: TOTP_SECRET,
         otpauth_url: `otpauth://totp/dnsaur:admin?secret=${TOTP_SECRET}&issuer=dnsaur`,
+        qr_png: TOTP_QR_PNG,
       }),
     ),
     http.post("/api/v1/auth/totp/confirm", () => {

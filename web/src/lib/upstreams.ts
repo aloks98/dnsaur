@@ -39,13 +39,13 @@ export type UpstreamErrorCode =
   | "bad_url"
   | "empty";
 
-export interface UpstreamError {
+interface UpstreamError {
   code: UpstreamErrorCode;
   entry: string;
   message: string;
 }
 
-export type ParseResult = { ok: true; entries: Upstream[] } | { ok: false; error: UpstreamError };
+type ParseResult = { ok: true; entries: Upstream[] } | { ok: false; error: UpstreamError };
 
 // Default ports and path, applied when the entry omits them — mirrors
 // addr.go's defaultPlainPort / defaultDoTPort / defaultDoHPort / defaultDoHPath.
