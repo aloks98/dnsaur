@@ -1040,22 +1040,38 @@ func clientSerial(q *dns.Msg) (uint32, bool) {
 // stands the watch down. See its call site for why closing is the only lever
 // there is.
 //
+// Standing the watch down *joins* the close rather than merely signalling it,
+// which is the whole point of the shape. serve calls it and then returns, and
+// the moment ServeTransfer returns miekg reads the response writer again
+// (server.go's serveTCPConn, after the handler) — so a Close still in flight
+// at that point is a data race on the writer, which is exactly what CI
+// caught. Waiting here means the caller cannot return while a Close is
+// pending, and the connection is either already closed or never will be.
+//
+// context.AfterFunc rather than a goroutine parked in a select, because its
+// stop reports which of the two happened: true means the close was cancelled
+// before it started and there is nothing to wait for, false means it is
+// already running and `stopped` is what says when it has finished. A select
+// over the two channels cannot tell those apart when both are ready — it
+// picks one at random, and picking ctx.Done() after the stand-down had
+// already returned is how the race got out.
+//
 // The returned function is safe to call once, on the one path that calls it:
 // the stream returning, however it returned.
 func watchStalledWrite(ctx context.Context, w dns.ResponseWriter) func() {
-	done := make(chan struct{})
-	go func() {
-		select {
-		case <-ctx.Done():
-			// The peer receives whatever the kernel already accepted and then
-			// a closed connection, which is what a transfer that ran out of
-			// time looks like from the far end. It retries on its own SOA
-			// schedule.
-			_ = w.Close()
-		case <-done:
+	stopped := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() {
+		defer close(stopped)
+		// The peer receives whatever the kernel already accepted and then a
+		// closed connection, which is what a transfer that ran out of time
+		// looks like from the far end. It retries on its own SOA schedule.
+		_ = w.Close()
+	})
+	return func() {
+		if !stop() {
+			<-stopped
 		}
-	}()
-	return func() { close(done) }
+	}
 }
 
 // qnameOf is the queried name for a log line, for a message that may have no
