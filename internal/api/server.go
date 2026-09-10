@@ -33,6 +33,14 @@ type Reloader interface {
 	// such a write no longer waits on the network.
 	RefreshFilters(ctx context.Context) error
 	RecompileFilters(ctx context.Context) error
+	// RefreshList downloads one list and then compiles, for the row's own
+	// "Refresh now". An id naming no list is store.ErrNotFound.
+	RefreshList(ctx context.Context, id int64) error
+	// NextFilterRefresh is unix ms of the moment the periodic list download
+	// runs next, 0 when no cadence is running. It is a property of the
+	// server-wide interval, not of any one list — there are no per-list
+	// schedules — so every row reports the same value.
+	NextFilterRefresh() int64
 	// NotifyZones wakes the outbound NOTIFY pass. See zones.Notifier.Wake:
 	// it is promptness, never correctness, so a handler that forgets this
 	// call only delays delivery by one tick rather than losing it.

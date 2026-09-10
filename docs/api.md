@@ -232,12 +232,19 @@ Full parameter/response detail lives in `internal/api/openapi.yaml`
   `PATCH /filters/lists/{id}` (enable/disable),
   `DELETE /filters/lists/{id}`, `DELETE /filters/rules/{id}` (delete a
   per-group rule), `POST /filters/refresh` (`202`, kicks off an
-  asynchronous refresh of all lists).
+  asynchronous refresh of all lists), `POST /filters/lists/{id}/refresh`
+  (`202`, downloads **that one list** and answers with its updated row —
+  the work runs inside the request, so unlike the all-lists refresh there
+  is nothing to poll for; a disabled list is `409`).
   Every other rule/list/assignment write **recompiles from the copies
   already on disk and does not download**, so none of them wait on the
   network. A list whose URL resolves to a loopback, link-local or private
   address is refused at fetch time and reads back `last_status: "failed"`;
   the same goes for a body over 64 MiB.
+  Rows from `GET /filters/lists` also carry `next_refresh_at`, unix ms of
+  the periodic download's next tick (`0` when no cadence is running). It
+  comes from the running ticker, not the database, and is the same on every
+  row — the interval is server-wide and there are no per-list schedules.
 - **Zones** — `GET /zones`, `POST /zones`, `GET /zones/{id}`,
   `PATCH /zones/{id}`, `DELETE /zones/{id}` (cascades its records).
   `PATCH` is conditional on the zone not having changed since it was read:

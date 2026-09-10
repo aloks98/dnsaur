@@ -124,10 +124,13 @@ and compiled into a domain set; the entry count shown is what actually
 compiled, not the line count of the file.
 
 Lists refresh on a timer set by `lists.refresh_hours` — **changing that
-interval needs a restart** (see [Settings](#settings)). Downloading and
-compiling are separate: editing a rule, a list or an assignment recompiles
-from the copies already on disk and answers immediately, while **Refresh
-now**, adding a list, enabling one and the timer are what actually fetch. A
+interval needs a restart** (see [Settings](#settings)). Each row says when it
+was last checked and how long until the next timed run, so a list that is
+about to fix itself is distinguishable from one that has been failing for a
+week. Downloading and compiling are separate: editing a rule, a list or an
+assignment recompiles from the copies already on disk and answers
+immediately, while **Refresh all**, a row's own **Refresh now**, adding a
+list, enabling one and the timer are what actually fetch. A
 restart compiles from those copies before it starts answering queries, so the
 network is filtered from the first query rather than from the end of the
 first download.

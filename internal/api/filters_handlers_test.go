@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -9,6 +10,145 @@ import (
 
 	"github.com/aloks98/dnsaur/internal/store"
 )
+
+// touchingReloader is fakeReloader with a RefreshList that actually records
+// the list's new state, the way filter.Refresher does. Counting the call
+// alone would let the handler read the row *before* the refresh and never
+// be caught: the response is supposed to be the list as the refresh left
+// it.
+type touchingReloader struct {
+	*fakeReloader
+	fs store.FilterStore
+	at int64
+	n  int64
+}
+
+func (t *touchingReloader) RefreshList(ctx context.Context, id int64) error {
+	if err := t.fakeReloader.RefreshList(ctx, id); err != nil {
+		return err
+	}
+	return t.fs.TouchList(ctx, id, t.at, t.n)
+}
+
+// TestListRefreshRefreshesOneListAndReturnsItsRow is the row's own "Refresh
+// now": one list is downloaded and the updated row comes straight back, so
+// the dashboard does not have to poll the table to find out what happened
+// the way it does after the all-lists 202.
+func TestListRefreshRefreshesOneListAndReturnsItsRow(t *testing.T) {
+	srv, s, rl := testServer(t)
+	cookie := login(t, srv, s)
+	h := srv.Handler()
+	lid, err := s.Filters().AddList(t.Context(), store.List{URL: "https://x.example/hosts", Kind: "block", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := s.Filters().AddList(t.Context(), store.List{URL: "https://y.example/hosts", Kind: "block", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr := &touchingReloader{fakeReloader: rl, fs: s.Filters(), at: 1_700_000_000_000, n: 99_277}
+	srv.deps.Reloader = tr
+	rl.nextRefreshAt = 1_700_000_600_000
+
+	w := doReq(t, h, "POST", fmt.Sprintf("/api/v1/filters/lists/%d/refresh", lid), "", cookie)
+	if w.Code != 202 {
+		t.Fatalf("refresh: %d %s", w.Code, w.Body.String())
+	}
+	var row struct {
+		store.List
+		NextRefreshAt int64 `json:"next_refresh_at"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &row); err != nil {
+		t.Fatal(err)
+	}
+	if row.ID != lid || row.LastStatus != store.ListStatusOK || row.EntryCount != 99_277 {
+		t.Fatalf("row = %+v; want list %d as the refresh left it", row.List, lid)
+	}
+	if row.LastAttempt != 1_700_000_000_000 {
+		t.Fatalf("last_attempt = %d; the row was read before the refresh", row.LastAttempt)
+	}
+	if row.NextRefreshAt != 1_700_000_600_000 {
+		t.Fatalf("next_refresh_at = %d, want the refresher's next tick", row.NextRefreshAt)
+	}
+	if got := rl.refreshedLists(); len(got) != 1 || got[0] != lid {
+		t.Fatalf("refreshed %v; want only list %d", got, lid)
+	}
+	if _, _, filters := rl.counts(); filters != 0 {
+		t.Fatalf("a per-list refresh also ran the all-lists download %d times", filters)
+	}
+	ls, _ := s.Filters().Lists(t.Context())
+	for _, l := range ls {
+		if l.ID == other && l.LastStatus == store.ListStatusOK {
+			t.Fatal("the other list was refreshed too")
+		}
+	}
+}
+
+// TestListRefreshRejectsUnknownAndDisabledLists: an id naming nothing is a
+// 404, and a disabled list is a 409 — the request is well-formed and the
+// caller is allowed, and what forbids it is the state of this list.
+func TestListRefreshRejectsUnknownAndDisabledLists(t *testing.T) {
+	srv, s, rl := testServer(t)
+	cookie := login(t, srv, s)
+	h := srv.Handler()
+	lid, err := s.Filters().AddList(t.Context(), store.List{URL: "https://x.example/hosts", Kind: "block", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Filters().SetListEnabled(t.Context(), lid, false); err != nil {
+		t.Fatal(err)
+	}
+
+	if w := doReq(t, h, "POST", "/api/v1/filters/lists/999999/refresh", "", cookie); w.Code != 404 {
+		t.Fatalf("unknown id: %d %s, want 404", w.Code, w.Body.String())
+	}
+	if w := doReq(t, h, "POST", "/api/v1/filters/lists/nope/refresh", "", cookie); w.Code != 400 {
+		t.Fatalf("non-numeric id: %d %s, want 400", w.Code, w.Body.String())
+	}
+	w := doReq(t, h, "POST", fmt.Sprintf("/api/v1/filters/lists/%d/refresh", lid), "", cookie)
+	if w.Code != 409 {
+		t.Fatalf("disabled list: %d %s, want 409", w.Code, w.Body.String())
+	}
+	if got := rl.refreshedLists(); len(got) != 0 {
+		t.Fatalf("a rejected request still downloaded %v", got)
+	}
+}
+
+// TestListsCarryTheNextRefreshTime: every row reports when the periodic
+// download runs next, which is a property of the server-wide cadence rather
+// than of any one list — there are no per-list intervals.
+func TestListsCarryTheNextRefreshTime(t *testing.T) {
+	srv, s, rl := testServer(t)
+	cookie := login(t, srv, s)
+	h := srv.Handler()
+	for _, u := range []string{"https://x.example/1", "https://x.example/2"} {
+		if _, err := s.Filters().AddList(t.Context(), store.List{URL: u, Kind: "block", Enabled: true}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rl.nextRefreshAt = 1_700_000_600_000
+
+	w := doReq(t, h, "GET", "/api/v1/filters/lists", "", cookie)
+	if w.Code != 200 {
+		t.Fatalf("lists: %d %s", w.Code, w.Body.String())
+	}
+	var rows []struct {
+		ID            int64 `json:"id"`
+		LastAttempt   int64 `json:"last_attempt"`
+		NextRefreshAt int64 `json:"next_refresh_at"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &rows); err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("rows = %+v, want 2", rows)
+	}
+	for _, r := range rows {
+		if r.NextRefreshAt != 1_700_000_600_000 {
+			t.Fatalf("row %d next_refresh_at = %d, want the refresher's next tick", r.ID, r.NextRefreshAt)
+		}
+	}
+}
 
 func TestListsCRUDAndAssignment(t *testing.T) {
 	srv, s, rl := testServer(t)

@@ -123,6 +123,17 @@ export interface List {
   last_error: string;
   /** Unix ms of the last attempt, successful or not; `0` = never tried. */
   last_attempt: number;
+  /**
+   * Unix ms of the moment the periodic download runs next; `0` when no
+   * cadence is running. The same value on every row — the interval is
+   * server-wide (`lists.refresh_hours`) and there are no per-list
+   * schedules.
+   *
+   * Optional because only `GET /filters/lists` and the per-list refresh
+   * response carry it; `GET /groups/{id}/lists` serves the stored row
+   * alone.
+   */
+  next_refresh_at?: number;
 }
 
 export interface Rule {

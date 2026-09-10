@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unicode/utf8"
@@ -42,6 +43,12 @@ type Refresher struct {
 	// concurrently, letting their list-cache .tmp writes and
 	// compiled-ruleset swaps interleave.
 	mu sync.Mutex
+
+	// nextRefresh is unix ms of the periodic download's next tick, 0 when
+	// no cadence is running. Atomic rather than under mu: mu is held for
+	// the whole of a refresh round, and a dashboard asking when the next
+	// one is due must not wait out a download to be told.
+	nextRefresh atomic.Int64
 }
 
 // RefresherOption adjusts a Refresher at construction.
@@ -434,55 +441,110 @@ func (r *Refresher) RefreshAll(ctx context.Context) error {
 		if !l.Enabled {
 			continue
 		}
-		at := r.now().UnixMilli()
-		fr := r.fetch(ctx, l)
-		if fr.body == nil {
-			// Nothing to parse and nothing cached: this list is blocking
-			// nothing. entry_count 0 is what marks it Failed rather than
-			// Stale, and it is also the truth — it contributes no entries
-			// to any group's ruleset this round.
-			slog.Error("list unavailable", "url", l.URL, "reason", fr.failure)
-			logListState(l.ID, r.fs.MarkListFailed(ctx, l.ID, at, 0, fr.failure))
-			continue
+		if c, ok := r.refreshList(ctx, l); ok {
+			compiled[l.ID] = c
 		}
-		res, err := ParseList(fr.body)
-		_ = fr.body.Close()
-		if err != nil {
-			// A copy we can't parse is as useless as one we couldn't
-			// fetch, even if the download itself was fine.
-			why := reason("parse failed: %v", err)
-			slog.Error("list parse failed", "url", l.URL, "reason", why)
-			logListState(l.ID, r.fs.MarkListFailed(ctx, l.ID, at, 0, why))
-			continue
-		}
-		c := compileList(l, res)
-		set := c.Set
-		compiled[l.ID] = c
-		if fr.failure != "" {
-			// The fetch failed but a copy parsed. MarkListFailed reads
-			// stale (entries still enforcing) or failed (none) from the
-			// count.
-			slog.Warn("list serving an older copy", "url", l.URL, "reason", fr.failure,
-				"from_cache", fr.cached, "entries", set.Len())
-			logListState(l.ID, r.fs.MarkListFailed(ctx, l.ID, at, int64(set.Len()), fr.failure))
-			continue
-		}
-		if set.Len() == 0 {
-			// Downloaded and parsed cleanly, and still blocks nothing.
-			// This is the wildcard-list case: 4.5 MB of `*.host.tld` that
-			// the parser rejected line by line. Reporting it as a plain
-			// "0 entries, refreshed just now" is what sends an admin
-			// hunting for a download bug that isn't there, so name the
-			// parser's side of it explicitly.
-			why := emptyReason(fr.size, res.Skipped)
-			slog.Warn("list produced no entries", "url", l.URL, "reason", why)
-			logListState(l.ID, r.fs.MarkListEmpty(ctx, l.ID, at, why))
-			continue
-		}
-		logListState(l.ID, r.fs.TouchList(ctx, l.ID, at, int64(set.Len())))
 	}
 	return r.install(ctx, compiled)
 }
+
+// refreshList downloads one list, records what the attempt produced, and
+// returns what it contributes to a ruleset. ok is false only when there was
+// nothing to compile at all — no body and no cache, or a copy that would
+// not parse; a stale copy and an empty one both still count, the first
+// because it is genuinely still enforcing and the second because an empty
+// set is what its row already claims.
+//
+// Callers hold r.mu.
+func (r *Refresher) refreshList(ctx context.Context, l store.List) (CompiledList, bool) {
+	at := r.now().UnixMilli()
+	fr := r.fetch(ctx, l)
+	if fr.body == nil {
+		// Nothing to parse and nothing cached: this list is blocking
+		// nothing. entry_count 0 is what marks it Failed rather than
+		// Stale, and it is also the truth — it contributes no entries
+		// to any group's ruleset this round.
+		slog.Error("list unavailable", "url", l.URL, "reason", fr.failure)
+		logListState(l.ID, r.fs.MarkListFailed(ctx, l.ID, at, 0, fr.failure))
+		return CompiledList{}, false
+	}
+	res, err := ParseList(fr.body)
+	_ = fr.body.Close()
+	if err != nil {
+		// A copy we can't parse is as useless as one we couldn't
+		// fetch, even if the download itself was fine.
+		why := reason("parse failed: %v", err)
+		slog.Error("list parse failed", "url", l.URL, "reason", why)
+		logListState(l.ID, r.fs.MarkListFailed(ctx, l.ID, at, 0, why))
+		return CompiledList{}, false
+	}
+	c := compileList(l, res)
+	set := c.Set
+	switch {
+	case fr.failure != "":
+		// The fetch failed but a copy parsed. MarkListFailed reads
+		// stale (entries still enforcing) or failed (none) from the
+		// count.
+		slog.Warn("list serving an older copy", "url", l.URL, "reason", fr.failure,
+			"from_cache", fr.cached, "entries", set.Len())
+		logListState(l.ID, r.fs.MarkListFailed(ctx, l.ID, at, int64(set.Len()), fr.failure))
+	case set.Len() == 0:
+		// Downloaded and parsed cleanly, and still blocks nothing.
+		// This is the wildcard-list case: 4.5 MB of `*.host.tld` that
+		// the parser rejected line by line. Reporting it as a plain
+		// "0 entries, refreshed just now" is what sends an admin
+		// hunting for a download bug that isn't there, so name the
+		// parser's side of it explicitly.
+		why := emptyReason(fr.size, res.Skipped)
+		slog.Warn("list produced no entries", "url", l.URL, "reason", why)
+		logListState(l.ID, r.fs.MarkListEmpty(ctx, l.ID, at, why))
+	default:
+		logListState(l.ID, r.fs.TouchList(ctx, l.ID, at, int64(set.Len())))
+	}
+	return c, true
+}
+
+// RefreshOne downloads exactly one list and then recompiles — the row's own
+// "Refresh now", as opposed to RefreshAll's every-subscription pass. Same
+// fetch, same size and address limits, same recorded outcome; the
+// difference is that no other list is downloaded or re-stated, so one
+// unreachable URL elsewhere costs this nothing.
+//
+// An id naming no list is store.ErrNotFound. A disabled one is still
+// fetched if asked — Recompile then ignores the copy, as it ignores every
+// disabled list — because the decision about whether that is a sensible
+// thing to ask for belongs to the caller, and the API refuses it (see
+// handleListRefresh).
+func (r *Refresher) RefreshOne(ctx context.Context, id int64) error {
+	if err := r.downloadOne(ctx, id); err != nil {
+		return err
+	}
+	return r.Recompile(ctx)
+}
+
+// downloadOne is RefreshOne's locked half, split out so the Recompile that
+// follows can take r.mu for itself rather than needing it to be reentrant.
+func (r *Refresher) downloadOne(ctx context.Context, id int64) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	lists, err := r.fs.Lists(ctx)
+	if err != nil {
+		return err
+	}
+	for _, l := range lists {
+		if l.ID == id {
+			r.refreshList(ctx, l)
+			return nil
+		}
+	}
+	return store.ErrNotFound
+}
+
+// NextRefresh is unix ms of the moment the periodic download will next run,
+// or 0 when no cadence is running — nothing configured, or nothing started
+// yet. Read by the API so the lists table can say how long the current
+// copies have left rather than only how old they are.
+func (r *Refresher) NextRefresh() int64 { return r.nextRefresh.Load() }
 
 // logListState surfaces a failed write of a list's own refresh outcome.
 // Discarded, it leaves the dashboard row describing the previous round —
@@ -512,11 +574,20 @@ func (r *Refresher) Run(ctx context.Context, every time.Duration) {
 	}
 	t := time.NewTicker(every)
 	defer t.Stop()
+	r.nextRefresh.Store(r.now().Add(every).UnixMilli())
 	for {
 		select {
 		case <-ctx.Done():
+			// Nothing is scheduled any more, and a timestamp left behind
+			// would keep the dashboard counting down to a tick that will
+			// never fire.
+			r.nextRefresh.Store(0)
 			return
 		case <-t.C:
+			// Before the download, not after: a ticker's next fire is one
+			// period after this one regardless of how long the round takes,
+			// and a refresh of a dozen lists can take minutes.
+			r.nextRefresh.Store(r.now().Add(every).UnixMilli())
 			if err := r.RefreshAll(ctx); err != nil {
 				slog.Error("blocklist refresh failed", "err", err)
 			}

@@ -40,10 +40,11 @@ import {
   useDeleteList,
   useLists,
   useRefreshFilters,
+  useRefreshList,
   useRenameList,
   useToggleList,
 } from "../../hooks/use-filters";
-import { relativeTime } from "../../lib/format";
+import { formatDuration, relativeTime } from "../../lib/format";
 import { deriveListName } from "../../lib/list-name";
 import { StaleDataAlert } from "../../components/stale-data-alert";
 import { ConfirmDeleteDialog, RenameDialog } from "../dialogs";
@@ -111,9 +112,26 @@ function statusDetail(list: List): string {
   }
 }
 
+/**
+ * The row's two temporal facts on one line: how old the copy being enforced
+ * is, and how long it has left. `last_attempt` rather than `last_refreshed`
+ * because this answers "did anyone look recently", which a failing list has
+ * to be able to answer too.
+ *
+ * `next_refresh_at` is 0 when no cadence is running, and a promise of a next
+ * time is then simply not made.
+ */
+function schedule(list: List): string {
+  const checked = list.last_attempt
+    ? `Checked ${relativeTime(list.last_attempt)}`
+    : "Not checked yet";
+  if (!list.next_refresh_at) return checked;
+  return `${checked} · next in ${formatDuration(list.next_refresh_at - Date.now())}`;
+}
+
 /** One declaration of the column geometry, shared by the header and every
  * row. Two copies of a six-column template is how they drift apart. */
-const GRID = "grid grid-cols-[1fr_96px_84px_96px_316px_84px] items-center gap-3.5 px-4";
+const GRID = "grid grid-cols-[1fr_96px_84px_96px_316px_116px] items-center gap-3.5 px-4";
 
 /** Mirrors the server's own check (net/url.Parse + scheme/host, see
  * internal/api/filters_handlers.go's handleListCreate) so a bad URL never
@@ -327,11 +345,13 @@ export function ListsTab() {
   const toggleList = useToggleList();
   const deleteList = useDeleteList();
   const refresh = useRefreshFilters();
+  const refreshList = useRefreshList();
 
   const [search, setSearch] = useState("");
   const [kindFilter, setKindFilter] = useState<"" | List["kind"]>("");
   const [statusFilter, setStatusFilter] = useState<StatusFilter>("");
   const [togglingId, setTogglingId] = useState<number | null>(null);
+  const [refreshingId, setRefreshingId] = useState<number | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<List | null>(null);
   const [renameTarget, setRenameTarget] = useState<List | null>(null);
 
@@ -380,6 +400,18 @@ export function ListsTab() {
     refresh.mutate(undefined, {
       onSuccess: () => toast.success("Refreshing filter lists…"),
       onError: () => toast.error("Couldn't start a refresh — try again"),
+    });
+  }
+
+  // Past tense, unlike "Refresh all": the request does not come back until
+  // the download has finished, so by the time this toast shows there is a
+  // new row on screen behind it.
+  function onRefreshOne(list: List) {
+    setRefreshingId(list.id);
+    refreshList.mutate(list.id, {
+      onSuccess: () => toast.success(`Refreshed ${list.name}`),
+      onError: () => toast.error(`Couldn't refresh ${list.name}`),
+      onSettled: () => setRefreshingId(null),
     });
   }
 
@@ -480,8 +512,19 @@ export function ListsTab() {
               </span>
             </span>
             <span className="text-xs text-pretty text-muted-foreground">{statusDetail(list)}</span>
+            <span className="text-xs text-muted-foreground">{schedule(list)}</span>
           </span>
           <span className="flex items-center justify-end gap-1">
+            <Button
+              type="button"
+              size="icon-sm"
+              variant="ghost"
+              aria-label={`Refresh ${list.name}`}
+              disabled={refreshingId === list.id}
+              onClick={() => onRefreshOne(list)}
+            >
+              <RefreshCw className={refreshingId === list.id ? "animate-spin" : undefined} />
+            </Button>
             <Button
               type="button"
               size="icon-sm"

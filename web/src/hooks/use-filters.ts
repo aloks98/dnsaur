@@ -129,6 +129,24 @@ export function useRefreshFilters() {
   });
 }
 
+/**
+ * POST /filters/lists/{id}/refresh — one list, downloaded inside the
+ * request. It answers 202 like the all-lists refresh, but the work is
+ * already done by then and the body is the updated row, so there is nothing
+ * to wait out: a plain invalidate reads the new state. That is the whole
+ * difference from `useRefreshFilters` and its settle ladder.
+ *
+ * Only the lists tree is invalidated. A refresh changes what a list holds,
+ * never which groups it is assigned to.
+ */
+export function useRefreshList() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (id: number) => api.post<List>(`/filters/lists/${id}/refresh`),
+    onSuccess: () => void qc.invalidateQueries({ queryKey: filterKeys.lists }),
+  });
+}
+
 // Rules for a single group. Used by the "why?" drawer (query log) to
 // resolve a QueryEntry's rule_id, and by the Filtering page's Rules tab
 // (Task 10).

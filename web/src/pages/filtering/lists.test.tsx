@@ -186,6 +186,89 @@ test("refresh now re-reads the lists table once the server has had a moment", as
   expect(screen.queryAllByText(/3d ago/i)).toHaveLength(0);
 }, 10_000);
 
+// The row's two temporal facts, together: how old the copy on disk is, and
+// how long it has left. `last_refreshed` alone answers only the first, which
+// leaves "is this about to fix itself?" unanswerable from the table.
+test("a row says when the list was last checked and when it refreshes next", async () => {
+  server.use(
+    http.get("/api/v1/filters/lists", () =>
+      HttpResponse.json([
+        list({
+          last_attempt: Date.now() - 3 * 60 * 60 * 1000,
+          // A half-minute of slack so the render's own clock read cannot
+          // round this down to "20h 59m".
+          next_refresh_at: Date.now() + 21 * 60 * 60 * 1000 + 30_000,
+        }),
+      ]),
+    ),
+  );
+
+  renderWithProviders(<ListsTab />);
+
+  expect(await screen.findByText("Checked 3h ago · next in 21h")).toBeInTheDocument();
+});
+
+// A server with no cadence running (lists.refresh_hours is not positive, or
+// it has only just started) sends 0, and there is no next time to promise.
+test("a row with no scheduled refresh says only when it was checked", async () => {
+  server.use(
+    http.get("/api/v1/filters/lists", () =>
+      HttpResponse.json([
+        list({ last_attempt: Date.now() - 3 * 60 * 60 * 1000, next_refresh_at: 0 }),
+      ]),
+    ),
+  );
+
+  renderWithProviders(<ListsTab />);
+
+  expect(await screen.findByText("Checked 3h ago")).toBeInTheDocument();
+});
+
+// Unlike the all-lists 202, this one has already done the work when it
+// answers — so the table reads the new state immediately rather than on the
+// 1s/4s/12s ladder.
+test("refreshing one list posts /filters/lists/{id}/refresh and re-reads the table", async () => {
+  const user = userEvent.setup();
+  let refreshedId = 0;
+  let entries = 85_000;
+  server.use(
+    http.get("/api/v1/filters/lists", () => HttpResponse.json([list({ entry_count: entries })])),
+    http.post("/api/v1/filters/lists/1/refresh", () => {
+      refreshedId = 1;
+      entries = 99_277;
+      return HttpResponse.json(list({ entry_count: entries }), { status: 202 });
+    }),
+  );
+  const successSpy = vi.spyOn(toast, "success");
+
+  renderWithProviders(<ListsTab />);
+  await screen.findByText("85,000");
+
+  await user.click(screen.getByRole("button", { name: /^refresh example\.com hosts$/i }));
+
+  await waitFor(() => expect(refreshedId).toBe(1));
+  expect(await screen.findByText("99,277")).toBeInTheDocument();
+  expect(successSpy).toHaveBeenCalledWith(expect.stringMatching(/example\.com hosts/i));
+});
+
+test("a failed per-list refresh names the list and leaves the row alone", async () => {
+  const user = userEvent.setup();
+  server.use(
+    http.get("/api/v1/filters/lists", () => HttpResponse.json([list()])),
+    http.post("/api/v1/filters/lists/1/refresh", () =>
+      HttpResponse.json({ error: "this list is disabled" }, { status: 409 }),
+    ),
+  );
+  const errorSpy = vi.spyOn(toast, "error");
+
+  renderWithProviders(<ListsTab />);
+  await screen.findByText("https://example.com/hosts");
+
+  await user.click(screen.getByRole("button", { name: /^refresh example\.com hosts$/i }));
+
+  await waitFor(() => expect(errorSpy).toHaveBeenCalledWith("Couldn't refresh example.com hosts"));
+});
+
 test("deleting a list asks for confirmation, then DELETEs /filters/lists/{id}", async () => {
   const user = userEvent.setup();
   let deleted = false;

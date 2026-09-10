@@ -217,9 +217,11 @@ func (a apiReloader) ReloadClients(context.Context) error { return nil }
 func (a apiReloader) ReloadZones(ctx context.Context) error {
 	return a.reload(ctx)
 }
-func (a apiReloader) RefreshFilters(context.Context) error   { return nil }
-func (a apiReloader) RecompileFilters(context.Context) error { return nil }
-func (a apiReloader) NotifyZones()                           {}
+func (a apiReloader) RefreshFilters(context.Context) error     { return nil }
+func (a apiReloader) RecompileFilters(context.Context) error   { return nil }
+func (a apiReloader) RefreshList(context.Context, int64) error { return nil }
+func (a apiReloader) NextFilterRefresh() int64                 { return 0 }
+func (a apiReloader) NotifyZones()                             {}
 
 // newAPIAndResolver builds one store with a real API server and a real
 // resolver over it, plus an authenticated handler to drive the API through.

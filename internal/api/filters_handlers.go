@@ -18,6 +18,7 @@ func (s *Server) filtersRoutes() {
 	s.route("POST /api/v1/filters/lists", s.requireAuth(s.handleListCreate))
 	s.route("PATCH /api/v1/filters/lists/{id}", s.requireAuth(s.handleListPatch))
 	s.route("DELETE /api/v1/filters/lists/{id}", s.requireAuth(s.handleListDelete))
+	s.route("POST /api/v1/filters/lists/{id}/refresh", s.requireAuth(s.handleListRefresh))
 	s.route("GET /api/v1/groups/{id}/lists", s.requireAuth(s.handleGroupListsGet))
 	s.route("PUT /api/v1/groups/{id}/lists", s.requireAuth(s.handleGroupListsPut))
 	s.route("GET /api/v1/groups/{id}/rules", s.requireAuth(s.handleRulesGet))
@@ -55,13 +56,54 @@ func (s *Server) downloadLists(r *http.Request) {
 	}()
 }
 
+// listRow is a list as GET /filters/lists serves it: the stored row plus
+// next_refresh_at, which is not stored anywhere. It comes from the running
+// refresher's ticker, so it is the same value on every row — there are no
+// per-list intervals — and it is what lets the table say how long the
+// copies it is showing have left rather than only how old they are.
+//
+// The embedded store.List is flattened by encoding/json, so the wire shape
+// is the list's own fields with one more beside them.
+type listRow struct {
+	store.List
+	NextRefreshAt int64 `json:"next_refresh_at"`
+}
+
+func (s *Server) listRows(ls []store.List) []listRow {
+	next := s.deps.Reloader.NextFilterRefresh()
+	rows := make([]listRow, len(ls))
+	for i, l := range ls {
+		rows[i] = listRow{List: l, NextRefreshAt: next}
+	}
+	return rows
+}
+
+// findList reads one list by id, answering 404 itself when nothing has that
+// id. FilterStore has no read-by-id and a homelab's subscription count is a
+// handful of rows, so scanning the same read the table already does beats
+// adding a query for it.
+func (s *Server) findList(w http.ResponseWriter, r *http.Request, id int64) (store.List, bool) {
+	ls, err := s.deps.Store.Filters().Lists(r.Context())
+	if err != nil {
+		storeErr(w, err)
+		return store.List{}, false
+	}
+	for _, l := range ls {
+		if l.ID == id {
+			return l, true
+		}
+	}
+	errJSON(w, http.StatusNotFound, "not found")
+	return store.List{}, false
+}
+
 func (s *Server) handleListsGet(w http.ResponseWriter, r *http.Request) {
 	ls, err := s.deps.Store.Filters().Lists(r.Context())
 	if err != nil {
 		storeErr(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, ls)
+	writeJSON(w, http.StatusOK, s.listRows(ls))
 }
 
 type listCreate struct {
@@ -359,4 +401,49 @@ func (s *Server) handleRuleDelete(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleRefresh(w http.ResponseWriter, r *http.Request) {
 	s.downloadLists(r)
 	writeJSON(w, http.StatusAccepted, map[string]string{"status": "refreshing"})
+}
+
+// handleListRefresh downloads one list on demand — the row's own "Refresh
+// now", as against POST /filters/refresh, which re-fetches every
+// subscription and so costs the slowest URL's timeout even when only one
+// row is being looked at.
+//
+// 202, the same status the all-lists refresh answers, so a client reads one
+// code for one verb. Unlike that one it is not fire-and-forget: the
+// download runs inside the request and the body is the list as the refresh
+// left it, which is what the row that asked for it needs and what saves the
+// UI from polling to find out.
+func (s *Server) handleListRefresh(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(r)
+	if !ok {
+		errJSON(w, http.StatusBadRequest, "bad id")
+		return
+	}
+	l, ok := s.findList(w, r, id)
+	if !ok {
+		return
+	}
+	if !l.Enabled {
+		// The request is well-formed and the caller is allowed; what
+		// forbids it is the state of this list, which is what 409 means
+		// here as it does for a built-in zone. Fetching a copy that
+		// nothing will compile would only rewrite the row's state with
+		// the outcome of a download that changes nothing.
+		errJSON(w, http.StatusConflict, "this list is disabled")
+		return
+	}
+	// WithoutCancel: the download records what it found on the list's own
+	// row, so a client that disconnects mid-fetch must not leave that row
+	// describing an attempt abandoned halfway.
+	if err := s.deps.Reloader.RefreshList(context.WithoutCancel(r.Context()), id); err != nil {
+		storeErr(w, err)
+		return
+	}
+	// Re-read rather than reuse l: the refresh is the whole point, and the
+	// row it wrote is what the caller asked for.
+	l, ok = s.findList(w, r, id)
+	if !ok {
+		return
+	}
+	writeJSON(w, http.StatusAccepted, listRow{List: l, NextRefreshAt: s.deps.Reloader.NextFilterRefresh()})
 }

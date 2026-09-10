@@ -389,10 +389,11 @@ Path ids must parse as int64 **and be > 0**, else 400 `bad id`. So `0`, `-1`,
 
 | Endpoint | Success | Notes |
 |---|---|---|
-| `GET /filters/lists` | 200 array | |
+| `GET /filters/lists` | 200 array | rows carry **`next_refresh_at`** on top of the stored fields (§3.2) |
 | `POST /filters/lists` | **201** `{"id":1}` | body `{"url","kind"}` + **optional `name`**; kicks off a background refresh of *every* list |
 | `PATCH /filters/lists/{id}` | 204 | body `{"enabled": bool}` and/or `{"name": string}` — **at least one required**; `url`/`kind` are rejected |
 | `DELETE /filters/lists/{id}` | 204 | |
+| `POST /filters/lists/{id}/refresh` | **202** the updated list row | downloads **this list only**, inside the request; no body read. **404** unknown id, **409** a disabled list |
 | `GET /groups/{id}/lists` | 200 array | **404** for a group that does not exist (it used to answer `[]` + 200) |
 | `PUT /groups/{id}/lists` | 204 | body `{"list_ids":[...]}`; `null`/omitted unassigns everything. One transaction; duplicate ids are a set; unknown id → 400, unknown group → 404 |
 | `GET /groups/{id}/rules` | 200 array | **404** for a group that does not exist |
@@ -406,13 +407,15 @@ Path ids must parse as int64 **and be > 0**, else 400 `bad id`. So `0`, `-1`,
   "name":"StevenBlack hosts",
   "kind":"block","enabled":true,
   "last_refreshed":1785946876638,"entry_count":99277,
-  "last_status":"ok","last_error":"","last_attempt":1785946876638},
+  "last_status":"ok","last_error":"","last_attempt":1785946876638,
+  "next_refresh_at":1785990076638},
  {"id":2,
   "url":"https://raw.githubusercontent.com/hagezi/dns-blocklists/main/hosts/pro.txt",
   "name":"hagezi hosts/pro.txt",
   "kind":"block","enabled":true,
   "last_refreshed":0,"entry_count":0,
-  "last_status":"failed","last_error":"404 Not Found","last_attempt":1785946876700}]
+  "last_status":"failed","last_error":"404 Not Found","last_attempt":1785946876700,
+  "next_refresh_at":1785990076638}]
 ```
 ```json
 [{"id":1,"group_id":1,"action":"block","pattern":"ads.example.com","is_regex":false}]
@@ -421,6 +424,7 @@ Path ids must parse as int64 **and be > 0**, else 400 `bad id`. So `0`, `-1`,
 | Status | Error string |
 |---|---|
 | 409 | `that list URL is already subscribed` |
+| 409 | `this list is disabled` (`POST /filters/lists/{id}/refresh`) |
 | 400 | `invalid json` — every body that fails to decode, PATCHing `url`/`kind` included (`DisallowUnknownFields` rejects them) |
 | 400 | `url must be http(s)` |
 | 400 | `kind must be block or allow` |
@@ -439,6 +443,14 @@ only hit the server log. Poll `GET /filters/lists` and read `last_status` /
 /filters/lists` does the same background refresh but answers **201**, so a
 freshly added list reads `entry_count: 0` with `last_status: "pending"` until
 the fetch lands.
+
+**`POST /filters/lists/{id}/refresh` is not.** It shares the 202 so one verb
+reads as one status, but the download runs *inside* the request and the body
+is the list row as the refresh left it — there is nothing to poll for, and no
+other subscription is touched (neither downloaded nor re-stated), so one
+unreachable URL elsewhere costs it nothing. A **disabled** list is a `409`:
+nothing would compile the copy, so the only effect would be to overwrite the
+row's state with the outcome of a download that changes nothing.
 
 **`PUT /groups/{id}/lists` is one transaction** (`FilterStore.ReplaceGroupLists`,
 `internal/store/sql.go`). It used to unassign every current list one-by-one and
@@ -964,6 +976,7 @@ than leaving it as an unused TODO — see §10 item 2.
 | `last_status` | string | `pending` \| `ok` \| `stale` \| `failed` \| `empty` — see below |
 | `last_error` | string | short single-line reason, ≤160 bytes; `""` when `last_status` is `pending` or `ok` |
 | `last_attempt` | int64 | **unix ms of the last attempt, successful or not**; `0` = never tried |
+| `next_refresh_at` | int64 | **unix ms of the periodic download's next tick**; `0` = no cadence running. **Not stored** — read from the running ticker, so the same on every row (the interval is server-wide, there are no per-list schedules). Present on `GET /filters/lists` and the per-list refresh response; **absent from `GET /groups/{id}/lists`** |
 
 #### Refresh outcome (`last_status`)
 
@@ -1008,8 +1021,9 @@ still does, and a block *rule* still wins. They are not promoted into the
 allow-list tier.
 
 **Downloading and compiling are separate.** Only `POST /filters/lists`,
-`PATCH /filters/lists/{id}` with `enabled: true`, `POST /filters/refresh` and
-the `lists.refresh_hours` ticker fetch; every other rule/list/assignment write
+`PATCH /filters/lists/{id}` with `enabled: true`, `POST /filters/refresh`,
+`POST /filters/lists/{id}/refresh` and the `lists.refresh_hours` ticker
+fetch; every other rule/list/assignment write
 recompiles from the on-disk copies and returns without touching the network,
 and startup compiles from them before the DNS listeners bind. A fetch is
 capped at **64 MiB** and refuses any address that is not public (loopback,
@@ -1438,7 +1452,8 @@ no `onMutate` and no `setQueryData` in the whole client.
 | Lists | Delete | `DELETE /filters/lists/{id}` | `Couldn't delete ${target.name}` |
 | Lists | Add | `POST /filters/lists` | server message, else `Couldn't add the list` |
 | Lists | Rename | `PATCH /filters/lists/{id}` | server message, else `Couldn't rename ${target.name}` |
-| Lists | Refresh now | `POST /filters/refresh` | `Couldn't start a refresh — try again` |
+| Lists | Refresh all | `POST /filters/refresh` | `Couldn't start a refresh — try again` |
+| Lists | Refresh now (one row) | `POST /filters/lists/{id}/refresh` | `Couldn't refresh ${list.name}` — success is `Refreshed ${list.name}`, past tense, because the request does not return until the download has |
 | Rules | Delete | `DELETE /filters/rules/{id}` | `Couldn't delete the rule for ${target.pattern}` |
 | Rules | Add | `POST /groups/{id}/rules` | server message, else `Couldn't add the rule` |
 | Groups | Toggle enabled | `PATCH /groups/{id}` | `Couldn't ${enabled ? "enable" : "disable"} ${group.name}` |
@@ -1482,7 +1497,9 @@ filter whenever `qlog.privacy` is not `full`, which shows the single option
 delete on group id 1 (`The default group can't be deleted`); delete on a group
 any client still points at (`Move its N clients first`) — the 409 above is the
 race guard behind it, not the first line of defence; a list toggle while that
-group's assignment read is in flight; Save changes when the form isn't dirty.
+group's assignment read is in flight; a row's **Refresh now** while its own
+download is running (the icon spins, and only that row's is disabled); Save
+changes when the form isn't dirty.
 
 Settings saves are per-key via `Promise.allSettled`, so a partial failure keeps
 the failed fields dirty with the admin's typed value intact.
@@ -1573,7 +1590,9 @@ moves without an operator.
 *One-off, not a poll:* `useRefreshFilters` (`web/src/hooks/use-filters.ts`)
 re-reads the list table on a **1s / 4s / 12s** ladder after a manual refresh,
 because `POST /filters/refresh` is a 202 that resolves long before any row
-changes.
+changes. Its per-row sibling `useRefreshList` has no ladder and needs none:
+that 202 arrives after the download, so a plain invalidate already reads the
+new state.
 
 Everything else is fetch-on-mount with a 10s stale time and no window-focus
 refetch; `me` is a further exception, refetching on focus only once it has

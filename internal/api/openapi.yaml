@@ -130,6 +130,19 @@ components:
             unix ms of the last attempt, successful or not; 0 = never tried.
             Differs from last_refreshed on a failing list, which is what lets
             the UI say "tried 5m ago, still serving Tuesday's copy".
+        next_refresh_at:
+          type: integer
+          format: int64
+          description: >
+            unix ms of the moment the periodic download runs next; 0 when no
+            cadence is running (lists.refresh_hours is not positive, or the
+            server has only just started). A property of the server-wide
+            interval rather than of any one list — there are no per-list
+            schedules — so every row carries the same value.
+
+            Present on GET /filters/lists and on the per-list refresh
+            response, and absent from GET /groups/{id}/lists, which serves
+            the stored row alone.
     Zone:
       type: object
       description: >
@@ -1865,6 +1878,66 @@ paths:
           $ref: "#/components/responses/ReadOnlyToken"
         "404":
           description: not found
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503":
+          description: storage unavailable
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /filters/lists/{id}/refresh:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: integer, format: int64 }
+    post:
+      tags: [Filters]
+      summary: Download one filter list now
+      description: >
+        Fetches this one list and recompiles, leaving every other
+        subscription alone — neither downloaded nor re-stated. Same fetch
+        path, same 64 MiB cap, same refusal of any address that is not
+        public, and the same last_status / last_error outcome as the
+        periodic pass writes.
+
+
+        202 matches POST /filters/refresh so one verb reads as one status,
+        but this one is not fire-and-forget: the download runs inside the
+        request, and the body is the list row as the refresh left it. No
+        body is read.
+
+
+        A disabled list is 409: nothing would compile the copy, so the only
+        effect would be to overwrite the row's state with the outcome of a
+        download that changes nothing.
+      responses:
+        "202":
+          description: Refreshed; the body is the updated list row
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/List" }
+        "400":
+          description: bad id
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401":
+          description: authentication required
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "403":
+          $ref: "#/components/responses/ReadOnlyToken"
+        "404":
+          description: not found
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "409":
+          description: this list is disabled
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }

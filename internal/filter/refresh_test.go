@@ -2,6 +2,7 @@ package filter
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -797,4 +798,105 @@ func TestFetchRefusesAPrivateRedirect(t *testing.T) {
 	if got := fs.stateOf(14); !strings.Contains(got.lastError, "not a public address") {
 		t.Fatalf("lastError = %q, want the redirect target refused", got.lastError)
 	}
+}
+
+// TestRefreshOneDownloadsOnlyThatList is the row's own "Refresh now": one
+// list is fetched and re-stated, and every other subscription is left
+// exactly as it was — neither re-downloaded (which is what makes the
+// all-lists button cost the slowest URL's timeout) nor overwritten with the
+// outcome of an attempt it was not part of.
+func TestRefreshOneDownloadsOnlyThatList(t *testing.T) {
+	goodURL, goodHits := countingList(t, "0.0.0.0 ads.example.com\n")
+	badHits := &atomic.Int64{}
+	bad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		badHits.Add(1)
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer bad.Close()
+
+	fs := &fakeFilterStore{lists: []store.List{
+		{ID: 1, URL: goodURL, Kind: "block", Enabled: true},
+		{ID: 2, URL: bad.URL, Kind: "block", Enabled: true},
+	}}
+	cs := &fakeClientStore{groups: []store.Group{{ID: 1, Name: "default", Enabled: true}}}
+	eng := NewEngine()
+	ref := NewRefresher(fs, cs, eng, t.TempDir(), AllowLoopbackTargets())
+
+	if err := ref.RefreshOne(context.Background(), 1); err != nil {
+		t.Fatal(err)
+	}
+	if got := fs.stateOf(1).status; got != store.ListStatusOK {
+		t.Fatalf("list 1 status = %q, want ok", got)
+	}
+	if got := fs.stateOf(2); got != (listState{}) {
+		t.Fatalf("list 2 was re-stated by a refresh of list 1: %+v", got)
+	}
+	if n := badHits.Load(); n != 0 {
+		t.Fatalf("list 2 was downloaded by a refresh of list 1: %d requests", n)
+	}
+	if v := (*eng.groups.Load())[1].Evaluate("ads.example.com"); v.Action != "block" {
+		t.Fatalf("refreshed list did not compile: %+v", v)
+	}
+
+	// The failing one on its own: list 1 keeps both its recorded state and
+	// its compiled entries, from the cache, without another download.
+	before := fs.stateOf(1)
+	if err := ref.RefreshOne(context.Background(), 2); err != nil {
+		t.Fatal(err)
+	}
+	if got := fs.stateOf(2).status; got != store.ListStatusFailed {
+		t.Fatalf("list 2 status = %q, want failed", got)
+	}
+	if got := fs.stateOf(2).lastError; got != "404 Not Found" {
+		t.Fatalf("list 2 error = %q", got)
+	}
+	if got := fs.stateOf(1); got != before {
+		t.Fatalf("list 1 state changed under a refresh of list 2: %+v, was %+v", got, before)
+	}
+	if n := goodHits.Load(); n != 1 {
+		t.Fatalf("list 1 downloaded %d times, want 1", n)
+	}
+	if v := (*eng.groups.Load())[1].Evaluate("ads.example.com"); v.Action != "block" {
+		t.Fatalf("refreshing another list dropped this one: %+v", v)
+	}
+
+	if err := ref.RefreshOne(context.Background(), 99); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("unknown id: %v, want ErrNotFound", err)
+	}
+}
+
+// TestRunRecordsWhenTheNextDownloadIsDue covers the "next in 21h" the lists
+// table shows: it comes from the ticker itself, so it has to advance when
+// the ticker fires rather than being computed once and then frozen.
+func TestRunRecordsWhenTheNextDownloadIsDue(t *testing.T) {
+	fs := &fakeFilterStore{}
+	cs := &fakeClientStore{groups: []store.Group{{ID: 1, Name: "default", Enabled: true}}}
+	ref := NewRefresher(fs, cs, NewEngine(), t.TempDir())
+	clock := &atomic.Int64{}
+	clock.Store(1_700_000_000_000)
+	ref.now = func() time.Time { return time.UnixMilli(clock.Load()) }
+
+	if got := ref.NextRefresh(); got != 0 {
+		t.Fatalf("a refresher that is not running has no next tick: %d", got)
+	}
+
+	const every = 20 * time.Millisecond
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go ref.Run(ctx, every)
+
+	waitForNextRefresh(t, ref, clock.Load()+every.Milliseconds())
+	clock.Store(1_700_000_600_000)
+	waitForNextRefresh(t, ref, clock.Load()+every.Milliseconds())
+}
+
+func waitForNextRefresh(t *testing.T, r *Refresher, want int64) {
+	t.Helper()
+	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); {
+		if r.NextRefresh() == want {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("next refresh never became %d (last read %d)", want, r.NextRefresh())
 }

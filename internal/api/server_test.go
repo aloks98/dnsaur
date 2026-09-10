@@ -28,6 +28,12 @@ import (
 type fakeReloader struct {
 	mu                                              sync.Mutex
 	clients, records, filters, recompiles, notifies int
+	// refreshed is the ids passed to RefreshList, in order, so a test can
+	// tell a per-list download from the all-lists one. nextRefreshAt is
+	// what NextFilterRefresh reports; set it before the request, since
+	// nothing here runs a ticker.
+	refreshed     []int64
+	nextRefreshAt int64
 }
 
 func (f *fakeReloader) ReloadClients(ctx context.Context) error {
@@ -47,6 +53,25 @@ func (f *fakeReloader) RefreshFilters(ctx context.Context) error {
 	defer f.mu.Unlock()
 	f.filters++
 	return nil
+}
+
+func (f *fakeReloader) RefreshList(ctx context.Context, id int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.refreshed = append(f.refreshed, id)
+	return nil
+}
+
+func (f *fakeReloader) refreshedLists() []int64 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]int64(nil), f.refreshed...)
+}
+
+func (f *fakeReloader) NextFilterRefresh() int64 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.nextRefreshAt
 }
 
 func (f *fakeReloader) RecompileFilters(ctx context.Context) error {

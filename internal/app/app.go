@@ -949,6 +949,11 @@ func (a *App) RefreshFilters(ctx context.Context) error   { return a.refresher.R
 func (a *App) RecompileFilters(ctx context.Context) error { return a.refresher.Recompile(ctx) }
 func (a *App) NotifyZones()                               { a.notifier.Wake() }
 
+func (a *App) RefreshList(ctx context.Context, id int64) error {
+	return a.refresher.RefreshOne(ctx, id)
+}
+func (a *App) NextFilterRefresh() int64 { return a.refresher.NextRefresh() }
+
 func (a *App) Shutdown(ctx context.Context) error {
 	if a.apiCancel != nil {
 		// Cancel in-flight request contexts first so handlers blocked on
