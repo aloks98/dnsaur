@@ -57,8 +57,9 @@ type StubFetcher struct {
 	keys TSIGKeys
 	tsig dns.TsigProvider
 	// res resolves both the masters named by hostname (ParsePrimaries) and
-	// any *out-of-zone* nameserver. nil means net.DefaultResolver.
-	res *net.Resolver
+	// any *out-of-zone* nameserver. nil means net.DefaultResolver — see
+	// Lookup.
+	res Lookup
 	// now is the clock refreshed_at is stamped from, injected for the same
 	// reason Transferrer.now is — and, like it, deliberately not the clock a
 	// TSIG request is signed with. See signedExchange.
@@ -78,8 +79,8 @@ func WithStubNow(now func() time.Time) StubOption {
 
 // WithStubResolver sets the resolver masters named by hostname, and
 // out-of-zone nameservers, are looked up through. nil (the default) means
-// net.DefaultResolver.
-func WithStubResolver(res *net.Resolver) StubOption {
+// net.DefaultResolver; production passes dnsaur's own forwarder — see Lookup.
+func WithStubResolver(res Lookup) StubOption {
 	return func(f *StubFetcher) { f.res = res }
 }
 
@@ -300,7 +301,7 @@ func (f *StubFetcher) exchange(ctx context.Context, ap netip.AddrPort, qname str
 // ADDITIONAL section or the nameserver is unusable and contributes nothing.
 //
 // An out-of-zone name cannot re-enter this zone, so it is resolved normally,
-// through the same net.Resolver ParsePrimaries uses. Its addresses are stored
+// through the same Lookup ParsePrimaries uses. Its addresses are stored
 // beside it exactly as glue is, because StubUpstreams has to rebuild the
 // routing table on a zone reload without querying anything.
 //

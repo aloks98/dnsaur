@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"net"
 	"time"
 
 	"github.com/aloks98/dnsaur/internal/store"
@@ -86,12 +85,13 @@ func WithNotifyNow(now func() time.Time) NotifyOption {
 }
 
 // WithNotifyResolver sets the resolver a target named by hostname is looked
-// up through at send time. nil (the default) means net.DefaultResolver.
+// up through at send time. nil (the default) means net.DefaultResolver;
+// production passes dnsaur's own forwarder — see Lookup.
 //
 // It replaces the sender, so a caller passing WithNotifySender as well gets
 // whichever came last — the two say the same thing about a different half of
 // the same field.
-func WithNotifyResolver(res *net.Resolver) NotifyOption {
+func WithNotifyResolver(res Lookup) NotifyOption {
 	return func(n *Notifier) { n.sender = newUDPSender(res) }
 }
 

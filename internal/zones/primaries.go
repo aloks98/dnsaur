@@ -40,6 +40,21 @@ import (
 // 53, the port any other DNS server is reached on.
 const DefaultPrimaryPort = 53
 
+// Lookup is how this package turns a hostname in a zone's configuration —
+// a secondary's primaries, a NOTIFY target, a stub's out-of-zone nameserver
+// — into addresses.
+//
+// It is exactly the one method of *net.Resolver these lookups use, so the
+// standard resolver satisfies it as it stands and a nil Lookup still means
+// net.DefaultResolver. Naming the method set rather than the type is what
+// lets internal/app hand all four call sites dnsaur's own cache and
+// forwarder instead: those lookups then follow the configured upstreams
+// (DoT and DoH included) rather than whatever the host machine resolves
+// through — which, on a machine running dnsaur, is usually dnsaur.
+type Lookup interface {
+	LookupNetIP(ctx context.Context, network, host string) ([]netip.Addr, error)
+}
+
 // primary is one entry of the list in the form it was written: a host that
 // may still be a name, and a port that has already had the default applied.
 type primary struct {
@@ -90,7 +105,7 @@ func ValidatePrimaries(s string) error {
 // pass. It is a parameter rather than a hard-wired default because a test
 // that resolves through the machine's own nameserver is not a test — it is
 // a dependency on whatever that machine happens to be answering today.
-func ParsePrimaries(ctx context.Context, res *net.Resolver, s string) ([]netip.AddrPort, error) {
+func ParsePrimaries(ctx context.Context, res Lookup, s string) ([]netip.AddrPort, error) {
 	ps, err := splitPrimaries(s)
 	if err != nil {
 		return nil, err
@@ -168,7 +183,7 @@ func FormatPrimaries(aps []netip.AddrPort) string {
 	return strings.Join(parts, ", ")
 }
 
-func (p primary) resolve(ctx context.Context, res *net.Resolver) ([]netip.AddrPort, error) {
+func (p primary) resolve(ctx context.Context, res Lookup) ([]netip.AddrPort, error) {
 	// An IP literal is already the answer; going to the resolver for it
 	// would make a transfer to a literal address depend on DNS working.
 	if addr, err := netip.ParseAddr(p.host); err == nil {

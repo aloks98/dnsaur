@@ -277,6 +277,42 @@ keeps the two branches disjoint: `Opcode == NOTIFY, Qtype == AXFR` is a
 NOTIFY and goes to the NOTIFY branch below, not to the transfer handler
 that happens to be tested first.
 
+## Hostnames in a zone's configuration
+
+Three columns let an operator write a name where an address would do: a
+secondary's `primaries`, a zone's `notify_to`, and a stub's out-of-zone
+nameserver. All three are stored as written and resolved at use time — that
+is what lets a primary move — and all three resolve through **dnsaur's own
+cache and forwarder**, never through the host machine's resolver.
+`internal/app`'s `zoneLookup` is that resolver, handed to `internal/zones` as
+the one-method `Lookup` its four call sites take; `*net.Resolver` satisfies
+the same interface, which is what tests use.
+
+Two things follow from it, and both are the reason for it.
+
+**A hostname primary inside the zone it serves can bootstrap.**
+`ns1.corp.example` as the primary of `corp.example` used to be unusable:
+`net.DefaultResolver` asks whatever the machine resolves through, which on a
+machine running dnsaur is usually dnsaur, so the query arrived at this
+server's own zones stage — where a secondary that has never transferred
+answers `SERVFAIL` for its whole suffix. The transfer that would have fixed
+that was the one thing that could not happen, on every attempt, forever.
+`zoneLookup` enters the pipeline *below* the zones stage, so the name is
+answered from the configured upstreams instead and the first transfer lands.
+
+**Those lookups follow `upstreams`.** A DoT or DoH upstream covers resolving
+a primary's name like any other query, rather than leaking it in the clear to
+the system resolver; a `forwarder` or `stub` zone claiming the suffix routes
+it too, which is what makes a primary named under an internal suffix
+resolvable at all. Entering above the cache is deliberate for the same
+reason the NOTIFY gate orders its checks the way it does (below): a hostname
+primary is resolved to match an arriving NOTIFY's source, so an uncached
+lookup there is one outbound query per packet.
+
+Nothing can loop back in. The forwarder is terminal — it puts the question on
+a socket and never re-enters the pipeline — so the worst a self-referential
+configuration does is fail to resolve.
+
 ## Zone NOTIFY (RFC 1996)
 
 Like AXFR/IXFR above, NOTIFY does not go through the middleware pipeline.
@@ -300,10 +336,11 @@ records this as the reason the interface exists, not as a nice-to-have.
 `NotifyServer.ServeNotify` runs the cheap, purely local checks first —
 question shape, apex, zone type, enabled — and only *then* resolves the
 zone's `primaries` to check the sender against them. That ordering is
-load-bearing, not tidiness: `ParsePrimaries` may do a live, uncached DNS
-lookup for a hostname primary, and doing that before the local checks would
-let one unauthenticated, trivially spoofable UDP packet drive an outbound
-recursive lookup for a NOTIFY that was going to be refused anyway. Two more
+load-bearing, not tidiness: `ParsePrimaries` may do a live DNS lookup for a
+hostname primary — through dnsaur's own forwarder, per the section above, so
+it is a real query leaving this server — and doing that before the local
+checks would let one unauthenticated, trivially spoofable UDP packet drive an
+outbound lookup for a NOTIFY that was going to be refused anyway. Two more
 bounds sit on that lookup for the NOTIFYs that do get past the local checks:
 the IP literals in `primaries` are matched first, so the ordinary
 `10.0.0.5, ns1.example.com` configuration costs no lookup at all for a NOTIFY
@@ -615,9 +652,9 @@ suffix, route into the stub, and need the address being resolved — a hang,
 not a slow failure. DNS's own answer is glue, and it is the right one here:
 the address comes from the master's ADDITIONAL section or the nameserver is
 unusable. An out-of-zone nameserver cannot re-enter the zone, so it is
-resolved normally, through the same `net.Resolver` a hostname in `primaries`
-is looked up through, and its addresses are stored beside it exactly as glue
-is.
+resolved normally, through the same `Lookup` a hostname in `primaries` is
+looked up through — dnsaur's own forwarder, never the host's resolver — and
+its addresses are stored beside it exactly as glue is.
 
 **This is why dnsaur emits glue for its own apex NS set.** A master that
 answers an apex `NS` query with names and no addresses leaves a stub with
@@ -687,7 +724,9 @@ at 60 seconds so a peer that publishes a zero cannot turn the schedule into
 a busy loop against itself. `refreshed_at`, `last_attempt` and `last_error`
 are written the same way for both, which is what makes a stub's state
 readable after a restart. Only the third SOA timer, `expire`, is
-type-specific — see above.
+type-specific — see above. Each attempt re-resolves whatever hostnames the
+zone's `primaries` names, through the forwarder rather than the host's
+resolver — see Hostnames in a zone's configuration, above.
 
 **A scheduled refresh of a secondary checks the serial before it transfers.**
 That is RFC 1034 §4.3.5's refresh timer as the RFC describes it — "check to see

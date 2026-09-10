@@ -238,12 +238,11 @@ func New(ctx context.Context, cfg *config.Config, version string) (*App, error) 
 	// out-of-zone nameserver. Four constructors default it independently,
 	// so it is decided here once instead of in each of them.
 	//
-	// nil is net.DefaultResolver, which is the system resolver rather than
-	// this server's own upstreams. Pointing it at the forwarder instead
-	// would change behaviour — those lookups would follow the conditional
-	// routing table and could arrive back here — so it is a change to make
-	// deliberately, at this line, rather than a default to drift into.
-	var zoneRes *net.Resolver
+	// It is this server's own cache and forwarder, entered below the zones
+	// stage — never the host machine's resolver, which on a machine running
+	// dnsaur is usually dnsaur itself. See zoneLookup for what that buys and
+	// what it deliberately cannot reach.
+	zoneRes := a.zoneLookup()
 	// Built before the Transferrer, which takes its Wake for the cascade.
 	a.notifier = zones.NewNotifier(st.Zones(), st.Notifies(), st.TSIGKeys(),
 		zones.WithNotifyResolver(zoneRes))

@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"log/slog"
-	"net"
 	"net/netip"
 	"sync"
 	"time"
@@ -96,10 +95,10 @@ type NotifyServer struct {
 	// Probes' doc comment. App wires it.
 	probes Probes
 	// dnsRes is the resolver ParsePrimaries uses to look up a hostname
-	// primary. nil means net.DefaultResolver — see ParsePrimaries' own
-	// comment on why that default belongs to the caller, not to a lookup
-	// baked into the gate.
-	dnsRes *net.Resolver
+	// primary. nil means net.DefaultResolver — see Lookup, and see
+	// ParsePrimaries' own comment on why that default belongs to the caller,
+	// not to a lookup baked into the gate.
+	dnsRes Lookup
 	// now is the clock admit and a BADTIME reply's timestamp read. Injected
 	// for the same reason TransferServer.now is: a test should be able to
 	// drive the throttle rather than wait for it.
@@ -140,12 +139,12 @@ func WithNotifyProbes(p Probes) NotifyServerOption {
 }
 
 // WithNotifyServerResolver replaces the resolver ParsePrimaries uses to
-// resolve a hostname primary. Production leaves it nil, which ParsePrimaries
-// reads as net.DefaultResolver (see ParsePrimaries' own doc comment). Tests
+// resolve a hostname primary. Production passes dnsaur's own forwarder (see
+// Lookup); nil is what ParsePrimaries reads as net.DefaultResolver. Tests
 // use it to prove a lookup was, or was not, made — in particular that
 // ServeNotify never resolves a zone's primaries until decideZone has already
 // accepted the NOTIFY — without touching a real network.
-func WithNotifyServerResolver(res *net.Resolver) NotifyServerOption {
+func WithNotifyServerResolver(res Lookup) NotifyServerOption {
 	return func(n *NotifyServer) { n.dnsRes = res }
 }
 

@@ -259,6 +259,13 @@ transfer requests with (see the TSIG keys page). A hostname is stored as
 written and resolved at transfer time, so a primary that moves keeps
 working.
 
+A hostname is resolved through the upstreams on the settings page, not
+through whatever this machine resolves through. Two consequences worth
+knowing: the lookup is encrypted if those upstreams are, and a primary named
+*inside the zone it serves* — `ns1.corp.example` for `corp.example` — works,
+because it is answered from the upstreams rather than from the zone that has
+nothing in it yet.
+
 The transfer band across the top says how current the copy is: the serial it
 last adopted, when it last refreshed and when it next will. **Refresh now**
 pulls immediately rather than waiting for the schedule.

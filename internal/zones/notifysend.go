@@ -74,15 +74,16 @@ const testNotifySendTimeout = time.Second
 // over UDP.
 type udpSender struct {
 	// res resolves a target named by hostname. nil means net.DefaultResolver
-	// — see NotifyTarget.Host and ParseNotifyTo's package comment for why
-	// resolution happens here, at send time, rather than at parse time.
-	res *net.Resolver
+	// — see Lookup, and see NotifyTarget.Host and ParseNotifyTo's package
+	// comment for why resolution happens here, at send time, rather than at
+	// parse time.
+	res Lookup
 	// timeout bounds dialing and one write-then-read round trip.
 	timeout time.Duration
 }
 
 // newUDPSender is the production constructor.
-func newUDPSender(res *net.Resolver) *udpSender {
+func newUDPSender(res Lookup) *udpSender {
 	return &udpSender{res: res, timeout: defaultNotifySendTimeout}
 }
 
@@ -101,7 +102,7 @@ func NewUDPSenderForTest() *udpSender {
 // to — e.g. proving Send's fan-out tries every address a name resolves to,
 // not just the first — cannot do that against net.DefaultResolver, which
 // depends on whatever the machine running the test happens to answer.
-func NewUDPSenderForTestWithResolver(res *net.Resolver) *udpSender {
+func NewUDPSenderForTestWithResolver(res Lookup) *udpSender {
 	return &udpSender{res: res, timeout: testNotifySendTimeout}
 }
 

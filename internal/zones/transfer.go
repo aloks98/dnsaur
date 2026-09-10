@@ -80,8 +80,8 @@ type Transferrer struct {
 	keys TSIGKeys
 	tsig dns.TsigProvider
 	// res resolves primaries named by hostname. nil means
-	// net.DefaultResolver — see ParsePrimaries.
-	res *net.Resolver
+	// net.DefaultResolver — see Lookup and ParsePrimaries.
+	res Lookup
 	// now is the clock the refreshed_at and expires_at stamps come from,
 	// injected for the same reason Resolver's is: crossing a zone's expiry
 	// is a decision a test has to be able to drive rather than wait for.
@@ -113,8 +113,9 @@ func WithTransferNow(now func() time.Time) TransferOption {
 }
 
 // WithTransferResolver sets the resolver primaries named by hostname are
-// looked up through. nil (the default) means net.DefaultResolver.
-func WithTransferResolver(res *net.Resolver) TransferOption {
+// looked up through. nil (the default) means net.DefaultResolver; production
+// passes dnsaur's own forwarder — see Lookup.
+func WithTransferResolver(res Lookup) TransferOption {
 	return func(t *Transferrer) { t.res = res }
 }
 
