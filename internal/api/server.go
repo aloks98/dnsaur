@@ -10,6 +10,8 @@ import (
 	"log/slog"
 	"net/http"
 	"net/netip"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -94,6 +96,13 @@ type ResolverStatus interface {
 	// yet, or a configured pair that has never once read cleanly — which is
 	// a different fact from "expires soon" and must not be reported as one.
 	CertExpiry() (notAfter time.Time, expiringSoon, ok bool)
+	// DNSListening reports whether any socket is actually answering DNS —
+	// a plain listener, or DoT or DoH. It is what GET /readyz turns on, and
+	// it is deliberately one boolean rather than Serving()'s per-protocol
+	// pair: readiness asks whether this instance resolves anything at all,
+	// and which transports it does so over is the settings screen's
+	// question, answered by GET /resolver/status.
+	DNSListening() bool
 }
 
 // ProtocolStatus is one encrypted protocol's status as the API reports it.
@@ -166,13 +175,25 @@ type Server struct {
 	routes      []routeReg
 	mux         *http.ServeMux
 	buildMuxOne sync.Once
+	// pathMux and allow are how the "/api/" catch-all tells a path that
+	// does not exist from one that exists under another method. pathMux
+	// holds every registered pattern with its method verb stripped, so
+	// http.ServeMux's own matching (path parameters included) answers which
+	// pattern a URL belongs to; allow maps that pattern to its Allow header
+	// value. Both are built in buildMux, from the same registry.
+	pathMux *http.ServeMux
+	allow   map[string]string
 	// attempts throttles the two unauthenticated endpoints that cost an
 	// argon2id hash. See attemptLimiter in auth_handlers.go.
 	attempts *attemptLimiter
+	// tailHeartbeat is how often an idle SSE stream writes a comment frame
+	// (handleQueriesTail). A field rather than the constant itself so a test
+	// can shorten it instead of waiting out the real interval.
+	tailHeartbeat time.Duration
 }
 
 func New(d Deps) *Server {
-	s := &Server{deps: d, attempts: newAttemptLimiter()}
+	s := &Server{deps: d, attempts: newAttemptLimiter(), tailHeartbeat: sseHeartbeat}
 	s.registerRoutes()
 	return s
 }
@@ -196,6 +217,7 @@ func (s *Server) registerRoutes() {
 	s.route("GET /api/v1/health", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "version": s.deps.Version})
 	})
+	s.route("GET /api/v1/readyz", s.handleReadyz)
 	s.route("GET /api/v1/openapi.yaml", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/yaml")
 		_, _ = w.Write(openapiDoc)
@@ -221,8 +243,55 @@ func (s *Server) registerRoutes() {
 	// through to the SPA mount below. There is nothing for a spec to
 	// document.
 	s.route("/api/", func(w http.ResponseWriter, r *http.Request) {
+		// A path that exists under another method is not missing, and
+		// telling its client to go looking for a URL it already has is the
+		// wrong answer twice over. http.ServeMux answers this case itself
+		// — 405 with Allow — but only when nothing matched at all, and this
+		// catch-all matches everything under /api/, so the mux never got
+		// the chance. See allowedMethods.
+		if allow := s.allowedMethods(r); allow != "" {
+			w.Header().Set("Allow", allow)
+			errJSON(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
 		errJSON(w, http.StatusNotFound, "not found")
 	})
+}
+
+// readyzTimeout bounds the store ping. A readiness probe that hangs is a
+// readiness probe that has failed, and the caller — a load balancer, a
+// container runtime — has a deadline of its own that this must land inside.
+const readyzTimeout = 2 * time.Second
+
+// handleReadyz is the readiness half of /health's liveness.
+//
+// /health answers 200 while the process is up, which is what a container
+// runtime asks before restarting it, and it must stay that way: a server
+// that cannot serve is still one that should not be killed in a loop. This
+// answers whether the instance can actually do its job — the store is
+// reachable and something is bound to serve DNS — which is what a load
+// balancer needs before it sends queries here. Pointing one at /health
+// keeps traffic flowing to a process that is up and resolving nothing.
+//
+// Unauthenticated, for the reason /health is: a probe has no credentials to
+// present, and the answer discloses only whether this instance is usable.
+// The reason is plain text in the usual error envelope, so an operator
+// reading a probe's log learns which half failed.
+func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), readyzTimeout)
+	defer cancel()
+	if err := s.deps.Store.Ping(ctx); err != nil {
+		errJSON(w, http.StatusServiceUnavailable, "storage unavailable")
+		return
+	}
+	// Nil ResolverStatus means no App behind this server, which is every
+	// test fixture and nothing in production. Nothing is serving DNS in
+	// that case, and saying so is the truthful answer.
+	if s.deps.ResolverStatus == nil || !s.deps.ResolverStatus.DNSListening() {
+		errJSON(w, http.StatusServiceUnavailable, "no DNS listener is bound")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
 // buildMux turns the recorded routes slice into a real *http.ServeMux. It
@@ -233,9 +302,28 @@ func (s *Server) registerRoutes() {
 func (s *Server) buildMux() {
 	s.buildMuxOne.Do(func() {
 		mux := http.NewServeMux()
+		pathMux := http.NewServeMux()
+		methods := map[string][]string{}
 		for _, rt := range s.routes {
 			mux.HandleFunc(rt.pattern, rt.handler)
+			method, path, ok := strings.Cut(rt.pattern, " ")
+			if !ok {
+				continue // the method-less "/api/" catch-all itself
+			}
+			if methods[path] == nil {
+				// Registered once per path; a second HandleFunc for the same
+				// pattern panics. The handler is never reached — only the
+				// pattern this reports back is used.
+				pathMux.Handle(path, http.NotFoundHandler())
+			}
+			methods[path] = append(methods[path], method)
 		}
+		s.allow = make(map[string]string, len(methods))
+		for path, ms := range methods {
+			sort.Strings(ms)
+			s.allow[path] = strings.Join(ms, ", ")
+		}
+		s.pathMux = pathMux
 		// The SPA owns everything else. More specific patterns above
 		// (including the "/api/" catch-all) take precedence, so this only
 		// ever sees non-API paths. Deliberately not routed through route():
@@ -246,6 +334,18 @@ func (s *Server) buildMux() {
 		}
 		s.mux = mux
 	})
+}
+
+// allowedMethods is the Allow header for a request whose path some route
+// serves under a different method, and "" for a path no route serves at
+// all. The lookup is http.ServeMux's own, so a path parameter matches here
+// exactly as it does when the request is routed.
+func (s *Server) allowedMethods(r *http.Request) string {
+	if s.pathMux == nil {
+		return ""
+	}
+	_, pattern := s.pathMux.Handler(r)
+	return s.allow[pattern]
 }
 
 func (s *Server) Handler() http.Handler {
@@ -312,6 +412,27 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 
 func errJSON(w http.ResponseWriter, code int, msg string) {
 	writeJSON(w, code, map[string]string{"error": msg})
+}
+
+// created answers a write that made a row: 201, a Location header naming
+// the row's own URL, and the row itself as the body.
+//
+// Both halves used to be missing. The answer was `{"id": 3}`, so a client
+// learned where its new row lived by string-building the URL from a number
+// it had to parse out of a body — which is the work RFC 9110 §15.3.2's
+// Location exists to save — and then had to fetch it to see any field the
+// server had filled in (a derived list name, a zone's generated SOA). One
+// answer now carries both.
+func created(w http.ResponseWriter, location string, v any) {
+	w.Header().Set("Location", location)
+	writeJSON(w, http.StatusCreated, v)
+}
+
+// resourceURL is the URL of one row of a collection, for created()'s
+// Location. The collection is the API path without its /api/v1 prefix, the
+// same spelling the routes are registered with.
+func resourceURL(collection string, id int64) string {
+	return "/api/v1/" + collection + "/" + strconv.FormatInt(id, 10)
 }
 
 func storeErr(w http.ResponseWriter, err error) {

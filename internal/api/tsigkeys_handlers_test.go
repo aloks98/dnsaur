@@ -144,11 +144,11 @@ func TestReadScopeTokenCannotReadTSIGSecrets(t *testing.T) {
 	}
 	id := itoa(int64(created["id"].(float64)))
 
-	_, readTok, err := srv.srv.deps.Auth.CreateAPIToken(t.Context(), 1, "reader", "read")
+	_, readTok, err := srv.srv.deps.Auth.CreateAPIToken(t.Context(), 1, "reader", "read", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, writeTok, err := srv.srv.deps.Auth.CreateAPIToken(t.Context(), 1, "writer", "write")
+	_, writeTok, err := srv.srv.deps.Auth.CreateAPIToken(t.Context(), 1, "writer", "write", 0)
 	if err != nil {
 		t.Fatal(err)
 	}

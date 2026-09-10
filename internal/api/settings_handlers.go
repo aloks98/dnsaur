@@ -4,6 +4,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"maps"
 	"net"
 	"net/http"
 	"path/filepath"
@@ -270,44 +271,136 @@ func (s *Server) handleResolverStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, out)
 }
 
-type settingPut struct {
-	Key   string `json:"key"`
-	Value string `json:"value"`
+// protocolEnabledKey reports whether key turns an encrypted protocol on or
+// off — the two keys whose validity depends on what the certificate keys
+// hold, and the reason a multi-key write has an order at all.
+func protocolEnabledKey(key string) bool {
+	return key == "serve.dot.enabled" || key == "serve.doh.enabled"
 }
 
-func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
-	body, err := decode[settingPut](r)
-	if err != nil {
-		errJSON(w, http.StatusBadRequest, "invalid json")
-		return
+// settingsPhases is the order a multi-key write is validated and applied
+// in, and it is the dashboard's own five phases (SAVE_PHASES in
+// web/src/pages/settings.tsx) moved to the end that can enforce them:
+//
+//  1. Disables first. Nothing below can be refused for a protocol that is
+//     already off.
+//  2. serve.tls.cert, then
+//  3. serve.tls.key — one after the other, because the pair is only checked
+//     once both halves are present, and a mismatched pair sent together
+//     would otherwise be judged against whatever was stored before.
+//  4. Everything else. Independent of each other and of the certificate.
+//  5. Enables last, against a certificate that is now in place.
+//
+// Every key falls in exactly one phase: it either turns a protocol on or
+// off (1 or 5), is one half of the certificate (2 or 3), or is neither (4).
+var settingsPhases = []func(key, value string) bool{
+	func(k, v string) bool { return protocolEnabledKey(k) && v != "true" },
+	func(k, _ string) bool { return k == "serve.tls.cert" },
+	func(k, _ string) bool { return k == "serve.tls.key" },
+	func(k, _ string) bool { return !protocolEnabledKey(k) && k != "serve.tls.cert" && k != "serve.tls.key" },
+	func(k, v string) bool { return protocolEnabledKey(k) && v == "true" },
+}
+
+// orderSettings sorts the keys of a write into settingsPhases order, sorted
+// within each phase so the same body always fails on the same key.
+func orderSettings(values map[string]string) []string {
+	keys := slices.Sorted(maps.Keys(values))
+	ordered := make([]string, 0, len(keys))
+	for _, inPhase := range settingsPhases {
+		for _, k := range keys {
+			if inPhase(k, values[k]) {
+				ordered = append(ordered, k)
+			}
+		}
 	}
-	validate, ok := editableSettings[body.Key]
+	return ordered
+}
+
+// settingsWrite reads the body of PUT /settings, which takes two shapes: a
+// map of settings, and the original single `{"key": ..., "value": ...}`.
+//
+// They are told apart by the "key" entry, since no editable setting is
+// called that. A body carrying it and nothing else (or only "value" beside
+// it) is the single-key form, so `{"key": "cache.min_ttl"}` still answers a
+// complaint about the value rather than "setting not editable: key".
+//
+// Every value is a string, numbers included — that is what the settings
+// table holds — so a number or a null is a decode failure and answers the
+// same "invalid json" every other endpoint does, rather than being coerced
+// into a value nobody sent.
+func settingsWrite(w http.ResponseWriter, r *http.Request) (map[string]string, bool) {
+	raw, ok := decodeOr400[map[string]any](w, r)
 	if !ok {
-		errJSON(w, http.StatusBadRequest, "setting not editable: "+body.Key)
+		return nil, false
+	}
+	values := make(map[string]string, len(raw))
+	for k, v := range raw {
+		sv, isString := v.(string)
+		if !isString {
+			errJSON(w, http.StatusBadRequest, "invalid json")
+			return nil, false
+		}
+		values[k] = sv
+	}
+	if key, single := values["key"]; single && len(values) <= 2 {
+		return map[string]string{key: values["value"]}, true
+	}
+	return values, true
+}
+
+// handleSettingsPut writes one setting or several.
+//
+// Every key is validated before any of them is written, and the whole write
+// then lands in one transaction with one config-version bump. Half-applying
+// a rejected body would leave the caller told "no" and the server in a
+// state neither of them chose; bumping per key would reconfigure the
+// running server once per field of a six-field save.
+//
+// The cross-field check runs against the store's current values *updated as
+// the phases go*, which is what lets a certificate and the enable that
+// depends on it travel in one request: by the time the enable is judged,
+// the simulated state already holds the paths that are about to be written.
+func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
+	values, ok := settingsWrite(w, r)
+	if !ok {
 		return
 	}
-	if err := validate(body.Value); err != nil {
-		// The prefix stays: it is what the existing suite and the web form
-		// both key off. The reason is appended, not substituted.
-		errJSON(w, http.StatusBadRequest, "invalid value for "+body.Key+": "+err.Error())
+	if len(values) == 0 {
+		errJSON(w, http.StatusBadRequest, "no settings to write")
 		return
 	}
-	// The per-key validator only ever sees this one value. Whether it is
-	// coherent with the rest of the configuration — enabling DoT against a
-	// certificate that is missing or broken — needs the current settings,
-	// so that check reads the store before the write is accepted.
+	// The per-key validators only ever see one value each. Whether the
+	// result is coherent — enabling DoT against a certificate that is
+	// missing or broken — needs the rest of the configuration, so the
+	// current values are read before anything is accepted.
 	current, err := s.deps.Store.Settings().All(r.Context())
 	if err != nil {
 		storeErr(w, err)
 		return
 	}
-	if err := validateCrossField(body.Key, body.Value, current); err != nil {
-		// Same shape as the per-key rejection above: one handler, one error
-		// format, whether the field that failed is spelled body.Key.
-		errJSON(w, http.StatusBadRequest, "invalid value for "+body.Key+": "+err.Error())
-		return
+	for _, key := range orderSettings(values) {
+		validate, editable := editableSettings[key]
+		if !editable {
+			errJSON(w, http.StatusBadRequest, "setting not editable: "+key)
+			return
+		}
+		value := values[key]
+		if err := validate(value); err != nil {
+			// The prefix stays: it is what the existing suite and the web
+			// form both key off. The reason is appended, not substituted.
+			errJSON(w, http.StatusBadRequest, "invalid value for "+key+": "+err.Error())
+			return
+		}
+		if err := validateCrossField(key, value, current); err != nil {
+			// Same shape as the per-key rejection above: one handler, one
+			// error format, whether or not the field that failed is the one
+			// the message names.
+			errJSON(w, http.StatusBadRequest, "invalid value for "+key+": "+err.Error())
+			return
+		}
+		current[key] = value
 	}
-	if err := s.deps.Store.Settings().Set(r.Context(), body.Key, body.Value); err != nil {
+	if err := s.deps.Store.Settings().SetMany(r.Context(), values); err != nil {
 		storeErr(w, err)
 		return
 	}

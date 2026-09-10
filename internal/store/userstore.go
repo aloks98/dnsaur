@@ -125,6 +125,11 @@ func (u *userStore) SetTOTP(ctx context.Context, id int64, secret string) error 
 	return err
 }
 
+func (u *userStore) SetPassword(ctx context.Context, id int64, hash string) error {
+	_, err := u.s.db.ExecContext(ctx, u.s.q(`UPDATE users SET password_hash = ? WHERE id = ?`), hash, id)
+	return err
+}
+
 func (u *userStore) ClaimTOTPStep(ctx context.Context, id, step int64) (bool, error) {
 	// One conditional UPDATE, not a read followed by a write: two logins
 	// presenting the same code at the same moment must not both find the

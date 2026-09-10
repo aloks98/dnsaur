@@ -506,12 +506,18 @@ const ALL_FIELDS: SettingField[] = SETTING_GROUPS.flatMap((group) => group.field
 /**
  * The order a multi-key save has to go out in.
  *
- * `PUT /api/v1/settings` takes one key per request, deliberately, and
- * `validateCrossField` (internal/api/settings_handlers.go) re-reads the
- * store on every one of them. So three of these keys are only valid
- * against values *other* requests in the same save are carrying, and firing
- * them all at once means each validator judges the others' values as they
- * were before the save started:
+ * `PUT /api/v1/settings` now also takes a map of keys, applied in this very
+ * order server-side — but this page keeps sending one key per request, so a
+ * save that is refused can report *which* field was refused and leave the
+ * rest saved. A map is all-or-nothing, which is the wrong shape for a form
+ * whose fields fail independently.
+ *
+ * One key per request means `validateCrossField`
+ * (internal/api/settings_handlers.go) re-reads the store on every one of
+ * them. So three of these keys are only valid against values *other*
+ * requests in the same save are carrying, and firing them all at once means
+ * each validator judges the others' values as they were before the save
+ * started:
  *
  * - `serve.*.enabled = "true"` is checked against the stored certificate
  *   pair, so both paths must already be written.

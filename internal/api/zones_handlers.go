@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 
@@ -356,12 +357,53 @@ func normalizeSOAName(raw string, escapeDot bool) (string, bool) {
 	return name, true
 }
 
+// zoneTypeInternal is the built-in zones' type (store.BuiltinZones): not
+// creatable through this API, but every install has sixteen of them, so a
+// ?type= filter that could not name them would be missing the value that
+// matches most of the table.
+const zoneTypeInternal = "internal"
+
+// listableZoneTypes is what ?type= accepts. A value outside it is refused
+// rather than answered with an empty array: a caller that mistyped
+// "forwarders" would otherwise read "you have no forwarders", which is a
+// different and wrong answer.
+var listableZoneTypes = map[string]bool{
+	zoneTypePrimary:   true,
+	zoneTypeSecondary: true,
+	zoneTypeForwarder: true,
+	zoneTypeStub:      true,
+	zoneTypeInternal:  true,
+}
+
+// handleZonesList answers every zone, optionally narrowed by ?type= and
+// ?enabled=.
+//
+// Filtered here rather than in SQL. ZoneStore.Zones takes no options, and
+// widening it means a new query, a new method or an options struct threaded
+// through the store interface and both dialects — to save scanning a slice
+// that is sixteen built-ins plus however many zones one household has. If a
+// zone table ever gets big enough for that to matter, the filter moves; the
+// endpoint's contract does not change when it does.
 func (s *Server) handleZonesList(w http.ResponseWriter, r *http.Request) {
+	zoneType := r.URL.Query().Get("type")
+	if zoneType != "" && !listableZoneTypes[zoneType] {
+		errJSON(w, http.StatusBadRequest,
+			"type must be primary, secondary, forwarder, stub or internal")
+		return
+	}
+	enabled, byEnabled, err := qBool(r, "enabled")
+	if err != nil {
+		errJSON(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	zs, err := s.deps.Store.Zones().Zones(r.Context())
 	if err != nil {
 		storeErr(w, err)
 		return
 	}
+	zs = slices.DeleteFunc(zs, func(z store.Zone) bool {
+		return (zoneType != "" && z.Type != zoneType) || (byEnabled && z.Enabled != enabled)
+	})
 	writeJSON(w, http.StatusOK, zs)
 }
 
@@ -578,7 +620,8 @@ func (s *Server) handleZoneCreate(w http.ResponseWriter, r *http.Request) {
 
 	s.reloadZones(r)
 	s.notifyZones()
-	writeJSON(w, http.StatusCreated, map[string]int64{"id": id})
+	zone.ID = id
+	created(w, resourceURL("zones", id), zone)
 }
 
 // zonePatch is groupPatch's pointer-per-field pattern extended to every zone

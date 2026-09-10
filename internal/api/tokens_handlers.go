@@ -35,6 +35,11 @@ func (s *Server) handleTokensList(w http.ResponseWriter, r *http.Request) {
 type tokenCreate struct {
 	Name  string `json:"name"`
 	Scope string `json:"scope"` // read | write; empty defaults to write
+	// ExpiresAt is unix ms the token stops working. Optional: omitted (or
+	// 0) means never, which is what every token minted before this field
+	// existed carries and still the default — a credential a script depends
+	// on must not acquire an expiry nobody asked for.
+	ExpiresAt int64 `json:"expires_at"`
 }
 
 func (s *Server) handleTokenCreate(w http.ResponseWriter, r *http.Request) {
@@ -49,15 +54,28 @@ func (s *Server) handleTokenCreate(w http.ResponseWriter, r *http.Request) {
 	if body.Scope == "" {
 		body.Scope = "write"
 	}
+	// A stamp already in the past would mint a credential that is dead on
+	// arrival: the create answers 201 with a token, and the very next
+	// request with it is 401. Refused here, where the caller can still fix
+	// the value.
+	// The auth service's own clock, not time.Now: it is what Authenticate
+	// will compare this stamp against, and a validator judging by a
+	// different clock would accept values that endpoint refuses.
+	if body.ExpiresAt != 0 && body.ExpiresAt <= s.deps.Auth.Now().UnixMilli() {
+		errJSON(w, http.StatusBadRequest, "expires_at must be a unix-ms time in the future")
+		return
+	}
 	// The insert id, not a guess. This used to re-list the user's tokens and
 	// take the highest id with a matching name, which two tokens called the
 	// same thing made ambiguous and a failed listing made 0.
-	id, plain, err := s.deps.Auth.CreateAPIToken(r.Context(), userFrom(r).ID, body.Name, body.Scope)
+	id, plain, err := s.deps.Auth.CreateAPIToken(r.Context(), userFrom(r).ID, body.Name, body.Scope, body.ExpiresAt)
 	if err != nil {
 		errJSON(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusCreated, map[string]any{"id": id, "token": plain})
+	// The plaintext is not part of the token row and never readable again —
+	// it is the one field this answer carries that no GET ever will.
+	created(w, resourceURL("tokens", id), map[string]any{"id": id, "token": plain})
 }
 
 func (s *Server) handleTokenRevoke(w http.ResponseWriter, r *http.Request) {

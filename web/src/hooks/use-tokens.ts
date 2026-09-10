@@ -16,6 +16,10 @@ export const tokenKeys = {
 interface CreateTokenInput {
   name: string;
   scope: "read" | "write";
+  /** Unix ms the token stops working. Omitted means never, which is the
+   * server's default too — a token a script depends on must not acquire an
+   * expiry nobody asked for. A stamp in the past is a 400. */
+  expires_at?: number;
 }
 
 // The plaintext `token` exists only in this one response body (see

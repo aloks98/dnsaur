@@ -120,6 +120,8 @@ func (s *Server) authRoutes() {
 	s.route("POST /api/v1/auth/login", s.handleLogin)
 	s.route("POST /api/v1/auth/logout", s.requireAuth(s.handleLogout))
 	s.route("GET /api/v1/auth/me", s.requireAuth(s.handleMe))
+	s.route("POST /api/v1/auth/password", s.requireAuth(s.handlePasswordChange))
+	s.route("DELETE /api/v1/auth/sessions", s.requireAuth(s.handleSessionsRevoke))
 }
 
 func (s *Server) handleSetupState(w http.ResponseWriter, r *http.Request) {
@@ -206,6 +208,60 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"id": u.ID, "username": u.Username, "totp_enabled": u.TOTPSecret != "",
 	})
+}
+
+type passwordChange struct {
+	CurrentPassword string `json:"current_password"`
+	NewPassword     string `json:"new_password"`
+}
+
+// handlePasswordChange is throttled on the same budget as login, and for
+// the same reason: it runs an argon2id verification and then says whether
+// the password was right. Being behind requireAuth narrows who can spend
+// that budget but does not make either fact cheaper — a stolen session
+// cookie would otherwise be an unmetered oracle for the password it is not
+// enough to change.
+func (s *Server) handlePasswordChange(w http.ResponseWriter, r *http.Request) {
+	if !s.throttle(w, r) {
+		return
+	}
+	body, ok := decodeOr400[passwordChange](w, r)
+	if !ok {
+		return
+	}
+	// The caller's own credential is kept: the change logs every other
+	// session out, and logging them out of the tab they made it from would
+	// be a bug rather than a safeguard — the same rule the TOTP handlers
+	// follow.
+	err := s.deps.Auth.ChangePassword(r.Context(), userFrom(r).ID,
+		body.CurrentPassword, body.NewPassword, tokenFrom(r).ID)
+	switch {
+	case err == nil:
+		w.WriteHeader(http.StatusNoContent)
+	case errors.Is(err, auth.ErrBadCredentials):
+		// 400, not 401: the request authenticated fine, and answering 401
+		// would tell a dashboard its session had expired and send the admin
+		// back to the login screen over a typo. There is no enumeration to
+		// protect here either — the account is the one the caller is
+		// already signed in to.
+		errJSON(w, http.StatusBadRequest, "current password is wrong")
+	case errors.Is(err, auth.ErrInvalidInput):
+		errJSON(w, http.StatusBadRequest, err.Error())
+	default:
+		storeErr(w, err)
+	}
+}
+
+// handleSessionsRevoke is "log out everywhere": every session on the
+// account but this one. Not throttled — it verifies nothing and costs a
+// DELETE — and deliberately not a way to revoke API tokens, which are
+// named credentials with their own list and their own revoke.
+func (s *Server) handleSessionsRevoke(w http.ResponseWriter, r *http.Request) {
+	if err := s.deps.Auth.RevokeOtherSessions(r.Context(), userFrom(r).ID, tokenFrom(r).ID); err != nil {
+		storeErr(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *Server) sessionCookie(value string, maxAge int, r *http.Request) *http.Cookie {

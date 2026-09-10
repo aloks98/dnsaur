@@ -619,6 +619,37 @@ paths:
                   status: { type: string, example: ok }
                   version: { type: string }
 
+  /readyz:
+    get:
+      tags: [Meta]
+      security: []
+      summary: Readiness
+      description: >
+        Whether this instance can actually serve: the store answers a ping,
+        and at least one socket is bound for DNS (plain, DoT or DoH). The
+        counterpart of /health, which answers 200 while the process is up
+        and is what a container runtime should restart on — a load balancer
+        pointed at /health keeps sending queries to a process that is up and
+        resolving nothing. Unauthenticated, like /health: a probe has no
+        credentials to present.
+      responses:
+        "200":
+          description: ready
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: ok }
+        "503":
+          description: >
+            not ready — "storage unavailable" when the store did not answer
+            within two seconds, "no DNS listener is bound" when nothing is
+            serving DNS
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
   /openapi.yaml:
     get:
       tags: [Meta]
@@ -780,6 +811,80 @@ paths:
               schema: { $ref: "#/components/schemas/Error" }
         "403":
           $ref: "#/components/responses/ReadOnlyToken"
+
+  /auth/password:
+    post:
+      tags: [Auth]
+      summary: Change the signed-in account's password
+      description: >
+        Verifies current_password, stores a new argon2id hash, and revokes
+        every other session on the account — the caller's own survives, and
+        API tokens are untouched. Shares POST /auth/login's per-source
+        budget of 10 attempts a minute: it runs the same argon2id
+        verification and answers whether the password was right, so a
+        stolen session cookie must not be an unmetered oracle for it.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [current_password, new_password]
+              properties:
+                current_password: { type: string }
+                new_password: { type: string, minLength: 8 }
+      responses:
+        "204":
+          description: No Content
+        "400":
+          description: >
+            invalid json; "current password is wrong"; or "invalid input:
+            password must be at least 8 characters". A wrong current
+            password is 400 rather than 401 — the request authenticated
+            fine, and 401 would send the dashboard back to the login screen
+            over a typo.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401":
+          description: authentication required
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "403":
+          $ref: "#/components/responses/ReadOnlyToken"
+        "429":
+          $ref: "#/components/responses/TooManyAttempts"
+        "503":
+          description: storage unavailable
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /auth/sessions:
+    delete:
+      tags: [Auth]
+      summary: Log out every other session
+      description: >
+        Revokes every session on this account except the one making the
+        request, for a cookie the admin believes has been copied. API
+        tokens are a separate credential and are not swept; they are
+        revoked by name via DELETE /tokens/{id}.
+      responses:
+        "204":
+          description: No Content
+        "401":
+          description: authentication required
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "403":
+          $ref: "#/components/responses/ReadOnlyToken"
+        "503":
+          description: storage unavailable
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
 
   /auth/me:
     get:
@@ -1007,7 +1112,7 @@ paths:
               schema: { $ref: "#/components/schemas/Error" }
     put:
       tags: [Settings]
-      summary: Set a single setting
+      summary: Set one setting or several
       description: >
         Editable keys: upstreams, upstream.strategy (failover|fastest|race),
         blocking.mode (null-ip|nxdomain), blocking.ttl (non-negative int),
@@ -1048,40 +1153,74 @@ paths:
         this requirement. Saving "serve.tls.cert" or "serve.tls.key" once
         both halves are set runs the same pair check, regardless of
         whether a protocol is currently enabled.
+
+
+        The body takes two shapes: a map of settings, and the original
+        single {"key": ..., "value": ...}. They are told apart by the "key"
+        entry, since no editable setting is called that.
+
+
+        A map is validated as a whole before any of it is written, then
+        applied in one transaction with a single config-version bump — so a
+        rejected body changes nothing, and a save of six fields
+        reconfigures the running server once rather than six times. The
+        keys are ordered for you, in the order their dependencies require:
+        protocols being turned off, then the certificate path, then the key
+        path, then everything else, then protocols being turned on. That is
+        what lets a certificate pair and the enable that depends on it
+        travel in one request.
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              type: object
-              required: [key, value]
-              properties:
-                key:
-                  type: string
-                  enum:
-                    - upstreams
-                    - upstream.strategy
-                    - blocking.mode
-                    - blocking.ttl
-                    - cache.min_ttl
-                    - cache.max_ttl
-                    - cache.max_entries
-                    - cache.serve_stale_for
-                    - lists.refresh_hours
-                    - qlog.retention_days
-                    - qlog.privacy
-                    - serve.dot.enabled
-                    - serve.dot.listen
-                    - serve.doh.enabled
-                    - serve.doh.listen
-                    - serve.tls.cert
-                    - serve.tls.key
-                value: { type: string }
+              oneOf:
+                - title: Several settings
+                  type: object
+                  description: >
+                    Setting key -> value. Every value is a string, numbers
+                    included, exactly as GET /settings returns them; a
+                    number or a null in this map is "invalid json".
+                  additionalProperties: { type: string }
+                  example:
+                    serve.tls.cert: /etc/dnsaur/tls.crt
+                    serve.tls.key: /etc/dnsaur/tls.key
+                    serve.dot.enabled: "true"
+                - title: One setting
+                  type: object
+                  required: [key, value]
+                  properties:
+                    key:
+                      type: string
+                      enum:
+                        - upstreams
+                        - upstream.strategy
+                        - blocking.mode
+                        - blocking.ttl
+                        - cache.min_ttl
+                        - cache.max_ttl
+                        - cache.max_entries
+                        - cache.serve_stale_for
+                        - lists.refresh_hours
+                        - qlog.retention_days
+                        - qlog.privacy
+                        - stats.retention_days
+                        - serve.dot.enabled
+                        - serve.dot.listen
+                        - serve.doh.enabled
+                        - serve.doh.listen
+                        - serve.tls.cert
+                        - serve.tls.key
+                    value: { type: string }
       responses:
         "204":
           description: No Content
         "400":
-          description: setting not editable, or invalid value for the key
+          description: >
+            setting not editable, invalid value for the key, "no settings
+            to write" for an empty body, or "invalid json" for a value that
+            is not a string. A map that fails any of these writes none of
+            itself.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -1285,12 +1424,18 @@ paths:
       responses:
         "201":
           description: Created
+          headers:
+            Location:
+              description: URL of the group this request created
+              schema: { type: string, example: /api/v1/groups/2 }
           content:
             application/json:
               schema:
                 type: object
                 properties:
                   id: { type: integer, format: int64 }
+                  name: { type: string }
+                  enabled: { type: boolean }
         "400":
           description: >
             invalid json, name required, or `list_ids names list <id>,
@@ -1550,12 +1695,24 @@ paths:
       responses:
         "201":
           description: Created
+          headers:
+            Location:
+              description: URL of the rule this request created
+              schema: { type: string, example: /api/v1/filters/rules/7 }
           content:
             application/json:
               schema:
                 type: object
+                description: >
+                  The stored rule, whose pattern is the normalised one when
+                  the request sent a literal. Its Location is the URL that
+                  deletes it: a rule has no read of its own.
                 properties:
                   id: { type: integer, format: int64 }
+                  group_id: { type: integer, format: int64 }
+                  action: { type: string, enum: [allow, block] }
+                  pattern: { type: string }
+                  is_regex: { type: boolean }
         "400":
           description: >
             invalid json; bad id; action allow|block and pattern required;
@@ -1586,6 +1743,18 @@ paths:
     get:
       tags: [Clients]
       summary: List clients
+      description: >
+        Every client, or one group's when group_id is given. A group_id
+        naming no group is an empty array rather than a 404 — the parameter
+        narrows a listing, it does not address a resource.
+      parameters:
+        - name: group_id
+          in: query
+          schema: { type: integer, format: int64 }
+          description: >
+            Must parse and be positive, the same rule an id in the path
+            follows; anything else is a 400 rather than a 0 that quietly
+            matches nothing.
       responses:
         "200":
           description: OK
@@ -1600,6 +1769,11 @@ paths:
                     name: { type: string }
                     matcher: { type: string, description: IP address or CIDR, stored canonically }
                     group_id: { type: integer, format: int64 }
+        "400":
+          description: group_id must be a positive id
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
         "401":
           description: authentication required
           content:
@@ -1633,12 +1807,20 @@ paths:
       responses:
         "201":
           description: Created
+          headers:
+            Location:
+              description: URL of the client this request created
+              schema: { type: string, example: /api/v1/clients/3 }
           content:
             application/json:
               schema:
                 type: object
+                description: The stored client, whose matcher is the canonical spelling.
                 properties:
                   id: { type: integer, format: int64 }
+                  name: { type: string }
+                  matcher: { type: string }
+                  group_id: { type: integer, format: int64 }
         "400":
           description: >
             invalid json; matcher must be an IP or CIDR without an interface
@@ -1819,12 +2001,14 @@ paths:
       responses:
         "201":
           description: Created
+          headers:
+            Location:
+              description: URL of the list this request created
+              schema: { type: string, example: /api/v1/filters/lists/4 }
           content:
             application/json:
               schema:
-                type: object
-                properties:
-                  id: { type: integer, format: int64 }
+                $ref: "#/components/schemas/List"
         "400":
           description: >
             url must be http(s), kind must be block or allow, or name too
@@ -2058,6 +2242,26 @@ paths:
     get:
       tags: [Zones]
       summary: List authoritative zones
+      description: >
+        Every zone, narrowed by the two optional filters when they are
+        given. An empty parameter (?type=) is no filter, which is the shape
+        a form sends for a choice nobody made; a value neither filter can
+        satisfy is a 400 rather than an empty array, so a mistyped
+        "forwarders" cannot read as "you have no forwarders".
+      parameters:
+        - name: type
+          in: query
+          schema: { type: string, enum: [primary, secondary, forwarder, stub, internal] }
+          description: >
+            internal is the built-in zones (localhost and the RFC 6303
+            reverse zones), which this API cannot create but every install
+            has.
+        - name: enabled
+          in: query
+          schema: { type: string, enum: ["true", "false"] }
+          description: >
+            Exactly "true" or "false" — not strconv.ParseBool's wider set,
+            so there is one spelling rather than several.
       responses:
         "200":
           description: OK
@@ -2066,6 +2270,13 @@ paths:
               schema:
                 type: array
                 items: { $ref: "#/components/schemas/Zone" }
+        "400":
+          description: >
+            "type must be primary, secondary, forwarder, stub or internal",
+            or "enabled must be true or false"
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
         "401":
           description: authentication required
           content:
@@ -2171,12 +2382,14 @@ paths:
       responses:
         "201":
           description: Created
+          headers:
+            Location:
+              description: URL of the zone this request created
+              schema: { type: string, example: /api/v1/zones/5 }
           content:
             application/json:
               schema:
-                type: object
-                properties:
-                  id: { type: integer, format: int64 }
+                $ref: "#/components/schemas/Zone"
         "400":
           description: >
             invalid json; name must be a valid domain name; type is set
@@ -2654,12 +2867,14 @@ paths:
       responses:
         "201":
           description: Created
+          headers:
+            Location:
+              description: URL of the record this request created
+              schema: { type: string, example: /api/v1/zones/5/records/12 }
           content:
             application/json:
               schema:
-                type: object
-                properties:
-                  id: { type: integer, format: int64 }
+                $ref: "#/components/schemas/ZoneRecord"
         "400":
           description: >
             invalid json; a name the zone's export cannot carry; type SOA
@@ -3115,12 +3330,14 @@ paths:
       responses:
         "201":
           description: Created
+          headers:
+            Location:
+              description: URL of the key this request created
+              schema: { type: string, example: /api/v1/tsig-keys/2 }
           content:
             application/json:
               schema:
-                type: object
-                properties:
-                  id: { type: integer, format: int64 }
+                $ref: "#/components/schemas/TSIGKey"
         "400":
           description: >
             name is not a valid domain name, algorithm is not one of the
@@ -3563,9 +3780,26 @@ paths:
               properties:
                 name: { type: string }
                 scope: { type: string, enum: [read, write], description: defaults to write when omitted }
+                expires_at:
+                  type: integer
+                  format: int64
+                  description: >
+                    Unix ms the token stops working. Optional; omitted or 0
+                    means never, which is the default and what every token
+                    minted before this field existed carries. Must be in the
+                    future — a stamp already past would mint a credential
+                    that is 401 on its very next use, so it is refused with
+                    "expires_at must be a unix-ms time in the future".
+                    Unlike a session, an API token's expiry does not slide:
+                    it is a date its owner chose, not a measure of whether
+                    somebody is still at the keyboard.
       responses:
         "201":
           description: Created
+          headers:
+            Location:
+              description: URL of the token this request created
+              schema: { type: string, example: /api/v1/tokens/2 }
           content:
             application/json:
               schema:
@@ -3581,7 +3815,9 @@ paths:
                       a failed listing made 0.
                   token: { type: string, description: plaintext token; shown once }
         "400":
-          description: invalid json, name required, or invalid scope
+          description: >
+            invalid json; name required; invalid scope; or "expires_at must
+            be a unix-ms time in the future"
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }

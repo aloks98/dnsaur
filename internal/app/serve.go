@@ -373,6 +373,21 @@ func (p protocolState) toAPI() api.ProtocolStatus {
 	return api.ProtocolStatus{Enabled: p.Enabled, Listening: p.Listening, Addr: p.Addr, Err: p.Err}
 }
 
+// DNSListening satisfies api.ResolverStatus: whether any socket is
+// answering DNS right now, which is what GET /readyz turns on.
+//
+// a.servers is written once, in Start, before the API server it is read
+// from exists, and never rewritten afterwards — Shutdown stops the
+// listeners without clearing the slice — so this needs no lock. The
+// encrypted pair is read through the reconciler, which takes its own.
+func (a *App) DNSListening() bool {
+	if len(a.servers) > 0 {
+		return true
+	}
+	st := a.serving.status()
+	return st.DoT.Listening || st.DoH.Listening
+}
+
 // CertExpiry satisfies api.ResolverStatus: the loaded certificate's expiry,
 // and whether it falls within certExpiryWarningWindow. ok is false when no
 // certificate has ever loaded successfully — see certLeaf — which is a

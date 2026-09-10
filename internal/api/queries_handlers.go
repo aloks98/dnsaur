@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"slices"
 	"strconv"
@@ -23,6 +24,43 @@ func (s *Server) queriesRoutes() {
 func qInt(r *http.Request, key string) int64 {
 	v, _ := strconv.ParseInt(r.URL.Query().Get(key), 10, 64)
 	return v
+}
+
+// qBool reads a list filter's boolean query parameter. Absent or empty is
+// "no filter" rather than false — ?enabled= is the shape a form sends for a
+// choice nobody made, and reading it as false would empty the listing.
+//
+// Exactly "true" or "false", the same grammar the serve.*.enabled settings
+// validator holds values to, rather than strconv.ParseBool's wider set: a
+// filter that silently accepts "1" and "T" is one more spelling for every
+// client to disagree about.
+func qBool(r *http.Request, key string) (value, present bool, err error) {
+	switch raw := r.URL.Query().Get(key); raw {
+	case "":
+		return false, false, nil
+	case "true":
+		return true, true, nil
+	case "false":
+		return false, true, nil
+	default:
+		return false, false, fmt.Errorf("%s must be true or false", key)
+	}
+}
+
+// qID reads a list filter's row-id query parameter, under the same rule
+// pathID applies to an id in the path: it has to parse and be positive.
+// Absent or empty is "no filter"; anything else that is not an id is an
+// error rather than a 0 that quietly matches nothing.
+func qID(r *http.Request, key string) (id int64, present bool, err error) {
+	raw := r.URL.Query().Get(key)
+	if raw == "" {
+		return 0, false, nil
+	}
+	id, perr := strconv.ParseInt(raw, 10, 64)
+	if perr != nil || id <= 0 {
+		return 0, false, fmt.Errorf("%s must be a positive id", key)
+	}
+	return id, true, nil
 }
 
 func (s *Server) handleQueriesSearch(w http.ResponseWriter, r *http.Request) {
@@ -48,6 +86,12 @@ func (s *Server) handleQueriesSearch(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, entries)
 }
 
+// sseHeartbeat is how often an idle tail writes a comment frame. Well
+// under the 60 seconds nginx, Caddy and every other reverse proxy time an
+// idle upstream read out at, and far too rare to be a cost: a stream that
+// is actually carrying queries writes this only in the gaps.
+const sseHeartbeat = 20 * time.Second
+
 func (s *Server) handleQueriesTail(w http.ResponseWriter, r *http.Request) {
 	if s.deps.Logger == nil {
 		errJSON(w, http.StatusServiceUnavailable, "query log disabled")
@@ -64,10 +108,23 @@ func (s *Server) handleQueriesTail(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-cache")
 	w.WriteHeader(http.StatusOK)
 	fl.Flush()
+	// The SSE keepalive: a comment frame, which the spec (WHATWG §9.2.4)
+	// says a client ignores, so it costs an EventSource nothing to read.
+	// Without it a quiet stream is indistinguishable from an abandoned
+	// connection, and whatever sits in front of dnsaur closes it on its own
+	// idle-read timeout — leaving the dashboard reconnecting on a loop it
+	// never asked for.
+	ping := time.NewTicker(s.tailHeartbeat)
+	defer ping.Stop()
 	for {
 		select {
 		case <-r.Context().Done():
 			return
+		case <-ping.C:
+			if _, err := io.WriteString(w, ": ping\n\n"); err != nil {
+				return
+			}
+			fl.Flush()
 		case e, open := <-ch:
 			if !open {
 				return

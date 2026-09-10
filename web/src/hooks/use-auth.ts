@@ -149,6 +149,31 @@ export function useLogout() {
   });
 }
 
+/**
+ * POST /auth/password. The server verifies `current_password` with argon2id,
+ * enforces the same 8-character minimum first-run setup does, and revokes
+ * every *other* session on the account — this one survives, so nothing here
+ * has to touch the auth gate. A wrong current password is a 400, not a 401,
+ * precisely so it does not read as an expired session.
+ *
+ * Shares the login throttle (10 attempts a minute per source), so a 429 is
+ * a real answer the call site has to be able to show.
+ */
+export function useChangePassword() {
+  return useMutation({
+    mutationFn: (v: { current_password: string; new_password: string }) =>
+      api.post<void>("/auth/password", v),
+  });
+}
+
+/** DELETE /auth/sessions — "log out everywhere". Every session but this
+ * one; API tokens are revoked by name instead, from the tokens list. */
+export function useRevokeSessions() {
+  return useMutation({
+    mutationFn: () => api.del<void>("/auth/sessions"),
+  });
+}
+
 export function useSetup() {
   // Deliberately no onSuccess invalidation: POST /setup only creates the
   // admin account, it does not establish a session. The setup wizard stays

@@ -155,17 +155,19 @@ func (s *Server) handleTSIGKeyCreate(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, code, msg)
 		return
 	}
-	id, err := s.deps.Store.TSIGKeys().Create(r.Context(), store.TSIGKey{
+	key := store.TSIGKey{
 		Name:      name,
 		Algorithm: body.Algorithm,
 		Secret:    body.Secret,
 		CreatedAt: time.Now().UnixMilli(),
-	})
+	}
+	id, err := s.deps.Store.TSIGKeys().Create(r.Context(), key)
 	if err != nil {
 		storeErrDup(w, err, "a TSIG key with that name already exists")
 		return
 	}
-	writeJSON(w, http.StatusCreated, map[string]int64{"id": id})
+	key.ID = id
+	created(w, resourceURL("tsig-keys", id), tsigKeyFor(r, key))
 }
 
 func (s *Server) handleTSIGKeyUpdate(w http.ResponseWriter, r *http.Request) {

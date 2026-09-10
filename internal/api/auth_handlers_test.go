@@ -276,3 +276,138 @@ func TestLoginLogoutMe(t *testing.T) {
 		t.Fatalf("session survives logout: %d", w.Code)
 	}
 }
+
+// loginCookie logs an existing admin in and returns the session cookie, so
+// a test can hold more than one session at once.
+func loginCookie(t *testing.T, h http.Handler, username, password string) *http.Cookie {
+	t.Helper()
+	w := doReq(t, h, "POST", "/api/v1/auth/login", `{"username":"`+username+`","password":"`+password+`"}`, nil)
+	if w.Code != 200 {
+		t.Fatalf("login as %s: %d %s", username, w.Code, w.Body.String())
+	}
+	for _, c := range w.Result().Cookies() {
+		if c.Name == "dnsaur_session" {
+			return c
+		}
+	}
+	t.Fatal("login answered 200 with no session cookie")
+	return nil
+}
+
+// TestChangePassword covers the whole of POST /auth/password: the current
+// password really is checked, the new one has to clear the same minimum
+// setup enforces, and a successful change ends every *other* session while
+// leaving the caller's own — and the account's API tokens — alone.
+//
+// The session sweep is the point of the endpoint rather than a nicety.
+// Changing a password is what someone does when they think it is known, and
+// it means nothing while the sessions minted with the old one keep working;
+// this is the same rule EnableTOTPConfirm already follows.
+func TestChangePassword(t *testing.T) {
+	srv, s, _ := testServer(t)
+	h := srv.Handler()
+	caller := login(t, srv, s) // creates the admin with password123
+	other := loginCookie(t, h, "admin", "password123")
+	_, apiTok, err := srv.deps.Auth.CreateAPIToken(t.Context(), 1, "kept", "write", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct{ name, body string }{
+		{"wrong current", `{"current_password":"not-it","new_password":"new-password1"}`},
+		{"short new", `{"current_password":"password123","new_password":"short"}`},
+		{"empty new", `{"current_password":"password123","new_password":""}`},
+	} {
+		if w := doReq(t, h, "POST", "/api/v1/auth/password", tc.body, caller); w.Code != 400 {
+			t.Errorf("%s = %d %s, want 400", tc.name, w.Code, strings.TrimSpace(w.Body.String()))
+		}
+	}
+	// Nothing above may have changed anything.
+	if w := doReq(t, h, "GET", "/api/v1/auth/me", "", other); w.Code != 200 {
+		t.Fatalf("a refused change logged another session out: %d", w.Code)
+	}
+
+	if w := doReq(t, h, "POST", "/api/v1/auth/password",
+		`{"current_password":"password123","new_password":"new-password1"}`, caller); w.Code != 204 {
+		t.Fatalf("change: %d %s", w.Code, w.Body.String())
+	}
+
+	if w := doReq(t, h, "POST", "/api/v1/auth/login", `{"username":"admin","password":"password123"}`, nil); w.Code != 401 {
+		t.Errorf("the old password still logs in: %d", w.Code)
+	}
+	if w := doReq(t, h, "POST", "/api/v1/auth/login", `{"username":"admin","password":"new-password1"}`, nil); w.Code != 200 {
+		t.Errorf("the new password does not log in: %d %s", w.Code, w.Body.String())
+	}
+	if w := doReq(t, h, "GET", "/api/v1/auth/me", "", caller); w.Code != 200 {
+		t.Errorf("the session that changed the password was logged out: %d", w.Code)
+	}
+	if w := doReq(t, h, "GET", "/api/v1/auth/me", "", other); w.Code != 401 {
+		t.Errorf("another browser's session survived the password change: %d", w.Code)
+	}
+	if w := bearerReq(h, "GET", "/api/v1/auth/me", apiTok); w.Code != 200 {
+		t.Errorf("an API token was revoked by a password change: %d", w.Code)
+	}
+}
+
+// TestChangePasswordIsThrottled — the endpoint verifies a password with
+// argon2id and answers whether it was right, which is the same expense and
+// the same oracle login is, one authenticated step further in. It shares
+// login's budget for exactly that reason.
+func TestChangePasswordIsThrottled(t *testing.T) {
+	srv, s, _ := testServer(t)
+	h := srv.Handler()
+	cookie := login(t, srv, s)
+	now := time.Unix(1_700_000_000, 0)
+	srv.attempts.now = func() time.Time { return now }
+
+	const bad = `{"current_password":"wrong-password","new_password":"new-password1"}`
+	change := func() *httptest.ResponseRecorder {
+		req := httptest.NewRequest("POST", "/api/v1/auth/password", stringsReader(bad))
+		req.Header.Set("Content-Type", "application/json")
+		req.AddCookie(cookie)
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, req)
+		return w
+	}
+	for i := range attemptLimit {
+		if w := change(); w.Code != 400 {
+			t.Fatalf("attempt %d = %d %s, want 400", i+1, w.Code, w.Body)
+		}
+	}
+	w := change()
+	if w.Code != http.StatusTooManyRequests {
+		t.Fatalf("attempt %d = %d %s, want 429", attemptLimit+1, w.Code, w.Body)
+	}
+	if got := w.Header().Get("Retry-After"); got != "60" {
+		t.Errorf("Retry-After = %q, want 60", got)
+	}
+}
+
+// TestDeleteSessionsKeepsTheCaller — "log out everywhere" has to leave the
+// browser that asked for it logged in, or the admin who suspects a stolen
+// cookie logs themselves out along with it and has to sign in again to find
+// out whether it worked. API tokens are a separate credential and are not
+// swept: they are revoked by name, on the account page.
+func TestDeleteSessionsKeepsTheCaller(t *testing.T) {
+	srv, s, _ := testServer(t)
+	h := srv.Handler()
+	caller := login(t, srv, s)
+	other := loginCookie(t, h, "admin", "password123")
+	_, apiTok, err := srv.deps.Auth.CreateAPIToken(t.Context(), 1, "kept", "write", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if w := doReq(t, h, "DELETE", "/api/v1/auth/sessions", "", caller); w.Code != 204 {
+		t.Fatalf("delete sessions: %d %s", w.Code, w.Body.String())
+	}
+	if w := doReq(t, h, "GET", "/api/v1/auth/me", "", caller); w.Code != 200 {
+		t.Errorf("the caller's own session was revoked: %d", w.Code)
+	}
+	if w := doReq(t, h, "GET", "/api/v1/auth/me", "", other); w.Code != 401 {
+		t.Errorf("another browser's session survived: %d", w.Code)
+	}
+	if w := bearerReq(h, "GET", "/api/v1/auth/me", apiTok); w.Code != 200 {
+		t.Errorf("an API token was revoked: %d", w.Code)
+	}
+}

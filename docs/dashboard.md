@@ -901,8 +901,18 @@ gone.
 
 ### Password
 
-Changing your password from the UI isn't built yet. The section is there and
-marked as planned.
+Current password, new password, confirm. The new one needs 8 characters, the
+same minimum first-run setup asks for. A wrong current password is reported on
+the field; there is nothing else to get wrong.
+
+Changing it **signs every other browser out**. This one stays signed in, and
+API tokens keep working — revoke those by name in the list above.
+
+**Log out everywhere** does the session half on its own, for a cookie you think
+has been copied. Same rule: this browser stays.
+
+There is still no recovery flow. A password you can't remember means database
+access or a fresh install.
 
 ### Two-factor authentication
 
@@ -928,4 +938,9 @@ Two scopes:
 The plaintext token is shown **once, at creation**, and is never recoverable —
 only a hash is stored. If you lose it, revoke it and make another.
 
-Tokens don't expire. Revoking is immediate.
+A token can be given an expiry when it is created — never, 30 days, 90 days
+or a year. Never is the default and what every token created before this
+existed has. The list says how long each one has left; an expired token stops
+working on its next use, with nothing to clean up.
+
+Revoking is immediate.

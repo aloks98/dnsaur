@@ -205,6 +205,32 @@ func TestSSETail(t *testing.T) {
 	}
 }
 
+// TestSSETailHeartbeat asserts an idle stream still writes something.
+//
+// A tail that only writes when a query arrives looks, to everything between
+// the browser and the server, exactly like a connection nobody is using: a
+// reverse proxy's read timeout (nginx defaults to 60s) closes it, and the
+// dashboard's EventSource silently reconnects every minute on a quiet
+// network. The comment frame is the SSE spec's own keepalive — an
+// EventSource ignores a line beginning with ":" — so it costs the client
+// nothing to receive.
+//
+// The interval is shortened here rather than waited out; tailHeartbeat is a
+// field for exactly this reason.
+func TestSSETailHeartbeat(t *testing.T) {
+	srv, s, _ := testServer(t)
+	cookie := login(t, srv, s)
+	srv.deps.Logger = qlog.New(&nullQLStore{}, qlog.Options{InstanceID: "i", FlushEvery: time.Hour, BatchSize: 100})
+	srv.tailHeartbeat = 10 * time.Millisecond
+
+	// Nothing published: the only thing that can arrive is the heartbeat.
+	_, line := tailStream(t, srv.Handler(), cookie, nil, func() {})
+	if line != ": ping\n" {
+		t.Fatalf("idle stream wrote %q, want a %q comment frame — an idle tail that writes "+
+			"nothing is closed by any proxy in front of it", line, ": ping\n")
+	}
+}
+
 // `hours` had no upper bound, and time.Duration(hours)*time.Hour overflows
 // int64 at about 2.5 million hours — so a large enough value wrapped
 // negative and asked the store for a window in the future, which answers

@@ -85,6 +85,11 @@ type AuthToken struct {
 
 // Store is the top-level persistence handle providing access to all data stores.
 type Store interface {
+	// Ping reports whether the database is reachable right now. The driver's
+	// own round trip, not a SELECT standing in for one: a pool whose
+	// connections have all gone away is exactly the state a readiness probe
+	// exists to notice, and it is not visible from a cached value.
+	Ping(ctx context.Context) error
 	Clients() ClientStore
 	Filters() FilterStore
 	Settings() SettingsStore
@@ -293,6 +298,11 @@ type StatsStore interface {
 type SettingsStore interface {
 	Get(ctx context.Context, key string) (string, bool, error)
 	Set(ctx context.Context, key, value string) error
+	// SetMany writes every pair in one transaction and bumps the version
+	// once, for a caller changing several dependent settings together — a
+	// bump per key reconfigures the running server once per key. Set is
+	// this with one pair.
+	SetMany(ctx context.Context, values map[string]string) error
 	SetInternal(ctx context.Context, key, value string) error
 	GetInt(ctx context.Context, key string) (int64, error)
 	ConfigVersion(ctx context.Context) (int64, error)
@@ -312,6 +322,10 @@ type UserStore interface {
 	ByID(ctx context.Context, id int64) (User, bool, error)
 	Count(ctx context.Context) (int64, error)
 	SetTOTP(ctx context.Context, id int64, secret string) error
+	// SetPassword replaces one account's argon2id hash. Only the hash: this
+	// store never sees a plaintext password, and the caller
+	// (auth.Service.ChangePassword) is what verifies the old one first.
+	SetPassword(ctx context.Context, id int64, hash string) error
 	// ClaimTOTPStep records step as the last TOTP time step user id
 	// authenticated with, and reports whether the claim was granted. It is
 	// refused (false, nil error) when step is not strictly greater than the

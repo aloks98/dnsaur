@@ -53,6 +53,14 @@ func (m *memUsers) SetTOTP(ctx context.Context, id int64, secret string) error {
 	}
 	return nil
 }
+func (m *memUsers) SetPassword(ctx context.Context, id int64, hash string) error {
+	for i := range m.users {
+		if m.users[i].ID == id {
+			m.users[i].PasswordHash = hash
+		}
+	}
+	return nil
+}
 func (m *memUsers) ClaimTOTPStep(ctx context.Context, id, step int64) (bool, error) {
 	for i := range m.users {
 		if m.users[i].ID == id {
@@ -191,7 +199,7 @@ func TestAPITokens(t *testing.T) {
 	svc := New(&memUsers{}, newMemTokens())
 	_ = svc.CreateAdmin(ctx, "admin", "password")
 	u, _, _ := func() (store.User, bool, error) { return svc.users.ByUsername(ctx, "admin") }()
-	_, plain, err := svc.CreateAPIToken(ctx, u.ID, "homeassistant", "write")
+	_, plain, err := svc.CreateAPIToken(ctx, u.ID, "homeassistant", "write", 0)
 	if err != nil {
 		t.Fatal(err)
 	}

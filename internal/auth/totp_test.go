@@ -127,7 +127,7 @@ func TestTOTPChangeRevokesOtherSessions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, apiTok, err := svc.CreateAPIToken(ctx, u.ID, "homeassistant", "write")
+	_, apiTok, err := svc.CreateAPIToken(ctx, u.ID, "homeassistant", "write", 0)
 	if err != nil {
 		t.Fatal(err)
 	}

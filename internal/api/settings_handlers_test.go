@@ -322,6 +322,10 @@ type fakeResolverStatus struct {
 	reason string
 
 	dot, doh ProtocolStatus
+	// dnsListening is what App reports for "some socket is answering DNS",
+	// which readiness turns on. False by default, so every existing fixture
+	// keeps meaning "a server with no listeners behind it".
+	dnsListening bool
 
 	notAfter     time.Time
 	expiringSoon bool
@@ -335,6 +339,8 @@ func (f *fakeResolverStatus) Serving() (dot, doh ProtocolStatus) { return f.dot,
 func (f *fakeResolverStatus) CertExpiry() (notAfter time.Time, expiringSoon, ok bool) {
 	return f.notAfter, f.expiringSoon, f.certLoaded
 }
+
+func (f *fakeResolverStatus) DNSListening() bool { return f.dnsListening }
 
 // The downgrade is server state, and it is reported by its own endpoint —
 // not folded into GET /settings, whose response is a flat map of settings
@@ -720,6 +726,247 @@ func TestSettingsServeDoTAndDoH(t *testing.T) {
 		t.Cleanup(func() { _ = os.Chmod(keyPath, 0o600) })
 		if rec := putSetting(t, ts, "serve.dot.enabled", "false"); rec.Code != http.StatusNoContent {
 			t.Fatalf("PUT serve.dot.enabled=false = %d (%s), want 204 with the key now unreadable", rec.Code, rec.Body.String())
+		}
+	})
+}
+
+// TestReadyz covers readiness, which is a different question from liveness
+// and needs a different answer.
+//
+// /health says the process is up, which is what a container runtime asks
+// before restarting it, and it must stay cheap and always-200 for that.
+// /readyz says this instance can actually do its job: the store answers,
+// and something is bound to serve DNS. A load balancer pointed at /health
+// keeps sending queries to a process that is up and resolving nothing.
+//
+// Unauthenticated, like /health: a probe has no credentials to present, and
+// the answer discloses only whether this instance is usable.
+func TestReadyz(t *testing.T) {
+	t.Run("no DNS listener", func(t *testing.T) {
+		srv, _, _ := testServer(t)
+		w := doReq(t, srv.Handler(), "GET", "/api/v1/readyz", "", nil)
+		if w.Code != http.StatusServiceUnavailable {
+			t.Fatalf("readyz with nothing serving = %d %s, want 503", w.Code, w.Body.String())
+		}
+		var body map[string]string
+		_ = json.Unmarshal(w.Body.Bytes(), &body)
+		if !strings.Contains(body["error"], "listener") {
+			t.Errorf("503 reason = %q, want it to name the missing listener", body["error"])
+		}
+	})
+
+	t.Run("serving DNS", func(t *testing.T) {
+		srv, _, _ := testServer(t, func(d *Deps) {
+			d.ResolverStatus = &fakeResolverStatus{dnsListening: true}
+		})
+		w := doReq(t, srv.Handler(), "GET", "/api/v1/readyz", "", nil)
+		if w.Code != http.StatusOK {
+			t.Fatalf("readyz while serving = %d %s, want 200", w.Code, w.Body.String())
+		}
+		var body map[string]string
+		_ = json.Unmarshal(w.Body.Bytes(), &body)
+		if body["status"] != "ok" {
+			t.Errorf("body = %v, want status ok", body)
+		}
+	})
+
+	t.Run("store unreachable", func(t *testing.T) {
+		srv, s, _ := testServer(t, func(d *Deps) {
+			d.ResolverStatus = &fakeResolverStatus{dnsListening: true}
+		})
+		h := srv.Handler()
+		if w := doReq(t, h, "GET", "/api/v1/readyz", "", nil); w.Code != http.StatusOK {
+			t.Fatalf("readyz before closing the store = %d %s, want 200", w.Code, w.Body.String())
+		}
+		// The real store, closed — not a fake that returns an error. What
+		// readiness has to detect is a database that has gone away under a
+		// process that is otherwise fine.
+		if err := s.Close(); err != nil {
+			t.Fatal(err)
+		}
+		w := doReq(t, h, "GET", "/api/v1/readyz", "", nil)
+		if w.Code != http.StatusServiceUnavailable {
+			t.Fatalf("readyz with a closed store = %d %s, want 503", w.Code, w.Body.String())
+		}
+		var body map[string]string
+		_ = json.Unmarshal(w.Body.Bytes(), &body)
+		if !strings.Contains(body["error"], "storage") {
+			t.Errorf("503 reason = %q, want it to name the storage failure", body["error"])
+		}
+	})
+
+	// /health is the liveness half and must keep answering 200 regardless:
+	// a process that cannot serve is still a process that should not be
+	// killed and restarted in a loop.
+	t.Run("health stays up", func(t *testing.T) {
+		srv, _, _ := testServer(t)
+		if w := doReq(t, srv.Handler(), "GET", "/api/v1/health", "", nil); w.Code != http.StatusOK {
+			t.Fatalf("health with nothing serving = %d, want 200", w.Code)
+		}
+	})
+}
+
+// TestSettingsPutMap covers the multi-key form of PUT /settings.
+//
+// One key per request made every dependent change a sequence the client had
+// to get right — the dashboard carries a five-phase dispatch table for it
+// (SAVE_PHASES in web/src/pages/settings.tsx) — and every save a burst of
+// round trips that each bumped the config version, so a save of six fields
+// reconfigured the running server six times. A map is one request, one
+// validation pass, one write and one bump.
+func TestSettingsPutMap(t *testing.T) {
+	t.Run("several keys at once, one config version bump", func(t *testing.T) {
+		srv, s, _ := testServer(t)
+		cookie := login(t, srv, s)
+		h := srv.Handler()
+		before, err := s.Settings().ConfigVersion(t.Context())
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		body := `{"blocking.mode":"nxdomain","blocking.ttl":"60","qlog.privacy":"anon"}`
+		if w := doReq(t, h, "PUT", "/api/v1/settings", body, cookie); w.Code != 204 {
+			t.Fatalf("map put: %d %s", w.Code, w.Body.String())
+		}
+		for key, want := range map[string]string{
+			"blocking.mode": "nxdomain", "blocking.ttl": "60", "qlog.privacy": "anon",
+		} {
+			if got, _, _ := s.Settings().Get(t.Context(), key); got != want {
+				t.Errorf("%s = %q, want %q", key, got, want)
+			}
+		}
+		after, err := s.Settings().ConfigVersion(t.Context())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if after != before+1 {
+			t.Errorf("config version went %d -> %d for one request; three keys must not "+
+				"reconfigure the running server three times", before, after)
+		}
+	})
+
+	t.Run("all or nothing", func(t *testing.T) {
+		srv, s, _ := testServer(t)
+		cookie := login(t, srv, s)
+		h := srv.Handler()
+		if w := doReq(t, h, "PUT", "/api/v1/settings", `{"blocking.mode":"null-ip"}`, cookie); w.Code != 204 {
+			t.Fatalf("seed: %d %s", w.Code, w.Body.String())
+		}
+		before, err := s.Settings().ConfigVersion(t.Context())
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		for _, tc := range []struct{ name, body, wantIn string }{
+			{"bad value", `{"blocking.mode":"nxdomain","blocking.ttl":"soon"}`, "blocking.ttl"},
+			{"key nobody may edit", `{"blocking.mode":"nxdomain","instance.id":"x"}`, "instance.id"},
+		} {
+			w := doReq(t, h, "PUT", "/api/v1/settings", tc.body, cookie)
+			if w.Code != 400 {
+				t.Fatalf("%s = %d %s, want 400", tc.name, w.Code, w.Body.String())
+			}
+			if got := settingsErr(t, w); !strings.Contains(got, tc.wantIn) {
+				t.Errorf("%s: error %q does not name %s", tc.name, got, tc.wantIn)
+			}
+			// The good key in the same body must not have landed. A partial
+			// apply is the worst outcome here: the caller is told the
+			// request failed and the server is in a state neither of them
+			// asked for.
+			if got, _, _ := s.Settings().Get(t.Context(), "blocking.mode"); got != "null-ip" {
+				t.Fatalf("%s: blocking.mode is %q — a rejected map wrote part of itself", tc.name, got)
+			}
+		}
+		after, err := s.Settings().ConfigVersion(t.Context())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if after != before {
+			t.Errorf("config version moved %d -> %d on a rejected write", before, after)
+		}
+	})
+
+	t.Run("dependent keys in one request", func(t *testing.T) {
+		srv, s, _ := testServer(t)
+		cookie := login(t, srv, s)
+		h := srv.Handler()
+		dir := t.TempDir()
+		cert, _ := certtest.For(t, "dns.example.test")
+		certPath, keyPath := writeKeypair(t, dir, "c", cert)
+
+		// Turning DoT on is only valid against a stored certificate pair, and
+		// the pair is only checked once both halves are present. Sent one at a
+		// time this needs three ordered requests; in one map the handler
+		// applies the same order itself.
+		body := `{"serve.dot.enabled":"true","serve.tls.cert":` + strconv.Quote(certPath) +
+			`,"serve.tls.key":` + strconv.Quote(keyPath) + `,"serve.dot.listen":"0.0.0.0:8853"}`
+		if w := doReq(t, h, "PUT", "/api/v1/settings", body, cookie); w.Code != 204 {
+			t.Fatalf("enabling DoT alongside its certificate: %d %s", w.Code, w.Body.String())
+		}
+		if got, _, _ := s.Settings().Get(t.Context(), "serve.dot.enabled"); got != "true" {
+			t.Errorf("serve.dot.enabled = %q, want true", got)
+		}
+
+		// And the other direction: clearing the paths is refused while a
+		// protocol is enabled, unless the disable travels with them — which
+		// is the phase order read backwards.
+		clear := `{"serve.tls.cert":"","serve.tls.key":""}`
+		if w := doReq(t, h, "PUT", "/api/v1/settings", clear, cookie); w.Code != 400 {
+			t.Errorf("clearing the certificate under an enabled protocol = %d, want 400", w.Code)
+		}
+		withDisable := `{"serve.dot.enabled":"false","serve.tls.cert":"","serve.tls.key":""}`
+		if w := doReq(t, h, "PUT", "/api/v1/settings", withDisable, cookie); w.Code != 204 {
+			t.Fatalf("clearing the certificate together with the disable: %d %s", w.Code, w.Body.String())
+		}
+	})
+
+	t.Run("a bad pair is refused before anything is written", func(t *testing.T) {
+		srv, s, _ := testServer(t)
+		cookie := login(t, srv, s)
+		h := srv.Handler()
+		dir := t.TempDir()
+		certA, _ := certtest.For(t, "a.example.test")
+		certB, _ := certtest.For(t, "b.example.test")
+		certPath, _ := writeKeypair(t, dir, "a", certA)
+		_, keyPath := writeKeypair(t, dir, "b", certB)
+
+		body := `{"serve.tls.cert":` + strconv.Quote(certPath) + `,"serve.tls.key":` + strconv.Quote(keyPath) + `}`
+		if w := doReq(t, h, "PUT", "/api/v1/settings", body, cookie); w.Code != 400 {
+			t.Fatalf("mismatched keypair accepted: %d %s", w.Code, w.Body.String())
+		}
+		if got, _, _ := s.Settings().Get(t.Context(), "serve.tls.cert"); got != "" {
+			t.Errorf("serve.tls.cert = %q after a rejected pair; nothing should have been written", got)
+		}
+	})
+
+	t.Run("the single-key form still works", func(t *testing.T) {
+		srv, s, _ := testServer(t)
+		cookie := login(t, srv, s)
+		h := srv.Handler()
+		if w := doReq(t, h, "PUT", "/api/v1/settings", `{"key":"blocking.mode","value":"nxdomain"}`, cookie); w.Code != 204 {
+			t.Fatalf("single-key put: %d %s", w.Code, w.Body.String())
+		}
+		if got, _, _ := s.Settings().Get(t.Context(), "blocking.mode"); got != "nxdomain" {
+			t.Fatalf("blocking.mode = %q", got)
+		}
+		// {"key": ...} with no value is still the single-key shape, so the
+		// answer stays a complaint about the value rather than "no such
+		// setting: key".
+		w := doReq(t, h, "PUT", "/api/v1/settings", `{"key":"blocking.ttl"}`, cookie)
+		if w.Code != 400 || !strings.Contains(settingsErr(t, w), "blocking.ttl") {
+			t.Errorf(`{"key":"blocking.ttl"} = %d %s, want 400 naming blocking.ttl`, w.Code, w.Body.String())
+		}
+	})
+
+	t.Run("a body that is not a string map is invalid json", func(t *testing.T) {
+		srv, s, _ := testServer(t)
+		cookie := login(t, srv, s)
+		h := srv.Handler()
+		for _, body := range []string{`{"blocking.ttl":60}`, `{"blocking.mode":null}`, `[]`} {
+			w := doReq(t, h, "PUT", "/api/v1/settings", body, cookie)
+			if w.Code != 400 || settingsErr(t, w) != "invalid json" {
+				t.Errorf("PUT %s = %d %s, want 400 invalid json — every value is a string, "+
+					"numbers included", body, w.Code, strings.TrimSpace(w.Body.String()))
+			}
 		}
 	})
 }

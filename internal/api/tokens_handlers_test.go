@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/aloks98/dnsaur/internal/auth"
 	"github.com/aloks98/dnsaur/internal/store"
@@ -236,5 +237,95 @@ func TestTOTPStartReturnsAScannableQR(t *testing.T) {
 	}
 	if got := img.Bounds().Dx(); got != qrPixels {
 		t.Fatalf("qr width = %d, want %d", got, qrPixels)
+	}
+}
+
+// TestTokenExpiry covers the optional expiry on POST /tokens end to end: a
+// stamp in the past is refused, one in the future is stored and listed, and
+// the token stops authenticating the moment it passes.
+//
+// The last part is the one that matters and the one nothing asserted:
+// auth.Service.Authenticate has always refused an expired token — that is
+// what makes a session expire — but until now no API token could ever carry
+// an expiry, so the branch was unreachable from this endpoint. A token
+// minted for a script that runs for a month is a credential that stops being
+// one on its own, which is the whole reason to offer the field.
+func TestTokenExpiry(t *testing.T) {
+	srv, s, _ := testServer(t)
+	h := srv.Handler()
+	cookie := login(t, srv, s)
+	now := time.Unix(1_700_000_000, 0)
+	srv.deps.Auth.Now = func() time.Time { return now }
+
+	past := now.Add(-time.Minute).UnixMilli()
+	future := now.Add(24 * time.Hour).UnixMilli()
+
+	for _, tc := range []struct{ name, body string }{
+		{"in the past", fmt.Sprintf(`{"name":"stale","expires_at":%d}`, past)},
+		{"now", fmt.Sprintf(`{"name":"stale","expires_at":%d}`, now.UnixMilli())},
+		{"negative", `{"name":"stale","expires_at":-1}`},
+	} {
+		w := doReq(t, h, "POST", "/api/v1/tokens", tc.body, cookie)
+		// The message is asserted, not just the status: before the field
+		// existed every one of these was 400 "invalid json" from the
+		// decoder's unknown-field check, which is the same status for a
+		// different reason and would pass a bare 400 assertion.
+		var body map[string]string
+		_ = json.Unmarshal(w.Body.Bytes(), &body)
+		if w.Code != 400 || !strings.Contains(body["error"], "expires_at") {
+			t.Errorf("expires_at %s = %d %s, want 400 naming expires_at", tc.name, w.Code, strings.TrimSpace(w.Body.String()))
+		}
+	}
+
+	w := doReq(t, h, "POST", "/api/v1/tokens",
+		fmt.Sprintf(`{"name":"month","scope":"write","expires_at":%d}`, future), cookie)
+	if w.Code != 201 {
+		t.Fatalf("create: %d %s", w.Code, w.Body.String())
+	}
+	var created struct {
+		Token string `json:"token"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &created); err != nil {
+		t.Fatal(err)
+	}
+
+	w = doReq(t, h, "GET", "/api/v1/tokens", "", cookie)
+	var list []store.AuthToken
+	if err := json.Unmarshal(w.Body.Bytes(), &list); err != nil {
+		t.Fatal(err)
+	}
+	if len(list) != 1 || list[0].ExpiresAt != future {
+		t.Fatalf("listed tokens = %+v, want one expiring at %d", list, future)
+	}
+
+	if w := bearerReq(h, "GET", "/api/v1/auth/me", created.Token); w.Code != 200 {
+		t.Fatalf("token refused before its expiry: %d %s", w.Code, w.Body.String())
+	}
+	now = now.Add(25 * time.Hour)
+	if w := bearerReq(h, "GET", "/api/v1/auth/me", created.Token); w.Code != 401 {
+		t.Errorf("expired token still authenticates: %d %s", w.Code, strings.TrimSpace(w.Body.String()))
+	}
+
+	// An omitted expiry still means never, which is what every token minted
+	// before this field existed carries.
+	w = doReq(t, h, "POST", "/api/v1/tokens", `{"name":"forever"}`, cookie)
+	if w.Code != 201 {
+		t.Fatalf("create without an expiry: %d %s", w.Code, w.Body.String())
+	}
+	var forever struct {
+		ID int64 `json:"id"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &forever); err != nil {
+		t.Fatal(err)
+	}
+	w = doReq(t, h, "GET", "/api/v1/tokens", "", cookie)
+	list = nil
+	if err := json.Unmarshal(w.Body.Bytes(), &list); err != nil {
+		t.Fatal(err)
+	}
+	for _, tok := range list {
+		if tok.ID == forever.ID && tok.ExpiresAt != 0 {
+			t.Errorf("a token created with no expires_at reports %d", tok.ExpiresAt)
+		}
 	}
 }

@@ -3,6 +3,7 @@ package api
 import (
 	"encoding/json"
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 
@@ -286,6 +287,58 @@ func TestGroupCreateRejectsUnknownListIDs(t *testing.T) {
 	for _, g := range groups {
 		if g.Name == "kids" {
 			t.Fatalf("a refused create left a group behind: %+v", g)
+		}
+	}
+}
+
+// TestClientsListFilterByGroup covers ?group_id= on GET /clients: the
+// group-detail screen wants one group's clients, and asking for all of them
+// to throw the rest away is work every screen has to repeat. Filtered in
+// the handler for the same reason the zone listing is — ClientStore.Clients
+// takes no options and the table is small.
+func TestClientsListFilterByGroup(t *testing.T) {
+	srv, s, _ := testServer(t)
+	h := srv.Handler()
+	cookie := login(t, srv, s)
+
+	kids := mustCreate(t, h, cookie, "/api/v1/groups", `{"name":"kids"}`)
+	iot := mustCreate(t, h, cookie, "/api/v1/groups", `{"name":"iot"}`)
+	mustCreate(t, h, cookie, "/api/v1/clients", fmt.Sprintf(`{"name":"ipad","matcher":"10.1.0.1","group_id":%d}`, kids))
+	mustCreate(t, h, cookie, "/api/v1/clients", fmt.Sprintf(`{"name":"bulb","matcher":"10.2.0.1","group_id":%d}`, iot))
+
+	names := func(query string) []string {
+		t.Helper()
+		w := doReq(t, h, "GET", "/api/v1/clients"+query, "", cookie)
+		if w.Code != 200 {
+			t.Fatalf("GET /clients%s = %d %s", query, w.Code, strings.TrimSpace(w.Body.String()))
+		}
+		var cs []store.Client
+		if err := json.Unmarshal(w.Body.Bytes(), &cs); err != nil {
+			t.Fatal(err)
+		}
+		out := make([]string, 0, len(cs))
+		for _, c := range cs {
+			out = append(out, c.Name)
+		}
+		return out
+	}
+
+	if got := names(""); len(got) != 2 {
+		t.Fatalf("unfiltered listing = %v, want both clients", got)
+	}
+	if got := names(fmt.Sprintf("?group_id=%d", kids)); !slices.Equal(got, []string{"ipad"}) {
+		t.Errorf("?group_id=%d = %v, want [ipad]", kids, got)
+	}
+	// A group with no clients is an empty list, not an error: the group
+	// exists and has nothing in it, which is a perfectly good answer.
+	empty := mustCreate(t, h, cookie, "/api/v1/groups", `{"name":"spare"}`)
+	if got := names(fmt.Sprintf("?group_id=%d", empty)); len(got) != 0 {
+		t.Errorf("?group_id on an empty group = %v, want []", got)
+	}
+	for _, query := range []string{"?group_id=abc", "?group_id=-1"} {
+		w := doReq(t, h, "GET", "/api/v1/clients"+query, "", cookie)
+		if w.Code != 400 {
+			t.Errorf("GET /clients%s = %d %s, want 400", query, w.Code, strings.TrimSpace(w.Body.String()))
 		}
 	}
 }

@@ -33,14 +33,27 @@ curl or any HTTP client.
   naming a row that does not exist is user input error, not infrastructure:
   it answers `404` when the missing row is the resource the URL addressed,
   and `400` naming the field when it came from the body.
+- A `POST` that creates something answers `201` with a **`Location`**
+  header naming the new row (`/api/v1/zones/7`) and **the created object**
+  as the body — not the bare `{"id": 7}` it used to, which made a client
+  build the URL itself out of a number and then fetch the row to see the
+  fields the server had filled in. `POST /tokens` is the one create whose
+  body is not the stored row: it also carries the plaintext token, which no
+  `GET` ever returns. `POST /setup` is the one `201` with no `Location` —
+  it creates the admin account, and there is no URL for a user.
 - A body that does not decode — malformed JSON, an unknown key, a
   wrong-typed field, an empty body — is always `400 invalid json`, on every
   endpoint. Field validation runs after that and says something about the
   field. Endpoints used to fold the two together, so `{"name": 5}` came
   back as `name required`, a claim about a field that had in fact been
   sent.
-- `GET /health` and `GET /openapi.yaml` are unauthenticated; every other
-  endpoint requires auth (`401` if missing/invalid).
+- A request naming a real path with a method it does not have is `405
+  method not allowed`, with an **`Allow`** header listing the methods that
+  path does serve (`DELETE /settings` → `Allow: GET, PUT`). Only a path no
+  endpoint serves at all is `404`.
+- `GET /health`, `GET /readyz` and `GET /openapi.yaml` are
+  unauthenticated; every other endpoint requires auth (`401` if
+  missing/invalid).
 
 ## Auth model
 
@@ -58,12 +71,31 @@ curl or any HTTP client.
   `POST /auth/logout` clears the cookie and revokes the session token.
   `GET /auth/me` returns the current user (`id`, `username`,
   `totp_enabled`).
-- **Throttle:** `POST /setup` and `POST /auth/login` share one budget of
+  `DELETE /auth/sessions` revokes every session on the account **except the
+  caller's own** — "log out everywhere" for a cookie you believe has been
+  copied — and answers `204`. API tokens are untouched: they are named
+  credentials, revoked by name.
+- **Password change:** `POST /auth/password`
+  (`{current_password, new_password}`) verifies the current password with
+  the same argon2id path login uses, enforces the same 8-character minimum
+  `POST /setup` does, and answers `204`. It **revokes every other session**
+  for the reason enabling TOTP does — a password change means nothing while
+  the sessions minted under the old one still work — keeping the caller's
+  own session and every API token. A wrong current password is `400
+  current password is wrong`, **not** `401`: the request authenticated
+  fine, and a `401` would tell a dashboard its session had expired over a
+  typo. There is no user enumeration to guard against here, since the
+  account is the one the caller is already signed in to.
+- **Throttle:** `POST /setup`, `POST /auth/login` and `POST /auth/password`
+  share one budget of
   **10 attempts per minute per source address**; exceeding it answers
   `429` (`{"error": "too many attempts"}`) with a `Retry-After` header, in
   seconds, for a one-minute lockout. Every answer costs an attempt — a
   malformed body, a wrong password, and the `428` that says the password
-  was right. That last one is what keeps the `428`/`401` split from being
+  was right. `POST /auth/password` is on the same budget although it is
+  authenticated: it runs the same argon2id verification and says whether
+  the password was right, so a stolen session cookie must not be an
+  unmetered oracle for the password it is not enough to change. That last one is what keeps the `428`/`401` split from being
   a free password oracle. Behind a reverse proxy, set `trusted_proxies`
   (see [`docs/configuration.md`](configuration.md)) or every request shares
   one source address and one budget.
@@ -142,23 +174,42 @@ Full parameter/response detail lives in `internal/api/openapi.yaml`
 (served at `GET /api/v1/openapi.yaml`). All paths below are relative to
 `/api/v1`.
 
-- **Meta** — `GET /health` (liveness + version), `GET /openapi.yaml` (this
-  spec). Both unauthenticated.
+- **Meta** — `GET /health` (liveness + version), `GET /readyz`
+  (readiness), `GET /openapi.yaml` (this spec). All unauthenticated.
+  **`/health` and `/readyz` answer different questions.** `/health` is 200
+  while the process is up — that is what a container runtime restarts on,
+  and a server that cannot serve is still one that should not be killed in
+  a loop. `/readyz` is 200 only when the store answers a ping *and* at
+  least one socket is bound for DNS (plain, DoT or DoH), and `503` with a
+  plain reason otherwise (`storage unavailable`, `no DNS listener is
+  bound`). A load balancer wants `/readyz`; pointing it at `/health` keeps
+  traffic flowing to a process that is up and resolving nothing.
 - **Setup** — `GET /setup`, `POST /setup`. See Auth model above.
 - **Auth** — `POST /auth/login`, `POST /auth/logout`, `GET /auth/me`,
+  `POST /auth/password`, `DELETE /auth/sessions`,
   `POST /auth/totp/start`, `POST /auth/totp/confirm`,
   `POST /auth/totp/disable`.
 - **Settings** — `GET /settings` (flat key→string map of all editable
   settings; `instance.*` keys and `stats.watermark` are internal and
   omitted),
-  `PUT /settings` (`{key, value}`, one key per call; editable keys:
+  `PUT /settings` (`{key, value}` for one, or a flat
+  `{"<key>": "<value>", ...}` map for several at once; editable keys:
   `upstreams`, `upstream.strategy`, `blocking.mode`, `blocking.ttl`,
   `cache.min_ttl`, `cache.max_ttl`, `cache.max_entries`,
   `cache.serve_stale_for`, `lists.refresh_hours`, `qlog.retention_days`,
   `qlog.privacy`, `stats.retention_days`, `serve.dot.enabled`, `serve.dot.listen`,
   `serve.doh.enabled`, `serve.doh.listen`, `serve.tls.cert`,
   `serve.tls.key` — see [`docs/configuration.md`](configuration.md) for
-  what each means and which require a restart to take effect). Enabling
+  what each means and which require a restart to take effect). **A map is
+  all-or-nothing**: every key is validated before any of them is written,
+  the write lands in one transaction, and there is one config-version bump
+  — so a rejected body changes nothing and a six-field save reconfigures
+  the running server once instead of six times. The keys are applied in
+  the order their dependencies require (protocols off, then
+  `serve.tls.cert`, then `serve.tls.key`, then everything else, then
+  protocols on), which is what lets a certificate pair and the enable that
+  depends on it travel in one request. Every value is a string, numbers
+  included; a number or a null is `400 invalid json`. Enabling
   `serve.dot.enabled`/`serve.doh.enabled` requires `serve.tls.cert` and
   `serve.tls.key` to already name a loadable certificate pair, or the
   write is rejected naming which to set first; and clearing either path
@@ -170,11 +221,7 @@ Full parameter/response detail lives in `internal/api/openapi.yaml`
   1 and up: it becomes the refresh timer's interval, and `0` is not a
   slower schedule but one no timer can be built from; and
   `stats.retention_days`, also 1 and up, because `0` would have the next
-  prune delete every hourly bucket the dashboard reads. **One
-  key per call is not incidental**: each write is validated against the
-  values already stored, so a client changing several dependent keys has to
-  order them — certificate paths before the `enabled` flags that check
-  them, and disables before a path is cleared. There is no separate
+  prune delete every hourly bucket the dashboard reads. There is no separate
   "upstreams" resource — upstream servers live in the `upstreams` setting.
 - **Resolver status** — `GET /resolver/status`
   (`{encryption_downgraded, reason, serving, certificate}`). Server state
@@ -227,7 +274,10 @@ Full parameter/response detail lives in `internal/api/openapi.yaml`
   ids in the array are a set, not an error. Every route under
   `/groups/{id}` answers `404` for a group that does not exist, reads
   included — `GET /groups/999/lists` is `404`, not `200 []`.
-- **Clients** — `GET /clients`, `POST /clients`, `PUT /clients/{id}`,
+- **Clients** — `GET /clients` (optionally `?group_id=` for one group's
+  clients; a group nobody created is an empty array, since the parameter
+  narrows a listing rather than addressing a resource, and a `group_id` that
+  is not a positive id is a `400`), `POST /clients`, `PUT /clients/{id}`,
   `DELETE /clients/{id}` — each client is an IP or CIDR `matcher` bound to
   a `group_id`. The matcher is stored canonically: CIDRs are masked,
   IPv4-mapped IPv6 is unmapped. An interface zone (`fe80::1%eth0`) is
@@ -253,7 +303,11 @@ Full parameter/response detail lives in `internal/api/openapi.yaml`
   the periodic download's next tick (`0` when no cadence is running). It
   comes from the running ticker, not the database, and is the same on every
   row — the interval is server-wide and there are no per-list schedules.
-- **Zones** — `GET /zones`, `POST /zones`, `GET /zones/{id}`,
+- **Zones** — `GET /zones` (optionally `?type=` — `primary`, `secondary`,
+  `forwarder`, `stub` or `internal` — and `?enabled=true|false`; an empty
+  parameter is no filter, and a value neither accepts is a `400` rather than
+  an empty array, so a mistyped filter cannot read as "you have none"),
+  `POST /zones`, `GET /zones/{id}`,
   `PATCH /zones/{id}`, `DELETE /zones/{id}` (cascades its records).
   `PATCH` is conditional on the zone not having changed since it was read:
   two patches touching different fields no longer overwrite each other, and
@@ -637,7 +691,10 @@ Full parameter/response detail lives in `internal/api/openapi.yaml`
 - **Queries** — `GET /queries` (search the query log; filters: `from`,
   `to`, `client`, `q`, `decision`, `type`, `limit` [default 100, capped
   1000], `offset`), `GET /queries/tail` (live tail as Server-Sent Events,
-  `text/event-stream`; `503` if query logging is disabled). A blocked row
+  `text/event-stream`; `503` if query logging is disabled). An idle stream
+  writes an SSE comment frame (`: ping`) every 20 seconds so a reverse
+  proxy's idle-read timeout does not close it; an `EventSource` ignores
+  comments, a hand-rolled parser has to. A blocked row
   carries `matched`, the rule pattern or list entry that fired — `rule_id`
   and `list_id` name the rule or the list, not the line of it. It is `""`
   for anything that was not blocked, and for rows logged before the column
@@ -652,10 +709,18 @@ Full parameter/response detail lives in `internal/api/openapi.yaml`
   duration arithmetic and asked for a span in the future, which answers
   nothing.
 - **Tokens** — `GET /tokens` (list this user's API tokens; session tokens
-  and hashes are never included), `POST /tokens` (`{name, scope}`, returns
-  the plaintext token once, and the `id` is the row that was actually
-  inserted), `DELETE /tokens/{id}` (revoke — `404` means this user owns no
-  token with that id, and only that; a storage failure is a `503`).
+  and hashes are never included), `POST /tokens`
+  (`{name, scope[, expires_at]}`, returns the plaintext token once
+  alongside the `id` of the row that was actually inserted),
+  `DELETE /tokens/{id}` (revoke — `404` means this user owns no token with
+  that id, and only that; a storage failure is a `503`).
+  `expires_at` is optional, unix ms, and must be in the future — a stamp
+  already past would mint a credential that is `401` on its next use, so it
+  is `400`. Omitted means never, which is the default and what every token
+  created before the field existed carries. Once it passes, the token is
+  `401` and is deleted on the attempt. **An API token's expiry does not
+  slide**, unlike a session's: it is a date its owner chose, and renewing it
+  on every use would mean a token set to die in a month never dies.
 
 TOTP enrollment/management endpoints are listed under Auth above, not
 Tokens — they manage account 2FA, not API tokens.

@@ -100,7 +100,11 @@ used to reach the storage-failure branch and answer `503 storage
 unavailable`. It is now `404 not found` when the missing row is the resource
 the URL named, and `400` naming the field when it came from the body.
 
-**Status codes** — `201` for creates (no `Location` header, ever), `204` for
+**Status codes** — `201` for creates — **with a `Location` header naming the
+new row, and the created object as the body**; a `POST` no longer answers a
+bare `{"id": n}` that the client has to build a URL out of. The one `201` with
+no `Location` is `POST /setup`, which creates the admin account, and this API
+has no URL for a user. `204` for
 updates/deletes (empty body — refetch to observe state), `202` for exactly one
 endpoint (`POST /filters/refresh`). Four more appear on the zone routes and
 nowhere else in this document until now: **`200` on a `POST`** (both
@@ -110,6 +114,13 @@ nowhere else in this document until now: **`200` on a `POST`** (both
 but is rejected, carrying an `errors` list beside the flat `error`), and
 **`502`** (`/zones/{id}/refresh`, when the master refused or was unreachable —
 a failure of a server this one depends on, not of this one).
+
+**`405`** is the one status no endpoint's own table lists, because no handler
+produces it: a request naming a real path with a method it does not have is
+answered by the router with `405 method not allowed` and an **`Allow`** header
+(`DELETE /api/v1/settings` → `Allow: GET, PUT`). It used to be `404 not
+found`, which is wrong twice over — the path was found, and the client was
+sent looking for a URL it already had.
 
 **No 405.** `/api/` is a registered catch-all, so a method mismatch on a real
 path returns **404** `not found`, not 405, and no `Allow` header. `HEAD` works
@@ -138,6 +149,20 @@ window in the future — a 200 reporting that nothing had happened.
 {"status":"ok","version":"dev"}
 ```
 `version` is the build version (`-X main.Version`); a source build reports `dev`.
+
+#### `GET /api/v1/readyz` — public
+
+```json
+{"status":"ok"}
+```
+200 only when the store answers a ping (within 2s) **and** at least one DNS
+socket is bound — plain, DoT or DoH. Otherwise `503` with the ordinary error
+envelope and one of two reasons: `storage unavailable`, or `no DNS listener is
+bound`.
+
+`/health` above is the liveness half and stays 200 either way. The split is the
+point: a process that cannot serve should stop receiving traffic, not be
+restarted in a loop.
 
 #### `GET /api/v1/openapi.yaml` — public
 Returns the embedded spec as `application/yaml`. Note it disagrees with the code
@@ -201,6 +226,26 @@ Body: `username`, `password`, `totp_code` (only needed once TOTP is enabled).
 **already-dead session gets 401** — treat that as success, the session is gone
 either way. A bearer-authenticated logout revokes nothing but still 204s.
 
+#### `POST /api/v1/auth/password`
+Body: `current_password`, `new_password` (**min 8 chars**, the same rule
+`/setup` enforces).
+
+**204** on success, and **every other session on the account is revoked** — the
+caller's own survives, API tokens are untouched. Any other tab is logged out on
+its next request with a plain 401, exactly as the TOTP endpoints do it.
+
+| Status | Error string | When |
+|---|---|---|
+| 400 | `invalid json` | |
+| 400 | `current password is wrong` | **not 401** — the request authenticated fine, and a 401 would send the dashboard back to the login screen over a typo |
+| 400 | `invalid input: password must be at least 8 characters` | |
+| 429 | `too many attempts` | shares `POST /auth/login`'s per-source budget: same argon2id cost, same yes/no answer about a password |
+| 503 | `storage unavailable` | |
+
+#### `DELETE /api/v1/auth/sessions`
+**204**, always. Revokes every session on the account except the caller's own.
+API tokens are not swept — they are revoked by name (§2.9). Nothing in the body.
+
 #### `GET /api/v1/auth/me`
 ```json
 {"id":1,"totp_enabled":false,"username":"admin"}
@@ -250,12 +295,32 @@ bookkeeping. `stats.retention_days` is an ordinary setting and is returned.
 ```
 
 #### `PUT /api/v1/settings`
-**One key per request**: `{"key": "...", "value": "..."}` — `value` must be a
-JSON *string* even for numeric settings. **204** on success.
+Two body shapes, told apart by the `key` entry (no editable setting is called
+that):
+
+- **One key**: `{"key": "...", "value": "..."}`.
+- **Several**: a flat `{"<key>": "<value>", ...}` map.
+
+Either way `value` must be a JSON *string*, even for numeric settings — a
+number or a null is `invalid json`. **204** on success.
+
+A map is **all-or-nothing**: every key is validated first, the write lands in
+one transaction, and the config version is bumped **once**. So a body with one
+bad key writes none of itself, and a six-field save reconfigures the running
+server once instead of six times.
+
+The server applies a map in the order the dependencies require — protocols
+being turned **off**, then `serve.tls.cert`, then `serve.tls.key`, then
+everything else, then protocols being turned **on** — which is the dashboard's
+own `SAVE_PHASES` (`web/src/pages/settings.tsx`) moved to the end that can
+enforce it. A certificate pair and the `enabled` that depends on it can
+therefore travel in one request. The dashboard still dispatches in phases; it
+does not have to.
 
 | Status | Error string |
 |---|---|
-| 400 | `invalid json` |
+| 400 | `invalid json` (including a non-string value) |
+| 400 | `no settings to write` (an empty map) |
 | 400 | `setting not editable: <key>` |
 | 400 | `invalid value for <key>` |
 | 503 | `storage unavailable` |
@@ -367,11 +432,11 @@ Path ids must parse as int64 **and be > 0**, else 400 `bad id`. So `0`, `-1`,
 | Endpoint | Success | Notes |
 |---|---|---|
 | `GET /groups` | 200 array | ordered by id |
-| `POST /groups` | 201 `{"id":2}` | body `{"name"[, "enabled"][, "list_ids"]}`; `name` required non-empty. `enabled` omitted = true. `list_ids` omitted = every existing list; `[]` = none. Every id must exist — one that doesn't is a 400 and **no group is created** |
+| `POST /groups` | 201 the group + `Location: /api/v1/groups/{id}` | body `{"name"[, "enabled"][, "list_ids"]}`; `name` required non-empty. `enabled` omitted = true. `list_ids` omitted = every existing list; `[]` = none. Every id must exist — one that doesn't is a 400 and **no group is created** |
 | `PATCH /groups/{id}` | 204 | body `{"name"?, "enabled"?}` — both optional pointers; `{}` is a legal no-op |
 | `DELETE /groups/{id}` | 204 | cascades the group's `group_lists` and `rules` |
-| `GET /clients` | 200 array | |
-| `POST /clients` | 201 `{"id":1}` | |
+| `GET /clients` | 200 array | `?group_id=` narrows to one group; a group with no clients (or none at all) is `[]`, never 404. A `group_id` that isn't a positive id is 400 `group_id must be a positive id` |
+| `POST /clients` | 201 the client + `Location: /api/v1/clients/{id}` | the `matcher` in the answer is the canonical spelling, not what was sent |
 | `PUT /clients/{id}` | 204 | **full replace** — an omitted `name` becomes `""` |
 | `DELETE /clients/{id}` | 204 | |
 
@@ -405,14 +470,14 @@ Path ids must parse as int64 **and be > 0**, else 400 `bad id`. So `0`, `-1`,
 | Endpoint | Success | Notes |
 |---|---|---|
 | `GET /filters/lists` | 200 array | rows carry **`next_refresh_at`** on top of the stored fields (§3.2) |
-| `POST /filters/lists` | **201** `{"id":1}` | body `{"url","kind"}` + **optional `name`**; kicks off a background refresh of *every* list |
+| `POST /filters/lists` | **201** the list + `Location: /api/v1/filters/lists/{id}` (same row shape `GET /filters/lists` returns, `next_refresh_at` included) | body `{"url","kind"}` + **optional `name`**; kicks off a background refresh of *every* list |
 | `PATCH /filters/lists/{id}` | 204 | body `{"enabled": bool}` and/or `{"name": string}` — **at least one required**; `url`/`kind` are rejected |
 | `DELETE /filters/lists/{id}` | 204 | |
 | `POST /filters/lists/{id}/refresh` | **202** the updated list row | downloads **this list only**, inside the request; no body read. **404** unknown id, **409** a disabled list |
 | `GET /groups/{id}/lists` | 200 array | **404** for a group that does not exist (it used to answer `[]` + 200) |
 | `PUT /groups/{id}/lists` | 204 | body `{"list_ids":[...]}`; `null`/omitted unassigns everything. One transaction; duplicate ids are a set; unknown id → 400, unknown group → 404 |
 | `GET /groups/{id}/rules` | 200 array | **404** for a group that does not exist |
-| `POST /groups/{id}/rules` | 201 `{"id":1}` | group comes from the **path**, not the body; a group that does not exist → **404** |
+| `POST /groups/{id}/rules` | 201 the rule + `Location: /api/v1/filters/rules/{id}` — the URL that **deletes** it, since a rule has no read of its own | group comes from the **path**, not the body; a group that does not exist → **404** |
 | `DELETE /filters/rules/{id}` | 204 | note the asymmetry: created under `/groups/{id}/rules`, deleted under `/filters/rules/{id}` |
 | `POST /filters/refresh` | **202** `{"status":"refreshing"}` | no body read |
 
@@ -485,13 +550,13 @@ forwarded**, which is the entire point of the change (see
 
 | Endpoint | Success |
 |---|---|
-| `GET /zones` | 200 array |
-| `POST /zones` | 201 `{"id":1}` |
+| `GET /zones` | 200 array — `?type=` (`primary`/`secondary`/`forwarder`/`stub`/`internal`) and `?enabled=` (exactly `true`/`false`) narrow it; an empty parameter is no filter, an unknown value is 400 |
+| `POST /zones` | 201 the zone, generated SOA fields included + `Location: /api/v1/zones/{id}` |
 | `GET /zones/{id}` | 200 object |
 | `PATCH /zones/{id}` | 204 — conditional on the zone not having changed since it was read (a lost race is retried once, then 409); renaming, disabling or re-enabling a `primary` moves the PTRs its records own |
 | `DELETE /zones/{id}` | 204 — cascades every record in the zone, and retires the PTRs those records owned from whatever reverse zone holds them (the cascade cannot reach those: they are rows in a different zone) |
 | `GET /zones/{id}/records` | 200 array |
-| `POST /zones/{id}/records` | 201 `{"id":1}` |
+| `POST /zones/{id}/records` | 201 the record, `rdata` in the parser's own spelling + `Location: /api/v1/zones/{id}/records/{rid}` |
 | `PUT /zones/{id}/records/{rid}` | 204 (full replace) |
 | `DELETE /zones/{id}/records/{rid}` | 204 |
 
@@ -752,8 +817,11 @@ Four things a client must know:
   middleware *before* the database assigns a row id
   (`internal/qlog/qlog.go:173`). Streamed rows therefore cannot be correlated
   with stored rows by id, and cannot be deduplicated against `GET /queries`.
-- **No heartbeat.** There is no keepalive ping, so an idle stream sends zero
-  bytes and any proxy with an idle timeout will drop it.
+- **A heartbeat every 20 seconds.** An idle stream writes `: ping\n\n`, an SSE
+  comment frame, so it never looks abandoned to a proxy with an idle-read
+  timeout in front of it. An `EventSource` ignores comment lines, so a client
+  needs no code for this — but a client parsing the stream by hand must skip
+  any line starting with `:`.
 
 Backpressure: the per-subscriber channel is buffered at **64** and publishing is
 non-blocking — a slow client **silently misses entries**, with no signal in the
@@ -830,18 +898,27 @@ Metric universes differ, so counts across metrics are not comparable:
 | Endpoint | Success | Notes |
 |---|---|---|
 | `GET /tokens` | 200 array | only the caller's `kind:"api"` rows; sessions are never listed |
-| `POST /tokens` | 201 `{"id","token"}` | plaintext returned **once** |
+| `POST /tokens` | 201 `{"id","token"}` + `Location: /api/v1/tokens/{id}` | body `{"name"[, "scope"][, "expires_at"]}`; plaintext returned **once** — the only field here that no `GET` ever returns, which is why this one answer is not the stored row |
 | `DELETE /tokens/{id}` | 204 | |
 
 ```json
 [{"id":2,"user_id":1,"kind":"api","name":"grafana-scraper","scope":"read",
   "created_at":1785946863832,"expires_at":0,"last_used":0}]
 ```
-`expires_at: 0` means **never expires** — every API token is non-expiring.
+`expires_at: 0` means **never expires**, and is the default: `POST /tokens`
+takes an optional `expires_at` (unix ms, and it must be **in the future** — a
+past one is a 400 rather than a token that is dead on arrival). Once it passes,
+the token answers 401 and is deleted on the attempt.
+
+**An API token's expiry never slides.** A session's is pushed out by use
+(§1); a token's is a date its owner chose, and renewing it every time a
+script runs would make the field a decoration.
+
 `token_hash` is `json:"-"` and never leaves the server.
 
 Errors: 400 `invalid json` (any body that fails to decode), 400 `name required`,
-400 `scope must be read or write`, 404 `not found` on delete — which covers a
+400 `scope must be read or write`, 400 `expires_at must be a unix-ms time in the
+future`, 404 `not found` on delete — which covers a
 token that does not exist and another user's token, **and nothing else**: a
 storage failure is a 503. Every error used to map to 404, so a database that
 was merely unreachable told a script the token was already gone.
@@ -859,7 +936,7 @@ silently, since that listing's error was discarded too.
 | Endpoint | Success | Notes |
 |---|---|---|
 | `GET /tsig-keys` | 200 array | `[]` when empty, never `null` |
-| `POST /tsig-keys` | 201 `{"id"}` | |
+| `POST /tsig-keys` | 201 the key + `Location: /api/v1/tsig-keys/{id}` | |
 | `GET /tsig-keys/{id}` | 200 object | |
 | `PUT /tsig-keys/{id}` | 204 | full replace — all three fields required, same as create. **409** when it renames a key a zone names by name — see below |
 | `DELETE /tsig-keys/{id}` | 204 | **404** for an id that never existed, **409** when a zone names the key — see below |
@@ -1320,7 +1397,8 @@ ordinary settings and stay visible).
 
 `kind` is `session` or `api` — **not** a DB or API-level enum, just the only two
 values the code writes. Session tokens always have `scope: "write"`, `name: ""`,
-and a 30-day expiry; API tokens have `expires_at: 0` (never). Token material is
+and a 30-day sliding expiry; an API token has `expires_at: 0` (never) unless one
+was chosen at creation, and that one never slides. Token material is
 32 random bytes, base64url for the plaintext, SHA-256 hex stored.
 
 ### 3.11 DHCP lease — **TODO, nothing exists**
@@ -1669,7 +1747,7 @@ an inline script because the served CSP is `script-src 'self'` with no
 | **Filtering → Lists** | The table leads with the list's `name`; the URL is a muted second line and stays in the row's `title`. Actions (toggle, rename, delete) are labelled by name. The **Status** column replaces the old "Last refreshed" one and carries the badge plus a plain-language line per `last_status`. |
 | **Dashboard health** | Reduced to the shell's two row-1 readouts (blocking state, and `DNS OK`/`DNS down` from `GET /health`). Filter-list freshness moved off the dashboard with the redesign and now lives only on Filtering → Lists. The spec's "upstreams healthy" signal **has no code at all** — there is no upstream-health endpoint. |
 | **Settings** | 12 keys work. The spec's "storage (read-only info)" section is absent, with a code comment noting no endpoint exists to source it. |
-| **Account** | TOTP and tokens are complete. **Change password is not implemented**; the page says so: *"Password changes aren't available yet — that's planned for a future update."* |
+| **Account** | TOTP, tokens and password are complete: the Password section holds a current/new/confirm form and a **Log out everywhere** action (`POST /auth/password`, `DELETE /auth/sessions`, §2.2). |
 | **Command palette** | Navigates to the 9 leaf pages only, grouped by nav section. The spec's "quick actions (pause, block a domain)" don't exist. |
 
 ### Not started

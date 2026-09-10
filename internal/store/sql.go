@@ -12,17 +12,18 @@ type sqlStore struct {
 	hub     notifyHub
 }
 
-func (s *sqlStore) Close() error            { return s.db.Close() }
-func (s *sqlStore) Clients() ClientStore    { return &clientStore{s} }
-func (s *sqlStore) Filters() FilterStore    { return &filterStore{s} }
-func (s *sqlStore) Settings() SettingsStore { return &settingsStore{s: s} }
-func (s *sqlStore) QueryLog() QueryLogStore { return &queryLogStore{s} }
-func (s *sqlStore) Stats() StatsStore       { return &statsStore{s: s} }
-func (s *sqlStore) Users() UserStore        { return &userStore{s} }
-func (s *sqlStore) Tokens() TokenStore      { return &tokenStore{s} }
-func (s *sqlStore) Zones() ZoneStore        { return &zoneStore{s} }
-func (s *sqlStore) TSIGKeys() TSIGKeyStore  { return &tsigKeyStore{s} }
-func (s *sqlStore) Notifies() NotifyStore   { return &notifyStore{s: s} }
+func (s *sqlStore) Close() error                   { return s.db.Close() }
+func (s *sqlStore) Ping(ctx context.Context) error { return s.db.PingContext(ctx) }
+func (s *sqlStore) Clients() ClientStore           { return &clientStore{s} }
+func (s *sqlStore) Filters() FilterStore           { return &filterStore{s} }
+func (s *sqlStore) Settings() SettingsStore        { return &settingsStore{s: s} }
+func (s *sqlStore) QueryLog() QueryLogStore        { return &queryLogStore{s} }
+func (s *sqlStore) Stats() StatsStore              { return &statsStore{s: s} }
+func (s *sqlStore) Users() UserStore               { return &userStore{s} }
+func (s *sqlStore) Tokens() TokenStore             { return &tokenStore{s} }
+func (s *sqlStore) Zones() ZoneStore               { return &zoneStore{s} }
+func (s *sqlStore) TSIGKeys() TSIGKeyStore         { return &tsigKeyStore{s} }
+func (s *sqlStore) Notifies() NotifyStore          { return &notifyStore{s: s} }
 
 func (s *sqlStore) q(q string) string { return rebind(s.dialect, q) }
 

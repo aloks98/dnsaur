@@ -215,7 +215,8 @@ func (s *Server) handleZoneRecordCreate(w http.ResponseWriter, r *http.Request) 
 	s.syncPTR(r.Context(), nil, &rec, zone.Name)
 	s.reloadZones(r)
 	s.notifyZones()
-	writeJSON(w, http.StatusCreated, map[string]int64{"id": id})
+	rec.ID = id
+	created(w, resourceURL("zones/"+strconv.FormatInt(zid, 10)+"/records", id), rec)
 }
 
 func (s *Server) handleZoneRecordUpdate(w http.ResponseWriter, r *http.Request) {

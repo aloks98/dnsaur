@@ -49,7 +49,7 @@ import {
 } from "@e412/rnui-react";
 import { ApiError } from "../api/client";
 import type { ApiToken } from "../api/types";
-import { useMe } from "../hooks/use-auth";
+import { useChangePassword, useMe, useRevokeSessions } from "../hooks/use-auth";
 import { useCreateToken, useRevokeToken, useTokens } from "../hooks/use-tokens";
 import {
   useTotpConfirm,
@@ -57,7 +57,7 @@ import {
   useTotpStart,
   type TotpStartResult,
 } from "../hooks/use-totp";
-import { relativeTime } from "../lib/format";
+import { formatDuration, relativeTime } from "../lib/format";
 import { requiredText, totpCodeSchema } from "../lib/schemas";
 import { StaleDataAlert } from "../components/stale-data-alert";
 import { ConfirmDeleteDialog } from "./dialogs";
@@ -498,9 +498,37 @@ function TokenScopeBadge({ scope }: { scope: ApiToken["scope"] }) {
   );
 }
 
+// The expiry options, as day counts. A small fixed set rather than a date
+// picker: the question a token is created with an answer to is "how long
+// should this live", and every honest answer to it is one of these.
+const EXPIRY_OPTIONS: { value: string; label: string; days: number }[] = [
+  { value: "never", label: "never", days: 0 },
+  { value: "30", label: "30 days", days: 30 },
+  { value: "90", label: "90 days", days: 90 },
+  { value: "365", label: "1 year", days: 365 },
+];
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+/** Unix ms the token should stop working, or undefined for never — the
+ * shape POST /tokens takes, where the field is simply absent. */
+function expiresAtFor(option: string): number | undefined {
+  const days = EXPIRY_OPTIONS.find((o) => o.value === option)?.days ?? 0;
+  return days === 0 ? undefined : Date.now() + days * DAY_MS;
+}
+
+/** What the Expires column says. `0` is the server's "never", and every
+ * token created before the field existed carries it. */
+function expiresLabel(expiresAt: number): string {
+  if (!expiresAt) return "never";
+  const remaining = expiresAt - Date.now();
+  return remaining <= 0 ? "expired" : `in ${formatDuration(remaining)}`;
+}
+
 const tokenFormSchema = z.object({
   name: requiredText("Name is required"),
   scope: z.enum(["read", "write"]),
+  expiresIn: z.string(),
 });
 
 type TokenFormValues = z.infer<typeof tokenFormSchema>;
@@ -512,12 +540,12 @@ type TokenFormValues = z.infer<typeof tokenFormSchema>;
 // a *new* credential the admin hasn't reasoned about yet; upgrading to
 // read & write is one deliberate Select change away.
 function tokenFormDefaults(): TokenFormValues {
-  return { name: "", scope: "read" };
+  return { name: "", scope: "read", expiresIn: "never" };
 }
 
 /** One declaration of the column geometry, shared by the header, the
  * create row and every token row. */
-const TOKEN_GRID = "grid grid-cols-[1fr_104px_108px_116px_96px_84px] items-center gap-3.5 px-5";
+const TOKEN_GRID = "grid grid-cols-[1fr_104px_108px_116px_112px_84px] items-center gap-3.5 px-5";
 
 /**
  * The create row: a band under the header rather than a dialog, so a token
@@ -549,7 +577,7 @@ function NewTokenRow({
 
   function onSubmit(values: TokenFormValues) {
     createToken.mutate(
-      { name: values.name.trim(), scope: values.scope },
+      { name: values.name.trim(), scope: values.scope, expires_at: expiresAtFor(values.expiresIn) },
       {
         onSuccess: (result) => {
           toast.success("Token created");
@@ -604,11 +632,27 @@ function NewTokenRow({
               </FormItem>
             )}
           />
-          {/* The three the server fills in, shown so the row lines up with
+          {/* The two the server fills in, shown so the row lines up with
               the header and says what the token will be. */}
           <span className="font-mono text-sm text-muted-foreground">now</span>
           <span className="font-mono text-sm text-muted-foreground">—</span>
-          <span className="font-mono text-sm text-muted-foreground">never</span>
+          <FormField
+            control={form.control}
+            name="expiresIn"
+            render={({ field }) => (
+              <FormItem>
+                <FormControl>
+                  <NativeSelect {...field} aria-label="Expires">
+                    {EXPIRY_OPTIONS.map((option) => (
+                      <NativeSelectOption key={option.value} value={option.value}>
+                        {option.label}
+                      </NativeSelectOption>
+                    ))}
+                  </NativeSelect>
+                </FormControl>
+              </FormItem>
+            )}
+          />
           <div className="flex items-center justify-end gap-1.5">
             <Button type="submit" size="sm" disabled={createToken.isPending}>
               {createToken.isPending ? "Creating…" : "Create"}
@@ -749,7 +793,15 @@ function TokensCard() {
         >
           {relativeTime(token.last_used)}
         </span>
-        <span className="font-mono text-sm text-muted-foreground">never</span>
+        <span
+          className={cn(
+            "font-mono text-sm",
+            token.expires_at ? "text-foreground" : "text-muted-foreground",
+          )}
+          title={token.expires_at ? new Date(token.expires_at).toLocaleString() : undefined}
+        >
+          {expiresLabel(token.expires_at)}
+        </span>
         <span className="flex items-center justify-end">
           <Button
             type="button"
@@ -832,7 +884,7 @@ function TokensCard() {
       <div className="flex shrink-0 items-center gap-2.5 border-b border-border px-5 py-2.5">
         <span className="font-mono text-xs text-muted-foreground">
           {tokens.data
-            ? `${tokens.data.length} ${tokens.data.length === 1 ? "token" : "tokens"} · none expire`
+            ? `${tokens.data.length} ${tokens.data.length === 1 ? "token" : "tokens"}`
             : ""}
         </span>
         {!isEmpty && !addOpen && (
@@ -900,6 +952,148 @@ function TokensCard() {
   );
 }
 
+// --- password ------------------------------------------------------------
+
+// Mirrors the server: an 8-character minimum (auth.minPasswordLen), checked
+// here only so a too-short password fails before the round trip. The
+// confirmation field has no server counterpart at all and is kept for the
+// reason first-run setup keeps one — there is no recovery flow, so a typo
+// in a new password is unrecoverable without shell access.
+const passwordFormSchema = z
+  .object({
+    current: z.string().min(1, "Enter your current password"),
+    next: z.string().min(8, "Password must be at least 8 characters"),
+    confirm: z.string().min(1, "Confirm your new password"),
+  })
+  .superRefine((values, ctx) => {
+    if (values.confirm !== values.next) {
+      ctx.addIssue({ code: "custom", message: "Passwords don't match", path: ["confirm"] });
+    }
+  });
+
+type PasswordFormValues = z.infer<typeof passwordFormSchema>;
+
+function PasswordCard() {
+  const changePassword = useChangePassword();
+  const revokeSessions = useRevokeSessions();
+  const form = useForm<PasswordFormValues>({
+    resolver: zodResolver(passwordFormSchema),
+    defaultValues: { current: "", next: "", confirm: "" },
+  });
+
+  function onSubmit(values: PasswordFormValues) {
+    changePassword.mutate(
+      { current_password: values.current, new_password: values.next },
+      {
+        onSuccess: () => {
+          toast.success("Password changed. Other sessions signed out.");
+          form.reset({ current: "", next: "", confirm: "" });
+          // The typed passwords survive in the mutation's `variables` until
+          // a new mutate() or an explicit reset(), regardless of the form
+          // being cleared above — the same retention the TOTP secret gets
+          // careful treatment for further up this page.
+          changePassword.reset();
+        },
+        onError: (err) => {
+          // The only 400 that can still reach here is a wrong current
+          // password: length and confirmation are checked above, before
+          // anything is sent. Everything else (429 from the shared login
+          // throttle, 503) is about the request rather than a field.
+          if (err instanceof ApiError && err.status === 400) {
+            form.setError("current", { message: err.message });
+            form.resetField("current", { keepError: true });
+            return;
+          }
+          toast.error(err instanceof ApiError ? err.message : "Couldn't change the password");
+        },
+      },
+    );
+  }
+
+  function onLogOutEverywhere() {
+    revokeSessions.mutate(undefined, {
+      onSuccess: () => toast.success("Other sessions signed out"),
+      onError: (err) =>
+        toast.error(err instanceof ApiError ? err.message : "Couldn't sign the other sessions out"),
+    });
+  }
+
+  return (
+    <Section title="Password" icon={Lock} description="The password you sign in with.">
+      <Form {...form}>
+        <form
+          className="flex max-w-sm flex-col gap-4 p-5"
+          onSubmit={(e) => void form.handleSubmit(onSubmit)(e)}
+          noValidate
+        >
+          <FormField
+            control={form.control}
+            name="current"
+            render={({ field }) => (
+              <FormItem>
+                <FormLabel>Current password</FormLabel>
+                <FormControl>
+                  <Input {...field} type="password" autoComplete="current-password" />
+                </FormControl>
+                <FormMessage />
+              </FormItem>
+            )}
+          />
+          <FormField
+            control={form.control}
+            name="next"
+            render={({ field }) => (
+              <FormItem>
+                <FormLabel>New password</FormLabel>
+                <FormControl>
+                  <Input {...field} type="password" autoComplete="new-password" />
+                </FormControl>
+                <FormDescription>At least 8 characters.</FormDescription>
+                <FormMessage />
+              </FormItem>
+            )}
+          />
+          <FormField
+            control={form.control}
+            name="confirm"
+            render={({ field }) => (
+              <FormItem>
+                <FormLabel>Confirm new password</FormLabel>
+                <FormControl>
+                  <Input {...field} type="password" autoComplete="new-password" />
+                </FormControl>
+                <FormMessage />
+              </FormItem>
+            )}
+          />
+          <div>
+            <Button type="submit" size="sm" disabled={changePassword.isPending}>
+              {changePassword.isPending ? "Changing…" : "Change password"}
+            </Button>
+          </div>
+        </form>
+      </Form>
+
+      <div className="flex flex-wrap items-center gap-5 border-t border-border-muted p-5">
+        <p className="text-sm text-muted-foreground">
+          Signs every other browser out. This one stays signed in.
+        </p>
+        <div className="ml-auto">
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            onClick={onLogOutEverywhere}
+            disabled={revokeSessions.isPending}
+          >
+            {revokeSessions.isPending ? "Signing out…" : "Log out everywhere"}
+          </Button>
+        </div>
+      </div>
+    </Section>
+  );
+}
+
 // --- page ------------------------------------------------------------------
 
 function AccountSkeleton() {
@@ -962,16 +1156,7 @@ export function Account() {
           )}
           <TotpCard enabled={me.data.totp_enabled} />
           <TokensCard />
-          <Section
-            title="Password"
-            icon={Lock}
-            badge={<Badge variant="secondary">Planned</Badge>}
-            description="The password you sign in with."
-          >
-            <p className="p-5 text-sm text-muted-foreground">
-              Password changes aren&apos;t available yet — that&apos;s planned for a future update.
-            </p>
-          </Section>
+          <PasswordCard />
         </>
       )}
     </div>

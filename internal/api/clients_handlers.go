@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"net/http"
+	"slices"
 	"strconv"
 
 	"github.com/aloks98/dnsaur/internal/clients"
@@ -116,7 +117,8 @@ func (s *Server) handleGroupCreate(w http.ResponseWriter, r *http.Request) {
 	// surfaced, not logged — answering 201 for a group that came out
 	// enabled when the caller asked for disabled is a lie about the one
 	// field they bothered to send.
-	if body.Enabled != nil && !*body.Enabled {
+	enabled := body.Enabled == nil || *body.Enabled
+	if !enabled {
 		if err := s.deps.Store.Clients().SetGroupEnabled(r.Context(), id, false); err != nil {
 			storeErr(w, err)
 			return
@@ -129,7 +131,7 @@ func (s *Server) handleGroupCreate(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	s.reloadClients(r)
-	writeJSON(w, http.StatusCreated, map[string]int64{"id": id})
+	created(w, resourceURL("groups", id), store.Group{ID: id, Name: body.Name, Enabled: enabled})
 }
 
 type groupPatch struct {
@@ -181,11 +183,27 @@ func (s *Server) handleGroupDelete(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// handleClientsList answers every client, optionally narrowed to one
+// group's by ?group_id=. Filtered in the handler, for the reason the zone
+// listing gives: ClientStore.Clients takes no options, and the row count is
+// a household's devices.
+//
+// A group_id naming no group is an empty array rather than a 404. The
+// parameter narrows a listing; it does not address a resource, and a group
+// that was deleted a moment ago has no clients, which is the true answer.
 func (s *Server) handleClientsList(w http.ResponseWriter, r *http.Request) {
+	groupID, byGroup, err := qID(r, "group_id")
+	if err != nil {
+		errJSON(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	cs, err := s.deps.Store.Clients().Clients(r.Context())
 	if err != nil {
 		storeErr(w, err)
 		return
+	}
+	if byGroup {
+		cs = slices.DeleteFunc(cs, func(c store.Client) bool { return c.GroupID != groupID })
 	}
 	writeJSON(w, http.StatusOK, cs)
 }
@@ -224,7 +242,8 @@ func (s *Server) handleClientCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.reloadClients(r)
-	writeJSON(w, http.StatusCreated, map[string]int64{"id": id})
+	body.ID = id
+	created(w, resourceURL("clients", id), body)
 }
 
 func (s *Server) handleClientPut(w http.ResponseWriter, r *http.Request) {

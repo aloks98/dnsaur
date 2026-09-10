@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -1243,5 +1244,73 @@ func TestZonePatchRefusesTypeChangeThatLeavesForwardToStale(t *testing.T) {
 
 	if bad := ts.do(t, "PATCH", "/api/v1/zones/"+id, `{"type":"stub","primaries":"10.0.0.9"}`); bad.Code != http.StatusBadRequest {
 		t.Fatalf("PATCH type to stub without clearing forward_to: status %d, body %s", bad.Code, bad.Body)
+	}
+}
+
+// TestZonesListFilters covers ?type= and ?enabled= on GET /zones.
+//
+// Without them a dashboard that wants the forwarders fetches every zone —
+// built-in reverse zones included, sixteen of them on a fresh install — and
+// throws most of it away. The filtering is done in the handler rather than
+// in SQL: ZoneStore.Zones takes no options, and a homelab's zone count is
+// the sixteen seeded ones plus a handful, so a WHERE clause would be a
+// store-interface change to save a slice scan.
+func TestZonesListFilters(t *testing.T) {
+	srv, s, _ := testServer(t)
+	h := srv.Handler()
+	cookie := login(t, srv, s)
+
+	mustCreate(t, h, cookie, "/api/v1/zones", `{"name":"home.test"}`)
+	mustCreate(t, h, cookie, "/api/v1/zones",
+		`{"name":"corp.test","type":"forwarder","forward_to":"10.0.0.1","enabled":false}`)
+
+	names := func(query string) []string {
+		t.Helper()
+		w := doReq(t, h, "GET", "/api/v1/zones"+query, "", cookie)
+		if w.Code != 200 {
+			t.Fatalf("GET /zones%s = %d %s", query, w.Code, strings.TrimSpace(w.Body.String()))
+		}
+		var zs []store.Zone
+		if err := json.Unmarshal(w.Body.Bytes(), &zs); err != nil {
+			t.Fatal(err)
+		}
+		out := make([]string, 0, len(zs))
+		for _, z := range zs {
+			out = append(out, z.Name)
+		}
+		return out
+	}
+
+	all := names("")
+	if len(all) < 3 {
+		t.Fatalf("unfiltered listing returned %v, want the built-ins plus both new zones", all)
+	}
+	if got := names("?type=forwarder"); !slices.Equal(got, []string{"corp.test"}) {
+		t.Errorf("?type=forwarder = %v, want [corp.test]", got)
+	}
+	if got := names("?enabled=false"); !slices.Equal(got, []string{"corp.test"}) {
+		t.Errorf("?enabled=false = %v, want [corp.test]", got)
+	}
+	if got := names("?type=primary&enabled=true"); !slices.Equal(got, []string{"home.test"}) {
+		t.Errorf("?type=primary&enabled=true = %v, want [home.test]", got)
+	}
+	// The built-ins are type "internal" and must be reachable by name too,
+	// or the one filter value that matches most of the table is missing.
+	if got := names("?type=internal"); len(got) == 0 || slices.Contains(got, "home.test") {
+		t.Errorf("?type=internal = %v, want the built-in zones and nothing else", got)
+	}
+	// An empty parameter is not a filter: ?type= is the shape a form sends
+	// for "no choice made", and answering nothing to it would be a listing
+	// that silently empties itself.
+	if got := names("?type=&enabled="); len(got) != len(all) {
+		t.Errorf("?type=&enabled= returned %d zones, want all %d", len(got), len(all))
+	}
+
+	for _, query := range []string{"?type=bogus", "?enabled=maybe", "?enabled=1"} {
+		w := doReq(t, h, "GET", "/api/v1/zones"+query, "", cookie)
+		if w.Code != 400 {
+			t.Errorf("GET /zones%s = %d %s, want 400 — a filter nobody can satisfy must not read "+
+				"as an empty result", query, w.Code, strings.TrimSpace(w.Body.String()))
+		}
 	}
 }

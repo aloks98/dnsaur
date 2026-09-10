@@ -164,7 +164,14 @@ func (s *Server) handleListCreate(w http.ResponseWriter, r *http.Request) {
 	// this one really does download — in the background, so the request
 	// doesn't block on it.
 	s.downloadLists(r)
-	writeJSON(w, http.StatusCreated, map[string]int64{"id": id})
+	// Read back rather than echoed: a blank name is derived from the URL on
+	// the way out, and the status columns are the store's to fill in, so
+	// only the stored row is the row this created.
+	l, ok := s.findList(w, r, id)
+	if !ok {
+		return
+	}
+	created(w, resourceURL("filters/lists", id), listRow{List: l, NextRefreshAt: s.deps.Reloader.NextFilterRefresh()})
 }
 
 // maxListNameLen bounds a user-supplied list name. It is rendered in table
@@ -381,7 +388,12 @@ func (s *Server) handleRuleCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.refreshFilters(r)
-	writeJSON(w, http.StatusCreated, map[string]int64{"id": id})
+	// The rule's own URL is the one that deletes it: a rule has no read of
+	// its own, and DELETE /filters/rules/{id} is the only thing that
+	// addresses one.
+	created(w, resourceURL("filters/rules", id), store.Rule{
+		ID: id, GroupID: gid, Action: body.Action, Pattern: pattern, IsRegex: body.IsRegex,
+	})
 }
 
 func (s *Server) handleRuleDelete(w http.ResponseWriter, r *http.Request) {

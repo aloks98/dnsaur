@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"maps"
+	"slices"
 	"strconv"
 	"sync"
 )
@@ -59,14 +61,32 @@ func (st *settingsStore) GetInt(ctx context.Context, key string) (int64, error) 
 }
 
 func (st *settingsStore) Set(ctx context.Context, key, value string) error {
+	return st.SetMany(ctx, map[string]string{key: value})
+}
+
+const settingUpsert = `INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value`
+
+// SetMany writes every pair in one transaction and bumps the config version
+// once, so a caller changing several dependent settings reconfigures the
+// running server once rather than once per key. Set is this with one pair.
+//
+// The keys are written in sorted order. Nothing observes the order — the
+// transaction commits as a unit — but two concurrent multi-key writes that
+// touched the same rows in opposite orders could deadlock on postgres,
+// which takes a row lock per UPDATE.
+func (st *settingsStore) SetMany(ctx context.Context, values map[string]string) error {
+	if len(values) == 0 {
+		return nil
+	}
 	tx, err := st.s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	upsert := `INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value`
-	if _, err := tx.ExecContext(ctx, st.s.q(upsert), key, value); err != nil {
-		return err
+	for _, key := range slices.Sorted(maps.Keys(values)) {
+		if _, err := tx.ExecContext(ctx, st.s.q(settingUpsert), key, values[key]); err != nil {
+			return err
+		}
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE config_version SET version = version + 1 WHERE id = 1`); err != nil {
 		return err
@@ -83,7 +103,7 @@ func (st *settingsStore) Set(ctx context.Context, key, value string) error {
 }
 
 func (st *settingsStore) SetInternal(ctx context.Context, key, value string) error {
-	_, err := st.s.db.ExecContext(ctx, st.s.q(`INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value`), key, value)
+	_, err := st.s.db.ExecContext(ctx, st.s.q(settingUpsert), key, value)
 	return err
 }
 

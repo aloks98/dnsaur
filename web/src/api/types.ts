@@ -333,8 +333,9 @@ export interface ApiToken {
   name: string;
   scope: "read" | "write";
   created_at: number;
-  /** Unix ms, `0` for never — which is every API token today; only sessions
-   * are minted with an expiry. */
+  /** Unix ms, `0` for never — the default, and what every token created
+   * before `POST /tokens` took an `expires_at` carries. Unlike a session's,
+   * this one never slides: it is a date the token's owner chose. */
   expires_at: number;
   last_used: number;
 }

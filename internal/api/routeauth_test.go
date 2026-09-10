@@ -48,6 +48,12 @@ var unauthenticatedRoutes = map[string]string{
 	"GET /api/v1/health": "liveness probe: container/monitoring healthchecks have no credentials to " +
 		"present, and it discloses only that the process is up and its version.",
 
+	"GET /api/v1/readyz": "readiness probe, the counterpart of the liveness one above: a load " +
+		"balancer or container runtime asking whether this instance can serve has no credentials " +
+		"to present. It discloses only whether the store answers and whether a DNS socket is " +
+		"bound — nothing about what is stored, and nothing an unauthenticated caller could not " +
+		"learn by sending one query.",
+
 	"GET /api/v1/openapi.yaml": "serves this API's own description, which is public documentation " +
 		"rather than user data; the dashboard also fetches it before anyone has logged in.",
 
@@ -205,11 +211,11 @@ func TestEveryRouteEnforcesAuth(t *testing.T) {
 	}
 
 	_ = login(t, srv, s) // creates admin user id 1
-	_, readTok, err := srv.deps.Auth.CreateAPIToken(context.Background(), 1, "route-auth-read", "read")
+	_, readTok, err := srv.deps.Auth.CreateAPIToken(context.Background(), 1, "route-auth-read", "read", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, writeTok, err := srv.deps.Auth.CreateAPIToken(context.Background(), 1, "route-auth-write", "write")
+	_, writeTok, err := srv.deps.Auth.CreateAPIToken(context.Background(), 1, "route-auth-write", "write", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -400,7 +406,7 @@ func TestOpenAPIDocumentsObservedGETStatuses(t *testing.T) {
 	spec := specResponses(t, h)
 
 	_ = login(t, srv, s)
-	_, readTok, err := srv.deps.Auth.CreateAPIToken(context.Background(), 1, "spec-observe-read", "read")
+	_, readTok, err := srv.deps.Auth.CreateAPIToken(context.Background(), 1, "spec-observe-read", "read", 0)
 	if err != nil {
 		t.Fatal(err)
 	}

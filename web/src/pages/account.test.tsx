@@ -105,16 +105,102 @@ test("shows an alert when the account fails to load", async () => {
   ).toBeInTheDocument();
 });
 
-test("says password changes aren't available yet, rather than showing a non-functional form", async () => {
+test("changes the password, sending the current one with it", async () => {
   mockMe();
   mockTokens([]);
+  let sent: unknown;
+  server.use(
+    http.post("/api/v1/auth/password", async ({ request }) => {
+      sent = await request.json();
+      return new HttpResponse(null, { status: 204 });
+    }),
+  );
+  const success = vi.spyOn(toast, "success");
 
   renderWithProviders(<Account />);
   await screen.findByText("Two-factor authentication");
 
-  expect(screen.getByText(/password changes aren.t available yet/i)).toBeInTheDocument();
-  expect(screen.queryByLabelText(/current password/i)).not.toBeInTheDocument();
-  expect(screen.queryByLabelText(/new password/i)).not.toBeInTheDocument();
+  const user = userEvent.setup();
+  await user.type(screen.getByLabelText(/current password/i), "password123");
+  await user.type(screen.getByLabelText(/^new password$/i), "new-password1");
+  await user.type(screen.getByLabelText(/confirm new password/i), "new-password1");
+  await user.click(screen.getByRole("button", { name: /change password/i }));
+
+  await waitFor(() =>
+    expect(sent).toEqual({ current_password: "password123", new_password: "new-password1" }),
+  );
+  // The toast says the other sessions went with it: the server revokes them
+  // and nothing else on screen would tell the admin that happened.
+  await waitFor(() => expect(success).toHaveBeenCalledWith(expect.stringMatching(/signed out/i)));
+  expect(screen.getByLabelText(/current password/i)).toHaveValue("");
+});
+
+test("a mistyped confirmation never reaches the server", async () => {
+  mockMe();
+  mockTokens([]);
+  let calls = 0;
+  server.use(
+    http.post("/api/v1/auth/password", () => {
+      calls++;
+      return new HttpResponse(null, { status: 204 });
+    }),
+  );
+
+  renderWithProviders(<Account />);
+  await screen.findByText("Two-factor authentication");
+
+  const user = userEvent.setup();
+  await user.type(screen.getByLabelText(/current password/i), "password123");
+  await user.type(screen.getByLabelText(/^new password$/i), "new-password1");
+  await user.type(screen.getByLabelText(/confirm new password/i), "new-passwordX");
+  await user.click(screen.getByRole("button", { name: /change password/i }));
+
+  expect(await screen.findByText(/passwords don't match/i)).toBeInTheDocument();
+  expect(calls).toBe(0);
+});
+
+// A wrong current password is a 400, not a 401, so it must land on the field
+// that was wrong rather than as a toast about a session that is still fine.
+test("a wrong current password is shown on the field", async () => {
+  mockMe();
+  mockTokens([]);
+  server.use(
+    http.post("/api/v1/auth/password", () =>
+      HttpResponse.json({ error: "current password is wrong" }, { status: 400 }),
+    ),
+  );
+
+  renderWithProviders(<Account />);
+  await screen.findByText("Two-factor authentication");
+
+  const user = userEvent.setup();
+  await user.type(screen.getByLabelText(/current password/i), "wrong-password");
+  await user.type(screen.getByLabelText(/^new password$/i), "new-password1");
+  await user.type(screen.getByLabelText(/confirm new password/i), "new-password1");
+  await user.click(screen.getByRole("button", { name: /change password/i }));
+
+  expect(await screen.findByText(/current password is wrong/i)).toBeInTheDocument();
+});
+
+test("logs every other session out", async () => {
+  mockMe();
+  mockTokens([]);
+  let called = 0;
+  server.use(
+    http.delete("/api/v1/auth/sessions", () => {
+      called++;
+      return new HttpResponse(null, { status: 204 });
+    }),
+  );
+  const success = vi.spyOn(toast, "success");
+
+  renderWithProviders(<Account />);
+  await screen.findByText("Two-factor authentication");
+
+  await userEvent.setup().click(screen.getByRole("button", { name: /log out everywhere/i }));
+
+  await waitFor(() => expect(called).toBe(1));
+  await waitFor(() => expect(success).toHaveBeenCalledWith("Other sessions signed out"));
 });
 
 test("TOTP off shows Enable 2FA; TOTP on shows Disable 2FA and an Enabled badge", async () => {
@@ -361,9 +447,75 @@ test("renders the tokens table with name, scope badge, and relative created/last
 
   // last_used: 0 reads as "never" (relativeTime's sentinel), not an epoch
   // date. Scoped to the row: the grid also has an Expires column, which
-  // reads "never" for every token since API tokens do not expire.
+  // reads "never" for a token created without one.
   const rows = document.querySelectorAll<HTMLElement>('[data-slot="token-row"]');
   expect(within(rows[1]).getAllByText("never").length).toBeGreaterThanOrEqual(1);
+});
+
+test("shows how long a token with an expiry has left", async () => {
+  mockMe();
+  mockTokens([
+    sampleToken({ id: 1, name: "Expiring", expires_at: Date.now() + 30 * 24 * 60 * 60 * 1000 }),
+    sampleToken({ id: 2, name: "Forever", expires_at: 0 }),
+  ]);
+
+  renderWithProviders(<Account />);
+  await screen.findByText("Expiring");
+
+  const rows = document.querySelectorAll<HTMLElement>('[data-slot="token-row"]');
+  expect(within(rows[0]).getByText(/in 29d|in 30d/)).toBeInTheDocument();
+  expect(within(rows[1]).getAllByText("never").length).toBeGreaterThanOrEqual(1);
+});
+
+test("the create row sends the chosen expiry as a unix-ms stamp", async () => {
+  mockMe();
+  mockTokens([]);
+  let sent: { name: string; scope: string; expires_at?: number } | undefined;
+  server.use(
+    http.post("/api/v1/tokens", async ({ request }) => {
+      sent = (await request.json()) as typeof sent;
+      return HttpResponse.json({ id: 7, token: "plaintext-once" }, { status: 201 });
+    }),
+  );
+
+  renderWithProviders(<Account />);
+  await screen.findByText("No API tokens yet");
+
+  const user = userEvent.setup();
+  await user.click(screen.getByRole("button", { name: /new token/i }));
+  await user.type(screen.getByLabelText("Name"), "ci");
+  await user.selectOptions(screen.getByLabelText("Expires"), "90");
+  await user.click(screen.getByRole("button", { name: /^create$/i }));
+
+  const ninetyDays = 90 * 24 * 60 * 60 * 1000;
+  await waitFor(() => expect(sent).toBeDefined());
+  expect(sent?.expires_at).toBeGreaterThan(Date.now() + ninetyDays - 60_000);
+  expect(sent?.expires_at).toBeLessThan(Date.now() + ninetyDays + 60_000);
+});
+
+test("the create row omits expires_at when the token should never expire", async () => {
+  mockMe();
+  mockTokens([]);
+  let sent: Record<string, unknown> | undefined;
+  server.use(
+    http.post("/api/v1/tokens", async ({ request }) => {
+      sent = (await request.json()) as Record<string, unknown>;
+      return HttpResponse.json({ id: 8, token: "plaintext-once" }, { status: 201 });
+    }),
+  );
+
+  renderWithProviders(<Account />);
+  await screen.findByText("No API tokens yet");
+
+  const user = userEvent.setup();
+  await user.click(screen.getByRole("button", { name: /new token/i }));
+  await user.type(screen.getByLabelText("Name"), "forever");
+  await user.click(screen.getByRole("button", { name: /^create$/i }));
+
+  await waitFor(() => expect(sent).toBeDefined());
+  // Absent, not 0: the server reads a missing field as "never" and would
+  // refuse an explicit stamp that is not in the future.
+  expect(sent).not.toHaveProperty("expires_at");
 });
 
 // Required test (d): the API omits token_hash, and the table must never

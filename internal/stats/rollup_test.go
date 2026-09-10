@@ -62,6 +62,13 @@ func (f *fakeSettingsStore) Set(ctx context.Context, key, value string) error {
 	return nil
 }
 
+func (f *fakeSettingsStore) SetMany(ctx context.Context, values map[string]string) error {
+	for k, v := range values {
+		f.values[k] = v
+	}
+	return nil
+}
+
 func (f *fakeSettingsStore) SetInternal(ctx context.Context, key, value string) error {
 	f.setInternalCalls = append(f.setInternalCalls, struct {
 		key   string

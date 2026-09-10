@@ -222,6 +222,43 @@ func TestUnknownRouteIs404JSON(t *testing.T) {
 	}
 }
 
+// TestWrongMethodIs405WithAllow pins the answer to a request that names a
+// real endpoint with a method it does not have. 404 "not found" is wrong
+// twice over: the path is found, and the client is told to go looking for a
+// URL it already has.
+//
+// http.ServeMux answers this itself — 405 with an Allow header — but only
+// when nothing else matches, and the "/api/" catch-all matches everything
+// under /api/, so it shadowed the mux's own answer. The catch-all now asks
+// which methods the path does serve before falling back to 404.
+//
+// Both cases are here because they exercise different matching: a literal
+// path, and one with a path parameter in it.
+func TestWrongMethodIs405WithAllow(t *testing.T) {
+	srv, _, _ := testServer(t)
+	h := srv.Handler()
+	for _, tc := range []struct {
+		method, path, allow string
+	}{
+		{"DELETE", "/api/v1/settings", "GET, PUT"},
+		{"POST", "/api/v1/zones/1", "DELETE, GET, PATCH"},
+	} {
+		t.Run(tc.method+" "+tc.path, func(t *testing.T) {
+			w := doReq(t, h, tc.method, tc.path, "", nil)
+			if w.Code != http.StatusMethodNotAllowed {
+				t.Errorf("%s %s = %d %s, want 405", tc.method, tc.path, w.Code,
+					strings.TrimSpace(w.Body.String()))
+			}
+			if got := w.Header().Get("Allow"); got != tc.allow {
+				t.Errorf("%s %s answered Allow %q, want %q", tc.method, tc.path, got, tc.allow)
+			}
+			if ct := w.Header().Get("Content-Type"); ct != "application/json; charset=utf-8" {
+				t.Errorf("Content-Type %q: a 405 is an error and carries the error envelope", ct)
+			}
+		})
+	}
+}
+
 // TestStaticMountDoesNotShadowAPI closes a gap left by Task 1 (flagged in
 // Task 14's brief): every other test in this package builds its Server via
 // testServer, which always leaves Deps.Static nil — so no committed test
@@ -297,7 +334,7 @@ func TestAuthRequired(t *testing.T) {
 		t.Fatalf("cookie auth: %d %s", w.Code, w.Body.String())
 	}
 	// bearer path
-	_, tok, _ := srv.deps.Auth.CreateAPIToken(context.Background(), 1, "t", "write")
+	_, tok, _ := srv.deps.Auth.CreateAPIToken(context.Background(), 1, "t", "write", 0)
 	req := httptest.NewRequest("GET", "/api/v1/_probe", nil)
 	req.Header.Set("Authorization", "Bearer "+tok)
 	w := httptest.NewRecorder()
@@ -316,7 +353,7 @@ func TestBearerSchemeIsCaseInsensitive(t *testing.T) {
 		writeJSON(w, http.StatusOK, map[string]string{"user": userFrom(r).Username})
 	}))
 	_ = login(t, srv, s)
-	_, tok, err := srv.deps.Auth.CreateAPIToken(context.Background(), 1, "case", "write")
+	_, tok, err := srv.deps.Auth.CreateAPIToken(context.Background(), 1, "case", "write", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -375,7 +412,7 @@ func TestReadScopeToken(t *testing.T) {
 	// login first so the admin user (id 1) exists before minting an API
 	// token for it, mirroring TestAuthRequired's ordering.
 	_ = login(t, srv, s)
-	_, tok, err := srv.deps.Auth.CreateAPIToken(context.Background(), 1, "ro", "read")
+	_, tok, err := srv.deps.Auth.CreateAPIToken(context.Background(), 1, "ro", "read", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -480,7 +517,7 @@ func stringsReader(s string) *strings.Reader { return strings.NewReader(s) }
 func TestCrossSiteCookieWriteRefused(t *testing.T) {
 	srv, s, _ := testServer(t)
 	cookie := login(t, srv, s)
-	_, tok, err := srv.deps.Auth.CreateAPIToken(t.Context(), 1, "csrf", "write")
+	_, tok, err := srv.deps.Auth.CreateAPIToken(t.Context(), 1, "csrf", "write", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
