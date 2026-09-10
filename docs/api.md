@@ -622,7 +622,11 @@ Full parameter/response detail lives in `internal/api/openapi.yaml`
 - **Queries** — `GET /queries` (search the query log; filters: `from`,
   `to`, `client`, `q`, `decision`, `type`, `limit` [default 100, capped
   1000], `offset`), `GET /queries/tail` (live tail as Server-Sent Events,
-  `text/event-stream`; `503` if query logging is disabled).
+  `text/event-stream`; `503` if query logging is disabled). A blocked row
+  carries `matched`, the rule pattern or list entry that fired — `rule_id`
+  and `list_id` name the rule or the list, not the line of it. It is `""`
+  for anything that was not blocked, and for rows logged before the column
+  existed.
 - **Stats** — `GET /stats/overview?hours=` (totals: `total`, `blocked`,
   `cached`, `forwarded`, `clients`, plus `dropped` — query log entries
   discarded since start because the write buffer was full, so a non-zero

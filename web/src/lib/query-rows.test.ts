@@ -17,6 +17,7 @@ function entry(over: Partial<QueryEntry> = {}): QueryEntry {
     upstream: "1.1.1.1:53",
     r_code: "NOERROR",
     duration_ms: 0,
+    matched: "",
     ...over,
   };
 }

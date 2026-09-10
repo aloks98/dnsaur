@@ -118,3 +118,36 @@ func TestDeleteInChunksReportsWhatItDeleted(t *testing.T) {
 		t.Fatalf("reported %d rows, want the 10 the first pass deleted", n)
 	}
 }
+
+// TestQueryLogRoundTripsMatched: the entry that fired is stored with the
+// row, not merely computed for the live tail. `list_id` names the list, not
+// the line in it, so a stored row without this can't say which of a hundred
+// thousand entries matched — and a column the writer fills but the reader
+// drops is the same as no column at all, which is why both halves are
+// asserted here rather than just the INSERT succeeding.
+func TestQueryLogRoundTripsMatched(t *testing.T) {
+	forEachDriver(t, func(t *testing.T, s Store) {
+		ctx := context.Background()
+		cleanupStats(t, s)
+		if err := s.QueryLog().InsertBatch(ctx, []QueryLogEntry{
+			{At: 1000, InstanceID: "i1", ClientIP: "10.0.0.5", QName: "tracker.ads.example", QType: "A", Decision: "blocked", RCode: "NOERROR", ListID: 3, Matched: "ads.example"},
+			{At: 2000, InstanceID: "i1", ClientIP: "10.0.0.5", QName: "ok.example", QType: "A", Decision: "forwarded", RCode: "NOERROR"},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		got, err := s.QueryLog().Search(ctx, QueryLogFilter{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != 2 {
+			t.Fatalf("searched %d rows, want 2", len(got))
+		}
+		// ORDER BY id DESC: the forwarded row first.
+		if got[0].Matched != "" {
+			t.Errorf("forwarded row Matched = %q, want empty", got[0].Matched)
+		}
+		if got[1].Matched != "ads.example" {
+			t.Errorf("blocked row Matched = %q, want the list entry that fired", got[1].Matched)
+		}
+	})
+}

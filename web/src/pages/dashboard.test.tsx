@@ -134,6 +134,7 @@ function entry(overrides: Partial<QueryEntry> = {}): QueryEntry {
     upstream: "1.1.1.1",
     r_code: "NOERROR",
     duration_ms: 7,
+    matched: "",
     ...overrides,
   };
 }

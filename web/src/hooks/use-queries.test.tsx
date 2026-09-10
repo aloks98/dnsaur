@@ -36,6 +36,7 @@ function entry(patch: Partial<QueryEntry> = {}): QueryEntry {
     upstream: "1.1.1.1:53",
     r_code: "NOERROR",
     duration_ms: 4,
+    matched: "",
     ...patch,
   };
 }

@@ -94,6 +94,7 @@ function entry(overrides: Partial<QueryEntry> = {}): QueryEntry {
     upstream: "1.1.1.1",
     r_code: "NOERROR",
     duration_ms: 12,
+    matched: "",
     ...overrides,
   };
 }
@@ -1860,4 +1861,95 @@ test("the Upstream column shows the address and keeps the canonical entry on hov
   const two = within(rowFor("two.example.com")).getByText("1.0.0.1:853");
   expect(one).toHaveAttribute("title", "tls://1.1.1.1:853#cloudflare-dns.com");
   expect(two).toHaveAttribute("title", "tls://1.0.0.1:853#cloudflare-dns.com");
+});
+
+// A blocklist is a hundred thousand names; "Matched example.com hosts" says
+// which file, not which line of it. The stored entry is the only thing that
+// tells the operator the list is over-matching on a parent domain.
+test("the rail names the list entry that matched, not just the list", async () => {
+  const user = userEvent.setup();
+  renderQueryLog();
+  const source = await firstSource();
+  act(() => source.emitOpen());
+  act(() =>
+    source.emit(
+      entry({
+        q_name: "tracker.ads.example",
+        decision: "blocked",
+        list_id: 1,
+        matched: "ads.example",
+      }),
+    ),
+  );
+
+  await screen.findByText("tracker.ads.example");
+  await selectRow(user, "tracker.ads.example");
+
+  const alert = within(inspector()).getByRole("alert");
+  await waitFor(() => expect(alert).toHaveTextContent("Matched example.com hosts"));
+  expect(within(alert).getByText("ads.example", { selector: "code" })).toBeInTheDocument();
+});
+
+// Allowing the *domain* leaves every sibling under the over-matching entry
+// blocked, and the operator has to come back for each one. The entry is the
+// pattern that actually fired, so allowing it un-blocks the whole subtree in
+// one click — which is the point of showing it.
+test("allowing the matched entry writes a rule for the entry, not the domain", async () => {
+  const user = userEvent.setup();
+  const posted: unknown[] = [];
+  server.use(
+    http.post("/api/v1/groups/1/rules", async ({ request }) => {
+      posted.push(await request.json());
+      return HttpResponse.json({ id: 3 }, { status: 201 });
+    }),
+  );
+  const successSpy = vi.spyOn(toast, "success");
+
+  renderQueryLog();
+  const source = await firstSource();
+  act(() => source.emitOpen());
+  act(() =>
+    source.emit(
+      entry({
+        q_name: "tracker.ads.example",
+        decision: "blocked",
+        list_id: 1,
+        matched: "ads.example",
+      }),
+    ),
+  );
+
+  await screen.findByText("tracker.ads.example");
+  await selectRow(user, "tracker.ads.example");
+
+  const allowEntry = await within(inspector()).findByRole("button", { name: /allow this entry/i });
+  await waitFor(() => expect(allowEntry).toBeEnabled());
+  await user.click(allowEntry);
+
+  await waitFor(() => expect(posted).toEqual([{ action: "allow", pattern: "ads.example" }]));
+  expect(successSpy).toHaveBeenCalledWith("Allowed ads.example");
+});
+
+// The entry action only earns its place when it differs from the domain
+// button beside it: a rule that matched the queried name exactly is already
+// what "Allow domain" writes, and a second button writing the same pattern is
+// a choice with no consequence.
+test("no entry action when the matched entry is the queried name itself", async () => {
+  const user = userEvent.setup();
+  renderQueryLog();
+  const source = await firstSource();
+  act(() => source.emitOpen());
+  act(() =>
+    source.emit(
+      entry({ q_name: "ads.example", decision: "blocked", list_id: 1, matched: "ads.example" }),
+    ),
+  );
+
+  await screen.findByText("ads.example");
+  await selectRow(user, "ads.example");
+
+  expect(await within(inspector()).findByRole("button", { name: /allow domain/i })).toBeVisible();
+  expect(
+    within(inspector()).queryByRole("button", { name: /allow this entry/i }),
+  ).not.toBeInTheDocument();
 });

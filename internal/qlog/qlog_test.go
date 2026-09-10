@@ -53,7 +53,7 @@ func blockedHandler() dnssrv.Handler {
 	return dnssrv.HandlerFunc(func(ctx context.Context, req *dnssrv.Request) (*dnssrv.Response, error) {
 		m := new(dns.Msg)
 		m.SetReply(req.Msg)
-		return &dnssrv.Response{Msg: m, Decision: dnssrv.DecisionBlocked, ListID: 7}, nil
+		return &dnssrv.Response{Msg: m, Decision: dnssrv.DecisionBlocked, ListID: 7, Matched: "ads.example"}, nil
 	})
 }
 
@@ -73,7 +73,10 @@ func TestMiddlewareEmitsAndFlushes(t *testing.T) {
 	for time.Now().Before(deadline) {
 		if es := fs.entries(); len(es) == 1 {
 			e := es[0]
-			if e.QName != "ads.example" || e.Decision != "blocked" || e.ListID != 7 || e.InstanceID != "i1" {
+			// Matched is what makes list #7 explicable: the middleware has
+			// to carry it off the response onto the entry, or the stored row
+			// names a list of a hundred thousand entries and not the one line.
+			if e.QName != "ads.example" || e.Decision != "blocked" || e.ListID != 7 || e.InstanceID != "i1" || e.Matched != "ads.example" {
 				t.Fatalf("%+v", e)
 			}
 			return

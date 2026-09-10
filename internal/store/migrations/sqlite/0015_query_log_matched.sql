@@ -1,0 +1,18 @@
+-- +goose Up
+-- The rule pattern or list entry that fired, for a blocked query.
+--
+-- The filter has always computed it (filter.Verdict.Matched) and it already
+-- reached the pipeline response and the in-memory log entry, but with no
+-- column here it died with the row's flush: a stored row carried only
+-- rule_id and list_id. That is enough to name the *list* and not the line in
+-- it, so "why was this blocked?" answered "one of these hundred thousand
+-- names" — and when the list is a big one, over-matching on a parent domain
+-- is exactly the case an operator needs to see to fix it.
+--
+-- '' for every row that was not blocked, and for every row that predates this
+-- column. Empty is the honest answer for both: nothing matched, or nothing
+-- was recorded. There is deliberately no backfill — the entry is not
+-- recoverable from rule_id/list_id after the fact, since a list's contents
+-- change under it and a rule can be deleted, and a guessed pattern presented
+-- as the one that fired would be worse than none.
+ALTER TABLE query_log ADD COLUMN matched TEXT NOT NULL DEFAULT '';

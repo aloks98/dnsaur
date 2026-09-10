@@ -53,14 +53,14 @@ func (q *queryLogStore) InsertBatch(ctx context.Context, batch []QueryLogEntry) 
 		return nil
 	}
 	var sb strings.Builder
-	sb.WriteString(`INSERT INTO query_log (at, instance_id, client_ip, client_id, qname, qtype, decision, rule_id, list_id, upstream, rcode, duration_ms) VALUES `)
-	args := make([]any, 0, len(batch)*12)
+	sb.WriteString(`INSERT INTO query_log (at, instance_id, client_ip, client_id, qname, qtype, decision, rule_id, list_id, upstream, rcode, duration_ms, matched) VALUES `)
+	args := make([]any, 0, len(batch)*13)
 	for i, e := range batch {
 		if i > 0 {
 			sb.WriteString(",")
 		}
-		sb.WriteString("(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
-		args = append(args, e.At, e.InstanceID, e.ClientIP, e.ClientID, e.QName, e.QType, e.Decision, e.RuleID, e.ListID, e.Upstream, e.RCode, e.DurationMs)
+		sb.WriteString("(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+		args = append(args, e.At, e.InstanceID, e.ClientIP, e.ClientID, e.QName, e.QType, e.Decision, e.RuleID, e.ListID, e.Upstream, e.RCode, e.DurationMs, e.Matched)
 	}
 	_, err := q.s.db.ExecContext(ctx, q.s.q(sb.String()), args...)
 	return err

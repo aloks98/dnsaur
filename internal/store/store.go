@@ -197,10 +197,9 @@ type QueryLogEntry struct {
 	RCode      string `json:"r_code"`
 	DurationMs int64  `json:"duration_ms"`
 	// Matched is the rule pattern or list entry that blocked the query, as
-	// the filter computed it. There is no column for it yet, so it is
-	// carried in memory and not serialised — a field that reads back empty
-	// from history while a live row carries it would be worse than absent.
-	Matched string `json:"-"`
+	// the filter computed it. Empty for anything that was not blocked, and
+	// for rows written before migration 0015 added the column.
+	Matched string `json:"matched"`
 }
 
 // QueryLogFilter specifies optional filters for query log search.

@@ -60,6 +60,12 @@ resolver doesn't start on an empty table, and keeps the last 500 rows in view.
 until you resume. It's a hold, not a saved view — leaving the screen resumes
 it, so coming back always shows a running tail.
 
+Selecting a row explains it in the rail on the right. For a blocked row that a
+list decided, the rail names the list and the entry in it that fired, and
+**Allow this entry** writes an allow rule for exactly that entry — which
+un-blocks everything under it, not just the name in the row. Rows logged before
+the upgrade that added this have no entry recorded and show none.
+
 If the stream drops, it reconnects on a widening delay and gives up after about
 half a minute, offering **Reconnect**. Giving up also re-checks your session,
 since an expired one looks exactly like a dead connection from here: if it has

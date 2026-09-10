@@ -290,6 +290,8 @@ export interface QueryEntry {
   upstream: string;
   r_code: string;
   duration_ms: number;
+  /** The rule pattern or list entry that fired; "" unless the row was blocked. */
+  matched: string;
 }
 
 export interface StatsOverview {

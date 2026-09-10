@@ -7,7 +7,7 @@ import (
 
 func (q *queryLogStore) Search(ctx context.Context, f QueryLogFilter) ([]QueryLogEntry, error) {
 	var sb strings.Builder
-	sb.WriteString(`SELECT id, at, instance_id, client_ip, client_id, qname, qtype, decision, rule_id, list_id, upstream, rcode, duration_ms FROM query_log WHERE 1=1`)
+	sb.WriteString(`SELECT id, at, instance_id, client_ip, client_id, qname, qtype, decision, rule_id, list_id, upstream, rcode, duration_ms, matched FROM query_log WHERE 1=1`)
 	var args []any
 	if f.FromMs > 0 {
 		sb.WriteString(` AND at >= ?`)
@@ -57,7 +57,7 @@ func (q *queryLogStore) Search(ctx context.Context, f QueryLogFilter) ([]QueryLo
 	out := []QueryLogEntry{}
 	for rows.Next() {
 		var e QueryLogEntry
-		if err := rows.Scan(&e.ID, &e.At, &e.InstanceID, &e.ClientIP, &e.ClientID, &e.QName, &e.QType, &e.Decision, &e.RuleID, &e.ListID, &e.Upstream, &e.RCode, &e.DurationMs); err != nil {
+		if err := rows.Scan(&e.ID, &e.At, &e.InstanceID, &e.ClientIP, &e.ClientID, &e.QName, &e.QType, &e.Decision, &e.RuleID, &e.ListID, &e.Upstream, &e.RCode, &e.DurationMs, &e.Matched); err != nil {
 			return nil, err
 		}
 		out = append(out, e)

@@ -3216,6 +3216,12 @@ paths:
                     upstream: { type: string }
                     r_code: { type: string }
                     duration_ms: { type: integer, format: int64 }
+                    matched:
+                      type: string
+                      description: >
+                        The rule pattern or list entry that fired. Empty for
+                        anything that was not blocked, and for rows logged
+                        before the column existed.
         "401":
           description: authentication required
           content:

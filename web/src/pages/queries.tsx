@@ -913,6 +913,20 @@ function matchTitle(entry: QueryEntry, groupName?: string, list?: List): string 
   return "No rule or list matched";
 }
 
+/** The pattern that actually fired. A list is a hundred thousand names, so
+ * naming the list says which file matched and not which line of it — and the
+ * line is what says the list is over-matching on a parent domain. Rendered
+ * only where the prose isn't already showing it: a resolved rule's own
+ * pattern *is* the entry. */
+function MatchedEntry({ matched }: { matched: string }) {
+  if (matched === "") return null;
+  return (
+    <p>
+      Entry <code className="font-mono break-all text-foreground">{matched}</code>.
+    </p>
+  );
+}
+
 function MatchProse({
   entry,
   rule,
@@ -939,20 +953,29 @@ function MatchProse({
     // flight — the rail populates before that request comes back.
     if (ruleLoading) return <p>Looking up the matching rule…</p>;
     return (
-      <p>
-        Matched rule #{entry.rule_id}, which isn&apos;t available right now (it may have been
-        deleted).
-      </p>
+      <>
+        <p>
+          Matched rule #{entry.rule_id}, which isn&apos;t available right now (it may have been
+          deleted).
+        </p>
+        <MatchedEntry matched={entry.matched} />
+      </>
     );
   }
   if (entry.list_id > 0) {
-    return list ? (
-      <p>
-        From the {list.kind} list <span className="font-medium text-foreground">{list.name}</span> (
-        <code className="font-mono break-all">{list.url}</code>).
-      </p>
-    ) : (
-      <p>Matched list #{entry.list_id}, which isn&apos;t available right now.</p>
+    return (
+      <>
+        {list ? (
+          <p>
+            From the {list.kind} list{" "}
+            <span className="font-medium text-foreground">{list.name}</span> (
+            <code className="font-mono break-all">{list.url}</code>).
+          </p>
+        ) : (
+          <p>Matched list #{entry.list_id}, which isn&apos;t available right now.</p>
+        )}
+        <MatchedEntry matched={entry.matched} />
+      </>
     );
   }
   return <p>No rule or list matched — resolved by the default policy.</p>;
@@ -972,7 +995,7 @@ function ActionStrip({
   status?: RowStatus;
   disabled: boolean;
   disabledReason: string;
-  onQuickRule: (action: "allow" | "block", entry: QueryEntry) => void;
+  onQuickRule: (action: "allow" | "block", entry: QueryEntry, pattern?: string) => void;
   onCopy: (entry: QueryEntry) => void;
 }) {
   const action = entry.decision === "blocked" ? "allow" : "block";
@@ -1002,6 +1025,22 @@ function ActionStrip({
           onClick={() => onQuickRule(action, entry)}
         >
           {action === "allow" ? "Allow domain" : "Block domain"}
+        </Button>
+      )}
+      {/* Offered only when the entry differs from the queried name: an entry
+          equal to it is already what the button beside this one writes.
+          Allowing the entry allows every name under it, which is the point
+          when a list matched a parent domain. */}
+      {!done && action === "allow" && entry.matched !== "" && entry.matched !== entry.q_name && (
+        <Button
+          type="button"
+          size="sm"
+          variant="outline"
+          disabled={status === "pending" || disabled}
+          title={disabled ? disabledReason : undefined}
+          onClick={() => onQuickRule("allow", entry, entry.matched)}
+        >
+          Allow this entry
         </Button>
       )}
       <Button type="button" size="sm" variant="outline" onClick={() => onCopy(entry)}>
@@ -1048,7 +1087,7 @@ const Inspector = memo(function Inspector({
   actionsDisabled: boolean;
   actionsDisabledReason: string;
   onClose: () => void;
-  onQuickRule: (action: "allow" | "block", entry: QueryEntry) => void;
+  onQuickRule: (action: "allow" | "block", entry: QueryEntry, pattern?: string) => void;
   onCopy: (entry: QueryEntry) => void;
 }) {
   useRenderCount("inspector");
@@ -1303,24 +1342,26 @@ export function QueryLog() {
   const { mutate: addRule } = useAddRule();
   const [rowStatus, setRowStatus] = useState<Record<string, RowStatus>>({});
 
+  // `pattern` defaults to the queried name; the rail passes the row's matched
+  // entry instead when the pattern that actually fired is the one to write.
+  // Either way the row is finished afterwards — an allow on the entry covers
+  // the name under it, so a second write from the same row changes nothing.
   const quickRule = useCallback(
-    (action: "allow" | "block", entry: QueryEntry) => {
+    (action: "allow" | "block", entry: QueryEntry, pattern: string = entry.q_name) => {
       const verb = action === "block" ? "block" : "allow";
       const groupId = groupForEntry(entry, clientGroups);
       if (groupId === null) {
-        toast.error(`Couldn't ${verb} ${entry.q_name} — this client's group is unknown`);
+        toast.error(`Couldn't ${verb} ${pattern} — this client's group is unknown`);
         return;
       }
       const key = rowKey(entry);
       setRowStatus((s) => ({ ...s, [key]: "pending" }));
       addRule(
-        { groupId, action, pattern: entry.q_name },
+        { groupId, action, pattern },
         {
           onSuccess: () => {
             setRowStatus((s) => ({ ...s, [key]: action === "block" ? "blocked" : "allowed" }));
-            toast.success(
-              action === "block" ? `Blocked ${entry.q_name}` : `Allowed ${entry.q_name}`,
-            );
+            toast.success(action === "block" ? `Blocked ${pattern}` : `Allowed ${pattern}`);
           },
           onError: () => {
             setRowStatus((s) => {
@@ -1328,7 +1369,7 @@ export function QueryLog() {
               delete next[key];
               return next;
             });
-            toast.error(`Couldn't ${verb} ${entry.q_name}`);
+            toast.error(`Couldn't ${verb} ${pattern}`);
           },
         },
       );

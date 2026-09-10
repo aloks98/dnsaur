@@ -693,12 +693,12 @@ Real capture (`?limit=2`) — both rows decided by the same zone, one NODATA
   "instance_id":"1fc5e9d1-9dc8-406f-a86e-555a39f48de2",
   "client_ip":"127.0.0.1","client_id":0,
   "q_name":"doesnotexist.home.lan","q_type":"A","decision":"authoritative",
-  "rule_id":0,"list_id":0,"upstream":"","r_code":"NXDOMAIN","duration_ms":0},
+  "rule_id":0,"list_id":0,"upstream":"","r_code":"NXDOMAIN","duration_ms":0,"matched":""},
  {"id":2,"at":1786219236203,
   "instance_id":"1fc5e9d1-9dc8-406f-a86e-555a39f48de2",
   "client_ip":"127.0.0.1","client_id":0,
   "q_name":"bifrost.home.lan","q_type":"AAAA","decision":"authoritative",
-  "rule_id":0,"list_id":0,"upstream":"","r_code":"NOERROR","duration_ms":0}]
+  "rule_id":0,"list_id":0,"upstream":"","r_code":"NOERROR","duration_ms":0,"matched":""}]
 ```
 
 #### `GET /api/v1/queries/tail` — SSE
@@ -712,7 +712,7 @@ Wire format is one line per event:
 data: {"id":0,"at":1785946986964,"instance_id":"29cbba52-…","client_ip":"127.0.0.1",
        "client_id":0,"q_name":"sse-probe.example.com","q_type":"A",
        "decision":"forwarded","rule_id":0,"list_id":0,"upstream":"1.1.1.1:53",
-       "r_code":"NOERROR","duration_ms":9}
+       "r_code":"NOERROR","duration_ms":9,"matched":""}
 ```
 
 Four things a client must know:
@@ -928,6 +928,7 @@ three.
 | `upstream` | string | `host:port` | **`""` = never left the box** (blocked/authoritative/cached/stale/error) |
 | `r_code` | string | `NOERROR`, `NXDOMAIN`, `SERVFAIL`, `REFUSED`, … | |
 | `duration_ms` | int64 | whole ms, truncated | sub-millisecond answers record `0` |
+| `matched` | string | rule pattern or list entry | **`""` = nothing matched**, and `""` on every row logged before migration 0015 added the column (not backfilled) |
 
 **`decision` enum** (`internal/dnssrv/pipeline.go:12-20`):
 
@@ -1059,13 +1060,15 @@ creation; only `name` and `enabled` are mutable.
   matches the domain *and every subdomain*, on whole-label boundaries.
 - Evaluation order: literal allow → regex allow → literal block → regex block →
   allowlists → blocklists. First match wins.
-- The matched pattern is computed per query and now reaches the pipeline
-  response and the in-memory log entry (`dnssrv.Response.Matched`,
-  `store.QueryLogEntry.Matched`), but there is **no `query_log` column for it
-  yet**, so it is `json:"-"` and does not appear on any endpoint. A stored row
-  still carries only `rule_id`/`list_id`, which is why the UI's "why?" drawer
-  re-resolves them and can only say *"Matched rule #N, which isn't available
-  right now"* if it was deleted.
+- The matched pattern is computed per query, reaches the pipeline response and
+  the log entry (`dnssrv.Response.Matched`, `store.QueryLogEntry.Matched`), and
+  since migration 0015 is stored in `query_log.matched` and served as
+  `matched` on both query endpoints (§3.1). Rows logged before that column
+  existed carry `""`: the entry is not recoverable from `rule_id`/`list_id`
+  after the fact — a list's contents change under it and a rule can be deleted
+  — so there is no backfill. The rail still resolves the rule and the list by
+  id for their names, which is why a deleted rule reads *"Matched rule #N,
+  which isn't available right now"* with the entry beside it.
 
 **TODO** — no update endpoint; rules are create/delete only.
 

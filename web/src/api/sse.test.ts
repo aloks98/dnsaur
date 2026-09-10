@@ -17,6 +17,7 @@ const sampleEntry: QueryEntry = {
   upstream: "",
   r_code: "NOERROR",
   duration_ms: 4,
+  matched: "",
 };
 
 beforeEach(() => {

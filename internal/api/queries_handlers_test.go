@@ -27,7 +27,7 @@ func seedAPIQlog(t *testing.T, s store.Store) {
 	now := time.Now().UnixMilli()
 	err := s.QueryLog().InsertBatch(t.Context(), []store.QueryLogEntry{
 		{At: now - 2000, InstanceID: "i", ClientIP: "10.0.0.5", QName: "a.example", QType: "A", Decision: "forwarded", RCode: "NOERROR"},
-		{At: now - 1000, InstanceID: "i", ClientIP: "10.0.0.6", QName: "ads.example", QType: "A", Decision: "blocked", RCode: "NOERROR"},
+		{At: now - 1000, InstanceID: "i", ClientIP: "10.0.0.6", QName: "ads.example", QType: "A", Decision: "blocked", RCode: "NOERROR", ListID: 3, Matched: "ads.example"},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -49,6 +49,40 @@ func TestQueriesSearch(t *testing.T) {
 // TestQueriesSearchNegativeOffset guards against a spurious 503: postgres
 // errors on a negative SQL OFFSET, so a client-supplied ?offset=-5 must be
 // clamped to 0 rather than passed straight through to the store.
+// TestQueriesSearchCarriesMatched: a blocked row has to name the entry that
+// fired, under the wire name `matched`. `list_id` alone points at a list of a
+// hundred thousand names and leaves the dashboard unable to say which one,
+// and a field that reads back empty from history is the same as absent — so
+// this asserts the JSON key itself, not a Go field the tag could have
+// renamed out from under it.
+func TestQueriesSearchCarriesMatched(t *testing.T) {
+	srv, s, _ := testServer(t)
+	cookie := login(t, srv, s)
+	seedAPIQlog(t, s)
+	w := doReq(t, srv.Handler(), "GET", "/api/v1/queries", "", cookie)
+	if w.Code != 200 {
+		t.Fatalf("search: %d %s", w.Code, w.Body.String())
+	}
+	var rows []map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &rows); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	byName := map[string]map[string]any{}
+	for _, r := range rows {
+		byName[fmt.Sprint(r["q_name"])] = r
+	}
+	blocked, ok := byName["ads.example"]
+	if !ok {
+		t.Fatalf("blocked row missing from %v", rows)
+	}
+	if got, ok := blocked["matched"]; !ok || got != "ads.example" {
+		t.Fatalf("blocked row matched = %v (present %v), want the list entry that fired", got, ok)
+	}
+	if got := byName["a.example"]["matched"]; got != "" {
+		t.Fatalf("forwarded row matched = %v, want empty", got)
+	}
+}
+
 func TestQueriesSearchNegativeOffset(t *testing.T) {
 	srv, s, _ := testServer(t)
 	cookie := login(t, srv, s)
