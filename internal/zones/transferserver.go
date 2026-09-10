@@ -403,7 +403,7 @@ func (t *TransferServer) refuse(ctx context.Context, w dns.ResponseWriter, q *dn
 		level = slog.LevelDebug
 	}
 	slog.Log(ctx, level, "zone transfer refused", attrs...)
-	return t.writeRefusal(w, q, ref, key, tsigErr)
+	return writeRefusal(w, q, ref.rcode, ref.tsigCode, t.now(), key, tsigErr)
 }
 
 // noteState is what note remembers about the last write it actually made
@@ -852,7 +852,13 @@ func answerSOAOnly(w dns.ResponseWriter, q *dns.Msg, z *Zone, key string, tsigEr
 	return w.WriteMsg(m)
 }
 
-// writeRefusal sends the one message a refused transfer consists of.
+// writeRefusal sends the one message a refused transfer or a refused NOTIFY
+// consists of. Both gates end here, which is why it takes the two fields of
+// a refusal rather than either refusal type: the rcodes mean different
+// things on the two sides (see decidePeer), the reply they produce does not.
+//
+// now is the caller's own clock — t.now() or n.now() — for the same reason
+// errorTSIG takes one: a BADTIME reply's timestamps are what a test drives.
 //
 // Deliberately not fitted to the client's datagram budget the way
 // answerSOAOnly is: a refusal is a header, a question and at most a TSIG
@@ -860,11 +866,11 @@ func answerSOAOnly(w dns.ResponseWriter, q *dns.Msg, z *Zone, key string, tsigEr
 // run in any case — truncating a reply whose entire content is "your
 // signature was not accepted" is not obviously the right answer, and nothing
 // has asked for it.
-func (t *TransferServer) writeRefusal(w dns.ResponseWriter, q *dns.Msg, ref *refusal, key string, tsigErr error) error {
+func writeRefusal(w dns.ResponseWriter, q *dns.Msg, rcode int, tsigCode uint16, now time.Time, key string, tsigErr error) error {
 	m := new(dns.Msg)
-	m.SetRcode(q, ref.rcode)
-	if ref.tsigCode != 0 {
-		if rr := errorTSIG(q, ref.tsigCode, t.now()); rr != nil {
+	m.SetRcode(q, rcode)
+	if tsigCode != 0 {
+		if rr := errorTSIG(q, tsigCode, now); rr != nil {
 			m.Extra = append(m.Extra, rr)
 			// Whether this one is signed is decided by which error it
 			// carries, and WriteMsg already applies exactly that rule:
@@ -891,12 +897,10 @@ func (t *TransferServer) writeRefusal(w dns.ResponseWriter, q *dns.Msg, ref *ref
 // through either gate, which only sets a TSIG error code for a verdict that
 // required a TSIG to reach).
 //
-// Shared by TransferServer.writeRefusal and NotifyServer.writeRefusal rather
-// than copied: the BADKEY/BADSIG-unsigned and BADTIME-signed rule below is
-// one rule, and two implementations of it would drift. now is the caller's
-// own clock (t.now() or n.now()) rather than time.Now(), for the same reason
-// every other timestamp in this file is injected — a test has to be able to
-// drive a BADTIME reply's Other Data without waiting on the wall clock.
+// now is the caller's own clock (t.now() or n.now()) rather than time.Now(),
+// for the same reason every other timestamp in this file is injected — a
+// test has to be able to drive a BADTIME reply's Other Data without waiting
+// on the wall clock.
 //
 // The three codes are deliberately not treated alike, and the difference is
 // the rule rather than an inconsistency to tidy away. It follows from what

@@ -240,23 +240,6 @@ func TestClientAndFilterCRUD(t *testing.T) {
 	})
 }
 
-func TestLocalRecords(t *testing.T) {
-	forEachDriver(t, func(t *testing.T, s Store) {
-		ctx := context.Background()
-		// Clean up local_records to handle shared postgres DB
-		ss := s.(*sqlStore)
-		_, _ = ss.db.ExecContext(ctx, ss.q(`DELETE FROM local_records`))
-
-		if _, err := s.Records().Add(ctx, LocalRecord{Name: "nas.home.lan", Type: "A", Value: "10.0.0.9", TTL: 300}); err != nil {
-			t.Fatal(err)
-		}
-		all, err := s.Records().All(ctx)
-		if err != nil || len(all) != 1 || all[0].Value != "10.0.0.9" {
-			t.Fatalf("records: %v %v", all, err)
-		}
-	})
-}
-
 // The pragmas are a query string, so a DSN that already carries one has to
 // be extended rather than restarted: "file:x.db?mode=ro" + "?_pragma=..." is
 // not a URI any driver reads back the way it was meant.

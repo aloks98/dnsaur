@@ -1,10 +1,11 @@
 package api
 
 import (
+	"cmp"
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"sort"
+	"slices"
 	"strconv"
 	"time"
 
@@ -154,7 +155,7 @@ func (s *Server) handleStatsTimeline(w http.ResponseWriter, r *http.Request) {
 	for b, d := range tl {
 		out = append(out, bucket{Bucket: b, Decisions: d})
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Bucket < out[j].Bucket })
+	slices.SortFunc(out, func(a, b bucket) int { return cmp.Compare(a.Bucket, b.Bucket) })
 	writeJSON(w, http.StatusOK, out)
 }
 
@@ -186,7 +187,7 @@ func (s *Server) handleStatsTop(w http.ResponseWriter, r *http.Request) {
 	for k, v := range counts {
 		out = append(out, kv{k, v})
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Count > out[j].Count })
+	slices.SortFunc(out, func(a, b kv) int { return cmp.Compare(b.Count, a.Count) })
 	if int64(len(out)) > n {
 		out = out[:n]
 	}

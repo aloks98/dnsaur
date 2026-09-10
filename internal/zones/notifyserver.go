@@ -26,7 +26,8 @@ import (
 // notifyRefusal is why a NOTIFY will not be acted on, and what to say about
 // it. It is refusal's twin from transferserver.go; the two are separate types
 // rather than one shared one because the rcodes mean different things — see
-// decidePeer's comment.
+// decidePeer's comment. The reply itself is not twinned: both end at
+// writeRefusal, which takes the fields rather than either type.
 type notifyRefusal struct {
 	rcode    int
 	tsigCode uint16 // dns.RcodeBadKey/BadSig/BadTime, or 0 for no TSIG error RR
@@ -333,7 +334,7 @@ func (n *NotifyServer) ServeNotify(ctx context.Context, w dns.ResponseWriter, m 
 	if ref != nil {
 		slog.Debug("notify refused", "peer", peer, "qname", qnameOf(m),
 			"rcode", dns.RcodeToString[ref.rcode], "reason", ref.reason)
-		if err := n.writeRefusal(w, m, ref, key, tsigErr); err != nil {
+		if err := writeRefusal(w, m, ref.rcode, ref.tsigCode, n.now(), key, tsigErr); err != nil {
 			slog.Debug("writing a notify refusal failed", "peer", peer, "err", err)
 		}
 		return
@@ -687,26 +688,4 @@ func (n *NotifyServer) primariesFor(ctx context.Context, z *Zone, peer netip.Add
 	st.primaries, st.primariesAt = aps, now
 	n.mu.Unlock()
 	return aps
-}
-
-// writeRefusal sends the one message a refused NOTIFY consists of.
-//
-// TransferServer.writeRefusal's logic with this type's rcodes: reuses
-// errorTSIG and signIfVerified from transferserver.go rather than a second
-// copy, since the BADKEY/BADSIG-unsigned and BADTIME-signed rule is
-// identical and two implementations of it would drift.
-func (n *NotifyServer) writeRefusal(w dns.ResponseWriter, q *dns.Msg, ref *notifyRefusal, key string, tsigErr error) error {
-	m := new(dns.Msg)
-	m.SetRcode(q, ref.rcode)
-	if ref.tsigCode != 0 {
-		if rr := errorTSIG(q, ref.tsigCode, n.now()); rr != nil {
-			m.Extra = append(m.Extra, rr)
-			// See TransferServer.writeRefusal's comment on the same line:
-			// whether this is signed is WriteMsg's own rule
-			// (TsigGenerateWithProvider — sign unless BADKEY/BADSIG).
-			return w.WriteMsg(m)
-		}
-	}
-	signIfVerified(m, q, key, tsigErr)
-	return w.WriteMsg(m)
 }

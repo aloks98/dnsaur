@@ -32,7 +32,11 @@ type Config struct {
 	// from anywhere else does not, because those headers are just headers
 	// and any client can send them. Empty (the default) trusts nothing,
 	// which is the right answer for a dnsaur exposed directly.
-	TrustedProxies []netip.Prefix `yaml:"trusted_proxies"`
+	//
+	// Tagged "-" because the struct decoder cannot read this key: a bare
+	// address is accepted here and netip.ParsePrefix refuses one. Load
+	// fills the field from trusted_proxies through its own reader.
+	TrustedProxies []netip.Prefix `yaml:"-"`
 	Storage        struct {
 		Driver string `yaml:"driver"`
 		DSN    string `yaml:"dsn"`
@@ -164,15 +168,16 @@ func Load(path string) (*Config, error) {
 		}
 	}
 
-	// Build Config struct from koanf
-	c := &Config{
-		DNSListen:  listenAddrs(k),
-		HTTPListen: k.String("http_listen"),
-		DataDir:    k.String("data_dir"),
-		LogLevel:   k.String("log_level"),
+	// koanf fills the plain fields straight from their yaml tags. The two
+	// that are not plain keep their own readers and run after the decode,
+	// so what those return is what the caller gets: dns_listen accepts a
+	// scalar as the one-element list it plainly means, and trusted_proxies
+	// accepts a bare address as the single host it plainly means.
+	c := &Config{}
+	if err := k.UnmarshalWithConf("", c, koanf.UnmarshalConf{Tag: "yaml"}); err != nil {
+		return nil, fmt.Errorf("decode config: %w", err)
 	}
-	c.Storage.Driver = k.String("storage.driver")
-	c.Storage.DSN = k.String("storage.dsn")
+	c.DNSListen = listenAddrs(k)
 	proxies, err := trustedProxies(k)
 	if err != nil {
 		return nil, err

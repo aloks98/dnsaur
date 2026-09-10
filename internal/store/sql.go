@@ -15,7 +15,6 @@ type sqlStore struct {
 func (s *sqlStore) Close() error            { return s.db.Close() }
 func (s *sqlStore) Clients() ClientStore    { return &clientStore{s} }
 func (s *sqlStore) Filters() FilterStore    { return &filterStore{s} }
-func (s *sqlStore) Records() RecordStore    { return &recordStore{s} }
 func (s *sqlStore) Settings() SettingsStore { return &settingsStore{s: s} }
 func (s *sqlStore) QueryLog() QueryLogStore { return &queryLogStore{s} }
 func (s *sqlStore) Stats() StatsStore       { return &statsStore{s: s} }
@@ -273,31 +272,6 @@ func (f *filterStore) Rules(ctx context.Context, groupID int64) ([]Rule, error) 
 			return nil, err
 		}
 		out = append(out, r)
-	}
-	return out, rows.Err()
-}
-
-type recordStore struct{ s *sqlStore }
-
-func (r *recordStore) Add(ctx context.Context, rec LocalRecord) (int64, error) {
-	return r.s.insert(ctx, `INSERT INTO local_records (name, type, value, ttl) VALUES (?, ?, ?, ?)`, rec.Name, rec.Type, rec.Value, rec.TTL)
-}
-
-func (r *recordStore) All(ctx context.Context) ([]LocalRecord, error) {
-	rows, err := r.s.db.QueryContext(ctx, `SELECT id, name, type, value, ttl FROM local_records ORDER BY id`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	// Non-nil so zero records marshals to `[]`, not `null` — see Groups
-	// above. Every fresh instance starts with no local records.
-	out := []LocalRecord{}
-	for rows.Next() {
-		var rec LocalRecord
-		if err := rows.Scan(&rec.ID, &rec.Name, &rec.Type, &rec.Value, &rec.TTL); err != nil {
-			return nil, err
-		}
-		out = append(out, rec)
 	}
 	return out, rows.Err()
 }

@@ -131,11 +131,3 @@ func (f *filterStore) UnassignList(ctx context.Context, groupID, listID int64) e
 func (f *filterStore) DeleteRule(ctx context.Context, id int64) error {
 	return f.s.execOne(ctx, `DELETE FROM rules WHERE id = ?`, id)
 }
-
-func (r *recordStore) Update(ctx context.Context, rec LocalRecord) error {
-	return r.s.execOne(ctx, `UPDATE local_records SET name = ?, type = ?, value = ?, ttl = ? WHERE id = ?`, rec.Name, rec.Type, rec.Value, rec.TTL, rec.ID)
-}
-
-func (r *recordStore) Delete(ctx context.Context, id int64) error {
-	return r.s.execOne(ctx, `DELETE FROM local_records WHERE id = ?`, id)
-}

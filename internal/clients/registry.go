@@ -1,10 +1,11 @@
 package clients
 
 import (
+	"cmp"
 	"context"
 	"log/slog"
 	"net/netip"
-	"sort"
+	"slices"
 	"sync/atomic"
 
 	"github.com/aloks98/dnsaur/internal/dnssrv"
@@ -101,7 +102,7 @@ func (r *Registry) Reload(ctx context.Context) error {
 			s.cidrs = append(s.cidrs, cidrEntry{prefix: p, info: info})
 		}
 	}
-	sort.Slice(s.cidrs, func(i, j int) bool { return s.cidrs[i].prefix.Bits() > s.cidrs[j].prefix.Bits() })
+	slices.SortFunc(s.cidrs, func(a, b cidrEntry) int { return cmp.Compare(b.prefix.Bits(), a.prefix.Bits()) })
 	r.snap.Store(s)
 	return nil
 }

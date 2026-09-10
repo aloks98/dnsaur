@@ -48,18 +48,16 @@ func ValidateACL(s string) error {
 // ParseACL parses s into the entries a request is matched against.
 func ParseACL(s string) ([]ACLEntry, error) {
 	var out []ACLEntry
-	for _, field := range strings.Split(s, ",") {
-		// Skipped rather than rejected, exactly as splitPrimaries does: a
-		// trailing comma names no peer, so there is nothing to be wrong about.
-		field = strings.TrimSpace(field)
-		if field == "" {
-			continue
-		}
+	err := splitList(s, func(field string) error {
 		e, err := parseACLEntry(field)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		out = append(out, e)
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 	return out, nil
 }
@@ -67,7 +65,7 @@ func ParseACL(s string) ([]ACLEntry, error) {
 func parseACLEntry(field string) (ACLEntry, error) {
 	if len(field) >= len(aclKeyPrefix) && strings.EqualFold(field[:len(aclKeyPrefix)], aclKeyPrefix) {
 		name := strings.TrimSpace(field[len(aclKeyPrefix):])
-		if !validACLKeyName(name) {
+		if !validDNSName(name, keyNameForbidden) {
 			return ACLEntry{}, fmt.Errorf("allow_transfer %q: key name must be a domain name", field)
 		}
 		// Canonical (lowercase, trailing dot) because that is how tsig_keys
@@ -99,29 +97,6 @@ func parseACLEntry(field string) (ACLEntry, error) {
 		return ACLEntry{Prefix: netip.PrefixFrom(addr, addr.BitLen())}, nil
 	}
 	return ACLEntry{}, fmt.Errorf("allow_transfer %q: expected an IP address, a CIDR prefix, or key:<name>", field)
-}
-
-// validACLKeyName is a stricter version of the guards normalizeTSIGName
-// applies (internal/api/tsigkeys_handlers.go), for the same underlying
-// reason: dns.IsDomainName documents itself as "extremely liberal — almost
-// any string is a valid domain name", so alone it accepts "ns 2". It also
-// forbids ',' and ':', which normalizeTSIGName has no reason to: those are
-// this format's own delimiters (the entry separator and the key: prefix),
-// so a name containing either would be indistinguishable from one. The ','
-// can never actually reach here — ParseACL splits every field on ',' before
-// parseACLEntry runs — but it stays in the set so this fails closed rather
-// than open if that splitting ever changes.
-func validACLKeyName(name string) bool {
-	if name == "" || strings.ContainsAny(name, " \t\r\n/\\,:") {
-		return false
-	}
-	for _, label := range strings.Split(strings.TrimSuffix(name, "."), ".") {
-		if label == "" {
-			return false
-		}
-	}
-	_, ok := dns.IsDomainName(name)
-	return ok
 }
 
 // FormatACL writes entries back in the spelling ParseACL reads. The API

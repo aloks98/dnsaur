@@ -1268,7 +1268,7 @@ Full editable allowlist. Values are always strings on the wire.
 | `cache.max_ttl` | `86400` | int ≥ 0 | **restart** (stored `0` → 24h) |
 | `cache.max_entries` | `10000` | int ≥ 0 | **restart** (stored `0` → 10000) |
 | `cache.serve_stale_for` | `86400` | int ≥ 0 | **restart** (stored `0` → 24h) |
-| `lists.refresh_hours` | `24` | int ≥ 1 | **restart** for the cadence — but any settings change triggers one immediate refresh |
+| `lists.refresh_hours` | `24` | int ≥ 1 | **restart** for the cadence — a settings change recompiles from the cached copies rather than re-downloading |
 | `qlog.retention_days` | `90` | int ≥ 0 | **hot, delayed** — re-read per prune run, so it lands on the next 24h tick |
 | `qlog.privacy` | `full` | `full` \| `anon` \| `none` | **hot**, read per query |
 | `stats.retention_days` | `365` | int ≥ 1 | **hot, delayed** — same prune run as `qlog.retention_days` |

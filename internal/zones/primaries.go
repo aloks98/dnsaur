@@ -8,8 +8,6 @@ import (
 	"net"
 	"net/netip"
 	"strings"
-
-	"github.com/miekg/dns"
 )
 
 // The `primaries` wire format, which shipped with none.
@@ -203,52 +201,33 @@ func (p primary) resolve(ctx context.Context, res *net.Resolver) ([]netip.AddrPo
 
 func splitPrimaries(s string) ([]primary, error) {
 	var out []primary
-	for _, field := range strings.Split(s, ",") {
-		// Skipped rather than rejected: a trailing comma or a doubled
-		// separator names no primary, so there is nothing to be wrong about.
-		// A list that is *only* separators still fails, on the emptiness
-		// check below.
-		field = strings.TrimSpace(field)
-		if field == "" {
-			continue
-		}
-		p, err := parsePrimary(field)
+	err := splitList(s, func(field string) error {
+		host, port, err := parseHostPort("primary", field, field)
 		if err != nil {
-			return nil, err
+			return err
 		}
-		out = append(out, p)
+		out = append(out, primary{host: host, port: port})
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
+	// A list that is *only* separators arrives here with nothing in it, and
+	// this is where it fails.
 	if len(out) == 0 {
 		return nil, errors.New("at least one primary is required")
 	}
 	return out, nil
 }
 
-func parsePrimary(field string) (primary, error) {
-	host, port, err := parseHostPort("primary", field, field)
-	if err != nil {
-		return primary{}, err
-	}
-	return primary{host: host, port: port}, nil
-}
-
 // validPrimaryHost accepts an IP literal or a domain name. The domain-name
-// half needs the same guards normalizeZoneName (internal/api) applies for
-// the same reason: dns.IsDomainName documents itself as "extremely liberal
-// — almost any string is a valid domain name", so on its own it would
-// accept "not a host".
+// half needs the same guards normalizeZoneName (internal/api) applies, which
+// is what validDNSName does: ':' is forbidden because a port is split off on
+// it, and ',' is absent from the set because the list was split on it long
+// before here.
 func validPrimaryHost(host string) bool {
 	if _, err := netip.ParseAddr(host); err == nil {
 		return true
 	}
-	if host == "" || strings.ContainsAny(host, " \t\r\n/\\:") {
-		return false
-	}
-	for _, label := range strings.Split(strings.TrimSuffix(host, "."), ".") {
-		if label == "" {
-			return false
-		}
-	}
-	_, ok := dns.IsDomainName(host)
-	return ok
+	return validDNSName(host, " \t\r\n/\\:")
 }

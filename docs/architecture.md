@@ -766,9 +766,9 @@ Planned, not yet present: `internal/dhcp` (Phase 2), `internal/sync`
   values from literal strings into presentation format — none of which is
   expressible in SQL. Its `local_records` source rows are deliberately kept
   after the conversion, not dropped: the conversion alters data, so the
-  originals are the only surviving record of what the user wrote. `Store`
-  therefore still exposes `RecordStore` over that table, but nothing serves
-  from it.
+  originals are the only surviving record of what the user wrote. The
+  migration is the only reader, through raw SQL — `Store` exposes no Go API
+  over that table, and nothing serves from it.
 - Almost all runtime configuration lives in a `settings` key/value table in
   the database, not in the bootstrap YAML. `internal/app` seeds sane
   defaults on first run, and components subscribe to a change notification
@@ -797,9 +797,10 @@ that waits on the internet.
 - **Compile** (`Recompile`) reads the stored rules and the cached list files
   and swaps in a new set of compiled rulesets. No network, no list state
   written — nothing was attempted, so there is nothing to report. Every API
-  write to a rule, a list or an assignment takes this path, which is why a
-  rule save answers in milliseconds even with an unreachable list
-  subscribed, and why "add a rule, see it blocked" is immediate.
+  write to a rule, a list or an assignment takes this path, and so does a
+  settings change (`internal/app`'s watcher), which is why a rule save
+  answers in milliseconds even with an unreachable list subscribed, and why
+  "add a rule, see it blocked" is immediate.
 - **Download** (`RefreshAll`) fetches every enabled list into the cache,
   records what each attempt produced (`ok`/`stale`/`failed`/`empty` — see
   [`ui-contract.md`](ui-contract.md#refresh-outcome-last_status)) and then

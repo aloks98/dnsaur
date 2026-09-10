@@ -87,7 +87,6 @@ type AuthToken struct {
 type Store interface {
 	Clients() ClientStore
 	Filters() FilterStore
-	Records() RecordStore
 	Settings() SettingsStore
 	QueryLog() QueryLogStore
 	Stats() StatsStore
@@ -266,14 +265,6 @@ type FilterStore interface {
 	DeleteList(ctx context.Context, id int64) error
 	UnassignList(ctx context.Context, groupID, listID int64) error
 	DeleteRule(ctx context.Context, id int64) error
-}
-
-// RecordStore manages locally-defined DNS records.
-type RecordStore interface {
-	All(ctx context.Context) ([]LocalRecord, error)
-	Add(ctx context.Context, r LocalRecord) (int64, error)
-	Update(ctx context.Context, r LocalRecord) error
-	Delete(ctx context.Context, id int64) error
 }
 
 // QueryLogStore manages DNS query log entries.

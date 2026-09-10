@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"gopkg.in/yaml.v3"
+	"go.yaml.in/yaml/v3"
 )
 
 // specOperationKeys are the sibling keys under an openapi.yaml path item

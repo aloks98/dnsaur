@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"time"
 
 	"github.com/aloks98/dnsaur/internal/store"
@@ -82,6 +83,16 @@ type NotifyOption func(*Notifier)
 // WithNotifyNow replaces the clock the pass is decided against.
 func WithNotifyNow(now func() time.Time) NotifyOption {
 	return func(n *Notifier) { n.now = now }
+}
+
+// WithNotifyResolver sets the resolver a target named by hostname is looked
+// up through at send time. nil (the default) means net.DefaultResolver.
+//
+// It replaces the sender, so a caller passing WithNotifySender as well gets
+// whichever came last — the two say the same thing about a different half of
+// the same field.
+func WithNotifyResolver(res *net.Resolver) NotifyOption {
+	return func(n *Notifier) { n.sender = newUDPSender(res) }
 }
 
 // WithNotifySender replaces how a NOTIFY is actually sent. Production never

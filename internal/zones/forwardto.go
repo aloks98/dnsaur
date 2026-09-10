@@ -57,18 +57,16 @@ func ValidateForwardTo(s string) error {
 // ParseForwardTo parses s into the targets a forwarder zone's queries go to.
 func ParseForwardTo(s string) ([]ForwardTarget, error) {
 	var out []ForwardTarget
-	for _, field := range strings.Split(s, ",") {
-		// Skipped rather than rejected, as splitPrimaries and ParseNotifyTo
-		// both do: a trailing comma names no target.
-		field = strings.TrimSpace(field)
-		if field == "" {
-			continue
-		}
+	err := splitList(s, func(field string) error {
 		host, port, err := parseHostPort("forward target", field, field)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		out = append(out, ForwardTarget{Host: host, Port: port})
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 	return out, nil
 }

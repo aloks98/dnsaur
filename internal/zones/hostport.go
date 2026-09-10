@@ -7,7 +7,65 @@ import (
 	"net/netip"
 	"strconv"
 	"strings"
+
+	"github.com/miekg/dns"
 )
+
+// What the four list columns — `primaries`, `notify_to`, `forward_to` and
+// `allow_transfer` — genuinely share: how a list is split, what makes a name
+// a name, and how one entry's host and port come apart. Each format keeps
+// its own entry syntax and its own error nouns.
+
+// splitList calls each with every entry of a comma-separated list column,
+// trimmed, skipping the empty ones.
+//
+// Skipped rather than rejected: a trailing comma or a doubled separator
+// names nothing, so there is nothing to be wrong about. What a list of
+// *only* separators means is the caller's to decide — splitPrimaries makes
+// no entries an error, the other three make it an empty list.
+func splitList(s string, each func(field string) error) error {
+	for _, field := range strings.Split(s, ",") {
+		field = strings.TrimSpace(field)
+		if field == "" {
+			continue
+		}
+		if err := each(field); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// keyNameForbidden are the characters a TSIG key name may not carry in
+// either format that names one. It is stricter than normalizeTSIGName's
+// guards (internal/api/tsigkeys_handlers.go) by ',' and ':', which are these
+// formats' own delimiters — the entry separator and the `key:` prefix — so a
+// name containing either would be indistinguishable from one. The ',' can
+// never actually reach the check, since both parsers split on it first, and
+// stays in the set so this fails closed rather than open if that splitting
+// ever changes.
+const keyNameForbidden = " \t\r\n/\\,:"
+
+// validDNSName reports whether name is a domain name worth storing, refusing
+// outright any character in forbidden.
+//
+// dns.IsDomainName documents itself as "extremely liberal — almost any
+// string is a valid domain name", so on its own it accepts "ns 2" and "not a
+// host"; the empty-label loop then catches "a..b" and a leading dot, which it
+// also tolerates. forbidden is what each format adds on top: its own
+// delimiters, plus the characters no host or key name has.
+func validDNSName(name, forbidden string) bool {
+	if name == "" || strings.ContainsAny(name, forbidden) {
+		return false
+	}
+	for _, label := range strings.Split(strings.TrimSuffix(name, "."), ".") {
+		if label == "" {
+			return false
+		}
+	}
+	_, ok := dns.IsDomainName(name)
+	return ok
+}
 
 // parseHostPort splits one "host", "host:port" or "[v6]:port" entry into a
 // validated host and a port, defaulting to DefaultPrimaryPort.

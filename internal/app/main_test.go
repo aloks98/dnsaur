@@ -2,19 +2,12 @@ package app
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
-	"net/url"
 	"os"
-	"sync/atomic"
 	"testing"
-	"time"
 
 	"github.com/aloks98/dnsaur/internal/config"
-	"github.com/aloks98/dnsaur/internal/store"
-	_ "github.com/jackc/pgx/v5/stdlib" // registers the "pgx" driver this file opens the maintenance database with
-	"github.com/testcontainers/testcontainers-go"
-	"github.com/testcontainers/testcontainers-go/wait"
+	"github.com/aloks98/dnsaur/internal/storetest"
 )
 
 // internal/store has run every case on both drivers for a long time
@@ -33,18 +26,15 @@ import (
 // behind this milestone's concurrency work — routeMu, the install ordering,
 // the cache purge — was taken on the driver where the window is narrowest.
 //
-// Same env var and the same skip-when-absent behaviour as the other two
-// packages, so a machine without Docker still gets a green run with the
-// postgres halves *reported as skipped* rather than quietly passing.
+// The container, the template and the per-test database are internal/
+// storetest's, shared with the other two packages that need them.
 
 // pgDSN is the maintenance DSN every per-test database is created from. It is
 // set by TestMain when a container came up (or when the environment already
 // provided one); empty means no postgres, which is a skip.
 var pgDSN string
 
-// pgTemplate is a database with the migrations already applied. Each test's
-// database is copied from it (CREATE DATABASE ... TEMPLATE), so a test pays
-// for a file copy rather than for goose replaying every migration. Named
+// pgTemplate is a database with the migrations already applied. Named
 // distinctly from internal/zones' template because CI may point both packages
 // at one shared cluster.
 const pgTemplate = "dnsaur_app_tmpl"
@@ -52,54 +42,14 @@ const pgTemplate = "dnsaur_app_tmpl"
 func TestMain(m *testing.M) { os.Exit(run(m)) }
 
 // run is TestMain's body in a function of its own so that its defers actually
-// run: os.Exit skips them, and with the reaper disabled (see below) this
-// process is the only thing that will ever stop the container it starts.
+// run: os.Exit skips them, and with the reaper disabled (see storetest.Start)
+// this process is the only thing that will ever stop the container it starts.
 func run(m *testing.M) int {
 	ctx := context.Background()
-	// An externally provided database wins: CI can point the suite at one it
-	// already runs, and nothing then starts a container.
-	dsn := os.Getenv("DNSAUR_TEST_POSTGRES_DSN")
-	if dsn == "" {
-		// **This is the third container-using package in one `go test`, and
-		// that is precisely where the last one broke.** testcontainers
-		// derives its session ID from the parent pid and its start time
-		// (internal/core/bootstrap.go), so every test binary in a single
-		// invocation shares one Ryuk — and Ryuk prunes everything carrying
-		// that session's labels as soon as a client disconnects. internal/
-		// store finishes in ~32s while this package and internal/zones run
-		// for minutes, so store exiting took the others' postgres down with
-		// it: "connection refused" against a mapped port with no container
-		// behind it, red only when the packages were run together, which is
-		// what `go test ./...` and CI do.
-		//
-		// Disabling the reaper for *this* process is what breaks the link.
-		// core.DefaultLabels adds org.testcontainers.reap=true only when the
-		// reaper is enabled, and that label is one of the filters the other
-		// process's reaper prunes by, so a container started from here is no
-		// longer matched by it. internal/zones does the same; nothing about
-		// internal/store changes.
-		//
-		// The cost is that nothing external cleans up after this process, so
-		// the Terminate below has to actually run — hence run() rather than
-		// os.Exit(m.Run()). A hard kill (SIGKILL, a panicking runtime) still
-		// leaks one container.
-		_ = os.Setenv("TESTCONTAINERS_RYUK_DISABLED", "true")
-		req := testcontainers.ContainerRequest{
-			Image:        "postgres:17-alpine",
-			Env:          map[string]string{"POSTGRES_PASSWORD": "t", "POSTGRES_DB": "dnsaur"},
-			ExposedPorts: []string{"5432/tcp"},
-			WaitingFor:   wait.ForListeningPort("5432/tcp").WithStartupTimeout(60 * time.Second),
-		}
-		pg, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{ContainerRequest: req, Started: true})
-		if err == nil {
-			host, _ := pg.Host(ctx)
-			port, _ := pg.MappedPort(ctx, "5432")
-			dsn = fmt.Sprintf("postgres://postgres:t@%s:%s/dnsaur?sslmode=disable", host, port.Port())
-			defer func() { _ = pg.Terminate(context.Background()) }()
-		}
-	}
+	dsn, stop := storetest.Start(ctx, "app")
+	defer stop()
 	if dsn != "" {
-		if err := buildPGTemplate(ctx, dsn); err != nil {
+		if err := storetest.BuildTemplate(ctx, dsn, pgTemplate); err != nil {
 			// Deliberately not fatal: a machine that can start a container
 			// but cannot build the template is still allowed to run the
 			// sqlite halves. pgDSN stays empty, so the postgres halves skip
@@ -112,122 +62,20 @@ func run(m *testing.M) int {
 	return m.Run()
 }
 
-// buildPGTemplate creates pgTemplate and runs the migrations into it once.
-func buildPGTemplate(ctx context.Context, dsn string) error {
-	admin, err := maintenanceDB(dsn)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = admin.Close() }()
-	// The port is listening before the server will accept a connection: the
-	// image's entrypoint runs initdb against a *local* postmaster first, and
-	// a connection that arrives in that window is refused with 57P03 "the
-	// database system is starting up". wait.ForListeningPort cannot see the
-	// difference, so the readiness check is made here, where it can.
-	if err := waitReady(ctx, admin); err != nil {
-		return err
-	}
-	if _, err := admin.ExecContext(ctx, `DROP DATABASE IF EXISTS "`+pgTemplate+`" WITH (FORCE)`); err != nil {
-		return fmt.Errorf("dropping a stale template: %w", err)
-	}
-	if _, err := admin.ExecContext(ctx, `CREATE DATABASE "`+pgTemplate+`"`); err != nil {
-		return fmt.Errorf("creating the template: %w", err)
-	}
-	// store.Open is what runs the migrator, so the template is migrated by
-	// exactly the code every test would otherwise run itself.
-	s, err := store.Open(ctx, "postgres", withDatabase(dsn, pgTemplate))
-	if err != nil {
-		return fmt.Errorf("migrating the template: %w", err)
-	}
-	// Closed before any copy is taken: CREATE DATABASE ... TEMPLATE refuses
-	// while another session is connected to the source.
-	return s.Close()
-}
-
-// waitReady pings until the server answers or the deadline passes.
-func waitReady(ctx context.Context, db *sql.DB) error {
-	deadline := time.Now().Add(60 * time.Second)
-	var err error
-	for time.Now().Before(deadline) {
-		if err = db.PingContext(ctx); err == nil {
-			return nil
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-	return fmt.Errorf("postgres never became ready: %w", err)
-}
-
-// maintenanceDB opens the cluster's "postgres" database. Connecting there
-// rather than to the application database is what lets CREATE DATABASE name
-// the latter as a template.
-func maintenanceDB(dsn string) (*sql.DB, error) {
-	db, err := sql.Open("pgx", withDatabase(dsn, "postgres"))
-	if err != nil {
-		return nil, err
-	}
-	// One connection, closed with the handle: a lingering idle connection to
-	// the maintenance database is harmless, but a pool of them is noise in
-	// pg_stat_activity while a test is diagnosing something.
-	db.SetMaxOpenConns(1)
-	return db, nil
-}
-
-func withDatabase(dsn, name string) string {
-	u, err := url.Parse(dsn)
-	if err != nil {
-		return dsn
-	}
-	u.Path = "/" + name
-	return u.String()
-}
-
-// pgSeq numbers the per-test databases. Names have to be unique within the
-// cluster for the whole run, not merely within one test.
-var pgSeq atomic.Int64
-
 // postgresConfig returns a config pointing at a database of this test's own,
 // copied from the migrated template and dropped on cleanup.
-//
-// A database each, rather than internal/store's one shared database with
-// unique row names, because App.ReloadZones reads *every* zone in the store:
-// zones left behind by an earlier test would end up in a later test's served
-// snapshot and its routing table, which is the thing under test here.
-//
-// The drop is registered *before* the caller builds its App, so it runs after
-// the App's own Shutdown — cleanups are LIFO, and Shutdown is what closes the
-// store's pool. Dropping while that pool is live would need FORCE to succeed
-// and would race the App's own goroutines.
 func postgresConfig(t *testing.T) *config.Config {
 	t.Helper()
-	if pgDSN == "" {
-		t.Skip("no postgres available: set DNSAUR_TEST_POSTGRES_DSN, or run with Docker so TestMain can start one")
-	}
-	ctx := context.Background()
-	admin, err := maintenanceDB(pgDSN)
-	if err != nil {
-		t.Fatalf("maintenance connection: %v", err)
-	}
-	defer func() { _ = admin.Close() }()
-
-	name := fmt.Sprintf("at_%d_%d", os.Getpid(), pgSeq.Add(1))
-	if _, err := admin.ExecContext(ctx, `CREATE DATABASE "`+name+`" TEMPLATE "`+pgTemplate+`"`); err != nil {
-		t.Fatalf("creating %s: %v", name, err)
-	}
-	t.Cleanup(func() {
-		db, err := maintenanceDB(pgDSN)
-		if err != nil {
-			return
-		}
-		defer func() { _ = db.Close() }()
-		_, _ = db.ExecContext(context.Background(), `DROP DATABASE IF EXISTS "`+name+`" WITH (FORCE)`)
-	})
+	// Registered before the caller builds its App, so the drop runs after
+	// the App's own Shutdown — see storetest.Database.
+	dsn := storetest.Database(t, pgDSN, pgTemplate, "at")
 
 	// DataDir still points at a temp directory: App.New makes it, and the
 	// blocklist refresher caches downloads under it. Only the store moves.
 	dir := t.TempDir()
 	cfg := &config.Config{DNSListen: []string{"127.0.0.1:0"}, HTTPListen: ":0", DataDir: dir, LogLevel: "error"}
 	cfg.Storage.Driver = "postgres"
-	cfg.Storage.DSN = withDatabase(pgDSN, name)
+	cfg.Storage.DSN = dsn
 	return cfg
 }
 

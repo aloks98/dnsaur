@@ -65,14 +65,17 @@ func TestClampTTL(t *testing.T) {
 	}
 }
 
-// seedLocalRecords writes through the pre-zone RecordStore — the API
-// local_records had before zones existed — rather than through ZoneStore,
-// since it's migrateLocalRecords itself that is under test here.
+// seedLocalRecords writes straight into local_records, which is both how
+// the pre-zone API wrote it and how migrateLocalRecords reads it back —
+// there is no Go CRUD in front of that table any more, and it is the
+// migration under test here rather than any store method.
 func seedLocalRecords(t *testing.T, s Store, recs []LocalRecord) {
 	t.Helper()
+	ss := s.(*sqlStore)
 	ctx := context.Background()
 	for _, r := range recs {
-		if _, err := s.Records().Add(ctx, r); err != nil {
+		if _, err := ss.insert(ctx, `INSERT INTO local_records (name, type, value, ttl) VALUES (?, ?, ?, ?)`,
+			r.Name, r.Type, r.Value, r.TTL); err != nil {
 			t.Fatalf("seedLocalRecords: %v", err)
 		}
 	}

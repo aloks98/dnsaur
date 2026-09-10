@@ -66,24 +66,21 @@ func ValidateNotifyTo(s string) error {
 
 // ParseNotifyTo parses s into the targets a NOTIFY is sent to.
 func ParseNotifyTo(s string) ([]NotifyTarget, error) {
+	// Unlike splitPrimaries there is no "at least one" check at the end. A
+	// secondary with no primaries cannot transfer, so an empty list there is
+	// a broken zone; a zone with no notify targets is the ordinary case and
+	// the default.
 	var out []NotifyTarget
-	for _, field := range strings.Split(s, ",") {
-		// Skipped rather than rejected, exactly as splitPrimaries and
-		// ParseACL do: a trailing comma names no target.
-		//
-		// Unlike splitPrimaries there is no "at least one" check at the end.
-		// A secondary with no primaries cannot transfer, so an empty list
-		// there is a broken zone; a zone with no notify targets is the
-		// ordinary case and the default.
-		field = strings.TrimSpace(field)
-		if field == "" {
-			continue
-		}
+	err := splitList(s, func(field string) error {
 		t, err := parseNotifyTarget(field)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		out = append(out, t)
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 	return out, nil
 }
@@ -107,7 +104,7 @@ func parseNotifyTarget(field string) (NotifyTarget, error) {
 		if strings.ContainsAny(name, " \t") {
 			return NotifyTarget{}, fmt.Errorf("notify target %q: only one `key:<name>` is allowed, and it must be the last token", field)
 		}
-		if !validNotifyKeyName(name) {
+		if !validDNSName(name, keyNameForbidden) {
 			return NotifyTarget{}, fmt.Errorf("notify target %q: key name must be a domain name", field)
 		}
 		key = dns.CanonicalName(name)
@@ -128,24 +125,6 @@ func parseNotifyTarget(field string) (NotifyTarget, error) {
 		return NotifyTarget{}, err
 	}
 	return NotifyTarget{Host: host, Port: port, Key: key}, nil
-}
-
-// validNotifyKeyName mirrors validACLKeyName exactly, including that ',' and
-// ':' are refused: they are this format's own delimiters, so a name carrying
-// either would be indistinguishable from one. The ',' cannot actually reach
-// here — ParseNotifyTo splits on it first — and stays in the set so this
-// fails closed rather than open if that splitting ever changes.
-func validNotifyKeyName(name string) bool {
-	if name == "" || strings.ContainsAny(name, " \t\r\n/\\,:") {
-		return false
-	}
-	for _, label := range strings.Split(strings.TrimSuffix(name, "."), ".") {
-		if label == "" {
-			return false
-		}
-	}
-	_, ok := dns.IsDomainName(name)
-	return ok
 }
 
 // FormatNotifyTo writes targets back in the spelling ParseNotifyTo reads. The

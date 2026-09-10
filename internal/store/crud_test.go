@@ -54,7 +54,7 @@ func TestClientGroupCRUD(t *testing.T) {
 	})
 }
 
-func TestFilterAndRecordCRUD(t *testing.T) {
+func TestFilterCRUD(t *testing.T) {
 	forEachDriver(t, func(t *testing.T, s Store) {
 		ctx := context.Background()
 		// Ensure id >= 2 so tests can check hardcoded id==1 constraint.
@@ -90,21 +90,6 @@ func TestFilterAndRecordCRUD(t *testing.T) {
 		}
 		if rs, _ := s.Filters().Rules(ctx, gid); len(rs) != 0 {
 			t.Fatalf("rule not deleted: %v", rs)
-		}
-
-		recID, _ := s.Records().Add(ctx, LocalRecord{Name: "u.home.lan", Type: "A", Value: "10.0.0.1", TTL: 60})
-		if err := s.Records().Update(ctx, LocalRecord{ID: recID, Name: "u.home.lan", Type: "A", Value: "10.0.0.2", TTL: 90}); err != nil {
-			t.Fatal(err)
-		}
-		all, _ := s.Records().All(ctx)
-		if all[len(all)-1].Value != "10.0.0.2" || all[len(all)-1].TTL != 90 {
-			t.Fatalf("record update: %+v", all[len(all)-1])
-		}
-		if err := s.Records().Delete(ctx, recID); err != nil {
-			t.Fatal(err)
-		}
-		if err := s.Records().Delete(ctx, recID); !errors.Is(err, ErrNotFound) {
-			t.Fatalf("double delete: %v", err)
 		}
 	})
 }
@@ -290,12 +275,6 @@ func TestEmptyListsMarshalAsJSONArrayNotNull(t *testing.T) {
 			t.Fatal(err)
 		}
 		mustMarshalArray(t, rules)
-
-		records, err := s.Records().All(ctx)
-		if err != nil {
-			t.Fatal(err)
-		}
-		mustMarshalArray(t, records)
 	})
 }
 

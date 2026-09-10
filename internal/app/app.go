@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -27,12 +28,11 @@ import (
 	"github.com/aloks98/dnsaur/internal/upstream"
 	"github.com/aloks98/dnsaur/internal/zones"
 	"github.com/aloks98/dnsaur/web"
-	"github.com/google/uuid"
 )
 
 func defaultSettings() map[string]string {
 	return map[string]string{
-		"instance.id":           uuid.NewString(),
+		"instance.id":           rand.Text(),
 		"upstreams":             "1.1.1.1:53,1.0.0.1:53,9.9.9.9:53",
 		"upstream.strategy":     "race",
 		"blocking.mode":         "null-ip",
@@ -233,8 +233,20 @@ func New(ctx context.Context, cfg *config.Config, version string) (*App, error) 
 		ready:    make(chan struct{}),
 	}
 	a.refresher = filter.NewRefresher(st.Filters(), st.Clients(), a.engine, cfg.DataDir)
+	// The resolver every hostname in a zone's configuration is looked up
+	// through: a secondary's primaries, a NOTIFY target, a stub's
+	// out-of-zone nameserver. Four constructors default it independently,
+	// so it is decided here once instead of in each of them.
+	//
+	// nil is net.DefaultResolver, which is the system resolver rather than
+	// this server's own upstreams. Pointing it at the forwarder instead
+	// would change behaviour — those lookups would follow the conditional
+	// routing table and could arrive back here — so it is a change to make
+	// deliberately, at this line, rather than a default to drift into.
+	var zoneRes *net.Resolver
 	// Built before the Transferrer, which takes its Wake for the cascade.
-	a.notifier = zones.NewNotifier(st.Zones(), st.Notifies(), st.TSIGKeys())
+	a.notifier = zones.NewNotifier(st.Zones(), st.Notifies(), st.TSIGKeys(),
+		zones.WithNotifyResolver(zoneRes))
 	// The transfer republishes the served snapshot itself: a zone installed
 	// into the store that nothing reloaded is answering from the copy it just
 	// replaced. The key store is passed live, not a snapshot, for the same
@@ -242,6 +254,7 @@ func New(ctx context.Context, cfg *config.Config, version string) (*App, error) 
 	// signs the next transfer, not the next restart.
 	a.zoneRefresh = zones.NewRefresher(st.Zones(),
 		zones.NewTransferrer(st.Zones(), st.TSIGKeys(),
+			zones.WithTransferResolver(zoneRes),
 			// **ReloadZones, not resolver.Reload.** The conditional routing
 			// table is derived from the served snapshot, so republishing the
 			// snapshot alone publishes half a reload: a forwarder or stub zone
@@ -272,6 +285,7 @@ func New(ctx context.Context, cfg *config.Config, version string) (*App, error) 
 		// that never happened — while the rows sit in the database and the
 		// zone page shows the delegation.
 		zones.WithStubFetcher(zones.NewStubFetcher(st.Zones(), st.TSIGKeys(),
+			zones.WithStubResolver(zoneRes),
 			zones.WithStubReload(a.ReloadZones))))
 	// The other direction: what a.zoneRefresh's Transferrer pulls from
 	// someone else's TransferServer, this one serves to a peer pulling from
@@ -289,6 +303,7 @@ func New(ctx context.Context, cfg *config.Config, version string) (*App, error) 
 	// line as the only signal. A primary editing ten records would cause
 	// ten full zone transfers.
 	a.notifyIn = zones.NewNotifyServer(a.resolver, st.Zones(), a.zoneRefresh,
+		zones.WithNotifyServerResolver(zoneRes),
 		zones.WithNotifyProbes(a.zoneRefresh.Transferrer()))
 	return a, nil
 }
@@ -860,8 +875,15 @@ func (a *App) Start(ctx context.Context) error {
 					return
 				case <-changes:
 					a.applySettings(c)
-					if err := a.refresher.RefreshAll(c); err != nil {
-						slog.Error("refresh after settings change failed", "err", err)
+					// Compile, do not download. A settings write can
+					// change which rules and lists a group enforces, so
+					// the ruleset has to be rebuilt; it cannot change
+					// what any URL serves, so there is nothing to fetch.
+					// Fetching anyway made every settings save wait on
+					// the slowest subscribed URL. The ticker and the
+					// list writes are what download.
+					if err := a.refresher.Recompile(c); err != nil {
+						slog.Error("recompiling filters after a settings change failed", "err", err)
 					}
 				}
 			}

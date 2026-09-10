@@ -1,11 +1,12 @@
 package upstream
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
 	"log/slog"
-	"sort"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -456,8 +457,8 @@ func (f *Forwarder) Handler() dnssrv.Handler {
 			ordered := healthy
 			if f.strategy == "fastest" {
 				ordered = append([]*up{}, healthy...)
-				sort.Slice(ordered, func(i, j int) bool {
-					return ordered[i].ewmaMicro.Load() < ordered[j].ewmaMicro.Load()
+				slices.SortFunc(ordered, func(a, b *up) int {
+					return cmp.Compare(a.ewmaMicro.Load(), b.ewmaMicro.Load())
 				})
 			}
 			for _, u := range ordered {

@@ -18,7 +18,11 @@ See also: [`README.md`](../README.md) · [`docs/architecture.md`](architecture.m
   drivers; `internal/zones` and `internal/app` run only the cases where
   connection or transaction behaviour could differ — the reload, the transfer
   and stub installs, the concurrent refreshes, and in `internal/app` the
-  routing-table windows and the cache invalidation that hangs off them.
+  routing-table windows and the cache invalidation that hangs off them. The
+  container, the migrated template database and the per-test copy taken from
+  it all live in `internal/storetest`, so a package that needs Postgres calls
+  `storetest.Start` from its `TestMain` and `storetest.Database` from its
+  fixture rather than growing a fourth copy of the scaffolding.
 - **golangci-lint v2.12** for linting (matches the version pinned in CI).
 
 ## Build

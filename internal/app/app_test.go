@@ -1571,3 +1571,83 @@ func TestSettingsReadFailureLeavesBlockingModeAndPrivacyUntouched(t *testing.T) 
 
 	check("after the failed read")
 }
+
+// A settings write must not put the blocklist downloader on the network.
+//
+// The watcher called RefreshAll after applySettings, so saving a blocking
+// mode or a cache size re-fetched every subscribed URL — and with one of
+// them unreachable, spent the whole fetch timeout doing it. Compiling from
+// the copies already on disk is all a settings change needs; downloading is
+// the ticker's job, and a list write's own.
+//
+// The fetch is observed at the list's own state rather than at a socket.
+// RefreshAll records an attempt against every list it tries, failures
+// included, and Recompile records none — "nothing was attempted, so nothing
+// is reported". A list nobody has ever fetched is therefore the sharpest
+// witness available, and it needs no server: the URL below is one the
+// fetcher's dialer refuses before it opens a connection, so the attempt
+// costs nothing and still leaves its mark.
+func TestSettingsChangeCompilesWithoutDownloading(t *testing.T) {
+	pub := mockDNS(t, answerA("5.6.7.8"))
+	pub2 := mockDNS(t, answerA("6.6.6.6"))
+	a := newTestApp(t, withUpstreams(pub))
+	ctx := context.Background()
+
+	id, err := a.Store().Filters().AddList(ctx, store.List{
+		URL: "http://127.0.0.1:1/hosts", Kind: "block", Enabled: true,
+	})
+	if err != nil {
+		t.Fatalf("AddList: %v", err)
+	}
+	if l := listByID(t, a, id); l.LastAttempt != 0 || l.LastStatus != store.ListStatusPending {
+		t.Fatalf("precondition: the list is already %s (attempt %d); an attempt during the settings change would not show up",
+			l.LastStatus, l.LastAttempt)
+	}
+
+	// Set (unlike SetInternal) bumps config_version and notifies Changes(),
+	// which is what the watcher goroutine is waiting on.
+	if err := a.Store().Settings().Set(ctx, "upstreams", pub2); err != nil {
+		t.Fatalf("Set(upstreams): %v", err)
+	}
+	// Poll a fresh name each time — a repeat would be answered from the
+	// cache — until the new default answers. That is the observable proof
+	// the watcher woke and ran applySettings, so what follows is measured
+	// after the work rather than before it.
+	deadline := time.Now().Add(5 * time.Second)
+	for i := 0; ; i++ {
+		if got := askApp(t, a, fmt.Sprintf("probe%d.example", i)); got == "6.6.6.6" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the upstreams setting never took effect, so the watcher never ran")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	// The refresh call follows applySettings immediately, so an attempt
+	// would already be recorded by the time the poll above sees its effect.
+	// The window is margin, not a guess at how long a fetch takes.
+	window := time.Now().Add(time.Second)
+	for time.Now().Before(window) {
+		if l := listByID(t, a, id); l.LastAttempt != 0 || l.LastStatus != store.ListStatusPending {
+			t.Fatalf("a settings change fetched the list (status %s, attempt %d); it must compile from the cache the ticker fills",
+				l.LastStatus, l.LastAttempt)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func listByID(t *testing.T, a *App, id int64) store.List {
+	t.Helper()
+	ls, err := a.Store().Filters().Lists(context.Background())
+	if err != nil {
+		t.Fatalf("Lists: %v", err)
+	}
+	for _, l := range ls {
+		if l.ID == id {
+			return l
+		}
+	}
+	t.Fatalf("list %d is gone", id)
+	return store.List{}
+}
