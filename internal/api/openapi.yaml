@@ -1101,12 +1101,27 @@ paths:
   /blocking:
     get:
       tags: [Blocking]
-      summary: Whether blocking is currently paused for a group
+      summary: Whether blocking is currently paused, for a group or a client
+      description: >
+        Reports the pause actually in force for the scope asked about. A
+        group inherits the global pause and a client inherits both its
+        group's and the global one; whichever ends later wins, and `scope`
+        says which of the three that was. Pauses survive a restart.
       parameters:
         - name: group_id
           in: query
           required: false
-          schema: { type: integer, format: int64, description: defaults to 0 when omitted }
+          description: >
+            Group ids start at 1, so 0 (the default) is the global pause.
+          schema: { type: integer, format: int64, default: 0 }
+        - name: client_id
+          in: query
+          required: false
+          description: >
+            One client, instead of a group. The answer folds in the pauses
+            on that client's group and on the whole server. An id naming no
+            client reports only the global pause.
+          schema: { type: integer, format: int64, default: 0 }
       responses:
         "200":
           description: OK
@@ -1119,8 +1134,24 @@ paths:
                     type: integer
                     format: int64
                     description: unix ms when the pause ends, or 0 if not paused
+                  scope:
+                    type: string
+                    enum: [global, group, client]
+                    description: >
+                      Which pause is the one in force. Absent when nothing
+                      is paused.
+        "400":
+          description: group_id and client_id were both given
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
         "401":
           description: authentication required
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503":
+          description: storage unavailable
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -1128,22 +1159,28 @@ paths:
   /blocking/pause:
     post:
       tags: [Blocking]
-      summary: Pause blocking for a group for N minutes
+      summary: Pause blocking for N minutes, globally or for one group or client
+      description: >
+        Pauses one scope. Send `group_id` for a group, `client_id` for a
+        single device, neither (or `group_id: 0`) for every query the server
+        answers. Sending both is refused. The pause is stored, so it stays
+        in force across a restart and ends at the time it was set for.
       requestBody:
         required: true
         content:
           application/json:
             schema:
               type: object
-              required: [group_id, minutes]
+              required: [minutes]
               properties:
-                group_id: { type: integer, format: int64 }
+                group_id: { type: integer, format: int64, default: 0 }
+                client_id: { type: integer, format: int64, default: 0 }
                 minutes: { type: integer, minimum: 1, maximum: 1440 }
       responses:
         "204":
           description: No Content
         "400":
-          description: minutes must be 1-1440
+          description: minutes must be 1-1440, or both ids were given
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -1156,7 +1193,11 @@ paths:
           $ref: "#/components/responses/ReadOnlyToken"
     delete:
       tags: [Blocking]
-      summary: Resume blocking for a group (cancel a pause)
+      summary: Resume blocking (cancel one scope's pause)
+      description: >
+        Clears only the named scope's own pause. A client whose group is
+        still paused stays paused, which is the same "later wins" rule seen
+        from the other side.
       parameters:
         - name: group_id
           in: query
@@ -1165,9 +1206,19 @@ paths:
             Omitted (or unparseable — qInt discards the error) means group
             0. The handler has always defaulted it; the spec said required.
           schema: { type: integer, format: int64, default: 0 }
+        - name: client_id
+          in: query
+          required: false
+          description: One client, instead of a group. Never both.
+          schema: { type: integer, format: int64, default: 0 }
       responses:
         "204":
           description: No Content
+        "400":
+          description: group_id and client_id were both given
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
         "401":
           description: authentication required
           content:

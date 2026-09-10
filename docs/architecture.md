@@ -42,9 +42,12 @@ terminal upstream forwarder. Each stage can answer the query outright
    rule id, the list id and the entry that actually matched. Rules are
    evaluated before lists and allow before block — see
    [`dashboard.md`](dashboard.md#the-order-that-matters) for the full
-   six-stage precedence. Compiled rulesets and the pause map are immutable
+   six-stage precedence. Compiled rulesets and the pause state are immutable
    values behind `atomic.Pointer`, so a refresh or a pause never makes a
-   query wait on a lock.
+   query wait on a lock. A pause covers the whole server, one group or one
+   client, whichever ends later winning; every change is written to one
+   settings row and installed again at the next start, so a restart in the
+   middle of a pause does not turn blocking back on.
 5. **zones** — answers authoritatively for the suffixes this server holds,
    before the cache or any upstream is consulted, and tags the result
    `authoritative` in the query log. This is a zone cut, not a set of

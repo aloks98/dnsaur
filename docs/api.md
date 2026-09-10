@@ -196,9 +196,17 @@ Full parameter/response detail lives in `internal/api/openapi.yaml`
   [`docs/configuration.md`](configuration.md#encrypted-serving) for the
   full story, including why a bind failure surfaces here rather than only
   in the log.
-- **Blocking** — `GET /blocking?group_id=` (pause status),
-  `POST /blocking/pause` (`{group_id, minutes}`, pauses 1–1440 minutes),
-  `DELETE /blocking/pause?group_id=` (resume/cancel a pause).
+- **Blocking** — `GET /blocking?group_id=` or `?client_id=` (pause status,
+  answering `{paused_until, scope}` where `scope` is `global`, `group` or
+  `client`), `POST /blocking/pause` (`{[group_id | client_id,] minutes}`,
+  pauses 1–1440 minutes), `DELETE /blocking/pause?group_id=` or
+  `?client_id=` (resume/cancel that scope's pause). Send one id or neither,
+  never both — both is a 400. Neither means the global pause, which is what
+  `group_id=0` has always meant. A group inherits the global pause and a
+  client inherits its group's and the global one; whichever ends later
+  wins, and `scope` says which that was, so a control knows whether its own
+  resume would change anything. Pauses are stored and survive a restart —
+  one that ran out while the server was down does not come back with it.
 - **Groups** — `GET /groups`, `POST /groups` (`{name[, enabled][, list_ids]}`
   — `enabled` defaults to true; `list_ids` omitted assigns **every** list,
   while an explicit `[]` assigns none), `PATCH /groups/{id}`

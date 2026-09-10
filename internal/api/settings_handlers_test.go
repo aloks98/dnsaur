@@ -14,6 +14,7 @@ import (
 
 	"github.com/aloks98/dnsaur/internal/certtest"
 	"github.com/aloks98/dnsaur/internal/filter"
+	"github.com/aloks98/dnsaur/internal/store"
 )
 
 func TestSettingsGetPut(t *testing.T) {
@@ -116,6 +117,20 @@ func TestRefreshHoursRejectsZero(t *testing.T) {
 	}
 }
 
+// blockingStatusFor reads GET /blocking with the given query.
+func blockingStatusFor(t *testing.T, h http.Handler, cookie *http.Cookie, query string) blockingStatus {
+	t.Helper()
+	w := doReq(t, h, "GET", "/api/v1/blocking"+query, "", cookie)
+	if w.Code != 200 {
+		t.Fatalf("GET /blocking%s: %d %s", query, w.Code, w.Body.String())
+	}
+	var st blockingStatus
+	if err := json.Unmarshal(w.Body.Bytes(), &st); err != nil {
+		t.Fatalf("GET /blocking%s: %v (%s)", query, err, w.Body.String())
+	}
+	return st
+}
+
 func TestBlockingPauseResume(t *testing.T) {
 	srv, s, _ := testServer(t)
 	srv.deps.Engine = filter.NewEngine()
@@ -125,22 +140,123 @@ func TestBlockingPauseResume(t *testing.T) {
 	if w := doReq(t, h, "POST", "/api/v1/blocking/pause", `{"group_id":0,"minutes":5}`, cookie); w.Code != 204 {
 		t.Fatalf("pause: %d %s", w.Code, w.Body.String())
 	}
-	w := doReq(t, h, "GET", "/api/v1/blocking", "", cookie)
-	var st map[string]int64
-	_ = json.Unmarshal(w.Body.Bytes(), &st)
-	if st["paused_until"] <= time.Now().UnixMilli() {
-		t.Fatalf("paused_until: %v", st)
+	st := blockingStatusFor(t, h, cookie, "")
+	if st.PausedUntil <= time.Now().UnixMilli() || st.Scope != filter.PauseGlobal {
+		t.Fatalf("status: %+v", st)
 	}
 	if w := doReq(t, h, "DELETE", "/api/v1/blocking/pause?group_id=0", "", cookie); w.Code != 204 {
 		t.Fatalf("resume: %d", w.Code)
 	}
-	w = doReq(t, h, "GET", "/api/v1/blocking", "", cookie)
-	_ = json.Unmarshal(w.Body.Bytes(), &st)
-	if st["paused_until"] != 0 {
-		t.Fatalf("still paused: %v", st)
+	if st := blockingStatusFor(t, h, cookie, ""); st.PausedUntil != 0 || st.Scope != "" {
+		t.Fatalf("still paused: %+v", st)
 	}
 	if w := doReq(t, h, "POST", "/api/v1/blocking/pause", `{"group_id":0,"minutes":0}`, cookie); w.Code != 400 {
 		t.Fatalf("zero minutes accepted: %d", w.Code)
+	}
+}
+
+// TestBlockingPauseRejectsBothIDs: a pause covers one scope. A body or query
+// naming a group *and* a client names none of them, and picking one would
+// pause something the caller never asked for.
+func TestBlockingPauseRejectsBothIDs(t *testing.T) {
+	srv, s, _ := testServer(t)
+	srv.deps.Engine = filter.NewEngine()
+	cookie := login(t, srv, s)
+	h := srv.Handler()
+
+	for _, tc := range []struct{ method, url, body string }{
+		{"POST", "/api/v1/blocking/pause", `{"group_id":2,"client_id":4,"minutes":5}`},
+		{"DELETE", "/api/v1/blocking/pause?group_id=2&client_id=4", ""},
+		{"GET", "/api/v1/blocking?group_id=2&client_id=4", ""},
+	} {
+		w := doReq(t, h, tc.method, tc.url, tc.body, cookie)
+		if w.Code != 400 {
+			t.Errorf("%s %s: %d %s, want 400", tc.method, tc.url, w.Code, w.Body.String())
+		}
+		if want := "send group_id or client_id, not both"; !strings.Contains(w.Body.String(), want) {
+			t.Errorf("%s %s: %s, want it to contain %q", tc.method, tc.url, w.Body.String(), want)
+		}
+	}
+	// And nothing was paused on the way to the rejection.
+	if st := blockingStatusFor(t, h, cookie, ""); st.PausedUntil != 0 {
+		t.Fatalf("a refused pause took effect anyway: %+v", st)
+	}
+}
+
+// TestBlockingReportsTheEffectiveScope: a client's pause control reads one
+// number and has to know whose it is. A pause on the client's group shows up
+// on the client as scope "group" — its Resume would clear the client's own
+// pause, not the group's, so a control that could not tell them apart would
+// offer an action that does nothing.
+func TestBlockingReportsTheEffectiveScope(t *testing.T) {
+	srv, s, _ := testServer(t)
+	srv.deps.Engine = filter.NewEngine()
+	cookie := login(t, srv, s)
+	h := srv.Handler()
+
+	gid, err := s.Clients().AddGroup(t.Context(), "office")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cid, err := s.Clients().AddClient(t.Context(), store.Client{Name: "laptop", Matcher: "10.0.0.5", GroupID: gid})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := "?client_id=" + strconv.FormatInt(cid, 10)
+
+	if w := doReq(t, h, "POST", "/api/v1/blocking/pause", `{"group_id":`+strconv.FormatInt(gid, 10)+`,"minutes":5}`, cookie); w.Code != 204 {
+		t.Fatalf("pause the group: %d %s", w.Code, w.Body.String())
+	}
+	st := blockingStatusFor(t, h, cookie, client)
+	if st.PausedUntil <= time.Now().UnixMilli() || st.Scope != filter.PauseGroup {
+		t.Fatalf("the client did not inherit its group's pause: %+v", st)
+	}
+	groupUntil := st.PausedUntil
+
+	// The client's own, longer pause takes over — and says so.
+	if w := doReq(t, h, "POST", "/api/v1/blocking/pause", `{"client_id":`+strconv.FormatInt(cid, 10)+`,"minutes":60}`, cookie); w.Code != 204 {
+		t.Fatalf("pause the client: %d %s", w.Code, w.Body.String())
+	}
+	st = blockingStatusFor(t, h, cookie, client)
+	if st.Scope != filter.PauseClient || st.PausedUntil <= groupUntil {
+		t.Fatalf("the client's own pause did not win: %+v", st)
+	}
+	// …while the group's other clients are unaffected by it.
+	if st := blockingStatusFor(t, h, cookie, "?group_id="+strconv.FormatInt(gid, 10)); st.Scope != filter.PauseGroup || st.PausedUntil != groupUntil {
+		t.Fatalf("pausing one client moved the group's pause: %+v", st)
+	}
+
+	// Resuming the client leaves the group's pause running under it.
+	if w := doReq(t, h, "DELETE", "/api/v1/blocking/pause"+client, "", cookie); w.Code != 204 {
+		t.Fatalf("resume the client: %d", w.Code)
+	}
+	if st := blockingStatusFor(t, h, cookie, client); st.Scope != filter.PauseGroup || st.PausedUntil != groupUntil {
+		t.Fatalf("resuming the client cleared its group's pause: %+v", st)
+	}
+}
+
+// TestPausesAreNotAnEditableSetting: the pause state lives in a settings row
+// like the rollup watermark does, and gets the same treatment — hidden from
+// GET /settings and refused by PUT. blocking.mode and blocking.ttl share its
+// prefix and must stay readable.
+func TestPausesAreNotAnEditableSetting(t *testing.T) {
+	srv, s, _ := testServer(t)
+	cookie := login(t, srv, s)
+	h := srv.Handler()
+	_ = s.Settings().SetInternal(t.Context(), "blocking.mode", "null-ip")
+	_ = s.Settings().SetInternal(t.Context(), filter.PausesKey, `{"global":4711}`)
+
+	w := doReq(t, h, "GET", "/api/v1/settings", "", cookie)
+	var m map[string]string
+	_ = json.Unmarshal(w.Body.Bytes(), &m)
+	if m["blocking.mode"] != "null-ip" {
+		t.Fatalf("blocking.mode not returned: %v", m)
+	}
+	if _, leaked := m[filter.PausesKey]; leaked {
+		t.Fatalf("the pause state leaked into GET /settings: %v", m)
+	}
+	if w := doReq(t, h, "PUT", "/api/v1/settings", `{"key":"`+filter.PausesKey+`","value":"{}"}`, cookie); w.Code != 400 {
+		t.Fatalf("the pause state accepted as editable: %d", w.Code)
 	}
 }
 

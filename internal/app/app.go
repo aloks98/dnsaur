@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"crypto/rand"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -336,6 +337,45 @@ func (a *App) runTokenCleanup(ctx context.Context) {
 func (a *App) getSetting(ctx context.Context, key string) string {
 	v, _, _ := a.st.Settings().Get(ctx, key)
 	return v
+}
+
+// restorePauses puts the blocking pauses a previous run recorded back in
+// force, and arranges for every later change to be recorded too.
+//
+// A pause is someone deliberately holding blocking off for a while. A
+// restart in the middle of one — an upgrade, a reboot, a crash — used to
+// turn blocking back on silently, which is the opposite of what they asked
+// for and shows up as a device that suddenly can't reach what it could a
+// moment ago. Anything that ran out while the process was down is dropped by
+// the engine, so the other direction can't happen either.
+//
+// Every failure here is logged rather than fatal: a pause that cannot be
+// stored is still a pause, and refusing to start over one would take DNS
+// down for the whole network.
+func (a *App) restorePauses(ctx context.Context) {
+	if v, ok, err := a.st.Settings().Get(ctx, filter.PausesKey); err != nil {
+		slog.Error("reading the stored blocking pauses failed", "err", err)
+	} else if ok {
+		var p filter.Pauses
+		if err := json.Unmarshal([]byte(v), &p); err != nil {
+			slog.Error("the stored blocking pauses could not be read", "err", err, "value", v)
+		} else {
+			a.engine.Restore(p)
+		}
+	}
+	a.engine.OnPauseChange(func(p filter.Pauses) {
+		b, err := json.Marshal(p)
+		if err != nil {
+			slog.Error("encoding the blocking pauses failed", "err", err)
+			return
+		}
+		// SetInternal: nothing edits this row by hand, and bumping
+		// config_version would make every settings watcher reconcile the
+		// whole configuration over a pause.
+		if err := a.st.Settings().SetInternal(ctx, filter.PausesKey, string(b)); err != nil {
+			slog.Error("storing the blocking pauses failed", "err", err)
+		}
+	})
 }
 
 // settingValue is getSetting for the keys where "the store could not answer"
@@ -772,6 +812,11 @@ func (a *App) Start(ctx context.Context) error {
 	if err := a.refresher.Recompile(ctx); err != nil {
 		slog.Error("compiling filters from the list cache at startup failed", "err", err)
 	}
+
+	// Also before binding: the first query a listener answers must already
+	// know about a pause the previous run was in the middle of. runCtx, not
+	// ctx, because the sink it installs outlives Start.
+	a.restorePauses(runCtx)
 
 	for _, addr := range a.cfg.DNSListen {
 		// The key store, not a snapshot of it: a key created through the API

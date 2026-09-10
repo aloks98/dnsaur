@@ -680,3 +680,65 @@ test("the client-matching popover states the order", async () => {
   const listed = screen.getAllByRole("listitem").map((li) => li.textContent);
   expect(listed).toEqual(["1.exact IP", "2.CIDR, longest prefix first", "3.default"]);
 });
+
+/** rnui's DropdownMenu is base-ui Menu-driven; under jsdom userEvent's full
+ * pointer sequence trips its outside-click detection and re-closes it. Same
+ * fireEvent workaround as components/pause-control.test.tsx. */
+function openPauseMenu(row: HTMLElement) {
+  fireEvent.click(within(row).getByRole("button", { name: /open blocking controls/i }));
+  const menu = document.querySelector('[data-slot="dropdown-menu-content"]');
+  if (!menu) throw new Error("pause menu did not open");
+  return menu as HTMLElement;
+}
+
+test("pausing from a client row pauses that device, not its group", async () => {
+  let body: unknown;
+  mockAll({ clients: [client({ id: 7, name: "Tablet", group_id: 1 })] });
+  server.use(
+    http.post("/api/v1/blocking/pause", async ({ request }) => {
+      body = await request.json();
+      return new HttpResponse(null, { status: 204 });
+    }),
+  );
+
+  renderWithProviders(<GroupsClientsTab />);
+  await waitFor(() => expect(clientRows()).toHaveLength(1));
+
+  const menu = openPauseMenu(clientRows()[0]);
+  fireEvent.click(within(menu).getByText(/pause 30 minutes/i));
+
+  await waitFor(() => expect(body).toEqual({ group_id: 0, client_id: 7, minutes: 30 }));
+});
+
+test("a client row showing its group's pause says so and can't resume it", async () => {
+  let deleted = false;
+  mockAll({
+    clients: [client({ id: 7, name: "Tablet", group_id: 2 })],
+    groups: [group({ id: 2 })],
+  });
+  server.use(
+    // The group's pause, reported on the client as the effective one.
+    http.get("/api/v1/blocking", ({ request }) => {
+      const q = new URL(request.url).searchParams;
+      const paused = q.get("client_id") === "7" || q.get("group_id") === "2";
+      return HttpResponse.json(
+        paused ? { paused_until: Date.now() + 600_000, scope: "group" } : { paused_until: 0 },
+      );
+    }),
+    http.delete("/api/v1/blocking/pause", () => {
+      deleted = true;
+      return new HttpResponse(null, { status: 204 });
+    }),
+  );
+
+  renderWithProviders(<GroupsClientsTab />);
+  await waitFor(() => expect(clientRows()).toHaveLength(1));
+  await within(clientRows()[0]).findByText(/^paused · \d+:[0-5]\d$/i);
+
+  const menu = openPauseMenu(clientRows()[0]);
+  expect(within(menu).getByText(/paused for this group/i)).toBeInTheDocument();
+
+  fireEvent.click(within(menu).getByText(/^resume blocking$/i));
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  expect(deleted).toBe(false);
+});

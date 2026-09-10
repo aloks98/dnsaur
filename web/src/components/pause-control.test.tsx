@@ -35,7 +35,7 @@ test("the trigger reads 'Blocking active' when there's no pause in effect", asyn
   expect(within(trigger()).getByText("Blocking active")).toBeInTheDocument();
 });
 
-test("Pause 5 minutes posts {group_id:0, minutes:5} and the trigger becomes a live countdown", async () => {
+test("Pause 5 minutes posts the global scope and the trigger becomes a live countdown", async () => {
   vi.useFakeTimers({ shouldAdvanceTime: true });
   try {
     let requestBody: unknown;
@@ -57,7 +57,7 @@ test("Pause 5 minutes posts {group_id:0, minutes:5} and the trigger becomes a li
     const menu = openMenu();
     fireEvent.click(within(menu).getByText(/pause 5 minutes/i));
 
-    await waitFor(() => expect(requestBody).toEqual({ group_id: 0, minutes: 5 }));
+    await waitFor(() => expect(requestBody).toEqual({ group_id: 0, client_id: 0, minutes: 5 }));
     // The status readout is the button: "Blocking active" is replaced in
     // place by a "Paused · m:ss" countdown, no separate indicator.
     const countdown = await screen.findByText(/^paused · \d+:[0-5]\d$/i);

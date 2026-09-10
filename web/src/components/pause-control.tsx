@@ -13,7 +13,12 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@e412/rnui-react";
-import { useBlockingStatus, usePauseBlocking, useResumeBlocking } from "../hooks/use-blocking";
+import {
+  useBlockingStatus,
+  usePauseBlocking,
+  useResumeBlocking,
+  type BlockingStatus,
+} from "../hooks/use-blocking";
 import { formatCountdown } from "../lib/format";
 
 const PAUSE_OPTIONS = [
@@ -26,6 +31,9 @@ interface PauseControlProps {
   /** 0 = global (every group) — the shell top bar's instance. The Filtering
    * page's group rows pass a real group id to reuse this same control. */
   groupId?: number;
+  /** A client row's alternative to `groupId`: this one device, not its
+   * group. Never both — the server refuses a pause that names two scopes. */
+  clientId?: number;
   /**
    * `"chrome"` is the top bar's row-1 cell: a square-edged, hairline-divided
    * strip of uppercase mono, not a button with a border and a radius.
@@ -61,8 +69,8 @@ interface PauseControlProps {
  * local 1s ticker keeps the countdown itself smooth without hammering the
  * network — it only runs while actually paused.
  */
-export function PauseControl({ groupId = 0, variant = "button" }: PauseControlProps) {
-  const status = useBlockingStatus(groupId);
+export function PauseControl({ groupId = 0, clientId = 0, variant = "button" }: PauseControlProps) {
+  const status = useBlockingStatus({ groupId, clientId });
   const pauseBlocking = usePauseBlocking();
   const resumeBlocking = useResumeBlocking();
 
@@ -106,10 +114,19 @@ export function PauseControl({ groupId = 0, variant = "button" }: PauseControlPr
   // succeeded: a 30s poll that blips must not un-grey Resume under a pause
   // this control already knows about.
   const stateKnown = status.data !== undefined;
+  // Resume only ever clears this control's own scope. When the countdown
+  // belongs to a wider one — a client showing its group's pause, a group
+  // showing the global one — there is nothing here to resume, so the menu
+  // says where the pause is from and greys the action out rather than
+  // offering one that would change nothing. A pause reported without a
+  // scope is not treated as inherited: greying out the one action this
+  // control has, on a half-understood answer, is the worse guess.
+  const ownScope = clientId ? "client" : groupId ? "group" : "global";
+  const inherited = isPaused && status.data?.scope !== undefined && status.data.scope !== ownScope;
 
   function onPause(minutes: number) {
     pauseBlocking.mutate(
-      { groupId, minutes },
+      { groupId, clientId, minutes },
       {
         onSuccess: () =>
           toast.success(`Blocking paused for ${minutes} minute${minutes === 1 ? "" : "s"}`),
@@ -119,10 +136,13 @@ export function PauseControl({ groupId = 0, variant = "button" }: PauseControlPr
   }
 
   function onResume() {
-    resumeBlocking.mutate(groupId, {
-      onSuccess: () => toast.success("Blocking resumed"),
-      onError: () => toast.error("Couldn't resume blocking — try again"),
-    });
+    resumeBlocking.mutate(
+      { groupId, clientId },
+      {
+        onSuccess: () => toast.success("Blocking resumed"),
+        onError: () => toast.error("Couldn't resume blocking — try again"),
+      },
+    );
   }
 
   return (
@@ -148,7 +168,7 @@ export function PauseControl({ groupId = 0, variant = "button" }: PauseControlPr
             Menu.Group ancestor even for a single ungrouped label. */}
         <DropdownMenuGroup>
           <DropdownMenuLabel>
-            {isPaused ? "Blocking is paused" : "Pause blocking"}
+            {menuLabel(isPaused, inherited, status.data?.scope)}
           </DropdownMenuLabel>
         </DropdownMenuGroup>
         <DropdownMenuSeparator />
@@ -160,13 +180,25 @@ export function PauseControl({ groupId = 0, variant = "button" }: PauseControlPr
         ))}
         <DropdownMenuSeparator />
         {/* Only greyed out when we *know* there is nothing to resume. */}
-        <DropdownMenuItem disabled={busy || (stateKnown && !isPaused)} onClick={onResume}>
+        <DropdownMenuItem
+          disabled={busy || (stateKnown && (!isPaused || inherited))}
+          onClick={onResume}
+        >
           <Play />
           Resume blocking
         </DropdownMenuItem>
       </DropdownMenuContent>
     </DropdownMenu>
   );
+}
+
+/** The menu's heading: what is going on, and — when the pause came from a
+ * wider scope than this control covers — where it came from, which is the
+ * only place that fact has to be said. */
+function menuLabel(isPaused: boolean, inherited: boolean, scope: BlockingStatus["scope"]) {
+  if (!isPaused) return "Pause blocking";
+  if (!inherited) return "Blocking is paused";
+  return scope === "global" ? "Paused for everyone" : "Paused for this group";
 }
 
 /**

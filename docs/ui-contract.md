@@ -331,16 +331,31 @@ mismatched pair stores with a 204.
 #### Blocking pause
 | Endpoint | Params | Success |
 |---|---|---|
-| `GET /blocking` | `group_id` int, optional, **default 0** | **200** `{"paused_until": <unix ms>}`, `0` when not paused |
-| `POST /blocking/pause` | body `{"group_id": int, "minutes": int}` | **204** |
-| `DELETE /blocking/pause` | `group_id` query, optional, default 0 | **204**, unconditionally |
+| `GET /blocking` | `group_id` **or** `client_id` int, optional, **default 0** | **200** `{"paused_until": <unix ms>, "scope": "global"\|"group"\|"client"}`, `paused_until` `0` and no `scope` when not paused |
+| `POST /blocking/pause` | body `{["group_id"\|"client_id": int,] "minutes": int}` | **204** |
+| `DELETE /blocking/pause` | `group_id` **or** `client_id` query, optional, default 0 | **204**, unconditionally |
 
-`minutes` must be **1–1440**, else 400 `minutes must be 1-1440`. `group_id` is
-**not validated** — `0` means the global pause across every group. A
-non-numeric `group_id` silently becomes `0`, so a typo clears the *global*
-pause. `DELETE` 204s even for a group that was never paused or doesn't exist.
+`minutes` must be **1–1440**, else 400 `minutes must be 1-1440`. Ids are
+**not validated** — an id naming nothing is accepted, and a non-numeric one
+silently becomes `0`, so a typo pauses or clears *globally*. Sending both
+`group_id` and `client_id` is 400 `send group_id or client_id, not both`, on
+all three endpoints. `DELETE` 204s even for a scope that was never paused.
 
-**Pause state is in-memory and lost on restart** (`internal/filter/engine.go:24`).
+Three scopes, one rule: **the later wins**. A group inherits the global
+pause, a client inherits its group's and the global one, and none can cut
+another short. `scope` on the `GET` says which of the three the reported
+`paused_until` came from — a client row needs it, because `DELETE` clears
+only the scope it names, so resuming a client whose *group* is paused would
+change nothing visible. `GET ?client_id=` reads the client list to find its
+group, which is where its **503** comes from; an id naming no client reports
+only the global pause.
+
+**Pause state survives a restart.** Every change writes the internal
+settings row `blocking.pauses` (unix ms per scope, expired entries pruned),
+which `App.Start` installs before the listeners bind. Entries that ran out
+while the process was down are dropped rather than reinstated. Like
+`stats.watermark`, the row is stripped from `GET /settings` and refused by
+`PUT`.
 
 ---
 
@@ -1297,7 +1312,9 @@ both are rejected with `must be a whole number, one or more`:
 next prune. `blocking.mode` treats **anything ≠ `nxdomain`** as null-ip.
 
 Non-editable keys that exist but are stripped from `GET /settings`:
-`instance.id`, `stats.watermark`.
+`instance.id`, `stats.watermark`, `blocking.pauses` (the stored pause state,
+see [Blocking pause](#blocking-pause) — the other `blocking.*` keys above are
+ordinary settings and stay visible).
 
 ### 3.10 Tokens
 
@@ -1892,9 +1909,9 @@ Go source. **The code is the source of truth.**
    `storage unavailable` response is documented on 45 of `openapi.yaml`'s 59
    operations, `GET`/`POST /setup` included — this entry previously said it
    was omitted from `POST /setup` and from "most operations", and both were
-   wrong. Twelve operations that touch storage still omit it:
+   wrong. Eleven operations that touch storage still omit it:
    `POST /auth/logout`, `GET /auth/me`, the three `POST /auth/totp/*`,
-   `GET /blocking`, `POST`/`DELETE /blocking/pause`, `POST /filters/refresh`,
+   `POST`/`DELETE /blocking/pause`, `POST /filters/refresh`,
    `GET /queries/tail`, `POST /tokens`, `DELETE /tokens/{id}`. (`GET /health`
    and `GET /openapi.yaml` also omit it and correctly: neither reads
    storage.) The **409-on-duplicate** half of this entry is fully resolved —
@@ -1904,8 +1921,10 @@ Go source. **The code is the source of truth.**
    /blocking/pause`; the code makes it optional, defaulting to 0 (the global
    pause).~~ **Fixed in the spec**, which is the half that was wrong: the
    parameter is `required: false` with `default: 0` and says why.
-8. `openapi.yaml` marks `group_id` required on `POST /blocking/pause`; only
-   `minutes` is actually validated.
+8. ~~`openapi.yaml` marks `group_id` required on `POST /blocking/pause`;
+   only `minutes` is actually validated.~~ **Fixed in the spec**, the half
+   that was wrong: `minutes` is the only required property, and `group_id`
+   and `client_id` are optional with `default: 0`.
 9. **Partly fixed.** The 1 MiB cap is documented on
    `POST /zones/{id}/file`, where it carries its own **413** — but as that
    endpoint's rule rather than as the global one it is (`decode`'s

@@ -45,18 +45,34 @@ function defaultTimeline(): TimelineBucket[] {
 }
 
 /**
- * Blocking-pause status, scoped per group exactly like the real handler
- * (internal/api/settings_handlers.go reads `group_id` and asks the engine
- * for *that* group's pause). The shell Header polls the global scope
- * (group 0) on every authenticated page, while the Filtering page mounts
- * one PauseControl per group — a group-blind fixture would let a control
- * that reads the wrong scope pass. Pass a map to make specific groups
- * paused: `server.use(blockingHandler({ 3: Date.now() + 60_000 }))`.
+ * Blocking-pause status, scoped exactly like the real handler
+ * (internal/api/settings_handlers.go reads `group_id` or `client_id` and
+ * asks the engine for *that* scope's pause, against the global one). The
+ * shell Header polls the global scope (group 0) on every authenticated
+ * page, the Filtering page mounts one PauseControl per group and one per
+ * client — a scope-blind fixture would let a control that reads the wrong
+ * one pass. Pass maps to make specific scopes paused:
+ * `server.use(blockingHandler({ 3: Date.now() + 60_000 }))`.
+ *
+ * Group 0 in the first map is the global pause, which every other scope
+ * inherits when it is the later of the two.
  */
-export function blockingHandler(pausedUntilByGroup: Record<number, number> = {}) {
+export function blockingHandler(
+  pausedUntilByGroup: Record<number, number> = {},
+  pausedUntilByClient: Record<number, number> = {},
+) {
   return http.get("/api/v1/blocking", ({ request }) => {
-    const groupId = Number(new URL(request.url).searchParams.get("group_id") ?? 0);
-    const status: BlockingStatus = { paused_until: pausedUntilByGroup[groupId] ?? 0 };
+    const q = new URL(request.url).searchParams;
+    const clientId = Number(q.get("client_id") ?? 0);
+    const groupId = Number(q.get("group_id") ?? 0);
+    const own = clientId
+      ? (pausedUntilByClient[clientId] ?? 0)
+      : (pausedUntilByGroup[groupId] ?? 0);
+    const global = pausedUntilByGroup[0] ?? 0;
+    const status: BlockingStatus =
+      own > global
+        ? { paused_until: own, scope: clientId ? "client" : "group" }
+        : { paused_until: global, ...(global > 0 && { scope: "global" as const }) };
     return HttpResponse.json(status);
   });
 }

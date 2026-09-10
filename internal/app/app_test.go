@@ -1651,3 +1651,61 @@ func listByID(t *testing.T, a *App, id int64) store.List {
 	t.Fatalf("list %d is gone", id)
 	return store.List{}
 }
+
+// TestPausesSurviveRestart: a pause outlives the process. Someone paused
+// blocking for an hour and the box rebooted twenty minutes in; blocking must
+// still be off when it comes back, and the pause must still end at the hour.
+// The other direction matters as much — one that ran out while the process
+// was down must not come back with it.
+func TestPausesSurviveRestart(t *testing.T) {
+	ctx := context.Background()
+	cfg := testConfig(t.TempDir())
+
+	first, err := New(ctx, cfg, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	first.WaitReady(5 * time.Second)
+	first.engine.Pause(filter.PauseClient, 4, time.Hour)
+	first.engine.Pause(filter.PauseGroup, 2, 20*time.Millisecond)
+	until, _ := first.engine.PausedUntil(0, 4)
+	if err := first.Shutdown(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// Long enough for the group's pause to be over before the second app
+	// reads it, short enough not to be felt.
+	time.Sleep(50 * time.Millisecond)
+
+	// Same config, so the same store: this is the restart.
+	second, err := New(ctx, cfg, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := second.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = second.Shutdown(context.Background()) })
+	second.WaitReady(5 * time.Second)
+
+	got, kind := second.engine.PausedUntil(0, 4)
+	if kind != filter.PauseClient || !got.Equal(until) {
+		t.Fatalf("after the restart PausedUntil(0, 4) = %v %q, want the client pause ending %v", got, kind, until)
+	}
+	if got, kind := second.engine.PausedUntil(2, 0); !got.IsZero() {
+		t.Fatalf("a pause that ran out while the process was down came back: %v %q", got, kind)
+	}
+
+	// And what the *next* restart would read carries no expired entry, so
+	// nothing accumulates in the row to be resurrected later.
+	second.engine.Pause(filter.PauseGlobal, 0, time.Hour)
+	v, ok, err := second.Store().Settings().Get(ctx, filter.PausesKey)
+	if err != nil || !ok {
+		t.Fatalf("the pause row is gone: %q %v %v", v, ok, err)
+	}
+	if strings.Contains(v, `"2"`) {
+		t.Fatalf("the expired group pause is still being written: %s", v)
+	}
+}

@@ -59,7 +59,7 @@ function friendlyDeleteError(err: unknown, fallback: string): string {
 }
 
 const GROUP_GRID = "grid grid-cols-[1fr_78px_156px_84px_168px_76px] items-center gap-3.5 px-4";
-const CLIENT_GRID = "grid grid-cols-[1fr_208px_152px_108px] items-center gap-3.5 px-4";
+const CLIENT_GRID = "grid grid-cols-[1fr_208px_152px_168px_108px] items-center gap-3.5 px-4";
 
 /** Which group a client lands in, on demand. Same treatment as the Rules
  * tab's match order: the sequence is the answer, so the popover is a list
@@ -685,6 +685,8 @@ function AddClientRow({
               </FormItem>
             )}
           />
+          {/* Pause: nothing to offer for a client that doesn't exist yet. */}
+          <span />
           <div className="flex items-center justify-end gap-1.5">
             <Button type="submit" size="sm" disabled={addClient.isPending}>
               {addClient.isPending ? "Adding…" : "Add"}
@@ -705,6 +707,7 @@ function AddClientRow({
           <span className="text-xs text-pretty text-muted-foreground">
             <FormField control={form.control} name="matcher" render={() => <FormMessage />} />
           </span>
+          <span />
           <span />
           <span />
         </div>
@@ -843,6 +846,9 @@ export function GroupsClientsTab() {
               {allGroups.find((g) => g.id === client.group_id)?.name ?? "unknown"}
             </Badge>
           </span>
+          <span>
+            <PauseControl clientId={client.id} />
+          </span>
           <span className="flex items-center justify-end">
             <Button
               type="button"
@@ -951,6 +957,7 @@ export function GroupsClientsTab() {
         <span>Name</span>
         <span>Matcher</span>
         <span>Group</span>
+        <span>Pause</span>
         <span className="text-right">Actions</span>
       </div>
 

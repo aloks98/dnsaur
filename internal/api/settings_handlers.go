@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aloks98/dnsaur/internal/filter"
 	"github.com/aloks98/dnsaur/internal/store"
 	"github.com/aloks98/dnsaur/internal/upstream"
 )
@@ -201,12 +202,13 @@ func (s *Server) handleSettingsGet(w http.ResponseWriter, r *http.Request) {
 		storeErr(w, err)
 		return
 	}
-	// The rollup's watermark is bookkeeping, not configuration, and nothing
-	// may edit it — but it is named by key, not by prefix: stats.* also
-	// holds stats.retention_days, which is an ordinary setting the screen
-	// has to be able to read.
+	// The rollup's watermark and the pause state are bookkeeping, not
+	// configuration, and nothing may edit them — but they are named by key,
+	// not by prefix: stats.* also holds stats.retention_days and blocking.*
+	// holds blocking.mode and blocking.ttl, which are ordinary settings the
+	// screen has to be able to read.
 	for k := range all {
-		if strings.HasPrefix(k, "instance.") || k == store.StatsWatermarkKey {
+		if strings.HasPrefix(k, "instance.") || k == store.StatsWatermarkKey || k == filter.PausesKey {
 			delete(all, k)
 		}
 	}
@@ -313,8 +315,30 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 }
 
 type pauseReq struct {
-	GroupID int64 `json:"group_id"`
-	Minutes int   `json:"minutes"`
+	GroupID  int64 `json:"group_id"`
+	ClientID int64 `json:"client_id"`
+	Minutes  int   `json:"minutes"`
+}
+
+// pauseScope turns the two optional ids into the one scope a pause targets.
+// Groups and clients are numbered from 1, so 0 means "not given" and neither
+// id means the global pause — which is also what the shell's control has
+// always sent as group_id 0.
+//
+// Both at once names no scope. Picking one would pause something the caller
+// did not ask for and leave them with no way to tell which, so it is
+// refused rather than guessed.
+func pauseScope(groupID, clientID int64) (filter.PauseKind, int64, error) {
+	switch {
+	case groupID != 0 && clientID != 0:
+		return "", 0, errors.New("send group_id or client_id, not both")
+	case clientID != 0:
+		return filter.PauseClient, clientID, nil
+	case groupID != 0:
+		return filter.PauseGroup, groupID, nil
+	default:
+		return filter.PauseGlobal, 0, nil
+	}
 }
 
 func (s *Server) handlePause(w http.ResponseWriter, r *http.Request) {
@@ -327,22 +351,64 @@ func (s *Server) handlePause(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusBadRequest, "minutes must be 1-1440")
 		return
 	}
-	s.deps.Engine.Pause(body.GroupID, time.Duration(body.Minutes)*time.Minute)
+	kind, id, err := pauseScope(body.GroupID, body.ClientID)
+	if err != nil {
+		errJSON(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	s.deps.Engine.Pause(kind, id, time.Duration(body.Minutes)*time.Minute)
 	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *Server) handleResume(w http.ResponseWriter, r *http.Request) {
-	gid, _ := strconv.ParseInt(r.URL.Query().Get("group_id"), 10, 64)
-	s.deps.Engine.Pause(gid, 0)
+	kind, id, err := pauseScope(qInt(r, "group_id"), qInt(r, "client_id"))
+	if err != nil {
+		errJSON(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	// Only this scope's own pause. A client whose group is paused stays
+	// paused, which is what "the later wins" means from the other side.
+	s.deps.Engine.Pause(kind, id, 0)
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// blockingStatus is what a pause control reads. Scope names which of the
+// three pauses is the one in force, because a control can only resume its
+// own: a client row showing a countdown it inherited from its group needs
+// to say so rather than offer a Resume that would change nothing.
+type blockingStatus struct {
+	PausedUntil int64            `json:"paused_until"`
+	Scope       filter.PauseKind `json:"scope,omitempty"`
+}
+
 func (s *Server) handleBlockingGet(w http.ResponseWriter, r *http.Request) {
-	gid, _ := strconv.ParseInt(r.URL.Query().Get("group_id"), 10, 64)
-	until := s.deps.Engine.PausedUntil(gid)
+	groupID, clientID := qInt(r, "group_id"), qInt(r, "client_id")
+	if _, _, err := pauseScope(groupID, clientID); err != nil {
+		errJSON(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if clientID != 0 {
+		// A client inherits its group's pause, so reporting the effective
+		// one needs the group too. There is no lookup by id and the client
+		// list is a handful of rows; an id naming no client leaves the
+		// group at 0, which matches none, so the answer is the global pause
+		// and the client's own.
+		cs, err := s.deps.Store.Clients().Clients(r.Context())
+		if err != nil {
+			storeErr(w, err)
+			return
+		}
+		for _, c := range cs {
+			if c.ID == clientID {
+				groupID = c.GroupID
+				break
+			}
+		}
+	}
+	until, kind := s.deps.Engine.PausedUntil(groupID, clientID)
 	var ms int64
 	if !until.IsZero() {
 		ms = until.UnixMilli()
 	}
-	writeJSON(w, http.StatusOK, map[string]int64{"paused_until": ms})
+	writeJSON(w, http.StatusOK, blockingStatus{PausedUntil: ms, Scope: kind})
 }

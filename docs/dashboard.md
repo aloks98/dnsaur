@@ -150,10 +150,18 @@ Two limits apply to a fetch, and a list that hits either is reported
 A list only applies to a group it's assigned to. That assignment is on the
 [Groups & clients](#groups--clients) screen, not here.
 
-**Pause** stops blocking without deleting anything — globally or for one group.
-A global pause and a group pause can both be in effect; whichever ends later
-wins. While paused, filtering is skipped entirely and queries forward as if no
-list or rule existed.
+**Pause** stops blocking without deleting anything — globally, for one group,
+or for one device. Pauses at different levels can all be in effect at once;
+whichever ends later wins, so a device pause can outlast its group's and a
+group pause can outlast a device's. While paused, filtering is skipped
+entirely and queries forward as if no list or rule existed.
+
+Resume clears only the pause you resume. A device showing a countdown its
+group set says **Paused for this group** and offers no resume, because
+resuming the device would leave the group's pause running.
+
+Pauses survive a restart. One that ends while the server is down does not
+come back with it.
 
 ### Rules
 
@@ -209,6 +217,10 @@ nothing is rarely what anyone means by "new group".
 Deleting a group is refused with `409 resource in use` while clients still
 point at it — move them first. The screen says so up front: Delete is
 unavailable on a group with clients, and the row says how many to move.
+
+Every group row and every client row carries the same **Pause** control the
+top bar does, for that group or that one device. See [Lists](#lists) above
+for how the levels combine.
 
 Disabling a group stops filtering for every client in it. For the **default**
 group that is every device you haven't pinned somewhere else, not just the
