@@ -113,6 +113,23 @@ function upstreamAddr(canonical: string): string {
  */
 export const renderCounts = { filterBar: 0, inspector: 0 };
 
+/**
+ * Count one commit of `which`.
+ *
+ * An effect rather than a `renderCounts.x += 1` in the body: writing to a
+ * module-level object during render is a side effect in render
+ * (react(immutability)), which is the thing the memo boundary below is
+ * supposed to be free of. It counts the same events — a component React
+ * skips re-rendering commits nothing and runs no effect — and if anything it
+ * counts them more honestly, since a render that bails out before committing
+ * costs nothing and should not read as a re-render.
+ */
+function useRenderCount(which: keyof typeof renderCounts) {
+  useEffect(() => {
+    renderCounts[which] += 1;
+  });
+}
+
 // --- group resolution --------------------------------------------------------
 
 /**
@@ -448,7 +465,7 @@ const FilterBar = memo(function FilterBar({
   onChange: (patch: Partial<FilterState>) => void;
   onTimeRange: (value: DateSelectorValue) => void;
 }) {
-  renderCounts.filterBar += 1;
+  useRenderCount("filterBar");
 
   // The picked value, kept here purely to label the trigger. The page only
   // ever wants the two epoch bounds, and DateSelector is left uncontrolled:
@@ -737,6 +754,7 @@ function QueryTable({
   isFetchingMore?: boolean;
   hasMore?: boolean;
 }) {
+  // oxlint-disable-next-line react/incompatible-library -- the DataGrid's table prop is TanStack's own API; this project does not run the React Compiler
   const table = useReactTable({
     data: entries,
     columns: QUERY_COLUMNS,
@@ -1033,7 +1051,7 @@ const Inspector = memo(function Inspector({
   onQuickRule: (action: "allow" | "block", entry: QueryEntry) => void;
   onCopy: (entry: QueryEntry) => void;
 }) {
-  renderCounts.inspector += 1;
+  useRenderCount("inspector");
 
   return (
     <aside
@@ -1426,11 +1444,17 @@ export function QueryLog() {
    * synchronously, and the same ref means the page can never out-run the
    * end of the results even if the grid asks again.
    *
-   * `pagedRef` is only ever written during render and read from callbacks —
-   * never read during render — so it stays out of the rendered output.
+   * `pagedRef` is written from an effect and read only from callbacks, never
+   * during render: a ref touched while rendering is a value React Compiler
+   * has to assume render depends on (react(refs)). Writing it after the
+   * commit can leave `fetchMore` one render behind, which is what
+   * `fetchMoreInFlight` was already there for — react-query's own flags were
+   * a render behind to begin with, per the paragraph above.
    */
   const pagedRef = useRef(paged);
-  pagedRef.current = paged;
+  useEffect(() => {
+    pagedRef.current = paged;
+  });
   const fetchMoreInFlight = useRef(false);
   const fetchMore = useCallback(() => {
     const p = pagedRef.current;

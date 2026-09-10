@@ -8,4 +8,11 @@ linters:
         - (*database/sql.DB).Close
         - (*database/sql.Tx).Rollback
 run:
-  timeout: 5m
+  # Room for a genuinely cold run — the first one on a fresh cache, or one
+  # after an eviction — on the smallest runner. Five minutes was not what
+  # ended run 468's checks job (the timeout is enforced and says so on
+  # stderr, and that job printed nothing at all), but it is less than a cold
+  # run there costs, so it would have turned the next one into a false
+  # failure. See .forgejo/workflows/ci.yml for the cache that keeps runs from
+  # being cold in the first place.
+  timeout: 10m

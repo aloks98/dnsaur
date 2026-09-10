@@ -272,7 +272,9 @@ func TestShutdownUnblocksSSETail(t *testing.T) {
 			}
 		}
 	}()
-	time.Sleep(100 * time.Millisecond) // let the handler subscribe
+	// No wait for the subscription: the tail handler subscribes before it
+	// writes the response head, so the 200 read above already means this
+	// connection is one Shutdown has to unblock.
 
 	start := time.Now()
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)

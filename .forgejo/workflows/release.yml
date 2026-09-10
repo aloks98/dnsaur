@@ -1,0 +1,49 @@
+name: release
+on:
+  push:
+    tags: ["v*"]
+
+# Deliberately builds and publishes nothing. `--snapshot --skip=publish`
+# exercises the whole of .goreleaser.yaml — the two builds, the archives,
+# the deb and the rpm — on every tag, so the config is known to work by the
+# time anyone decides to turn publishing on; and the image build proves the
+# same for the Dockerfile on both architectures. Enabling a real release is
+# a matter of dropping those flags and giving the job a token, plus a
+# registry login and `--push` for the image.
+jobs:
+  release:
+    runs-on: medium
+    steps:
+      # Full history and tags: GoReleaser derives the version and the
+      # changelog from them, and a shallow checkout leaves it with neither.
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: actions/setup-go@v5
+        with: { go-version: "1.26" }
+      - uses: actions/setup-node@v4
+        with: { node-version: "24" }
+      - name: Enable corepack
+        run: corepack enable
+      # The dashboard first: the binaries GoReleaser builds embed web/dist
+      # via //go:embed, and .gitkeep alone would ship API-only artifacts.
+      - name: Build the dashboard
+        working-directory: web
+        run: pnpm install --frozen-lockfile && pnpm build
+      - name: Build the artifacts
+        run: go run github.com/goreleaser/goreleaser/v2@v2.18.1 release --snapshot --clean --skip=publish
+      # A named builder, because the default docker driver refuses a
+      # multi-platform build. No --push and no --load, so the result stays in
+      # the build cache: the point here is that both architectures compile.
+      - name: Set up buildx
+        run: docker buildx create --name dnsaur --driver docker-container --use
+      - name: Build the container image
+        run: docker buildx build --platform linux/amd64,linux/arm64 --build-arg VERSION=${GITHUB_REF_NAME#v} .
+      - uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: dist
+          path: |
+            dist/*.tar.gz
+            dist/*.deb
+            dist/*.rpm
+          if-no-files-found: warn

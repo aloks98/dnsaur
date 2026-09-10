@@ -11,7 +11,7 @@ import {
   X,
 } from "lucide-react";
 import { toast } from "sonner";
-import { useForm, type UseFormReturn } from "react-hook-form";
+import { useForm, useWatch, type UseFormReturn } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { z } from "zod";
 import {
@@ -215,7 +215,7 @@ function NewKeyRow({ onClose }: { onClose: () => void }) {
     form.setFocus("name");
   }, [form]);
 
-  const typedName = form.watch("name");
+  const typedName = useWatch({ control: form.control, name: "name" });
   const canonical = canonicalKeyName(typedName);
   const nameError = form.formState.errors.name?.message;
   const secretError = form.formState.errors.secret?.message;

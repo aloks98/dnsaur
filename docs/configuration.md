@@ -74,6 +74,44 @@ server that answers nothing (see
   a session cookie shipping without `Secure`, and nothing anywhere saying
   why.
 
+### In a container
+
+The image (`Dockerfile` at the repo root — see
+[`docs/development.md`](development.md#container-image) for how to build it;
+nothing is published yet) is configured through the same `DNSAUR_*`
+variables and nothing else. Its entrypoint passes **no** `-config`
+deliberately: the default path is the one `config.Load` tolerates being
+absent, so an env-only container starts, while `WORKDIR /data` means a file
+bind-mounted at `/data/dnsaur.yaml` is still picked up with no flag to
+change. Naming a path in the entrypoint would make that file mandatory and
+break the first case, per *What startup refuses* above.
+
+`DNSAUR_DATA_DIR=/data` is baked in, and `/data` is a volume owned by the
+image's non-root user (uid 65532), so the SQLite database and the blocklist
+cache land there and survive a container replacement.
+
+That non-root user is also why port 53 is not bound directly: Docker does
+not grant `CAP_NET_BIND_SERVICE` to a non-root process, so dnsaur listens
+high inside the container and the host publishes 53 onto it.
+
+```sh
+docker run -d --name dnsaur \
+  -e DNSAUR_DNS_LISTEN=:5353 \
+  -e DNSAUR_HTTP_LISTEN=:8080 \
+  -e DNSAUR_LOG_LEVEL=info \
+  -v dnsaur-data:/data \
+  -p 53:5353/udp -p 53:5353/tcp \
+  -p 8080:8080 \
+  dnsaur:local
+```
+
+`--sysctl net.ipv4.ip_unprivileged_port_start=0` with
+`DNSAUR_DNS_LISTEN=:53` is the alternative if the port must match inside and
+out — needed for `--network host`, where there is no publishing to remap.
+
+`storage.driver: postgres` works the same way:
+`-e DNSAUR_STORAGE_DRIVER=postgres -e DNSAUR_STORAGE_DSN=postgres://…`.
+
 ## Behind a reverse proxy
 
 dnsaur speaks plain HTTP behind nginx, Caddy or Traefik, which is the usual

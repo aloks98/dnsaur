@@ -704,7 +704,11 @@ const RATE_TICK_MS = 1_000;
  * measured. It only re-renders this readout, not the rows beside it.
  */
 function useArrivalRate(entries: QueryEntry[]): number | undefined {
-  const observedFrom = useRef(Date.now());
+  // A lazy state initialiser rather than useRef(Date.now()): useRef evaluates
+  // its argument on every render and discards all but the first, so a clock
+  // read there is an impurity in render (react(purity)) for a value that is
+  // fixed at mount. This one never changes and is never written.
+  const [observedFrom] = useState(() => Date.now());
   // Object identity, not `entry.id`: every row on the stream carries id 0
   // (ui-contract §3.1 — qlog publishes to the SSE hub before the batched
   // insert assigns a primary key), so "ids above the last one counted"
@@ -737,7 +741,7 @@ function useArrivalRate(entries: QueryEntry[]): number | undefined {
     const timer = setInterval(() => {
       const now = Date.now();
       arrivals.current = arrivals.current.filter((a) => a.at >= now - RATE_WINDOW_MS);
-      const observed = now - observedFrom.current;
+      const observed = now - observedFrom;
       if (observed < RATE_MIN_OBSERVED_MS) {
         setRate(undefined);
         return;
@@ -746,7 +750,8 @@ function useArrivalRate(entries: QueryEntry[]): number | undefined {
       setRate(counted / (Math.min(observed, RATE_WINDOW_MS) / 1000));
     }, RATE_TICK_MS);
     return () => clearInterval(timer);
-  }, []);
+    // observedFrom is fixed at mount, so this still runs exactly once.
+  }, [observedFrom]);
 
   return rate;
 }

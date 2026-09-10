@@ -80,8 +80,31 @@ jobs:
     runs-on: tiny-no-docker
     steps:
       - uses: actions/checkout@v4
+      # setup-go's built-in cache keys on the go.sum hash with no fallback,
+      # and exposes no way to give it one. A dependency bump therefore misses
+      # outright ("Cache is not found"), and golangci-lint then loads and
+      # compiles the whole module from nothing — measured cold at 40s and
+      # ~1.5 GB peak on a 16-core box, which on this runner is what turned
+      # the job into a 13-minute one that died without printing a line.
+      #
+      # Off, in favour of the explicit cache below, which can fall back.
       - uses: actions/setup-go@v5
-        with: { go-version: "1.26" }
+        with: { go-version: "1.26", cache: false }
+      # Same shape and the same reasoning as the pnpm store above: the
+      # lockfile hash is the right key, because the build cache's contents
+      # follow the resolved dependency set — and restore-keys is what stops a
+      # changed go.sum being expensive, since a miss falls back to the newest
+      # previous cache and only what actually moved gets recompiled.
+      #
+      # The lint action keeps its own cache under its own key; this is only
+      # the Go build and module caches it stands on.
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: go-${{ hashFiles('go.sum') }}
+          restore-keys: go-
       - name: Lint
         uses: https://github.com/golangci/golangci-lint-action@v8
         with: { version: v2.12 }
@@ -97,8 +120,33 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with: { go-version: "1.26" }
+      # DNSAUR_TEST_REQUIRE_POSTGRES turns "no postgres, its halves will
+      # skip" from a line on stderr into a failed run (internal/storetest).
+      # This runner has Docker, so a suite that skips half of internal/store,
+      # internal/zones and internal/app here is not a green suite — and the
+      # only trace it used to leave was that stderr line, in the middle of a
+      # passing log.
       - name: Race tests
-        run: go test -race ./...
+        env: { DNSAUR_TEST_REQUIRE_POSTGRES: "1" }
+        # pipefail, or `tee` succeeding would report a failed suite as green.
+        # -count=1, because a race suite served from the build cache detects
+        # nothing: `go test` replays the previous PASS without running the
+        # binary, and a race that only shows up sometimes never gets the
+        # chance to.
+        run: |
+          set -o pipefail
+          go test -race -cover -count=1 ./... | tee /tmp/cover.txt
+      # Per-package coverage where the run reports it, rather than in the
+      # scrollback. Not a gate: nothing fails on a number moving.
+      - name: Coverage summary
+        if: always()
+        run: |
+          {
+            echo '## Go coverage'
+            echo '```'
+            grep -E 'coverage:|no test files' /tmp/cover.txt || true
+            echo '```'
+          } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
 
   # Playwright smoke test (web/e2e/smoke.spec.ts) against the real embedded
   # build: webServer (web/playwright.config.ts) builds the actual dnsaur

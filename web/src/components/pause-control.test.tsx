@@ -230,3 +230,39 @@ test("a failed GET /blocking says so instead of claiming blocking is active", as
   fireEvent.click(within(menu).getByText(/^resume blocking$/i));
   await waitFor(() => expect(deleteCalled).toBe(true));
 });
+
+// The countdown is measured from the answer that carried the pause, not from
+// a clock this component happened to read at mount. Nothing ticks while
+// blocking is active, so by the time a pause arrives — from a poll, or from
+// another tab — the component's own clock state can be arbitrarily old, and a
+// countdown built on it alone would open minutes too long.
+test("a pause that arrives long after mount opens at its real remaining time", async () => {
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  try {
+    let pausedUntil = 0;
+    server.use(
+      http.get("/api/v1/blocking", () => HttpResponse.json({ paused_until: pausedUntil })),
+    );
+
+    const view = renderWithProviders(<PauseControl />);
+    await screen.findByText("Blocking active");
+
+    // Ten minutes of nothing happening, which is exactly what leaves a clock
+    // read at mount ten minutes behind.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(10 * 60_000);
+    });
+
+    pausedUntil = Date.now() + 5 * 60_000;
+    await act(async () => {
+      await view.queryClient.refetchQueries({ queryKey: blockingKeys.status(0) });
+    });
+
+    const countdown = await screen.findByText(/^paused · \d+:[0-5]\d$/i);
+    const minutes = Number(/(\d+):/.exec(countdown.textContent ?? "")?.[1]);
+    expect(minutes).toBeLessThanOrEqual(5);
+    expect(minutes).toBeGreaterThanOrEqual(4);
+  } finally {
+    vi.useRealTimers();
+  }
+});

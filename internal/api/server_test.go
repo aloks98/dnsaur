@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -10,6 +11,7 @@ import (
 	"sync"
 	"testing"
 	"testing/fstest"
+	"time"
 
 	"github.com/aloks98/dnsaur/internal/auth"
 	"github.com/aloks98/dnsaur/internal/filter"
@@ -127,6 +129,51 @@ func doReq(t *testing.T, h http.Handler, method, path, body string, cookie *http
 	w := httptest.NewRecorder()
 	h.ServeHTTP(w, req)
 	return w
+}
+
+// tailStream opens a live SSE tail, calls publish, and returns the response
+// together with the first line the handler wrote to it.
+//
+// A real server rather than a recorder, and two waits go away with it.
+// handleQueriesTail subscribes *before* it writes the response head, so a
+// client holding the headers is a client the next Publish reaches — no
+// sleeping to "let the handler subscribe" — and reading the body blocks
+// until the event lands rather than guessing at how long that takes. The
+// client timeout is what bounds that read, so a handler that never writes
+// fails here instead of hanging the package.
+func tailStream(t *testing.T, h http.Handler, cookie *http.Cookie, reqHeader http.Header, publish func()) (*http.Response, string) {
+	t.Helper()
+	ts := httptest.NewServer(h)
+	// Registered first, so LIFO closes the body before this: ts.Close waits
+	// for the handler, and the handler returns when the client hangs up.
+	t.Cleanup(ts.Close)
+
+	req, err := http.NewRequest(http.MethodGet, ts.URL+"/api/v1/queries/tail", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.AddCookie(cookie)
+	for k, vs := range reqHeader {
+		for _, v := range vs {
+			req.Header.Add(k, v)
+		}
+	}
+	resp, err := (&http.Client{Timeout: 5 * time.Second}).Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = resp.Body.Close() })
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("tail: %d", resp.StatusCode)
+	}
+
+	publish()
+
+	line, err := bufio.NewReader(resp.Body).ReadString('\n')
+	if err != nil {
+		t.Fatalf("reading the first SSE line: %v", err)
+	}
+	return resp, line
 }
 
 func TestHealthUnauthenticated(t *testing.T) {

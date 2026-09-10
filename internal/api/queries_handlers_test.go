@@ -1,7 +1,6 @@
 package api
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -164,26 +163,9 @@ func TestSSETail(t *testing.T) {
 	logger := qlog.New(&nullQLStore{}, qlog.Options{InstanceID: "i", FlushEvery: time.Hour, BatchSize: 100})
 	srv.deps.Logger = logger
 
-	req := httptest.NewRequest("GET", "/api/v1/queries/tail", nil)
-	req.AddCookie(cookie)
-	ctx, cancelReq := context.WithCancel(context.Background())
-	req = req.WithContext(ctx)
-	w := httptest.NewRecorder()
-	done := make(chan struct{})
-	go func() {
-		srv.Handler().ServeHTTP(w, req)
-		close(done)
-	}()
-	time.Sleep(50 * time.Millisecond) // let the handler subscribe
-	logger.Publish(store.QueryLogEntry{QName: "live.example", Decision: "blocked"})
-	time.Sleep(100 * time.Millisecond)
-	cancelReq()
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("tail handler did not flush/close")
-	}
-	line, _ := bufio.NewReader(w.Body).ReadString('\n')
+	_, line := tailStream(t, srv.Handler(), cookie, nil, func() {
+		logger.Publish(store.QueryLogEntry{QName: "live.example", Decision: "blocked"})
+	})
 	if !strings.HasPrefix(line, "data: ") || !strings.Contains(line, "live.example") {
 		t.Fatalf("sse line: %q", line)
 	}

@@ -90,7 +90,15 @@ function ProtocolRow({
   listenField: ReturnType<typeof useController>["field"];
   reality: ProtocolStatus | undefined;
 }) {
-  const enabled = enabledField.value === "true";
+  // Destructured, then spread, rather than picked apart prop by prop. Naming
+  // `.ref` in JSX is what tells React Compiler this object is a ref, after
+  // which every other read of it during render is an error (react(refs)) and
+  // the component is dropped from memoization. The value and the onChange are
+  // the two this input genuinely does differently — a checkbox reads
+  // "true"/"false" as checked, and writes it back the same way — so they come
+  // out and the rest goes on whole.
+  const { value: enabledValue, onChange: onEnabledChange, ...enabledRest } = enabledField;
+  const enabled = enabledValue === "true";
   const line = realityLine(reality);
 
   return (
@@ -103,12 +111,10 @@ function ProtocolRow({
     >
       <label className="flex min-w-0 cursor-pointer items-center gap-[9px]">
         <input
-          ref={enabledField.ref}
+          {...enabledRest}
           type="checkbox"
-          name={enabledField.name}
           checked={enabled}
-          onChange={(e) => enabledField.onChange(e.target.checked ? "true" : "false")}
-          onBlur={enabledField.onBlur}
+          onChange={(e) => onEnabledChange(e.target.checked ? "true" : "false")}
           className="peer sr-only"
         />
         <span
@@ -131,11 +137,7 @@ function ProtocolRow({
       <span className="flex items-center gap-[9px]">
         <Input
           aria-label={`${name} listen address`}
-          value={listenField.value}
-          onChange={listenField.onChange}
-          onBlur={listenField.onBlur}
-          name={listenField.name}
-          ref={listenField.ref}
+          {...listenField}
           autoComplete="off"
           spellCheck={false}
           className="w-[200px] font-mono text-xs"
@@ -260,11 +262,7 @@ export function ProtocolsField({ control }: { control: Control<Record<string, st
             </div>
             <Input
               id={certId}
-              value={cert.field.value}
-              onChange={cert.field.onChange}
-              onBlur={cert.field.onBlur}
-              name={cert.field.name}
-              ref={cert.field.ref}
+              {...cert.field}
               placeholder="/etc/letsencrypt/live/adam.dns.e412.in/fullchain.pem"
               autoComplete="off"
               spellCheck={false}
@@ -279,11 +277,7 @@ export function ProtocolsField({ control }: { control: Control<Record<string, st
             </div>
             <Input
               id={keyId}
-              value={key.field.value}
-              onChange={key.field.onChange}
-              onBlur={key.field.onBlur}
-              name={key.field.name}
-              ref={key.field.ref}
+              {...key.field}
               placeholder="/etc/letsencrypt/live/adam.dns.e412.in/privkey.pem"
               autoComplete="off"
               spellCheck={false}

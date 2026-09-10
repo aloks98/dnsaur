@@ -2,3 +2,4 @@
 /dnsaur
 /data/
 *.db
+/dist/

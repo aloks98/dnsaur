@@ -69,8 +69,17 @@ interface FormError {
 function useStepTransition(step: Step) {
   const [settled, setSettled] = useState(false);
 
-  useEffect(() => {
+  // Unsettled again during render rather than from the effect — React's own
+  // recipe for adjusting state to a changed prop, and the one that runs
+  // before anything is shown rather than after a committed render of the new
+  // step already in its final position.
+  const [settledFor, setSettledFor] = useState(step);
+  if (settledFor !== step) {
+    setSettledFor(step);
     setSettled(false);
+  }
+
+  useEffect(() => {
     const raf = requestAnimationFrame(() => setSettled(true));
     return () => cancelAnimationFrame(raf);
   }, [step]);

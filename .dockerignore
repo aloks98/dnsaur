@@ -1,0 +1,16 @@
+# The build stages fetch their own dependencies and produce their own
+# artifacts; anything a local checkout already has is stale weight in the
+# context and, for web/dist, would be copied over anyway.
+.git
+.gitignore
+.claude
+.forgejo
+.golangci.yml
+docs
+**/node_modules
+web/dist
+web/playwright-report
+web/test-results
+data
+*.db
+dnsaur

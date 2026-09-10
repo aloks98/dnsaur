@@ -42,6 +42,11 @@ import (
 // postgres halves *reported as skipped* rather than quietly passing. pkg
 // names the caller in that diagnostic.
 //
+// Where postgres is not optional, DNSAUR_TEST_REQUIRE_POSTGRES=1 turns that
+// skip into a failed run. CI sets it: on a runner with Docker, the postgres
+// halves silently not running is not a green suite, and a line on stderr in
+// the middle of a passing log is not how anyone finds out. See noPostgres.
+//
 // The reaper is disabled deliberately. testcontainers derives its session ID
 // from the parent pid and its start time (internal/core/bootstrap.go), so
 // every test binary in one `go test ./...` shares a single Ryuk — and Ryuk
@@ -72,7 +77,7 @@ func Start(ctx context.Context, pkg string) (string, func()) {
 		}
 		pg, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{ContainerRequest: req, Started: true})
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "%s tests: no postgres, its halves will skip: %v\n", pkg, err)
+			noPostgres(pkg, "no postgres", err)
 			return "", stop
 		}
 		host, _ := pg.Host(ctx)
@@ -86,11 +91,27 @@ func Start(ctx context.Context, pkg string) (string, func()) {
 	// database system is starting up". wait.ForListeningPort cannot see the
 	// difference, so the readiness check is made here, where it can.
 	if err := waitReady(ctx, dsn); err != nil {
-		fmt.Fprintf(os.Stderr, "%s tests: postgres never became ready, its halves will skip: %v\n", pkg, err)
 		stop()
+		noPostgres(pkg, "postgres never became ready", err)
 		return "", func() {}
 	}
 	return dsn, stop
+}
+
+// noPostgres reports that the calling package's postgres halves will not run.
+//
+// It exits rather than returning when DNSAUR_TEST_REQUIRE_POSTGRES=1, and
+// exits from here rather than failing in each test, because "there is no
+// postgres" is a fact about the whole run: one refusal that names the reason
+// beats every postgres subtest failing with the same message. Start's
+// container is already stopped by the time this is reached, so there is
+// nothing left for a deferred call to clean up.
+func noPostgres(pkg, what string, err error) {
+	if os.Getenv("DNSAUR_TEST_REQUIRE_POSTGRES") == "1" {
+		fmt.Fprintf(os.Stderr, "%s tests: %s, and DNSAUR_TEST_REQUIRE_POSTGRES=1 says that is a failure: %v\n", pkg, what, err)
+		os.Exit(1)
+	}
+	fmt.Fprintf(os.Stderr, "%s tests: %s, its halves will skip: %v\n", pkg, what, err)
 }
 
 // BuildTemplate creates the database called name and runs the migrations

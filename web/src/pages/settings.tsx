@@ -1,4 +1,4 @@
-import { useEffect, useRef, type ReactNode } from "react";
+import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { useBlocker } from "react-router";
 import {
   Database,
@@ -11,7 +11,7 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import { toast } from "sonner";
-import { useForm, type Control } from "react-hook-form";
+import { useForm, useWatch, type Control } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { z } from "zod";
 import {
@@ -814,10 +814,27 @@ function SaveBar({
 
 function SettingsForm({ settings }: { settings: Settings }) {
   const updateSetting = useUpdateSetting();
-  const defaultsRef = useRef(buildDefaults(settings));
+  // The baseline — what the server last confirmed, per field — is state,
+  // because render compares against it: the changed count, the per-field
+  // dots and the leave guard are all derived from it. As a ref it could move
+  // without a render and leave all three describing the previous one.
+  //
+  // The ref beside it is the same value for the two places that must see the
+  // latest one without making it a dependency: the refetch effect and the
+  // submit below. A baseline dependency on that effect would re-run it the
+  // moment a save moved the baseline — against a `settings` still holding
+  // the pre-save value, which it would then dutifully put back.
+  const [baseline, setBaseline] = useState(() => buildDefaults(settings));
+  const baselineRef = useRef(baseline);
+  const moveBaseline = useCallback((next: SettingsFormValues) => {
+    baselineRef.current = next;
+    setBaseline(next);
+  }, []);
   const form = useForm<SettingsFormValues>({
     resolver: zodResolver(SETTINGS_SCHEMA),
-    defaultValues: defaultsRef.current,
+    // Read once, on the first render: react-hook-form keeps its own copy of
+    // the defaults from here on, and the resets below are what move it.
+    defaultValues: baseline,
   });
 
   // Watched rather than read from formState.dirtyFields: RHF marks a field
@@ -827,8 +844,7 @@ function SettingsForm({ settings }: { settings: Settings }) {
   // agreeing with each other — trimmed the same way, because the submit
   // sends a trimmed value and a bar counting the raw one calls a trailing
   // space a change and then leaves Save with nothing to send.
-  const values = form.watch();
-  const baseline = defaultsRef.current;
+  const values = useWatch({ control: form.control });
   const changedFields = ALL_FIELDS.filter(
     (f) => (values[rhfName(f.key)] ?? "").trim() !== (baseline[rhfName(f.key)] ?? ""),
   );
@@ -851,7 +867,7 @@ function SettingsForm({ settings }: { settings: Settings }) {
    */
   useEffect(() => {
     const fromServer = buildDefaults(settings);
-    const moved: SettingsFormValues = { ...defaultsRef.current };
+    const moved: SettingsFormValues = { ...baselineRef.current };
     let any = false;
     for (const field of ALL_FIELDS) {
       const name = rhfName(field.key);
@@ -862,8 +878,8 @@ function SettingsForm({ settings }: { settings: Settings }) {
       any = true;
       form.resetField(name, { defaultValue: now });
     }
-    if (any) defaultsRef.current = moved;
-  }, [settings, form]);
+    if (any) moveBaseline(moved);
+  }, [settings, form, moveBaseline]);
 
   /**
    * Nothing here is saved until Save is pressed, and every other screen in
@@ -878,7 +894,7 @@ function SettingsForm({ settings }: { settings: Settings }) {
   }, [blocker, changedFields.length]);
 
   async function onSubmit(submitted: SettingsFormValues) {
-    const base = defaultsRef.current;
+    const base = baselineRef.current;
     // Diff against ALL_FIELDS (the authoritative key list), not
     // Object.entries(values) — RHF's `name` is a dot-path, so `values`
     // also holds react-hook-form's own bookkeeping shape for any
@@ -929,7 +945,7 @@ function SettingsForm({ settings }: { settings: Settings }) {
         failedKeys.push(apiKey);
       }
     });
-    defaultsRef.current = nextBaseline;
+    moveBaseline(nextBaseline);
     // keepValues: true — only the baseline (dirty comparison) moves;
     // fields that failed to save keep the admin's attempted value in
     // place, still marked dirty, ready to retry.
@@ -982,7 +998,7 @@ function SettingsForm({ settings }: { settings: Settings }) {
           hotCount={hotCount}
           restartCount={restartCount}
           isSubmitting={form.formState.isSubmitting}
-          onDiscard={() => form.reset(defaultsRef.current)}
+          onDiscard={() => form.reset(baselineRef.current)}
         />
 
         <div className="min-h-0 flex-1 overflow-y-auto">

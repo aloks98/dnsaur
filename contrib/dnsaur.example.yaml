@@ -1,0 +1,21 @@
+# dnsaur's bootstrap configuration: the handful of settings that have to be
+# known before the database is open. Everything else — upstreams, blocklists,
+# client groups, zones, retention — lives in the database and is edited from
+# the dashboard or the API. See docs/configuration.md.
+#
+# Every field here also has a DNSAUR_* environment override.
+
+dns_listen: [":53"]
+http_listen: ":8080"
+
+# Matches StateDirectory=dnsaur in the systemd unit.
+data_dir: "/var/lib/dnsaur"
+
+log_level: "info"
+
+storage:
+  driver: sqlite
+
+# Networks a reverse proxy in front of dnsaur may connect from. Empty trusts
+# nothing, which is right when dnsaur is reached directly.
+# trusted_proxies: ["10.0.0.0/8"]

@@ -1,7 +1,6 @@
 package api
 
 import (
-	"bufio"
 	"bytes"
 	"compress/gzip"
 	"context"
@@ -156,39 +155,25 @@ func TestGzipAndCSPDoNotTouchAPIOrSSE(t *testing.T) {
 	logger := qlog.New(&nullQLStore{}, qlog.Options{InstanceID: "i", FlushEvery: time.Hour, BatchSize: 100})
 	srv.deps.Logger = logger
 
-	req := httptest.NewRequest("GET", "/api/v1/queries/tail", nil)
-	req.AddCookie(cookie)
-	req.Header.Set("Accept-Encoding", "gzip, deflate, br")
-	ctx, cancelReq := context.WithCancel(context.Background())
-	req = req.WithContext(ctx)
-	w := httptest.NewRecorder()
-	done := make(chan struct{})
-	go func() {
-		srv.Handler().ServeHTTP(w, req)
-		close(done)
-	}()
-	time.Sleep(50 * time.Millisecond) // let the handler subscribe
-	logger.Publish(store.QueryLogEntry{QName: "live.example", Decision: "blocked"})
-	time.Sleep(100 * time.Millisecond)
-	cancelReq()
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("tail handler did not flush/close")
-	}
+	// Accept-Encoding set by hand, so the transport leaves the response
+	// exactly as the server sent it rather than transparently decoding it.
+	resp, line := tailStream(t, srv.Handler(), cookie,
+		http.Header{"Accept-Encoding": {"gzip, deflate, br"}},
+		func() { logger.Publish(store.QueryLogEntry{QName: "live.example", Decision: "blocked"}) })
 
-	if got := w.Header().Get("Content-Encoding"); got != "" {
+	if got := resp.Header.Get("Content-Encoding"); got != "" {
 		t.Fatalf("SSE Content-Encoding = %q, want none (must stay unbuffered)", got)
 	}
-	if ct := w.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/event-stream") {
+	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "text/event-stream") {
 		t.Fatalf("SSE Content-Type = %q", ct)
 	}
 	// The static hardening headers must not leak onto API responses.
-	if got := w.Header().Get("Content-Security-Policy"); got != "" {
+	if got := resp.Header.Get("Content-Security-Policy"); got != "" {
 		t.Fatalf("API got CSP %q", got)
 	}
-	// Body is plain, readable SSE — not gzip framing.
-	line, _ := bufio.NewReader(w.Body).ReadString('\n')
+	// Body is plain, readable SSE — not gzip framing. Reaching this line at
+	// all is the unbuffered part: a wrapper that held the response would not
+	// have produced it before the read timed out.
 	if !strings.HasPrefix(line, "data: ") || !strings.Contains(line, "live.example") {
 		t.Fatalf("sse line: %q", line)
 	}

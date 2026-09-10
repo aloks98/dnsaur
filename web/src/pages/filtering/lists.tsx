@@ -1,7 +1,7 @@
 import { useMemo, useState, type ReactNode } from "react";
 import { Pencil, Plus, RefreshCw, Trash2, TriangleAlert } from "lucide-react";
 import { toast } from "sonner";
-import { useForm } from "react-hook-form";
+import { useForm, useWatch } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { z } from "zod";
 import {
@@ -170,7 +170,7 @@ function AddListDialog() {
 
   // Recomputed as the URL changes, so the Name placeholder always shows the
   // default that leaving it blank would actually produce.
-  const urlSoFar = form.watch("url");
+  const urlSoFar = useWatch({ control: form.control, name: "url" });
   const derivedNamePreview = urlSoFar.trim() ? deriveListName(urlSoFar) : "a name from the URL";
 
   function onSubmit(values: AddListValues) {

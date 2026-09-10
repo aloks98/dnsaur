@@ -10,7 +10,7 @@ import {
   X,
 } from "lucide-react";
 import { toast } from "sonner";
-import { useForm, useFormState, type Control } from "react-hook-form";
+import { useForm, useFormState, useWatch, type Control } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { z } from "zod";
 import {
@@ -607,7 +607,7 @@ function AddZoneRow({ onClose }: { onClose: () => void }) {
     form.setFocus("name");
   }, [form]);
 
-  const type = form.watch("type");
+  const type = useWatch({ control: form.control, name: "type" });
 
   function onSubmit(values: AddZoneValues) {
     // Every type-dependent field is sent only for the types it applies to and

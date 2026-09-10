@@ -1801,7 +1801,12 @@ test("a transfer landing re-reads that zone's records, and only that zone's", as
 
   renderWithProviders(<ZonesList />);
   await waitFor(() => expect(zoneRows()).toHaveLength(2));
-  expect(within(zoneRows()[0]).getByText("1")).toBeInTheDocument();
+  // Waited for, not asserted outright: the rows and their record counts come
+  // from two different queries, so a row being on screen does not mean its
+  // count is. Asserting the precondition directly failed here roughly one run
+  // in three under a full-suite load, on the setup rather than on the
+  // behaviour under test.
+  await waitFor(() => expect(within(zoneRows()[0]).getByText("1")).toBeInTheDocument());
 
   refreshedAt = Date.now();
   await act(async () => {

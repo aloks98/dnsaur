@@ -324,15 +324,16 @@ function AddRuleRow({ groupId, onClose }: { groupId: number; onClose: () => void
  */
 export function RulesTab() {
   const groups = useGroups();
-  const [groupId, setGroupId] = useState<number>(DEFAULT_GROUP_ID);
+  const [selectedId, setSelectedId] = useState<number>(DEFAULT_GROUP_ID);
 
   // Fall back to whatever group actually exists once groups load, in the
-  // unlikely case the seeded default (id 1) isn't among them.
-  useEffect(() => {
-    if (groups.data && groups.data.length > 0 && !groups.data.some((g) => g.id === groupId)) {
-      setGroupId(groups.data[0].id);
-    }
-  }, [groups.data, groupId]);
+  // unlikely case the seeded default (id 1) isn't among them. Derived here
+  // rather than corrected by an effect: the effect let one render go out
+  // naming a group that isn't there — and useRules fetch its rules — before
+  // putting it right.
+  const known = groups.data;
+  const groupId =
+    known && known.length > 0 && !known.some((g) => g.id === selectedId) ? known[0].id : selectedId;
 
   const rules = useRules(groupId);
   const deleteRule = useDeleteRule();
@@ -468,7 +469,7 @@ export function RulesTab() {
           </span>
           <NativeSelect
             value={String(groupId)}
-            onChange={(e) => setGroupId(Number(e.target.value))}
+            onChange={(e) => setSelectedId(Number(e.target.value))}
             disabled={groups.isPending || !groups.data || groups.data.length === 0}
             aria-label="Group"
           >

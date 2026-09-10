@@ -14,7 +14,7 @@ import {
   X,
 } from "lucide-react";
 import { toast } from "sonner";
-import { useForm, type Control, type UseFormReturn } from "react-hook-form";
+import { useForm, useWatch, type Control, type UseFormReturn } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { z } from "zod";
 import {
@@ -382,14 +382,14 @@ function RecordFormRow({
     form.setFocus("name");
   }, [form]);
 
-  const type = form.watch("type");
+  const type = useWatch({ control: form.control, name: "type" });
 
   // At "@" the zone *is* the name, so the chip carries the apex whole and
   // the typed text goes muted — the field is saying "there is nothing left
   // for you to add". Anywhere else it carries the apex with its joining
   // dot, and what's typed reads as the subdomain in front of it. A wildcard
   // ("*", "*.nexus") is an ordinary relative name and gets no special case.
-  const atApex = form.watch("name").trim() === "@";
+  const atApex = (useWatch({ control: form.control, name: "name" }) ?? "").trim() === "@";
   const suffixFull = atApex ? apex : `.${apex}`;
   const suffixShown = atApex ? clipApex(apex) : `.${clipApex(apex)}`;
   const dataIsName = NAME_VALUED_TYPES.has(type as RecordType);
@@ -1010,7 +1010,7 @@ function SoaBand({ zone }: { zone: Zone }) {
  * difference between "connection refused" four minutes ago and the same words
  * four days ago, and only one of those is worth acting on now.
  */
-function TransferBand({ zone }: { zone: Zone }) {
+function TransferBand({ zone, asOf }: { zone: Zone; asOf: number }) {
   const state = transferState(zone);
   const failure = lastTransferError(zone);
   /**
@@ -1049,7 +1049,12 @@ function TransferBand({ zone }: { zone: Zone }) {
   } else if (state === "never") {
     nextRefresh = "due now";
   } else if (state === "fresh") {
-    nextRefresh = `in ${formatDuration(nextRefreshAt(zone) - Date.now())}`;
+    // asOf, not Date.now(): render reads no clock (react(purity)), and the
+    // countdown is anchored to the answer it describes rather than to
+    // whenever React last happened to re-render this band. useZone polls
+    // while a zone watches transfers — which is every zone that gets one of
+    // these — so it advances on the same schedule the rest of the band does.
+    nextRefresh = `in ${formatDuration(nextRefreshAt(zone) - asOf)}`;
   } else {
     nextRefresh = `retrying every ${formatDuration(retryIntervalMs(zone))}`;
   }
@@ -1630,7 +1635,17 @@ function UpstreamRow({ zone }: { zone: Zone }) {
    * value that is saved is read at submit time.
    */
   const [keyId, setKeyId] = useState(zone.tsig_key_id);
-  useEffect(() => setKeyId(zone.tsig_key_id), [zone.tsig_key_id]);
+  // Reset during render rather than from an effect — React's own recipe for
+  // adjusting state when a prop changes. The effect this replaces rendered
+  // the stale key once, committed it, and only then corrected itself; this
+  // re-runs the component before anything is shown. The reset still fires on
+  // exactly the same occasions: the saved key changing, which is the initial
+  // load and the refetch after a save, and never an unrelated poll.
+  const [keyIdFor, setKeyIdFor] = useState(zone.tsig_key_id);
+  if (keyIdFor !== zone.tsig_key_id) {
+    setKeyIdFor(zone.tsig_key_id);
+    setKeyId(zone.tsig_key_id);
+  }
 
   // The field this row edits, and the only difference between the shapes
   // that reaches the wire. They are separate columns because they are
@@ -2623,7 +2638,11 @@ function ZoneDetailFor({ zoneId }: { zoneId: number }) {
           reads (it answers from no records at all); a stub's arrives with
           every fetch and is overwritten by the next one, exactly as a
           secondary's is. What they get instead is the upstream row below. */}
-      {isSecondary ? <TransferBand zone={z} /> : isRouting ? null : <SoaBand zone={z} />}
+      {isSecondary ? (
+        <TransferBand zone={z} asOf={zone.dataUpdatedAt} />
+      ) : isRouting ? null : (
+        <SoaBand zone={z} />
+      )}
 
       {/* Where this zone goes to get what it serves, and what it signs the
           asking with — one row for all three types that have somewhere to

@@ -1,0 +1,61 @@
+version: 2
+
+project_name: dnsaur
+
+builds:
+  - main: ./cmd/dnsaur
+    binary: dnsaur
+    # Same combination the Dockerfile and the CI build use: pure Go, so an
+    # arm64 artifact cross-compiles from an amd64 runner.
+    env: [CGO_ENABLED=0]
+    goos: [linux]
+    goarch: [amd64, arm64]
+    flags: [-trimpath]
+    ldflags:
+      - -s -w -X main.Version={{.Version}}
+
+archives:
+  - formats: [tar.gz]
+    files:
+      - LICENSE
+      - README.md
+      - contrib/dnsaur.service
+      - contrib/dnsaur.example.yaml
+
+nfpms:
+  - package_name: dnsaur
+    vendor: aloks98
+    homepage: https://github.com/aloks98/dnsaur
+    maintainer: Alok Kumar Sahoo <aloksahoo9819@gmail.com>
+    description: |-
+      Self-hosted DNS server for homelabs.
+      A forwarding and caching resolver with per-client blocklist filtering,
+      authoritative zones, a query log and an embedded web dashboard.
+    license: AGPL-3.0-only
+    formats: [deb, rpm]
+    bindir: /usr/bin
+    contents:
+      - src: contrib/dnsaur.service
+        dst: /usr/lib/systemd/system/dnsaur.service
+      - src: contrib/dnsaur.example.yaml
+        dst: /etc/dnsaur/dnsaur.yaml
+        # noreplace, so an upgrade never overwrites the operator's edits —
+        # the packaged file is a starting point, not managed state.
+        type: config|noreplace
+
+changelog:
+  use: git
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+
+# No `dockers`/`dockers_v2` section on purpose. GoReleaser builds images in a
+# temporary context holding only the release artifacts, so it can only drive
+# a Dockerfile that copies a prebuilt binary — while ./Dockerfile builds the
+# dashboard and the binary from source, which is what `docker build .` and CI
+# use. One Dockerfile that both paths share beats a GoReleaser stanza plus a
+# second, quietly diverging one, so the image is built by
+# `docker buildx build --platform linux/amd64,linux/arm64 .` alongside the
+# GoReleaser run (see .forgejo/workflows/release.yml).

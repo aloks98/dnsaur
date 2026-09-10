@@ -150,7 +150,19 @@ function queryIdentity(e: QueryEntry): string {
 export function useLiveTail(enabled: boolean): LiveTailResult {
   const qc = useQueryClient();
   const [entries, setEntries] = useState<QueryEntry[]>([]);
-  const [state, setState] = useState<SseState>(enabled ? "reconnecting" : "closed");
+  const [streamState, setStreamState] = useState<SseState>("reconnecting");
+  // "closed" is a fact about `enabled`, not something to remember: with the
+  // tail switched off there is no subscription for a state to be about. The
+  // effect below used to write it after the teardown, a render late and as
+  // the kind of setState-in-an-effect React Compiler will not memoize around.
+  const [subscribed, setSubscribed] = useState(enabled);
+  if (subscribed !== enabled) {
+    setSubscribed(enabled);
+    // Each subscription starts over, so the next one does not open on
+    // however the last one ended.
+    setStreamState("reconnecting");
+  }
+  const state: SseState = enabled ? streamState : "closed";
   // Bumped by reconnect() to re-run the effect (and so reopen the stream)
   // after the subscription has given up on a dead endpoint.
   const [attempt, setAttempt] = useState(0);
@@ -224,17 +236,14 @@ export function useLiveTail(enabled: boolean): LiveTailResult {
    */
   const handleState = useCallback(
     (next: SseState) => {
-      setState(next);
+      setStreamState(next);
       if (next === "failed") void qc.invalidateQueries({ queryKey: authKeys.me, exact: true });
     },
     [qc],
   );
 
   useEffect(() => {
-    if (!enabled) {
-      setState("closed");
-      return;
-    }
+    if (!enabled) return;
     const unsubscribe = subscribeQueries((entry) => {
       pending.current.push(entry);
       flushTimer.current ??= setTimeout(flush, FLUSH_INTERVAL_MS);

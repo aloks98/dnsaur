@@ -51,8 +51,10 @@ registrar. Until then a client that sets DO gets whatever signatures the
 upstream returned, subject to the cache: an answer cached for a DO=0 client
 is served without them.
 
-There's no published Docker image yet, but you no longer need to hand-edit
-the database or shell out to curl for everyday admin: a React dashboard
+Nothing is published to a registry or a package repo yet — the Dockerfile
+and the deb/rpm build are in the repo and you run them yourself (see Quick
+start). What you no longer need is to hand-edit the database or shell out to
+curl for everyday admin: a React dashboard
 (`web/`, embedded into the `dnsaur` binary and served alongside the API —
 see [`docs/architecture.md`](docs/architecture.md)) covers first-run setup,
 live query monitoring, per-client blocklists/allowlists/rules, authoritative
@@ -64,11 +66,51 @@ client groups, filter lists, zones, and more are all scriptable over HTTP
 
 ## Quick start
 
-Build from source (Go 1.26+, Node 22+ and pnpm for the dashboard):
+There are no published images and no packages to download yet, so all three
+paths build from this repo. The release config is in place and exercised on
+every tag ([`docs/development.md`](docs/development.md#release)), so
+publishing is a decision rather than a project.
 
 ```sh
 git clone https://github.com/aloks98/dnsaur.git
 cd dnsaur
+```
+
+### Docker
+
+```sh
+docker build -t dnsaur:local .
+docker run -d --name dnsaur \
+  -e DNSAUR_DNS_LISTEN=:5353 \
+  -v dnsaur-data:/data \
+  -p 53:5353/udp -p 53:5353/tcp -p 8080:8080 \
+  dnsaur:local
+```
+
+The image builds the dashboard and the binary itself, so nothing needs a Go
+or Node toolchain. It is configured through `DNSAUR_*` variables, or a
+`dnsaur.yaml` mounted at `/data/dnsaur.yaml`; see
+[`docs/configuration.md`](docs/configuration.md#in-a-container), which also
+covers why 53 is published onto a high port rather than bound directly.
+
+### A deb or an rpm
+
+```sh
+cd web && pnpm install && pnpm build && cd ..   # or the packages serve API-only
+go run github.com/goreleaser/goreleaser/v2@v2.18.1 release --snapshot --clean --skip=publish
+sudo apt install ./dist/dnsaur_*_linux_amd64.deb   # or: sudo rpm -i dist/dnsaur_*_linux_amd64.rpm
+sudo systemctl enable --now dnsaur
+```
+
+That installs `/usr/bin/dnsaur`, `/etc/dnsaur/dnsaur.yaml` to edit, and a
+systemd unit that reaches port 53 without root and keeps its database in
+`/var/lib/dnsaur`.
+
+### From source
+
+Go 1.26+, Node 22+ and pnpm:
+
+```sh
 cd web && pnpm install && pnpm build && cd ..   # builds the dashboard into web/dist
 go build ./cmd/dnsaur                           # embeds web/dist into the binary
 ```
@@ -94,17 +136,16 @@ Run it:
 ./dnsaur -config dnsaur.yaml
 ```
 
-On first start dnsaur creates `./data`, opens (and migrates) its SQLite
+### First start
+
+dnsaur creates its data directory, opens (and migrates) its SQLite
 database, seeds default settings (Cloudflare/Quad9 upstreams, a `default`
-client group), and starts serving DNS on `:53`. Point a client or your
-router's DNS setting at the host running dnsaur to try it.
+client group), and starts serving DNS. Point a client or your router's DNS
+setting at the host running dnsaur to try it.
 
 Open `http://<host>:8080` (or whatever `http_listen` is set to) in a
 browser for the dashboard — it walks you through creating an admin account
 on first visit.
-
-Docker images are planned (multi-arch, GHCR) but not published yet — for
-now, building from source is the only supported install path.
 
 ## Documentation
 
@@ -118,8 +159,7 @@ now, building from source is the only supported install path.
 
 ## License
 
-No license has been chosen yet — license TBD. Until a `LICENSE` file is
-added, treat this repository as "all rights reserved."
+AGPL-3.0-only — see [`LICENSE`](LICENSE).
 
 ## Contributing
 

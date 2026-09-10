@@ -67,19 +67,28 @@ export function PauseControl({ groupId = 0, variant = "button" }: PauseControlPr
   const resumeBlocking = useResumeBlocking();
 
   const pausedUntil = status.data?.paused_until ?? 0;
-  const isPaused = pausedUntil > Date.now();
 
+  // The clock is state, never a Date.now() read while rendering: render has
+  // to be pure, and one that reads the clock can print two different seconds
+  // for the same frame.
   const [now, setNow] = useState(() => Date.now());
+  // …floored at the moment this answer arrived. Between pauses no ticker
+  // runs, so `now` is whatever the last one left behind — which for a pause
+  // that starts minutes later would show a countdown minutes too long until
+  // the first tick corrected it. dataUpdatedAt is when the server said this,
+  // so the pause is measured from there and the ticker takes over from the
+  // second onwards. It used to be an effect that set the clock the instant
+  // it saw a pause, which is a render the state was already able to describe.
+  const asOf = Math.max(now, status.dataUpdatedAt);
+  const isPaused = pausedUntil > asOf;
+
   useEffect(() => {
     if (!isPaused) return;
-    // Sync immediately (not just on the first tick) so the countdown is
-    // accurate the instant a pause takes effect, not up to a second stale.
-    setNow(Date.now());
     const id = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(id);
   }, [isPaused]);
 
-  const remainingMs = Math.max(0, pausedUntil - now);
+  const remainingMs = Math.max(0, pausedUntil - asOf);
   const busy = pauseBlocking.isPending || resumeBlocking.isPending;
 
   // A failed or not-yet-answered GET /blocking must not render as a
