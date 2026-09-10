@@ -783,7 +783,7 @@ Planned, not yet present: `internal/dhcp` (Phase 2), `internal/sync`
   a single connection and a multi-million-row `DELETE` would hold it long
   enough for the query log's own buffered writes to time out and be
   discarded.
-- The DNS cache and the compiled filter trie are memory-only — never
+- The DNS cache and the compiled filter sets are memory-only — never
   persisted to the DB. Downloaded blocklist files are cached on disk
   (`<data_dir>/lists/<id>.txt`, with the server's `ETag` beside it) so a
   restart doesn't force a re-download.
@@ -831,7 +831,7 @@ everything else is expendable before it.
 
 - Upstream failures fail over to healthy upstreams, then serve-stale cache
   entries, and only return `SERVFAIL` as a last resort.
-- Storage failures don't stop resolution — the filter trie and cache are
+- Storage failures don't stop resolution — the filter sets and cache are
   in-memory — while DB-dependent API endpoints return `503` and the query
   log buffer drops oldest entries with a surfaced warning rather than
   blocking.

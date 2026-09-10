@@ -1055,7 +1055,7 @@ creation; only `name` and `enabled` are mutable.
   that is not a domain — `||x^`, `ads.*.example.com`, `*` — is
   `400 pattern must be a domain like example.com, *.example.com or localhost`
   rather than a stored rule that matches nothing. There is still no length cap
-  beyond the 253-byte domain limit. Inserted into a label trie, so a rule
+  beyond the 253-byte domain limit. Inserted into a domain set, so a rule
   matches the domain *and every subdomain*, on whole-label boundaries.
 - Evaluation order: literal allow → regex allow → literal block → regex block →
   allowlists → blocklists. First match wins.
