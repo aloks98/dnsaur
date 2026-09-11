@@ -246,6 +246,10 @@ func TestPausesAreNotAnEditableSetting(t *testing.T) {
 	h := srv.Handler()
 	_ = s.Settings().SetInternal(t.Context(), "blocking.mode", "null-ip")
 	_ = s.Settings().SetInternal(t.Context(), filter.PausesKey, `{"global":4711}`)
+	// The main's registry of replicas is the same kind of row, and
+	// sync.interval_seconds shares its prefix the way blocking.mode does.
+	_ = s.Settings().SetInternal(t.Context(), "sync.replicas", `{"r1":{"instance_id":"r1"}}`)
+	_ = s.Settings().SetInternal(t.Context(), "sync.interval_seconds", "30")
 
 	w := doReq(t, h, "GET", "/api/v1/settings", "", cookie)
 	var m map[string]string
@@ -256,8 +260,17 @@ func TestPausesAreNotAnEditableSetting(t *testing.T) {
 	if _, leaked := m[filter.PausesKey]; leaked {
 		t.Fatalf("the pause state leaked into GET /settings: %v", m)
 	}
+	if _, leaked := m["sync.replicas"]; leaked {
+		t.Fatalf("the replica registry leaked into GET /settings: %v", m)
+	}
+	if m["sync.interval_seconds"] == "" {
+		t.Fatalf("sync.interval_seconds not returned: %v", m)
+	}
 	if w := doReq(t, h, "PUT", "/api/v1/settings", `{"key":"`+filter.PausesKey+`","value":"{}"}`, cookie); w.Code != 400 {
 		t.Fatalf("the pause state accepted as editable: %d", w.Code)
+	}
+	if w := doReq(t, h, "PUT", "/api/v1/settings", `{"key":"sync.replicas","value":"{}"}`, cookie); w.Code != 400 {
+		t.Fatalf("the replica registry accepted as editable: %d", w.Code)
 	}
 }
 

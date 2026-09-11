@@ -346,13 +346,18 @@ func (s *Server) handleSettingsGet(w http.ResponseWriter, r *http.Request) {
 	// holds blocking.mode and blocking.ttl, which are ordinary settings the
 	// screen has to be able to read.
 	//
+	// sync.replicas is the same kind of bookkeeping as the watermark: the
+	// main's registry of who pulls from it, written by registrations rather
+	// than by anyone editing settings, and reported by GET /sync/status in
+	// a shape the screen can use.
+	//
 	// sync.token is editable and is still stripped, for the opposite reason:
 	// it is the credential this instance pulls its config with, and a GET
 	// that hands a credential back to everyone who can read settings is the
 	// leak #54 closed for TSIG secrets. The screen shows set/not set instead.
 	for k := range all {
 		if strings.HasPrefix(k, "instance.") || k == store.StatsWatermarkKey ||
-			k == filter.PausesKey || k == syncTokenSetting {
+			k == filter.PausesKey || k == syncTokenSetting || k == syncReplicasSetting {
 			delete(all, k)
 		}
 	}

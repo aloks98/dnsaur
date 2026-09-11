@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aloks98/dnsaur/internal/api"
 	"github.com/aloks98/dnsaur/internal/config"
 	"github.com/aloks98/dnsaur/internal/dnssrv"
 	"github.com/aloks98/dnsaur/internal/filter"
@@ -1707,5 +1708,80 @@ func TestPausesSurviveRestart(t *testing.T) {
 	}
 	if strings.Contains(v, `"2"`) {
 		t.Fatalf("the expired group pause is still being written: %s", v)
+	}
+}
+
+// TestAppIsTheSyncer pins the delegation api.Deps.Sync depends on: which
+// half of the sync subsystem answers is decided by sync.peer_url alone, and
+// it decides it live — the API's write guard reads PeerURL on every write,
+// so a box that starts following must stop accepting writes at once rather
+// than at its next poll.
+func TestAppIsTheSyncer(t *testing.T) {
+	ctx := context.Background()
+	a := newTestApp(t)
+
+	if peer := a.PeerURL(); peer != "" {
+		t.Fatalf("PeerURL = %q on a main", peer)
+	}
+	if st := a.Status(); st.Role != "main" || len(st.Replicas) != 0 {
+		t.Fatalf("status %+v", st)
+	}
+
+	// The main's half: Register and Forget go to the registry, idempotently.
+	rep := api.Replica{InstanceID: "r1", DNSAddr: "10.0.0.6:53", VersionApplied: 7}
+	if err := a.Register(ctx, rep); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if err := a.Register(ctx, rep); err != nil {
+		t.Fatalf("re-Register: %v", err)
+	}
+	st := a.Status()
+	if len(st.Replicas) != 1 || st.Replicas[0].InstanceID != "r1" || st.Replicas[0].VersionApplied != 7 {
+		t.Fatalf("replicas %+v", st.Replicas)
+	}
+	if st.Replicas[0].LastSeen == 0 {
+		t.Fatalf("registration is not dated: %+v", st.Replicas[0])
+	}
+
+	// The replica's half, the moment the setting lands.
+	if err := a.Store().Settings().Set(ctx, "sync.peer_url", "http://main.example"); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	if peer := a.PeerURL(); peer != "http://main.example" {
+		t.Fatalf("PeerURL = %q", peer)
+	}
+	if st := a.Status(); st.Role != "replica" || st.PeerURL != "http://main.example" || !st.PlainHTTP {
+		t.Fatalf("status %+v", st)
+	}
+
+	if err := a.Forget(ctx, "r1"); err != nil {
+		t.Fatalf("Forget: %v", err)
+	}
+	if err := a.Forget(ctx, "nobody"); err != nil {
+		t.Fatalf("Forget of an unknown id: %v", err)
+	}
+	if err := a.Store().Settings().Set(ctx, "sync.peer_url", ""); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	if st := a.Status(); st.Role != "main" || len(st.Replicas) != 0 {
+		t.Fatalf("after the promotion: %+v", st)
+	}
+}
+
+// TestReloadSettingsRebuildsTheForwarder: a pull applies a bundle straight
+// into the store, so nothing in the API layer has told the app about it.
+// ReloadSettings is what makes the new upstreams the ones queries go to.
+func TestReloadSettingsRebuildsTheForwarder(t *testing.T) {
+	ctx := context.Background()
+	a := newTestApp(t)
+	before := a.fwd.forwarder()
+	if err := a.Store().Settings().SetInternal(ctx, "upstreams", "10.9.9.9:53"); err != nil {
+		t.Fatalf("SetInternal: %v", err)
+	}
+	if err := a.ReloadSettings(ctx); err != nil {
+		t.Fatalf("ReloadSettings: %v", err)
+	}
+	if a.fwd.forwarder() == before {
+		t.Fatal("ReloadSettings left the previous forwarder serving")
 	}
 }

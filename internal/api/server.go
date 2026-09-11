@@ -43,6 +43,12 @@ type Reloader interface {
 	// server-wide interval, not of any one list — there are no per-list
 	// schedules — so every row reports the same value.
 	NextFilterRefresh() int64
+	// ReloadSettings re-runs everything a settings write reconfigures — the
+	// forwarder, the blocking mode, the encrypted listeners. The API's own
+	// settings handler does not call it (the store's change channel already
+	// wakes that path); the config-sync pull does, because it writes a whole
+	// bundle straight into the store and nothing here ever hears about it.
+	ReloadSettings(ctx context.Context) error
 	// NotifyZones wakes the outbound NOTIFY pass. See zones.Notifier.Wake:
 	// it is promptness, never correctness, so a handler that forgets this
 	// call only delays delivery by one tick rather than losing it.

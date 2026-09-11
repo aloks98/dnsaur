@@ -21,6 +21,7 @@ import (
 	"github.com/aloks98/dnsaur/internal/cache"
 	"github.com/aloks98/dnsaur/internal/clients"
 	"github.com/aloks98/dnsaur/internal/config"
+	"github.com/aloks98/dnsaur/internal/confsync"
 	"github.com/aloks98/dnsaur/internal/dnssrv"
 	"github.com/aloks98/dnsaur/internal/filter"
 	"github.com/aloks98/dnsaur/internal/qlog"
@@ -142,6 +143,14 @@ type App struct {
 	notifier *zones.Notifier
 	notifyIn *zones.NotifyServer
 	logger   *qlog.Logger
+	// replica is the config-sync pull loop and replicas is the registry of
+	// the boxes that pull from this one. Both exist on every instance,
+	// because which kind this is is a setting and not a startup decision:
+	// the loop dials nobody while sync.peer_url is empty, and the registry
+	// stays empty while nothing registers. App is the api.Syncer in front
+	// of the pair — see PeerURL.
+	replica  *confsync.Replica
+	replicas *confsync.Registry
 	fwd      *swappable
 	// dnsCache is the pipeline's cache, held here rather than left local to
 	// Start because a routing change has to be able to invalidate it: an
@@ -239,6 +248,17 @@ func New(ctx context.Context, cfg *config.Config, version string) (*App, error) 
 		ready:    make(chan struct{}),
 	}
 	a.refresher = filter.NewRefresher(st.Filters(), st.Clients(), a.engine, cfg.DataDir)
+	a.replicas = confsync.NewRegistry(st)
+	// The address this box registers with its main is the first dns_listen
+	// entry verbatim. A wildcard host (":53", the default) is therefore what
+	// the main would record, and it can neither allow a transfer from it nor
+	// notify it — a two-box deployment names a real address here. There is
+	// no sync.replica_dns to override it in this version.
+	var dnsAddr string
+	if len(cfg.DNSListen) > 0 {
+		dnsAddr = cfg.DNSListen[0]
+	}
+	a.replica = confsync.NewReplica(st, a, a.getSetting(ctx, "instance.id"), dnsAddr)
 	// The resolver every hostname in a zone's configuration is looked up
 	// through: a secondary's primaries, a NOTIFY target, a stub's
 	// out-of-zone nameserver. Four constructors default it independently,
@@ -852,7 +872,10 @@ func (a *App) Start(ctx context.Context) error {
 		ZoneRefresher: a.zoneRefresh,
 		// a, again: App is what knows the ladder fell to plaintext defaults.
 		ResolverStatus: a,
-		Version:        a.version, Static: web.Dist(),
+		// And again: App is the one object that can say which half of the
+		// sync subsystem answers.
+		Sync:    a,
+		Version: a.version, Static: web.Dist(),
 		TrustedProxies: a.cfg.TrustedProxies,
 		DataDir:        a.cfg.DataDir,
 	})
@@ -918,6 +941,11 @@ func (a *App) Start(ctx context.Context) error {
 		// for it before closing the store rather than pulling the store out
 		// from under a transfer.
 		a.notifyIn.Run,
+		// The config-sync pull loop. It pulls once before its first wait, so
+		// a restart applies whatever the main changed while this box was
+		// down, and it costs a box that follows nobody one settings read
+		// every five seconds.
+		a.replica.Run,
 		// Re-attempts DoT/DoH while either is enabled and not listening, so
 		// a bind failure whose cause the operator has since cleared stops
 		// needing an unrelated settings write to notice — see
@@ -1010,6 +1038,41 @@ func (a *App) RefreshList(ctx context.Context, id int64) error {
 	return a.refresher.RefreshOne(ctx, id)
 }
 func (a *App) NextFilterRefresh() int64 { return a.refresher.NextRefresh() }
+
+// ReloadSettings rebuilds everything applySettings owns — the forwarder, the
+// blocking mode, the encrypted listeners — for a caller that wrote settings
+// straight into the store rather than through the API. That caller is the
+// config-sync pull: it imports a whole bundle in one transaction, and
+// nothing in the API layer ever hears about it.
+//
+// It returns an error to satisfy the interface, and never does: applySettings
+// degrades in place (it keeps the previous forwarder, logs what it could not
+// use) precisely so that a bad settings value cannot take DNS down.
+func (a *App) ReloadSettings(ctx context.Context) error { a.applySettings(ctx); return nil }
+
+// PeerURL, Status, Register and Forget are App's api.Syncer half (§8).
+// Which object answers is decided by sync.peer_url, read live: it is what
+// the write guard asks on every write, and the two roles are the two sides
+// of that one setting.
+func (a *App) PeerURL() string { return a.replica.PeerURL() }
+
+func (a *App) Status() api.SyncStatus {
+	if a.replica.PeerURL() != "" {
+		return a.replica.Status()
+	}
+	// context.Background, not a request's: Status has no context to take
+	// (it answers a status endpoint and a background warning strip alike),
+	// and the reads behind it are two settings rows.
+	return a.replicas.Status(context.Background())
+}
+
+func (a *App) Register(ctx context.Context, r api.Replica) error {
+	return a.replicas.Register(ctx, r)
+}
+
+func (a *App) Forget(ctx context.Context, instanceID string) error {
+	return a.replicas.Forget(ctx, instanceID)
+}
 
 func (a *App) Shutdown(ctx context.Context) error {
 	if a.apiCancel != nil {

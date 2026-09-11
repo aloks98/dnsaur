@@ -168,6 +168,10 @@ const (
 	// syncPeerURLSetting is the main this instance follows, and the one
 	// setting that decides which kind of instance it is.
 	syncPeerURLSetting = "sync.peer_url"
+	// syncReplicasSetting is the main's registry of registered replicas —
+	// bookkeeping, not configuration, and stripped from GET /settings for
+	// the reason the rollup watermark is.
+	syncReplicasSetting = "sync.replicas"
 )
 
 func (s *Server) handleSyncBundle(w http.ResponseWriter, r *http.Request) {
