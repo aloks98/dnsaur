@@ -231,6 +231,22 @@ func TestSSETailHeartbeat(t *testing.T) {
 	}
 }
 
+// The greeting must not wait for the heartbeat: with the interval far off,
+// the only bytes that can arrive inside tailStream's client timeout are the
+// connect comment itself.
+func TestSSETailGreetsBeforeAnyEvent(t *testing.T) {
+	srv, s, _ := testServer(t)
+	cookie := login(t, srv, s)
+	srv.deps.Logger = qlog.New(&nullQLStore{}, qlog.Options{InstanceID: "i", FlushEvery: time.Hour, BatchSize: 100})
+	srv.tailHeartbeat = time.Hour
+
+	entry := store.QueryLogEntry{QName: "greet.example", QType: "A", Decision: "forwarded"}
+	_, line := tailStream(t, srv.Handler(), cookie, nil, func() { srv.deps.Logger.Publish(entry) })
+	if !strings.HasPrefix(line, "data: ") {
+		t.Fatalf("after the greeting, first frame %q, want the published event", line)
+	}
+}
+
 // `hours` had no upper bound, and time.Duration(hours)*time.Hour overflows
 // int64 at about 2.5 million hours — so a large enough value wrapped
 // negative and asked the store for a window in the future, which answers

@@ -192,9 +192,25 @@ func tailStream(t *testing.T, h http.Handler, cookie *http.Cookie, reqHeader htt
 		t.Fatalf("tail: %d", resp.StatusCode)
 	}
 
+	// The stream greets before anything else: a comment frame written
+	// straight after the headers, so a proxy that buffers headers until the
+	// first body byte (Node's http-proxy, which Vite's dev server uses)
+	// delivers them at once instead of leaving the browser connecting.
+	rd := bufio.NewReader(resp.Body)
+	greeting, err := rd.ReadString('\n')
+	if err != nil {
+		t.Fatalf("reading the SSE greeting: %v", err)
+	}
+	if greeting != ": connected\n" {
+		t.Fatalf("first SSE line %q, want %q", greeting, ": connected\n")
+	}
+	if blank, err := rd.ReadString('\n'); err != nil || blank != "\n" {
+		t.Fatalf("after the greeting: %q, %v; want the frame's blank line", blank, err)
+	}
+
 	publish()
 
-	line, err := bufio.NewReader(resp.Body).ReadString('\n')
+	line, err := rd.ReadString('\n')
 	if err != nil {
 		t.Fatalf("reading the first SSE line: %v", err)
 	}

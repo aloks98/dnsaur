@@ -107,6 +107,12 @@ func (s *Server) handleQueriesTail(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.WriteHeader(http.StatusOK)
+	// A comment frame straight after the headers. Node's http-proxy — which
+	// Vite's dev server puts in front of this — buffers response headers
+	// until the first body byte, so without one an idle stream never opens
+	// in the browser: it sits in CONNECTING until the first heartbeat. The
+	// spec (WHATWG §9.2.4) has clients ignore comments, so it costs nothing.
+	_, _ = io.WriteString(w, ": connected\n\n")
 	fl.Flush()
 	// The SSE keepalive: a comment frame, which the spec (WHATWG §9.2.4)
 	// says a client ignores, so it costs an EventSource nothing to read.
