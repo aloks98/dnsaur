@@ -113,6 +113,8 @@ function defaultZones(): Zone[] {
       last_xfr_error: "",
       notify_to: "",
       forward_to: "",
+      next_attempt_at: 0,
+      failures: 0,
       created_at: Date.now() - 30 * 24 * 60 * 60 * 1000,
       modified_at: Date.now() - 15 * 60 * 1000,
     },

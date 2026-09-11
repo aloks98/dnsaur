@@ -158,6 +158,11 @@ func newNotifyFixture(t *testing.T, z store.Zone, opts ...zones.NotifyServerOpti
 		t.Fatalf("Reload: %v", err)
 	}
 	rf := &fakeRefresher{}
+	// The key store is wired the way production wires it (internal/app), so
+	// every row here exercises the real shape. A zone naming a key id no row
+	// answers to — which is most of the table — reads exactly as it did
+	// before it was attached.
+	opts = append([]zones.NotifyServerOption{zones.WithNotifyKeys(st.TSIGKeys())}, opts...)
 	return &notifyFixture{
 		ns:   zones.NewNotifyServer(res, st.Zones(), rf, opts...),
 		rf:   rf,
@@ -936,4 +941,106 @@ func TestNotifyServerRunWaitsForTheWorkItAdmitted(t *testing.T) {
 				"it is outside the WaitGroup Shutdown already waited on")
 		}
 	}
+}
+
+// A primary behind NAT reaches its secondary from an address that is not in
+// `primaries` — the NAT's, not its own — so the source check refuses a NOTIFY
+// it has no other way to send. A TSIG that verifies under *this zone's own
+// key* is a stronger statement about who sent it than a source address is, so
+// it stands in for the address rather than being checked after it.
+//
+// Only the zone's own key. A message signed under some other key this server
+// holds says nothing about being this zone's master, and an unsigned or
+// wrongly signed one from an unlisted source is refused exactly as before.
+func TestNotifyFromAnUnlistedSourceIsAcceptedWhenItVerifiesUnderTheZoneKey(t *testing.T) {
+	const (
+		zoneKey  = "primary-nat."
+		otherKey = "someone-else."
+	)
+
+	tests := []struct {
+		name        string
+		peer        string
+		key         string
+		tsigErr     error
+		wantRcode   int
+		wantTSIG    uint16
+		wantRefresh bool
+	}{
+		{
+			name: "signed under the zone's key from an address nobody listed",
+			peer: "203.0.113.77", key: zoneKey,
+			wantRcode: dns.RcodeSuccess, wantRefresh: true,
+		},
+		{
+			// The rule is not "signed by anything we hold": a key that
+			// exists is not a claim to be this zone's master.
+			name: "signed under another zone's key from an unlisted address",
+			peer: "203.0.113.77", key: otherKey,
+			wantRcode: dns.RcodeRefused,
+		},
+		{
+			name: "unsigned from an unlisted address",
+			peer: "203.0.113.77", tsigErr: dnssrv.ErrTSIGUnsigned,
+			wantRcode: dns.RcodeRefused,
+		},
+		{
+			// A TSIG that did not verify is a TSIG error wherever it came
+			// from, and it is still not a way past the source check.
+			name: "a broken MAC from an unlisted address",
+			peer: "203.0.113.77", key: zoneKey, tsigErr: dns.ErrSig,
+			wantRcode: dns.RcodeRefused,
+		},
+		{
+			// The listed source still needs no signature at all — this
+			// widens the gate, it does not tighten it.
+			name: "the listed primary, signed under the zone's key",
+			peer: "10.0.0.1", key: zoneKey,
+			wantRcode: dns.RcodeSuccess, wantRefresh: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			z := notifyZone()
+			z.TSIGKeyID = 1
+			f := newNotifyFixture(t, z)
+			// Ids start at 1 in a store this test just opened, so the first
+			// key created is the one the zone names — asserted rather than
+			// assumed.
+			id := addTSIGKey(t, f.st, zoneKey)
+			if id != z.TSIGKeyID {
+				t.Fatalf("the zone's key got id %d, want %d", id, z.TSIGKeyID)
+			}
+			addTSIGKey(t, f.st, otherKey)
+
+			reply := f.notify(t, notifyApex, dns.TypeSOA, tc.peer, tc.key, tc.tsigErr)
+			if reply.Rcode != tc.wantRcode {
+				t.Errorf("rcode = %s, want %s",
+					dns.RcodeToString[reply.Rcode], dns.RcodeToString[tc.wantRcode])
+			}
+			if got := tsigErrorOf(reply); got != tc.wantTSIG {
+				t.Errorf("TSIG error = %d, want %d", got, tc.wantTSIG)
+			}
+
+			deadline := time.Now().Add(2 * time.Second)
+			for f.rf.count() == 0 && time.Now().Before(deadline) {
+				time.Sleep(time.Millisecond)
+			}
+			if got := f.rf.count() > 0; got != tc.wantRefresh {
+				t.Errorf("refresh triggered = %v, want %v", got, tc.wantRefresh)
+			}
+		})
+	}
+}
+
+func addTSIGKey(t *testing.T, st store.Store, name string) int64 {
+	t.Helper()
+	id, err := st.TSIGKeys().Create(context.Background(), store.TSIGKey{
+		Name: name, Algorithm: dns.HmacSHA256, Secret: "c2VjcmV0LXNlY3JldC1zZWNyZXQ=",
+	})
+	if err != nil {
+		t.Fatalf("creating TSIG key %q: %v", name, err)
+	}
+	return id
 }

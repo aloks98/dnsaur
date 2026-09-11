@@ -9,6 +9,7 @@ import {
   pullState,
   refreshIntervalMs,
   retryIntervalMs,
+  schedulerNote,
   transferErrorLead,
   transferState,
   type TransferState,
@@ -57,6 +58,8 @@ function secondary(): Zone {
     last_xfr_error: "",
     notify_to: "",
     forward_to: "",
+    next_attempt_at: 0,
+    failures: 0,
     created_at: NOW - 30 * DAY,
     modified_at: NOW - 30 * DAY,
   } satisfies Zone;
@@ -364,4 +367,30 @@ test("a secondary's pull state is its transfer state, expiry and all", () => {
     ["fresh", secondary()],
   ];
   expect(cases.map(([, zone]) => pullState(zone, NOW))).toEqual(cases.map(([want]) => want));
+});
+
+test("the scheduler note carries the back-off and the failure run", () => {
+  const zone = zoneWith({ next_attempt_at: NOW + 4 * 60_000, failures: 3 });
+  expect(schedulerNote(zone, NOW)).toBe("next attempt in 4m · 3 failed attempts");
+});
+
+test("one failure is not pluralised", () => {
+  expect(schedulerNote(zoneWith({ next_attempt_at: 0, failures: 1 }), NOW)).toBe(
+    "1 failed attempt",
+  );
+});
+
+/** Both halves are process-local, so a restarted server reports zeroes for a
+ * zone that is still failing — and the durable last-error line beside this
+ * one is what keeps saying so. */
+test("the scheduler note is empty when the process knows nothing", () => {
+  expect(schedulerNote(zoneWith({ next_attempt_at: 0, failures: 0 }), NOW)).toBe("");
+});
+
+/** A back-off already in the past has nothing left to count: the attempt is
+ * running, or the next tick has not come round. */
+test("a back-off that has already passed is dropped", () => {
+  expect(schedulerNote(zoneWith({ next_attempt_at: NOW - 1, failures: 2 }), NOW)).toBe(
+    "2 failed attempts",
+  );
 });

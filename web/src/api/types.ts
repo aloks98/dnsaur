@@ -265,6 +265,25 @@ export interface Zone {
    * written, ", "-separated), which may differ from what was sent.
    */
   forward_to: string;
+  /**
+   * When the scheduler will next attempt this zone, unix ms — **0 whenever
+   * there is no back-off pending**, which is every healthy zone, every type
+   * that does not pull, and every zone in a server process that has not
+   * scheduled one yet.
+   *
+   * This and `failures` are the scheduler's own view (Go:
+   * zones.Refresher.Status), and unlike `last_error`/`last_attempt` they are
+   * process-local: a restart forgets both. So they *add to* the durable pair
+   * rather than replacing it — read alone they would show a zone that had
+   * been failing for a week as healthy after every restart. What they add is
+   * the two things no column can say: when the next attempt actually falls,
+   * and how many have failed in a row.
+   */
+  next_attempt_at: number;
+  /** Consecutive failed attempts in the running server process; 0 after a
+   * success, and 0 for a zone that process has never scheduled. See
+   * `next_attempt_at`. */
+  failures: number;
   created_at: number;
   modified_at: number;
 }

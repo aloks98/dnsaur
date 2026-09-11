@@ -818,3 +818,151 @@ func TestBothWritersReadBareAtAsTheApex(t *testing.T) {
 		})
 	}
 }
+
+// ── PATCH /zones/{id}/records ─────────────────────────────────────────────
+
+// bulkTTLZone is a primary with three A records under two names, plus the
+// apex NS the create seeds. The RRSet at "web" is two rows, which is what
+// makes "the whole set or none of it" a real question.
+func bulkTTLZone(t *testing.T, srv *zoneTestServer) (zoneID int64, ids map[string]int64) {
+	t.Helper()
+	rec := srv.do(t, "POST", "/api/v1/zones", `{"name":"e412.in"}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create: status = %d body = %s", rec.Code, rec.Body)
+	}
+	zoneID = createdID(t, rec)
+	ids = map[string]int64{}
+	for _, r := range []struct{ name, rdata string }{
+		{"web", "10.0.0.1"},
+		{"web", "10.0.0.2"},
+		{"nas", "10.0.0.9"},
+	} {
+		got := srv.do(t, "POST", fmt.Sprintf("/api/v1/zones/%d/records", zoneID),
+			fmt.Sprintf(`{"name":%q,"type":"A","ttl":300,"rdata":%q}`, r.name, r.rdata))
+		if got.Code != http.StatusCreated {
+			t.Fatalf("adding %s/%s: status = %d body = %s", r.name, r.rdata, got.Code, got.Body)
+		}
+		ids[r.rdata] = createdID(t, got)
+	}
+	return zoneID, ids
+}
+
+// Retuning a zone before a migration is a TTL change on every record in it,
+// and one row at a time is one serial bump and one snapshot rebuild each.
+func TestZoneRecordsBulkTTLWritesOnceAndBumpsTheSerialOnce(t *testing.T) {
+	srv := newTestServer(t)
+	zoneID, ids := bulkTTLZone(t, srv)
+	before := srv.zone(t, zoneID)
+
+	body := fmt.Sprintf(`{"ids":[%d,%d,%d],"ttl":60}`, ids["10.0.0.1"], ids["10.0.0.2"], ids["10.0.0.9"])
+	got := srv.do(t, "PATCH", fmt.Sprintf("/api/v1/zones/%d/records", zoneID), body)
+	if got.Code != http.StatusNoContent {
+		t.Fatalf("status = %d body = %s; want 204", got.Code, got.Body)
+	}
+
+	for _, r := range srv.records(t, zoneID) {
+		want := uint32(60)
+		if r.Type == "NS" {
+			// The apex NS was not named, so it keeps what it had.
+			want = apexNSTTL
+		}
+		if r.TTL != want {
+			t.Errorf("%s %s ttl = %d, want %d", r.Name, r.Type, r.TTL, want)
+		}
+		if r.Type == "A" && r.RData == "" {
+			t.Errorf("%s lost its rdata", r.Name)
+		}
+	}
+
+	// One bump for the whole edit, not one per record: a serial is this
+	// zone's name for a version of its contents, and three of them for one
+	// change is three transfers a secondary did not need.
+	if after := srv.zone(t, zoneID); after.SOASerial != before.SOASerial+1 {
+		t.Errorf("soa_serial = %d, want %d", after.SOASerial, before.SOASerial+1)
+	}
+}
+
+// The RRSet rule (RFC 2181 §5.2) is checked against the set as it will be,
+// not as it was — otherwise changing half an RRSet and its other half in the
+// same request would refuse itself.
+func TestZoneRecordsBulkTTLValidatesTheResultingSet(t *testing.T) {
+	srv := newTestServer(t)
+	zoneID, ids := bulkTTLZone(t, srv)
+
+	// Half of the "web" RRSet, which would leave one row at 60 and one at
+	// 300 — an RRSet answering differently depending on which row a lookup
+	// reads first.
+	half := fmt.Sprintf(`{"ids":[%d],"ttl":60}`, ids["10.0.0.1"])
+	got := srv.do(t, "PATCH", fmt.Sprintf("/api/v1/zones/%d/records", zoneID), half)
+	if got.Code != http.StatusConflict {
+		t.Fatalf("splitting an RRSet: status = %d body = %s; want 409", got.Code, got.Body)
+	}
+	if !strings.Contains(got.Body.String(), "same RRSet must share one TTL") {
+		t.Errorf("body = %s, want the RRSet rule named", got.Body)
+	}
+	// And nothing was written: a refused bulk edit is not a partial one.
+	for _, r := range srv.records(t, zoneID) {
+		if r.Type == "A" && r.TTL != 300 {
+			t.Errorf("%s %s ttl = %d after a refusal, want 300", r.Name, r.RData, r.TTL)
+		}
+	}
+
+	// Both halves together are fine.
+	both := fmt.Sprintf(`{"ids":[%d,%d],"ttl":60}`, ids["10.0.0.1"], ids["10.0.0.2"])
+	if ok := srv.do(t, "PATCH", fmt.Sprintf("/api/v1/zones/%d/records", zoneID), both); ok.Code != http.StatusNoContent {
+		t.Fatalf("the whole RRSet: status = %d body = %s; want 204", ok.Code, ok.Body)
+	}
+}
+
+func TestZoneRecordsBulkTTLRefusals(t *testing.T) {
+	srv := newTestServer(t)
+	zoneID, ids := bulkTTLZone(t, srv)
+	other := srv.do(t, "POST", "/api/v1/zones", `{"name":"other.test"}`)
+	if other.Code != http.StatusCreated {
+		t.Fatalf("create other: status = %d body = %s", other.Code, other.Body)
+	}
+	otherID := createdID(t, other)
+
+	tests := []struct {
+		name     string
+		zone     int64
+		body     string
+		wantCode int
+		wantMsg  string
+	}{
+		{"no ids at all", zoneID, `{"ids":[],"ttl":60}`, http.StatusBadRequest, "ids must name at least one record"},
+		{"a ttl beyond the RFC 2181 ceiling", zoneID, fmt.Sprintf(`{"ids":[%d],"ttl":2147483648}`, ids["10.0.0.9"]), http.StatusBadRequest, "ttl"},
+		{
+			"an id from another zone", zoneID,
+			fmt.Sprintf(`{"ids":[%d],"ttl":60}`, ids["10.0.0.9"]+9999),
+			http.StatusNotFound, "not found",
+		},
+		{"a zone with no records of its own", otherID, `{"ids":[1],"ttl":60}`, http.StatusNotFound, "not found"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := srv.do(t, "PATCH", fmt.Sprintf("/api/v1/zones/%d/records", tc.zone), tc.body)
+			if got.Code != tc.wantCode {
+				t.Fatalf("status = %d body = %s; want %d", got.Code, got.Body, tc.wantCode)
+			}
+			if !strings.Contains(got.Body.String(), tc.wantMsg) {
+				t.Errorf("body = %s, want it to mention %q", got.Body, tc.wantMsg)
+			}
+		})
+	}
+}
+
+// The same gate every other write into these zones meets: their records come
+// from somewhere else and a write here is destroyed by the next pull.
+func TestZoneRecordsBulkTTLIsRefusedWhereRecordWritesAre(t *testing.T) {
+	srv := newTestServer(t)
+	id := createSecondary(t, srv, "pulled.test", "203.0.113.9")
+
+	got := srv.do(t, "PATCH", fmt.Sprintf("/api/v1/zones/%d/records", id), `{"ids":[1],"ttl":60}`)
+	if got.Code != http.StatusConflict {
+		t.Fatalf("status = %d body = %s; want 409", got.Code, got.Body)
+	}
+	if !strings.Contains(got.Body.String(), "come from its primary") {
+		t.Errorf("body = %s, want the secondary's own refusal", got.Body)
+	}
+}

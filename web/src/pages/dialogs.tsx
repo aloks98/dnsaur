@@ -42,7 +42,13 @@ interface RenameValues {
 }
 
 /**
- * Rename one thing, by name.
+ * Ask for one name and do something with it — rename a group, clone a zone.
+ *
+ * It is named for its first caller rather than generalised into a
+ * `TextPromptDialog`: every use so far asks for a name, validates it with the
+ * caller's own schema, and posts it, and a second component for the same
+ * three things would be the drift this one exists to prevent. What varies is
+ * the copy, which is all props.
  *
  * `targetId` is the reset key, and the reason this exists. Both screens used
  * to mount their rename dialog unconditionally and let `useForm` capture
@@ -61,6 +67,8 @@ export function RenameDialog({
   placeholder,
   hint,
   schema,
+  submitLabel = "Save",
+  pendingLabel = "Saving…",
   isPending,
   onSubmit,
   onClose,
@@ -78,6 +86,11 @@ export function RenameDialog({
   /** The caller's own validation, since "blank" means different things:
    * a group needs a name, a list reads blank as "back to the URL default". */
   schema: z.ZodType<RenameValues, RenameValues>;
+  /** The confirm button's words, and the words it wears while the request is
+   * in flight. "Save" is right for a rename and wrong for anything that
+   * creates something. */
+  submitLabel?: string;
+  pendingLabel?: string;
   isPending: boolean;
   onSubmit: (name: string) => void;
   onClose: () => void;
@@ -124,7 +137,7 @@ export function RenameDialog({
             <DialogFooter>
               <DialogClose render={<Button type="button" variant="outline" />}>Cancel</DialogClose>
               <Button type="submit" disabled={isPending}>
-                {isPending ? "Saving…" : "Save"}
+                {isPending ? pendingLabel : submitLabel}
               </Button>
             </DialogFooter>
           </form>

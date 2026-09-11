@@ -108,6 +108,14 @@ func TestEveryCreateAnswersLocation(t *testing.T) {
 			location: func(id int64) string { return fmt.Sprintf("/api/v1/zones/%d", id) },
 		},
 		{
+			pattern: "POST /api/v1/zones/{id}/clone",
+			url:     fmt.Sprintf("/api/v1/zones/%d/clone", zoneID),
+			body:    `{"name":"location-probe-clone.test"}`,
+			// A clone creates a zone, so the URL it points at is a zone's,
+			// not a sub-resource of the one that was copied.
+			location: func(id int64) string { return fmt.Sprintf("/api/v1/zones/%d", id) },
+		},
+		{
 			pattern: "POST /api/v1/zones/{id}/records",
 			url:     fmt.Sprintf("/api/v1/zones/%d/records", zoneID),
 			body:    `{"name":"nas","type":"A","rdata":"192.168.1.10","ttl":300}`,

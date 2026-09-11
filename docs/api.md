@@ -308,7 +308,10 @@ Full parameter/response detail lives in `internal/api/openapi.yaml`
   parameter is no filter, and a value neither accepts is a `400` rather than
   an empty array, so a mistyped filter cannot read as "you have none"),
   `POST /zones`, `GET /zones/{id}`,
-  `PATCH /zones/{id}`, `DELETE /zones/{id}` (cascades its records).
+  `PATCH /zones/{id}`, `DELETE /zones/{id}` (cascades its records),
+  `POST /zones/{id}/clone` (`{name}` — a second zone holding this one's
+  configuration and every one of its records under a new apex; `201` with
+  `Location` and the new zone).
   `PATCH` is conditional on the zone not having changed since it was read:
   two patches touching different fields no longer overwrite each other, and
   only a second collision answers `409 zone changed since it was read`.
@@ -345,6 +348,19 @@ Full parameter/response detail lives in `internal/api/openapi.yaml`
   refused with `409`. A reverse zone for your own network isn't a distinct
   type; it's an ordinary `primary` zone whose `name` ends in
   `in-addr.arpa` or `ip6.arpa` (e.g. `168.192.in-addr.arpa`).
+- **Cloning a zone** — `POST /zones/{id}/clone` with `{"name": "e412.dev"}`
+  creates a second zone from an existing one: a second site, a staging
+  domain, a vanity alias. Everything is copied verbatim except the name and
+  the serial — `type`, the SOA fields, `allow_transfer`, `notify_to`,
+  `primaries`, `tsig_key_id`, `forward_to`, `enabled`, and every record with
+  its TTL, rdata, enabled flag and comment. Records need no rewriting,
+  because they are stored relative to the apex; `rdata` and the SOA's two
+  names are copied as written, since an absolute name in either is a
+  deliberate one. `soa_serial` restarts at `1` like any other new zone, and
+  the transfer history is not copied at all — the copy has pulled nothing and
+  been asked for nothing. The name is normalised and checked exactly as
+  `POST /zones` does it: `400` if it is not a domain name, `409` if it is
+  already in use. Cloning an `internal` zone is `409`, as creating one is.
 - **Secondary zones** — a `secondary` is a copy of a zone held elsewhere,
   pulled over AXFR and kept fresh on the schedule its own SOA publishes — the
   scheduled attempt asks for the primary's serial first and transfers only if
@@ -381,6 +397,11 @@ Full parameter/response detail lives in `internal/api/openapi.yaml`
   written together and survive a restart — the scheduler's own view of a
   failure does not — so they are the honest answer to "is this zone
   working", and `last_error` should always be read beside `last_attempt`.
+  Two more fields carry the part that has no column: `next_attempt_at` (unix
+  ms, `0` when no back-off is pending) is when the scheduler will next try,
+  and `failures` is how many attempts have failed in a row. Both come from
+  the running process, so a restart reports `0` for both while the zone is
+  still failing — read them beside `last_error`, never instead of it.
 - **Forwarder zones** — a `forwarder` claims a suffix and sends every query
   beneath it to addresses you name, instead of to the `upstreams` setting.
   It holds no records and answers nothing of its own; see
@@ -554,6 +575,7 @@ Full parameter/response detail lives in `internal/api/openapi.yaml`
   does — the target's own SOA `refresh` timer is the backstop regardless of
   how a round ends.
 - **Zone records** — `GET /zones/{id}/records`, `POST /zones/{id}/records`,
+  `PATCH /zones/{id}/records` (bulk TTL, below),
   `PUT /zones/{id}/records/{rid}`, `DELETE /zones/{id}/records/{rid}` —
   records within a zone, named relative to its apex (`@`, `bifrost`, `*`,
   `*.nexus`; a fully-qualified name has the apex stripped automatically).
@@ -598,6 +620,24 @@ Full parameter/response detail lives in `internal/api/openapi.yaml`
   them, under the same check. This can bump the **SOA serial of a
   different zone** than the one in the request path — the reverse zone's,
   not just the forward zone's — since its contents just changed too.
+- **Bulk TTL** — `PATCH /zones/{id}/records` with
+  `{"ids": [12, 13], "ttl": 60}` sets one TTL across the records named and
+  changes nothing else about them. Retuning a zone before a migration is the
+  case it exists for: one row at a time is one serial bump, one snapshot
+  rebuild and one NOTIFY pass per record. The whole edit is one transaction
+  and one serial bump, so it lands entirely or not at all. `204` on success.
+  The ids are always explicit — there is no "everything matching a filter"
+  form, because the filter belongs to the client and re-deriving it here
+  would be a rule the two ends could disagree about on a request that
+  rewrites rows. Each changed record is validated exactly as a single write
+  is, and against the set **as it will be**: changing half an RRSet is a
+  `409` under RFC 2181 §5.2, while changing both halves in one request is
+  fine. An empty `ids` or a `ttl` past the RFC 2181 §8 ceiling is `400`; an
+  id that is not one of this zone's records is `404` and applies none of the
+  edit; the `internal`/`secondary`/`stub` refusal is the same `409` the other
+  record routes give. **auto-PTR deliberately does not run** — a PTR's TTL is
+  the only thing this could change about the reverse, and it is cosmetic,
+  where what makes a PTR correct is the name it points at.
 - **Zone files** — `GET /zones/{id}/file` renders the zone as a BIND
   master file (RFC 1035 §5) and returns it as an attachment (the
   `Content-Disposition` filename is built with `mime.FormatMediaType`, so

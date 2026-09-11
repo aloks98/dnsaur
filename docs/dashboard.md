@@ -259,11 +259,36 @@ or a stub may also name a TSIG key there; a forwarder may not, because it
 signs nothing.
 
 Each row's name is a link into that zone's own page, and everything else it
-can be told to do is behind the **⋮** at the end of the row: **Disable** (or
-**Enable**), **Delete zone**, and — on a secondary or a stub that is not
-pulling cleanly — **Retry transfer** or **Fetch now**. Disabling takes
-effect at once and is one click to undo, so it isn't confirmed; deleting is.
-A built-in zone has no menu at all: its row says `BUILT-IN` instead.
+can be told to do is behind the **⋮** at the end of the row: **Clone**,
+**Disable** (or **Enable**), **Delete zone**, and — on a secondary or a stub
+that is not pulling cleanly — **Retry transfer** or **Fetch now**. Disabling
+takes effect at once and is one click to undo, so it isn't confirmed;
+deleting is. A built-in zone has no menu at all: its row says `BUILT-IN`
+instead.
+
+**Clone** asks for one thing — the new zone's name — and copies everything
+else: the SOA settings, the transfer configuration, and every record with
+its TTL, data and comment. Records are stored relative to the apex, so they
+mean the same thing under the new name without being rewritten. The serial
+starts at 1, and the copy has no transfer history of its own. It is the
+answer to a second site or a staging domain, where the alternative is thirty
+record writes and one forgotten **Transfers out**.
+
+### Retuning TTLs in bulk
+
+Filter the record grid — by name, by type, or both — and the filter bar
+grows a **Set TTL for N filtered records** button. It asks for one number and
+applies it to exactly the N records on screen; anything outside the filter
+keeps what it had. It is one write, so the zone's serial moves once and a
+secondary sees one new version rather than one per record.
+
+The button is there only while a filter is on. With no filter it would mean
+"retune the whole zone", which is a larger claim than one press should make.
+Zones whose records come from somewhere else — a secondary, a stub, a
+built-in — do not get it, like every other write control on their pages.
+
+A record's reverse (auto-PTR, below) is left alone by this: what makes a PTR
+correct is the name it points at, and that is not what a TTL change moves.
 
 ### Secondary zones
 
@@ -324,6 +349,13 @@ The failure reason is stored, not merely remembered, so restarting dnsaur
 does not make a zone that has been failing for a week look healthy. It is
 always shown with when the attempt was made — "connection refused" four
 minutes ago and the same words four days ago are not the same situation.
+
+Beside it, in smaller type, is what the running server is doing about it:
+**next attempt in 4m**, and **3 failed attempts** once more than one has
+gone the same way. A stub carries the same two on its **Primaries** row,
+which is where its fetch errors are. These two are remembered rather than
+stored, so restarting dnsaur clears them until the next attempt — which is
+why they sit beside the failure above rather than replacing it.
 
 A transfer error is one long line from the server, and it usually repeats
 the zone's name and the primary's address before getting to what actually
@@ -535,6 +567,12 @@ zone, and a record of type `SOA` is refused: a zone has exactly one, and a
 second one written here would be exported beside the real one and make the
 file unloadable.
 
+**The values that get pasted elsewhere have a copy button.** The SOA's
+**Primary NS** and **Responsible**, its **Serial**, **Primaries** and the TSIG
+key beside it, **Transfers out** and **Notify out** — everything on this page
+that ends up in somebody else's config, or in a `dig` you are comparing
+against. A field with no value has no button: there is nothing to copy.
+
 **Types dnsaur cannot serve are refused**, including RFC 3597's `TYPE65280`
 form for a type it does not know. Anything the DNS parser understands works
 — that list already runs well past what a homelab needs.
@@ -548,6 +586,13 @@ it to `A`.
 An empty zone says **No records yet** and nothing more. **Add record** opens
 the row that fills it; until then the zone answers `NXDOMAIN` for every name
 beneath it, authoritatively, which is the whole point of holding the suffix.
+
+**Three keys, listed on the filter bar.** `/` puts the caret in the filter,
+`n` opens the add-record row, and `Esc` closes whichever row is open. The
+first two do nothing while you are typing in a field — `n` belongs in a
+record name — and `n` is not offered at all on a zone whose records come
+from somewhere else. `Esc` works from inside the form it closes, which is
+where the caret already is.
 
 **Quote TXT values.** Presentation format is not a free-text field: spaces
 separate values and `;` starts a comment. Pasted raw, `v=spf1 -all` is

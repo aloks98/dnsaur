@@ -854,3 +854,112 @@ func TestUpdateZoneIfUnchangedRefusesAStaleWrite(t *testing.T) {
 		}
 	})
 }
+
+// The shape a zone clone writes: a brand-new zone row, then a replace that is
+// nothing but adds, into a zone holding no records at all.
+//
+// It is a subset of TestReplaceRecordsAppliesTheWholeDiff's diff, and it is
+// still worth its own case on both drivers: that one always has a row to
+// delete and a row to update, so an adds-only replace — the only kind a copy
+// ever issues — would go untested, and "the empty half of a statement group"
+// is exactly where the two dialects have historically differed.
+func TestReplaceRecordsWithNothingButAddsFillsAnEmptyZone(t *testing.T) {
+	forEachDriver(t, func(t *testing.T, s Store) {
+		ctx := context.Background()
+		srcID, _, _ := seedReplaceZone(t, s, testGroupName("clone-src.test"))
+		src, srcRecs := zoneSnapshot(t, s, srcID)
+
+		clone := src
+		clone.ID = 0
+		clone.Name = testGroupName("clone-dst.test")
+		clone.SOASerial = 1
+		cloneID, err := s.Zones().AddZone(ctx, clone)
+		if err != nil {
+			t.Fatalf("AddZone: %v", err)
+		}
+		clone.ID = cloneID
+
+		adds := make([]ZoneRecord, len(srcRecs))
+		for i, r := range srcRecs {
+			r.ID, r.ZoneID = 0, cloneID
+			adds[i] = r
+		}
+		if err := s.Zones().ReplaceRecords(ctx, clone, nil, nil, adds); err != nil {
+			t.Fatalf("ReplaceRecords: %v", err)
+		}
+
+		gotZone, gotRecs := zoneSnapshot(t, s, cloneID)
+		if !reflect.DeepEqual(gotZone, clone) {
+			t.Errorf("the cloned zone row:\n got %+v\nwant %+v", gotZone, clone)
+		}
+		if len(gotRecs) != len(srcRecs) {
+			t.Fatalf("the clone holds %d records, want %d", len(gotRecs), len(srcRecs))
+		}
+		for i, r := range gotRecs {
+			if r.ZoneID != cloneID {
+				t.Errorf("record %q belongs to zone %d, want %d", r.Name, r.ZoneID, cloneID)
+			}
+			if r.Name != srcRecs[i].Name || r.Type != srcRecs[i].Type ||
+				r.TTL != srcRecs[i].TTL || r.RData != srcRecs[i].RData {
+				t.Errorf("cloned record %d = %+v, want a copy of %+v", i, r, srcRecs[i])
+			}
+		}
+
+		// The source is a read, and a replace addressed elsewhere must not
+		// have touched it.
+		if _, stillThere := zoneSnapshot(t, s, srcID); len(stillThere) != len(srcRecs) {
+			t.Errorf("the source zone holds %d records after the copy, want %d",
+				len(stillThere), len(srcRecs))
+		}
+	})
+}
+
+// The shape a bulk TTL edit writes: no deletes, no adds, several rows changed
+// in place, and the zone row carrying one bumped serial for all of them.
+//
+// Its own case on both drivers for the same reason the adds-only one above
+// has one — TestReplaceRecordsAppliesTheWholeDiff always has every bucket
+// filled, so the empty ones go untested — and because the serial is the part
+// that has to move exactly once: records that commit under a serial that did
+// not move are contents no secondary ever comes back for.
+func TestReplaceRecordsWithNothingButUpdatesRetunesInPlace(t *testing.T) {
+	forEachDriver(t, func(t *testing.T, s Store) {
+		ctx := context.Background()
+		zid, keepID, otherID := seedReplaceZone(t, s, testGroupName("bulk-ttl.test"))
+		before, beforeRecs := zoneSnapshot(t, s, zid)
+
+		next := before
+		next.SOASerial = before.SOASerial + 1
+		next.ModifiedAt = 1785946876638
+		updates := make([]ZoneRecord, 0, len(beforeRecs))
+		for _, r := range beforeRecs {
+			r.TTL = 60
+			updates = append(updates, r)
+		}
+
+		if err := s.Zones().ReplaceRecords(ctx, next, nil, updates, nil); err != nil {
+			t.Fatalf("ReplaceRecords: %v", err)
+		}
+
+		gotZone, gotRecs := zoneSnapshot(t, s, zid)
+		if gotZone.SOASerial != before.SOASerial+1 {
+			t.Errorf("soa_serial = %d, want %d", gotZone.SOASerial, before.SOASerial+1)
+		}
+		if len(gotRecs) != len(beforeRecs) {
+			t.Fatalf("the zone holds %d records, want %d — an update must not add or delete",
+				len(gotRecs), len(beforeRecs))
+		}
+		ids := map[int64]bool{}
+		for _, r := range gotRecs {
+			ids[r.ID] = true
+			if r.TTL != 60 {
+				t.Errorf("%s %s ttl = %d, want 60", r.Name, r.Type, r.TTL)
+			}
+		}
+		// Updated in place, not replaced: the row ids an operator's screen is
+		// holding must still address the same records afterwards.
+		if !ids[keepID] || !ids[otherID] {
+			t.Errorf("the row ids changed: got %v, want %d and %d to survive", ids, keepID, otherID)
+		}
+	})
+}

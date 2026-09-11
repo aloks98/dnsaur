@@ -371,6 +371,29 @@ components:
             Stored and read back in its canonical spelling (the port
             always explicit, ", "-separated), which may differ from what
             was written even though it means the same thing.
+        next_attempt_at:
+          type: integer
+          format: int64
+          description: >
+            unix ms of the earliest the scheduler will attempt this zone
+            again; 0 whenever no back-off is pending, which is every healthy
+            zone, every type that does not pull, and every zone in a server
+            process that has not scheduled one yet. The ordinary schedule is
+            refreshed_at + soa_refresh and is not repeated here.
+
+
+            Read-only, and — unlike last_attempt/last_error — **not durable**:
+            it and failures are the running process's own view
+            (zones.Refresher.Status), so a restart reports 0 for both while
+            the zone is still failing. Read them beside last_error, never
+            instead of it.
+        failures:
+          type: integer
+          description: >
+            Consecutive failed attempts against this zone's master in the
+            running process; 0 after a success and 0 for a zone this process
+            has never scheduled. Read-only and not durable — see
+            next_attempt_at.
         created_at: { type: integer, format: int64 }
         modified_at: { type: integer, format: int64 }
     ZoneRecord:
@@ -2720,6 +2743,99 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
 
+  /zones/{id}/clone:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: integer, format: int64 }
+    post:
+      tags: [Zones]
+      summary: Copy a zone under a new name
+      description: >
+        Creates a second zone holding this one's configuration and every
+        one of its records, under the name in the body. What a second
+        site, a staging domain or a vanity alias actually is — and what
+        would otherwise be a create plus one record write per row, with
+        whichever field was not on screen left behind.
+
+
+        Everything is copied verbatim except the name and the serial:
+        type, the SOA fields, allow_transfer, notify_to, primaries,
+        tsig_key_id, forward_to, enabled, and every record with its ttl,
+        rdata, enabled flag and comment. Records need no rewriting because
+        they are stored relative to the apex; rdata and the SOA's two
+        names are copied as they stand, since an absolute name in either
+        is a deliberate one and a copy is not the place to guess which
+        were meant to follow the apex.
+
+
+        soa_serial restarts at 1, like any other new zone. The transfer
+        history is not copied at all — refreshed_at, expires_at,
+        last_attempt, last_error and the outbound last_xfr_* fields are 0
+        or "" on the new zone, because it has pulled nothing and been
+        asked for nothing.
+
+
+        A zone of type internal — the RFC 6303 built-ins — cannot be
+        cloned; the request is rejected with 409, as create refuses the
+        type outright.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name:
+                  type: string
+                  description: >
+                    the new zone's apex. Normalised exactly as POST /zones
+                    normalises it (lowercased, a trailing dot dropped) and
+                    must not already be in use.
+                  example: e412.dev
+      responses:
+        "201":
+          description: Created; Location is the new zone, and the body is it
+          headers:
+            Location:
+              schema: { type: string }
+              description: /api/v1/zones/{new id}
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Zone" }
+        "400":
+          description: bad id, or the name is not a valid domain name
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401":
+          description: authentication required
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "403":
+          $ref: "#/components/responses/ReadOnlyToken"
+        "404":
+          description: no such zone to copy
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "409":
+          description: >
+            the name is already in use ("a zone with that name already
+            exists"), or the source is type internal ("built-in zones
+            cannot be cloned")
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503":
+          description: storage unavailable
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
   /zones/{id}/records:
     parameters:
       - name: id
@@ -2749,6 +2865,97 @@ paths:
               schema: { $ref: "#/components/schemas/Error" }
         "404":
           description: zone not found
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503":
+          description: storage unavailable
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+    patch:
+      tags: [Zones]
+      summary: Set one TTL across many of a zone's records
+      description: >
+        Changes the ttl of every record named in ids, and nothing else about
+        them. Retuning a zone before a migration is the case it exists for:
+        done one row at a time it is one serial bump, one snapshot rebuild
+        and one NOTIFY pass per record.
+
+
+        The whole edit is one transaction and one serial bump, so it either
+        lands entirely or not at all, and a secondary sees one new version
+        rather than one per row.
+
+
+        The ids are always explicit — there is no "everything matching a
+        filter" form. The filter belongs to the client, and re-deriving it
+        here would be a rule the two ends could disagree about on a request
+        that rewrites rows.
+
+
+        Each changed record is validated exactly as a single write is, and
+        against the set **as it will be**: RFC 2181 §5.2 makes every record
+        of one RRSet share a TTL, so changing half an RRSet is refused with
+        409 — while changing both halves in one request is fine, which
+        checking each row against the stored values would have refused too.
+        A ttl past the RFC 2181 §8 ceiling is 400.
+
+
+        Refused for the zone types whose records are written elsewhere —
+        internal, secondary and stub — with the same 409 the other record
+        routes answer.
+
+
+        **auto-PTR is deliberately not run.** A PTR's TTL is the only thing
+        this edit could change about the reverse, and it is cosmetic: what
+        makes a PTR correct is the name it points at, which is untouched.
+        Restamping it would mean reading and rewriting a second zone per
+        address record, bumping that zone's serial each time.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [ids, ttl]
+              properties:
+                ids:
+                  type: array
+                  minItems: 1
+                  items: { type: integer, format: int64 }
+                  description: >
+                    the records to change. Every one must belong to this
+                    zone; an id that does not is 404, and none of the edit
+                    is applied. Repeats are ignored.
+                ttl:
+                  type: integer
+                  format: int64
+                  description: seconds, 0-2147483647 (RFC 2181 §8)
+      responses:
+        "204":
+          description: No Content
+        "400":
+          description: bad id, an empty ids array, or a ttl past the ceiling
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401":
+          description: authentication required
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "403":
+          $ref: "#/components/responses/ReadOnlyToken"
+        "404":
+          description: no such zone, or an id that is not one of its records
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "409":
+          description: >
+            the zone's records are written elsewhere (internal, secondary
+            or stub), or the change would leave one RRSet with two TTLs
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }

@@ -4,8 +4,10 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/aloks98/dnsaur/internal/store"
 	"github.com/aloks98/dnsaur/internal/zones"
@@ -14,6 +16,7 @@ import (
 func (s *Server) zoneRecordsRoutes() {
 	s.route("GET /api/v1/zones/{id}/records", s.requireAuth(s.handleZoneRecordsList))
 	s.route("POST /api/v1/zones/{id}/records", s.requireAuth(s.handleZoneRecordCreate))
+	s.route("PATCH /api/v1/zones/{id}/records", s.requireAuth(s.handleZoneRecordsPatch))
 	s.route("PUT /api/v1/zones/{id}/records/{rid}", s.requireAuth(s.handleZoneRecordUpdate))
 	s.route("DELETE /api/v1/zones/{id}/records/{rid}", s.requireAuth(s.handleZoneRecordDelete))
 }
@@ -217,6 +220,134 @@ func (s *Server) handleZoneRecordCreate(w http.ResponseWriter, r *http.Request) 
 	s.notifyZones()
 	rec.ID = id
 	created(w, resourceURL("zones/"+strconv.FormatInt(zid, 10)+"/records", id), rec)
+}
+
+// zoneRecordsPatch is a bulk edit of records that already exist: the rows to
+// change, and the one property being changed on all of them.
+//
+// TTL is the only one, and that is not a placeholder for a general bulk
+// editor. It is the property whose value is *the same* across many records
+// on purpose — retuning a zone before a migration means the same number on
+// every row — while a name, a type or an rdata is by definition per record
+// and has nothing to say in bulk.
+//
+// The ids are the client's, always explicit. There is deliberately no
+// "everything matching this filter" form: the dashboard's filter is the
+// dashboard's, and a second implementation of it on the server would be a
+// rule the two ends could disagree about, on a request that rewrites rows.
+// The client sends the ids it is showing, which is exactly what it means.
+type zoneRecordsPatch struct {
+	IDs []int64 `json:"ids"`
+	TTL uint32  `json:"ttl"`
+}
+
+// handleZoneRecordsPatch sets one TTL across many of a zone's records.
+//
+// **The whole edit is one transaction and one serial bump.** Done one row at
+// a time it is one bump, one snapshot rebuild and one NOTIFY pass per record
+// — a hundred serials for one change, and a hundred transfers a secondary
+// did not need.
+//
+// **The validation is run against the set as it will be, not as it is.** RFC
+// 2181 §5.2 makes every record of one RRSet share a TTL, so changing half an
+// RRSet is a refusal — but changing *both* halves in one request is not, and
+// checking each row against the stored set would refuse the second case
+// along with the first. Each changed row goes through buildZoneRecord, the
+// same validator behind a hand write, against the updated slice.
+//
+// Only the TTL is written. buildZoneRecord's return value is deliberately
+// discarded: it re-derives rdata in the parser's own spelling, which would
+// quietly rewrite rows written before that normalisation existed — a change
+// nobody asked this request for.
+//
+// **auto-PTR is deliberately not run.** A PTR's TTL is the only thing a
+// TTL-only edit could change about the reverse, and it is cosmetic: what
+// makes a PTR correct is the name it points at, which is untouched here. The
+// alternative is a read and a rewrite of a second zone per address record,
+// bumping that zone's serial each time, to restamp a number nothing depends
+// on. The forward record's own write path still moves a PTR whenever the
+// address or the name changes, which is the half that matters.
+func (s *Server) handleZoneRecordsPatch(w http.ResponseWriter, r *http.Request) {
+	zid, ok := pathID(r)
+	if !ok {
+		errJSON(w, http.StatusBadRequest, "bad id")
+		return
+	}
+	zone, err := s.deps.Store.Zones().Zone(r.Context(), zid)
+	if err != nil {
+		storeErr(w, err)
+		return
+	}
+	if msg := recordWriteRefusal(zone); msg != "" {
+		errJSON(w, http.StatusConflict, msg)
+		return
+	}
+	body, ok := decodeOr400[zoneRecordsPatch](w, r)
+	if !ok {
+		return
+	}
+	if len(body.IDs) == 0 {
+		errJSON(w, http.StatusBadRequest, "ids must name at least one record")
+		return
+	}
+	existing, err := s.deps.Store.Zones().Records(r.Context(), zid)
+	if err != nil {
+		storeErr(w, err)
+		return
+	}
+
+	// The set as it will be. Built first, so the RRSet check below sees every
+	// row this request moves rather than each one against the old values.
+	updated := slices.Clone(existing)
+	wanted := make(map[int64]bool, len(body.IDs))
+	for _, id := range body.IDs {
+		if wanted[id] {
+			continue
+		}
+		i := slices.IndexFunc(updated, func(rec store.ZoneRecord) bool { return rec.ID == id })
+		if i < 0 {
+			// The same answer the single-record routes give an id that is not
+			// this zone's: the row addressed does not exist here.
+			errJSON(w, http.StatusNotFound, "not found")
+			return
+		}
+		wanted[id] = true
+		updated[i].TTL = body.TTL
+	}
+
+	changed := make([]store.ZoneRecord, 0, len(wanted))
+	for _, rec := range updated {
+		if !wanted[rec.ID] {
+			continue
+		}
+		if _, code, msg, ok := buildZoneRecord(zone, zoneRecordWrite{
+			Name:    rec.Name,
+			Type:    rec.Type,
+			TTL:     rec.TTL,
+			RData:   rec.RData,
+			Enabled: &rec.Enabled,
+			Comment: rec.Comment,
+		}, updated, rec.ID, true); !ok {
+			errJSON(w, code, msg)
+			return
+		}
+		changed = append(changed, rec)
+	}
+
+	// One serial for the whole edit, computed here rather than through
+	// BumpSerial, because ReplaceRecords writes the zone row in the same
+	// transaction as the records — which is the point: records that committed
+	// under a serial that did not move are contents no secondary will ever
+	// come back for.
+	zone.SOASerial++
+	zone.ModifiedAt = time.Now().UnixMilli()
+	if err := s.deps.Store.Zones().ReplaceRecords(r.Context(), zone, nil, changed, nil); err != nil {
+		storeErr(w, err)
+		return
+	}
+	s.reloadZones(r)
+	s.notifyZones()
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *Server) handleZoneRecordUpdate(w http.ResponseWriter, r *http.Request) {

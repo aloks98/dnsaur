@@ -304,6 +304,12 @@ func New(ctx context.Context, cfg *config.Config, version string) (*App, error) 
 	// ten full zone transfers.
 	a.notifyIn = zones.NewNotifyServer(a.resolver, st.Zones(), a.zoneRefresh,
 		zones.WithNotifyServerResolver(zoneRes),
+		// Live, not a snapshot, for the reason the DNS servers get it that
+		// way: it is what lets a signed NOTIFY from a primary behind NAT be
+		// accepted on the strength of the key the zone names, and a key
+		// edited through the API decides the next NOTIFY rather than the
+		// next restart.
+		zones.WithNotifyKeys(st.TSIGKeys()),
 		zones.WithNotifyProbes(a.zoneRefresh.Transferrer()))
 	return a, nil
 }

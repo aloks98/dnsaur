@@ -213,6 +213,31 @@ export function useUpdateZone() {
   });
 }
 
+/**
+ * Copy a zone under a new name — POST /zones/{id}/clone.
+ *
+ * Everything is the server's: the configuration and every record are copied
+ * there in one request rather than replayed from here as a create plus N
+ * record writes, which is what makes a clone all-or-nothing and what stops
+ * the browser inventing a second, drifting idea of which fields a copy
+ * carries.
+ *
+ * Records are invalidated as well as zones, because the new zone arrives
+ * holding a copy of the source's set and any list already on screen predates
+ * it.
+ */
+export function useCloneZone() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, name }: { id: number; name: string }) =>
+      api.post<Zone>(`/zones/${id}/clone`, { name }),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: zoneKeys.all });
+      void qc.invalidateQueries({ queryKey: zoneRecordKeys.all });
+    },
+  });
+}
+
 export function useDeleteZone() {
   const qc = useQueryClient();
   return useMutation({
@@ -456,6 +481,28 @@ export function useUpdateZoneRecord() {
   return useMutation({
     mutationFn: ({ zoneId, id, ...v }: ZoneRecordInput & { zoneId: number; id: number }) =>
       api.put<void>(`/zones/${zoneId}/records/${id}`, v),
+    onSuccess: (_data, { zoneId }) => invalidateZoneAndRecords(qc, zoneId),
+    onError: (err, { zoneId }) => refetchIfGone(qc, err, zoneId),
+  });
+}
+
+/**
+ * One TTL across many of a zone's records — PATCH /zones/{id}/records.
+ *
+ * The ids are always explicit, and are the ids the grid is showing. There is
+ * no "everything matching this filter" form on purpose: the filter is this
+ * client's, and asking the server to re-derive it would be a rule the two
+ * ends could disagree about on a request that rewrites rows.
+ *
+ * One request rather than one PUT per row, because the server makes it one
+ * transaction and one serial bump — N puts are N serials and N NOTIFY passes
+ * for a single change.
+ */
+export function useSetZoneRecordsTTL() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ zoneId, ids, ttl }: { zoneId: number; ids: number[]; ttl: number }) =>
+      api.patch<void>(`/zones/${zoneId}/records`, { ids, ttl }),
     onSuccess: (_data, { zoneId }) => invalidateZoneAndRecords(qc, zoneId),
     onError: (err, { zoneId }) => refetchIfGone(qc, err, zoneId),
   });

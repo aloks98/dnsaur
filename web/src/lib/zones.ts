@@ -1,19 +1,23 @@
 import type { Zone } from "../api/types";
+import { formatDuration } from "./format";
 
 /**
  * What a secondary zone's transfer state is, derived from the zone row alone.
  *
- * Every fact used here is a column, and that is the point. The scheduler
- * keeps a richer picture in memory — the consecutive failure count, the
- * pending retry back-off, the error text (zones.Refresher.Status) — but all
- * of that is process-local and dies with the process, so a UI built on it
- * would show a zone that had been failing for a week as healthy for up to a
- * retry interval after every restart.
- *
- * `last_error` and `last_attempt` are the durable half of it (see the 0010
+ * Every fact the *state* uses is a durable column, and that is the point.
+ * `last_error` and `last_attempt` are that durable half (see the 0010
  * migration), written together in one statement by the scheduler and cleared
- * on success. So the screens can state both the state *and* the cause, and
+ * on success, so the screens can state both the state *and* the cause and
  * both are as current after a restart as before one.
+ *
+ * The scheduler also keeps a richer picture in memory — the consecutive
+ * failure count and the pending retry back-off (zones.Refresher.Status) —
+ * which the API now carries as `next_attempt_at` and `failures`. It is read
+ * by `schedulerNote` below and by nothing else here, deliberately: it is
+ * process-local and dies with the process, so a *state* built on it would
+ * show a zone that had been failing for a week as healthy after every
+ * restart. It says how the retrying is going; it never decides whether the
+ * zone is in trouble.
  */
 
 /**
@@ -208,6 +212,32 @@ export function pullState(zone: Zone, now: number = Date.now()): TransferState {
   if (zone.type === "secondary") return transferState(zone, now);
   if (zone.refreshed_at === 0) return "never";
   return lastTransferError(zone) !== null ? "failing" : "fresh";
+}
+
+/**
+ * The scheduler's own account of a zone between attempts: when the next one
+ * falls due, and how many have failed in a row.
+ *
+ * Both come from the running process rather than a column (see the note at
+ * the top of this file), so both are absent after a restart and the caller
+ * shows this *beside* the durable last-error line rather than instead of it.
+ * "" when there is nothing to add, which is every healthy zone.
+ *
+ * The moment is rendered as a countdown rather than a clock time for the
+ * reason every other duration on these screens is: the question being asked
+ * is "how long am I waiting", and a back-off that is already past — the
+ * attempt is running, or the tick has not come round — has nothing left to
+ * count and is dropped.
+ */
+export function schedulerNote(zone: Zone, now: number = Date.now()): string {
+  const parts: string[] = [];
+  if (zone.next_attempt_at > now) {
+    parts.push(`next attempt in ${formatDuration(zone.next_attempt_at - now)}`);
+  }
+  if (zone.failures > 0) {
+    parts.push(`${zone.failures} failed attempt${zone.failures === 1 ? "" : "s"}`);
+  }
+  return parts.join(" · ");
 }
 
 /**

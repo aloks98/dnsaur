@@ -99,6 +99,12 @@ type NotifyServer struct {
 	// ParsePrimaries' own comment on why that default belongs to the caller,
 	// not to a lookup baked into the gate.
 	dnsRes Lookup
+	// keys resolves a zone's own tsig_key_id to the key name a verified
+	// message arrives under — the source gate's second route in, for a
+	// primary whose packets do not come from an address anyone would list.
+	// nil is a server built without WithNotifyKeys, which fails that route
+	// closed rather than opening it. App wires it.
+	keys TSIGKeys
 	// now is the clock admit and a BADTIME reply's timestamp read. Injected
 	// for the same reason TransferServer.now is: a test should be able to
 	// drive the throttle rather than wait for it.
@@ -144,6 +150,15 @@ func WithNotifyProbes(p Probes) NotifyServerOption {
 // use it to prove a lookup was, or was not, made — in particular that
 // ServeNotify never resolves a zone's primaries until decideZone has already
 // accepted the NOTIFY — without touching a real network.
+// WithNotifyKeys attaches the TSIG key store the source gate resolves a
+// zone's own tsig_key_id through. Without it a NOTIFY from an address the
+// zone does not list is refused however it was signed — the pre-NAT
+// behaviour — because there is nothing to compare the verified key name
+// against. Production always passes it (internal/app).
+func WithNotifyKeys(keys TSIGKeys) NotifyServerOption {
+	return func(n *NotifyServer) { n.keys = keys }
+}
+
 func WithNotifyServerResolver(res Lookup) NotifyServerOption {
 	return func(n *NotifyServer) { n.dnsRes = res }
 }
@@ -232,14 +247,25 @@ func (n *NotifyServer) decideZone(m *dns.Msg) (*Zone, *notifyRefusal) {
 // refused transfer NOTAUTH under RFC 5936 §2.2.1, which is about authority
 // over the zone, while a refused NOTIFY is a policy statement by a server
 // that does hold the zone and declines to be told by this peer.
-func (n *NotifyServer) decidePeer(z *Zone, peer netip.Addr, primaries []netip.AddrPort, key string, tsigErr error) *notifyRefusal {
+func (n *NotifyServer) decidePeer(ctx context.Context, z *Zone, peer netip.Addr, primaries []netip.AddrPort, key string, tsigErr error) *notifyRefusal {
 	// RFC 1996 §3.10 says to ignore a NOTIFY from a host that is not a known
 	// master. dnsaur answers REFUSED instead — a deliberate divergence,
 	// recorded in §9.9. Silence is indistinguishable from a firewall drop,
 	// the usual cause here is a primaries list one address wrong, and a
 	// NOTIFY and its refusal are both ~50 bytes, so there is no
 	// amplification and 1:1 reflection is not a useful attack primitive.
-	if !notifyPeerAllowed(primaries, peer) {
+	//
+	// **A TSIG that verified under this zone's own key stands in for the
+	// address**, because it is the stronger claim of the two: an address can
+	// be spoofed and a MAC cannot, and the key named on the zone is
+	// specifically the one its master signs with. Without this a primary
+	// behind NAT could not notify at all — it reaches us from the NAT's
+	// address, which is not the one anybody would write in `primaries`, and
+	// the only remedy was to widen the list to an address that is not the
+	// primary's. Nothing else is widened: a message that is unsigned, signed
+	// under a key this zone does not name, or signed and not verifying is
+	// refused from an unlisted source exactly as before (§9.9, §9.10).
+	if !notifyPeerAllowed(primaries, peer) && !n.signedByZoneKey(ctx, z, key, tsigErr) {
 		return &notifyRefusal{rcode: dns.RcodeRefused, reason: "source is not a configured primary"}
 	}
 
@@ -303,6 +329,35 @@ func notifyPeerAllowed(primaries []netip.AddrPort, peer netip.Addr) bool {
 	return false
 }
 
+// signedByZoneKey reports whether this message verified under the key the
+// zone itself names — the one thing that can stand in for a source address
+// (see decidePeer).
+//
+// Every condition is a refusal to guess. tsigErr non-nil means nothing
+// verified; an empty key name is what RequireTSIG returns alongside any
+// failure, so it is never a verified message; a zone naming no key has
+// nothing for a signature to match; and a server with no key store attached
+// cannot resolve the id, which fails closed rather than accepting.
+//
+// A lookup error is also false rather than an error upward: this runs on an
+// unauthenticated packet's path, and the caller's next answer for a source
+// nobody listed is a refusal either way.
+func (n *NotifyServer) signedByZoneKey(ctx context.Context, z *Zone, key string, tsigErr error) bool {
+	if tsigErr != nil || key == "" || z.TSIGKeyID == 0 || n.keys == nil {
+		return false
+	}
+	k, ok, err := n.keys.Get(ctx, z.TSIGKeyID)
+	if err != nil {
+		slog.Debug("resolving a zone's tsig key for a notify failed",
+			"zone", z.Name, "key", z.TSIGKeyID, "err", err)
+		return false
+	}
+	// Canonical on both sides for the reason acl.go canonicalises: the stored
+	// name, the verified name and a hand-typed one are three spellings of one
+	// thing, and comparing any two literally is a match that silently fails.
+	return ok && dns.CanonicalName(k.Name) == dns.CanonicalName(key)
+}
+
 // ServeNotify answers one NOTIFY, then acts on it.
 //
 // The order is RFC 1996's and is not an optimisation. §4.7 has the responder
@@ -328,7 +383,7 @@ func (n *NotifyServer) ServeNotify(ctx context.Context, w dns.ResponseWriter, m 
 	// nothing for most of the ones that were not (see its own comment).
 	z, ref := n.decideZone(m)
 	if ref == nil {
-		ref = n.decidePeer(z, peer, n.primariesFor(ctx, z, peer), key, tsigErr)
+		ref = n.decidePeer(ctx, z, peer, n.primariesFor(ctx, z, peer), key, tsigErr)
 	}
 	if ref != nil {
 		slog.Debug("notify refused", "peer", peer, "qname", qnameOf(m),

@@ -931,12 +931,34 @@ func (t *Transferrer) install(ctx context.Context, z store.Zone, ap netip.AddrPo
 	// secondary look edited on every refresh — undoing, in the one column an
 	// operator reads to find out what happened, the no-op the diff above
 	// works to achieve.
-	if contentChanged(before, z, diff) {
+	changed := contentChanged(before, z, diff)
+	if changed {
 		z.ModifiedAt = nowMs
 	}
 
 	if err := t.zs.ReplaceRecords(ctx, z, diff.DeleteIDs(), diff.Updates(), diff.Add); err != nil {
 		return TransferResult{}, err
+	}
+
+	// A transfer that changed served data is an event, and this is the only
+	// place that knows *what* changed — the diff is computed here and nothing
+	// downstream carries it. The serial alone says a new version arrived;
+	// these three counts say whether it was a routine re-sign or somebody
+	// deleting a nameserver, which is the difference between reading the log
+	// and going to look at the zone.
+	//
+	// After the commit, never before it: a line claiming an install that then
+	// failed is worse than no line. It is here rather than in the scheduler's
+	// noteSuccess so that a NOTIFY-driven and an operator-driven transfer say
+	// it too — all three reach this function and only one reaches that one.
+	// The unchanged case says nothing at this level: a refresh that found the
+	// zone already current is the routine outcome and stays at Debug, where
+	// noteSuccess already reports it.
+	if changed {
+		slog.Info("zone transferred with changes",
+			"zone", z.Name, "primary", ap.String(),
+			"old_serial", before.SOASerial, "new_serial", z.SOASerial,
+			"added", len(diff.Add), "removed", len(diff.Delete), "changed", len(diff.Change))
 	}
 
 	// The install committed, so a reload failure does not undo it and must

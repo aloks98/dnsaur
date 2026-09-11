@@ -55,6 +55,8 @@ function zone(overrides: Partial<Zone> = {}): Zone {
     last_xfr_error: "",
     notify_to: "",
     forward_to: "",
+    next_attempt_at: 0,
+    failures: 0,
     created_at: Date.now() - 86_400_000,
     modified_at: Date.now() - 60_000,
     ...overrides,

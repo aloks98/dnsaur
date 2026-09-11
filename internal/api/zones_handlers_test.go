@@ -14,6 +14,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/aloks98/dnsaur/internal/store"
 	"github.com/aloks98/dnsaur/internal/zones"
@@ -876,6 +877,17 @@ type fakeZoneRefresher struct {
 	calls  []int64
 	result zones.TransferResult
 	err    error
+	// status is what Status reports for every zone; the zero value means the
+	// scheduler has never seen one, which is what a server with no pass yet
+	// reports and what every other test here wants.
+	status zones.RefreshStatus
+	seen   bool
+}
+
+func (f *fakeZoneRefresher) Status(int64) (zones.RefreshStatus, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.status, f.seen || f.status != zones.RefreshStatus{}
 }
 
 func (f *fakeZoneRefresher) Refresh(_ context.Context, zoneID int64) (zones.TransferResult, error) {
@@ -1312,5 +1324,275 @@ func TestZonesListFilters(t *testing.T) {
 			t.Errorf("GET /zones%s = %d %s, want 400 — a filter nobody can satisfy must not read "+
 				"as an empty result", query, w.Code, strings.TrimSpace(w.Body.String()))
 		}
+	}
+}
+
+// The scheduler's own view of a zone has no column — it is process-local
+// (zones.Refresher.Status) — so the only way it reaches a screen is on the
+// zone the API answers with. Both routes carry it, because both are read by
+// a page that shows it.
+func TestZoneReadsCarryTheSchedulerStatus(t *testing.T) {
+	fake := &fakeZoneRefresher{status: zones.RefreshStatus{
+		NotBefore: time.UnixMilli(1754000240000),
+		Failures:  3,
+	}}
+	srv := newRefreshTestServer(t, fake)
+	id := createSecondary(t, srv, "e412.in", "203.0.113.9")
+
+	rec := srv.do(t, "GET", fmt.Sprintf("/api/v1/zones/%d", id), "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /zones/{id}: status = %d body = %s", rec.Code, rec.Body)
+	}
+	var one struct {
+		NextAttemptAt int64 `json:"next_attempt_at"`
+		Failures      int   `json:"failures"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &one); err != nil {
+		t.Fatalf("decoding the zone: %v", err)
+	}
+	if one.NextAttemptAt != 1754000240000 || one.Failures != 3 {
+		t.Errorf("GET /zones/{id} = next_attempt_at %d, failures %d; want 1754000240000, 3",
+			one.NextAttemptAt, one.Failures)
+	}
+
+	list := srv.do(t, "GET", "/api/v1/zones?type=secondary", "")
+	if list.Code != http.StatusOK {
+		t.Fatalf("GET /zones: status = %d body = %s", list.Code, list.Body)
+	}
+	var all []struct {
+		ID            int64 `json:"id"`
+		NextAttemptAt int64 `json:"next_attempt_at"`
+		Failures      int   `json:"failures"`
+	}
+	if err := json.Unmarshal(list.Body.Bytes(), &all); err != nil {
+		t.Fatalf("decoding the zone list: %v", err)
+	}
+	idx := slices.IndexFunc(all, func(z struct {
+		ID            int64 `json:"id"`
+		NextAttemptAt int64 `json:"next_attempt_at"`
+		Failures      int   `json:"failures"`
+	}) bool {
+		return z.ID == id
+	})
+	if idx < 0 {
+		t.Fatalf("zone %d is missing from GET /zones", id)
+	}
+	if all[idx].NextAttemptAt != 1754000240000 || all[idx].Failures != 3 {
+		t.Errorf("GET /zones = next_attempt_at %d, failures %d; want 1754000240000, 3",
+			all[idx].NextAttemptAt, all[idx].Failures)
+	}
+}
+
+// A zone the scheduler has never seen — a primary, or a secondary in a
+// process that has not run a pass yet — reports zeroes rather than a stale
+// number from another zone.
+func TestZoneReadsCarryZeroesWhenTheSchedulerHasNoState(t *testing.T) {
+	srv := newTestServer(t)
+	rec := srv.do(t, "POST", "/api/v1/zones", `{"name":"e412.in"}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create: status = %d body = %s", rec.Code, rec.Body)
+	}
+	id := createdID(t, rec)
+
+	got := srv.do(t, "GET", fmt.Sprintf("/api/v1/zones/%d", id), "")
+	var one struct {
+		NextAttemptAt int64 `json:"next_attempt_at"`
+		Failures      int   `json:"failures"`
+	}
+	if err := json.Unmarshal(got.Body.Bytes(), &one); err != nil {
+		t.Fatalf("decoding the zone: %v", err)
+	}
+	if one.NextAttemptAt != 0 || one.Failures != 0 {
+		t.Errorf("next_attempt_at %d, failures %d; want 0, 0", one.NextAttemptAt, one.Failures)
+	}
+}
+
+// ── POST /zones/{id}/clone ────────────────────────────────────────────────
+
+// A second site's zone is the first one's with a different apex: the same
+// hosts, the same ACL, the same notify targets. Building it by hand is thirty
+// record writes and one forgotten allow_transfer.
+func TestZoneCloneCopiesTheConfigurationAndTheRecords(t *testing.T) {
+	srv := newTestServer(t)
+	rec := srv.do(t, "POST", "/api/v1/zones",
+		`{"name":"e412.in","soa_ns":"ns1.e412.in","soa_mbox":"hostadmin.e412.in",`+
+			`"soa_refresh":1800,"soa_retry":600,"soa_expire":1209600,"soa_minimum":600,`+
+			`"allow_transfer":"10.0.0.0/24","notify_to":"10.0.0.2"}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create: status = %d body = %s", rec.Code, rec.Body)
+	}
+	src := createdID(t, rec)
+	add := srv.do(t, "POST", fmt.Sprintf("/api/v1/zones/%d/records", src),
+		`{"name":"bifrost","type":"A","ttl":300,"rdata":"10.0.0.10","comment":"the nas"}`)
+	if add.Code != http.StatusCreated {
+		t.Fatalf("adding a record: status = %d body = %s", add.Code, add.Body)
+	}
+
+	got := srv.do(t, "POST", fmt.Sprintf("/api/v1/zones/%d/clone", src), `{"name":"E412.dev."}`)
+	if got.Code != http.StatusCreated {
+		t.Fatalf("clone: status = %d body = %s", got.Code, got.Body)
+	}
+	id := createdID(t, got)
+	if want := fmt.Sprintf("/api/v1/zones/%d", id); got.Header().Get("Location") != want {
+		t.Errorf("Location = %q, want %q", got.Header().Get("Location"), want)
+	}
+
+	clone := srv.zone(t, id)
+	source := srv.zone(t, src)
+	// The name is the one thing that differs, normalised like any other zone
+	// name — and the serial starts over, because this zone has published
+	// nothing yet and inheriting a serial would claim it had.
+	if clone.Name != "e412.dev" {
+		t.Errorf("name = %q, want %q", clone.Name, "e412.dev")
+	}
+	if clone.SOASerial != 1 {
+		t.Errorf("soa_serial = %d, want 1", clone.SOASerial)
+	}
+	// The SOA's two names carry over verbatim: they name *servers*, not
+	// records inside the zone, and rewriting them would silently repoint the
+	// clone at a nameserver nobody asked for.
+	for _, f := range []struct {
+		name      string
+		got, want any
+	}{
+		{"type", clone.Type, source.Type},
+		{"soa_ns", clone.SOANS, source.SOANS},
+		{"soa_mbox", clone.SOAMbox, source.SOAMbox},
+		{"soa_refresh", clone.SOARefresh, source.SOARefresh},
+		{"soa_retry", clone.SOARetry, source.SOARetry},
+		{"soa_expire", clone.SOAExpire, source.SOAExpire},
+		{"soa_minimum", clone.SOAMinimum, source.SOAMinimum},
+		{"soa_ttl", clone.SOATTL, source.SOATTL},
+		{"allow_transfer", clone.AllowTransfer, source.AllowTransfer},
+		{"notify_to", clone.NotifyTo, source.NotifyTo},
+		{"enabled", clone.Enabled, source.Enabled},
+	} {
+		if f.got != f.want {
+			t.Errorf("%s = %v, want %v", f.name, f.got, f.want)
+		}
+	}
+
+	// Records are named relative to the apex, so they need no rewriting to
+	// mean the same thing under a different one.
+	recs := srv.records(t, id)
+	if len(recs) != 2 {
+		t.Fatalf("the clone holds %d records, want 2 (the apex NS and the A)", len(recs))
+	}
+	var a store.ZoneRecord
+	for _, r := range recs {
+		if r.Type == "A" {
+			a = r
+		}
+		if r.ZoneID != id {
+			t.Errorf("record %d belongs to zone %d, want %d", r.ID, r.ZoneID, id)
+		}
+	}
+	if a.Name != "bifrost" || a.RData != "10.0.0.10" || a.TTL != 300 || a.Comment != "the nas" {
+		t.Errorf("the cloned A record = %+v, want bifrost/10.0.0.10/300/\"the nas\"", a)
+	}
+
+	// The source is untouched — a clone is a read of it.
+	if len(srv.records(t, src)) != 2 {
+		t.Errorf("the source zone has %d records after the clone, want 2", len(srv.records(t, src)))
+	}
+	if _, records, _ := srv.rl.counts(); records == 0 {
+		t.Error("the clone did not reload the served snapshot, so it answers nothing until something else does")
+	}
+}
+
+// Everything a secondary needs to pull is configuration rather than content,
+// so it comes along; what the previous copy happened to hold does not.
+func TestZoneCloneCarriesThePullConfigurationAndNoTransferHistory(t *testing.T) {
+	srv := newTestServer(t)
+	src := createSecondary(t, srv, "e412.in", "203.0.113.9:5353")
+	z := srv.zone(t, src)
+	z.RefreshedAt = 1754000000000
+	z.LastAttempt = 1754000000000
+	z.LastError = "connection refused"
+	z.ExpiresAt = 1754604800000
+	if err := srv.store.Zones().UpdateZone(t.Context(), z); err != nil {
+		t.Fatalf("UpdateZone: %v", err)
+	}
+	if err := srv.store.Zones().NoteTransferAttempt(t.Context(), src, 1754000000000, "connection refused"); err != nil {
+		t.Fatalf("NoteTransferAttempt: %v", err)
+	}
+
+	got := srv.do(t, "POST", fmt.Sprintf("/api/v1/zones/%d/clone", src), `{"name":"e412.dev"}`)
+	if got.Code != http.StatusCreated {
+		t.Fatalf("clone: status = %d body = %s", got.Code, got.Body)
+	}
+	clone := srv.zone(t, createdID(t, got))
+	if clone.Type != "secondary" || clone.Primaries != "203.0.113.9:5353" {
+		t.Errorf("type/primaries = %q/%q, want secondary/203.0.113.9:5353", clone.Type, clone.Primaries)
+	}
+	// A clone has never pulled anything, and a stamp saying otherwise would
+	// make it look like it was serving a copy it does not have.
+	if clone.RefreshedAt != 0 || clone.ExpiresAt != 0 || clone.LastAttempt != 0 || clone.LastError != "" {
+		t.Errorf("the clone carried transfer history: %+v", clone)
+	}
+}
+
+func TestZoneCloneRefusals(t *testing.T) {
+	tests := []struct {
+		name     string
+		body     string
+		wantCode int
+		wantMsg  string
+	}{
+		{"an empty name", `{"name":""}`, http.StatusBadRequest, "name must be a valid domain name"},
+		{"a name that is not a domain", `{"name":"not a zone"}`, http.StatusBadRequest, "name must be a valid domain name"},
+		{"the source's own name", `{"name":"e412.in"}`, http.StatusConflict, "a zone with that name already exists"},
+		{"a name already taken", `{"name":"taken.example"}`, http.StatusConflict, "a zone with that name already exists"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := newTestServer(t)
+			rec := srv.do(t, "POST", "/api/v1/zones", `{"name":"e412.in"}`)
+			if rec.Code != http.StatusCreated {
+				t.Fatalf("create: status = %d body = %s", rec.Code, rec.Body)
+			}
+			src := createdID(t, rec)
+			if other := srv.do(t, "POST", "/api/v1/zones", `{"name":"taken.example"}`); other.Code != http.StatusCreated {
+				t.Fatalf("create other: status = %d body = %s", other.Code, other.Body)
+			}
+
+			got := srv.do(t, "POST", fmt.Sprintf("/api/v1/zones/%d/clone", src), tc.body)
+			if got.Code != tc.wantCode {
+				t.Fatalf("status = %d body = %s; want %d", got.Code, got.Body, tc.wantCode)
+			}
+			if !strings.Contains(got.Body.String(), tc.wantMsg) {
+				t.Errorf("body = %s, want it to mention %q", got.Body, tc.wantMsg)
+			}
+		})
+	}
+}
+
+// A built-in is seeded by a migration and refused on create, so a copy of one
+// is a zone this API would not have made in the first place.
+func TestZoneCloneRefusesABuiltIn(t *testing.T) {
+	srv := newTestServer(t)
+	zs, err := srv.store.Zones().Zones(t.Context())
+	if err != nil {
+		t.Fatalf("Zones: %v", err)
+	}
+	idx := slices.IndexFunc(zs, func(z store.Zone) bool { return z.Type == "internal" })
+	if idx < 0 {
+		t.Fatal("no built-in zone to clone")
+	}
+
+	got := srv.do(t, "POST", fmt.Sprintf("/api/v1/zones/%d/clone", zs[idx].ID), `{"name":"copy.example"}`)
+	if got.Code != http.StatusConflict {
+		t.Fatalf("status = %d body = %s; want 409", got.Code, got.Body)
+	}
+	if !strings.Contains(got.Body.String(), "built-in zones cannot be cloned") {
+		t.Errorf("body = %s, want it to say built-in zones cannot be cloned", got.Body)
+	}
+}
+
+func TestZoneCloneOfAZoneThatDoesNotExistIs404(t *testing.T) {
+	srv := newTestServer(t)
+	got := srv.do(t, "POST", "/api/v1/zones/99999/clone", `{"name":"copy.example"}`)
+	if got.Code != http.StatusNotFound {
+		t.Fatalf("status = %d body = %s; want 404", got.Code, got.Body)
 	}
 }

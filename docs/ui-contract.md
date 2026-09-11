@@ -555,8 +555,10 @@ forwarded**, which is the entire point of the change (see
 | `GET /zones/{id}` | 200 object |
 | `PATCH /zones/{id}` | 204 — conditional on the zone not having changed since it was read (a lost race is retried once, then 409); renaming, disabling or re-enabling a `primary` moves the PTRs its records own |
 | `DELETE /zones/{id}` | 204 — cascades every record in the zone, and retires the PTRs those records owned from whatever reverse zone holds them (the cascade cannot reach those: they are rows in a different zone) |
+| `POST /zones/{id}/clone` | 201 the new zone + `Location: /api/v1/zones/{new id}` — body `{name}`; copies the configuration and every record, resets `soa_serial` to 1 and carries no transfer history. 409 on a duplicate name or an `internal` source |
 | `GET /zones/{id}/records` | 200 array |
 | `POST /zones/{id}/records` | 201 the record, `rdata` in the parser's own spelling + `Location: /api/v1/zones/{id}/records/{rid}` |
+| `PATCH /zones/{id}/records` | 204 — body `{ids, ttl}`; sets one TTL across the records named, in one transaction with one serial bump. 400 on empty `ids` or a TTL past 2147483647, 404 on an id that is not this zone's, 409 on the RRSet rule or a zone whose records are written elsewhere. auto-PTR does not run |
 | `PUT /zones/{id}/records/{rid}` | 204 (full replace) |
 | `DELETE /zones/{id}/records/{rid}` | 204 |
 
@@ -1238,6 +1240,7 @@ unmatched clients fall back to it.
 | `forward_to` | string | where a `forwarder` sends the queries it claims — `forwarder` only, rejected on every other type. See [`docs/api.md`](api.md)'s Forwarder zones entry for the format, and for why what is stored can differ from what was sent. **Empty is legal and means the zone claims its suffix and SERVFAILs it** (§3.8) |
 | `allow_transfer`, `last_xfr_at`, `last_xfr_peer`, `last_xfr_error` | string / int64 | the outbound AXFR ACL and the last inbound transfer *request*'s outcome — `primary` and `secondary` only. See [`docs/api.md`](api.md)'s `allow_transfer` entry for the format and what each read-only field means (and why `last_xfr_peer` is not proof of who asked) |
 | `notify_to` | string | who this zone tells when it changes (DNS NOTIFY, RFC 1996) — `primary` and `secondary` only, the same reach as `allow_transfer`. See [`docs/api.md`](api.md)'s `notify_to` entry for the format. Per-target delivery status is a separate read, `GET /zones/{id}/notifies`, not a field on the zone itself — see §9's Notify-out item |
+| `next_attempt_at`, `failures` | int64 (unix ms) / int | the scheduler's own view: when the next attempt is allowed (`0` when no back-off is pending) and how many have failed in a row. **Process-local, not columns** (`zones.Refresher.Status`) — a restart reports `0`/`0` for a zone that is still failing, so they are read *beside* `last_error`, never instead of it. `0`/`0` on every type that does not pull |
 | `created_at`, `modified_at` | int64 (unix ms) | |
 
 ### 3.7 Zone record
@@ -1706,10 +1709,21 @@ Pausing the tail is per-visit: the flag is cleared when the query log unmounts,
 because the buffer it governs is per-mount and the seed only runs while
 unpaused.
 
-**Keyboard** — exactly one shortcut: ⌘K / Ctrl+K toggles the command palette.
-It is registered on `window` with no target filtering, so it also fires while
-typing in an input. The hint in the search cell reads `⌘K` on Apple platforms
-and `Ctrl+K` everywhere else; the listener accepts either modifier on both.
+**Keyboard** — one shortcut everywhere: ⌘K / Ctrl+K toggles the command
+palette. It is registered on `window` with no target filtering, so it also
+fires while typing in an input. The hint in the search cell reads `⌘K` on
+Apple platforms and `Ctrl+K` everywhere else; the listener accepts either
+modifier on both.
+
+Three more are scoped to the zone detail page and listed on its filter bar:
+`/` focuses the record filter, `n` opens the add-record row, `Esc` closes
+whichever record form is open. Also on `window`, but **target-filtered**: `/`
+and `n` do nothing while focus is in an input, textarea, select or
+contenteditable, and none of the three fire with a modifier held. `Esc` is
+deliberately *not* target-filtered — the form it closes is where the focus is
+— and stands down entirely while a dialog is open, since the dialog closes
+itself on that key. `n` is inert, and unlisted, wherever there is no add band to open — every
+type but `primary`.
 
 **Theme** — `dnsaur.theme` in `localStorage` (`light`/`dark`) overrides
 `prefers-color-scheme`, and with nothing stored the app follows the OS live.

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/aloks98/dnsaur/internal/store"
+	"golang.org/x/sync/errgroup"
 )
 
 // The outbound half of NOTIFY: deciding who to tell when a zone this server
@@ -40,6 +41,10 @@ import (
 const MaxNotifyAttempts = 5
 
 const notifyBaseBackoff = 5 * time.Second
+
+// notifySendConcurrency is how many targets one pass may be sending to at
+// once. See Pass.
+const notifySendConcurrency = 8
 
 // notifyTick is how often the pass runs without a Wake. It bounds how late a
 // notify can be, not how often one happens, and it is also the coalescer: a
@@ -275,6 +280,26 @@ func (n *Notifier) Pass(ctx context.Context) error {
 			return err
 		}
 	}
+	// The sends of one pass run concurrently, bounded, for the reason
+	// Refresher.RefreshDue runs its zones concurrently: they are independent
+	// — one socket and one row each — and the cost of one is a timeout
+	// against a target that is up and not answering. Run one at a time, that
+	// target's silence was paid for by everything behind it in the list, on
+	// every pass, for as long as it stayed silent: a household with one
+	// mothballed secondary delayed every other zone's notification by
+	// seconds it had no reason to spend.
+	//
+	// Nothing about *what* is sent or recorded changes: maybeSend is called
+	// once per deduped target with the same row and the same nowMs it would
+	// have had, and its bookkeeping writes address one row each.
+	//
+	// The bound exists so a pass cannot open one socket per target on a
+	// server with hundreds of them. It is a limit on the pathological case
+	// rather than a tuning knob: a target that answers is done in a
+	// millisecond, so the only thing that ever occupies a slot is a silent
+	// one.
+	g := new(errgroup.Group)
+	g.SetLimit(notifySendConcurrency)
 	for _, z := range all {
 		// Deduped by address: ParseNotifyTo does not dedupe, and Reconcile
 		// deliberately creates one row for a repeated target — so without
@@ -295,9 +320,16 @@ func (n *Notifier) Pass(ctx context.Context) error {
 				// against, and the next pass will recreate it.
 				continue
 			}
-			n.maybeSend(ctx, z, t, row, nowMs)
+			g.Go(func() error {
+				n.maybeSend(ctx, z, t, row, nowMs)
+				return nil
+			})
 		}
 	}
+	// maybeSend reports every outcome against its own row and returns
+	// nothing, so there is no error to collect here — only the wait, which
+	// is what keeps Pass meaning "the pass is over" for Wake and for Run.
+	_ = g.Wait()
 	return nil
 }
 

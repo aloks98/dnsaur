@@ -21,6 +21,7 @@ func (s *Server) zonesRoutes() {
 	s.route("PATCH /api/v1/zones/{id}", s.requireAuth(s.handleZonePatch))
 	s.route("DELETE /api/v1/zones/{id}", s.requireAuth(s.handleZoneDelete))
 	s.route("POST /api/v1/zones/{id}/refresh", s.requireAuth(s.handleZoneRefresh))
+	s.route("POST /api/v1/zones/{id}/clone", s.requireAuth(s.handleZoneClone))
 }
 
 // reloadZones is called after successful zone mutations; failures are
@@ -404,7 +405,58 @@ func (s *Server) handleZonesList(w http.ResponseWriter, r *http.Request) {
 	zs = slices.DeleteFunc(zs, func(z store.Zone) bool {
 		return (zoneType != "" && z.Type != zoneType) || (byEnabled && z.Enabled != enabled)
 	})
-	writeJSON(w, http.StatusOK, zs)
+	out := make([]zoneResponse, len(zs))
+	for i, z := range zs {
+		out[i] = s.zoneResponse(z)
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// zoneResponse is the stored row plus the part of a pulled zone's state that
+// has no column: the scheduler's pending back-off and its consecutive failure
+// count (zones.RefreshStatus).
+//
+// Both are process-local and die with the process, which is why they are
+// *additions* to the durable last_error/last_attempt pair rather than a
+// replacement for it — a dashboard that read only these would show a zone
+// that had been failing for a week as healthy after every restart. What they
+// add is the two things the columns cannot say: when the next attempt is
+// actually due, and how many have failed in a row.
+//
+// Embedded rather than nested, so every existing field of a zone is spelled
+// exactly where it was and no client has to learn a new shape to keep reading
+// what it already read.
+type zoneResponse struct {
+	store.Zone
+	// NextAttemptAt is unix ms, and 0 whenever there is no back-off pending —
+	// which is every zone that is not currently failing, every type that does
+	// not pull, and every zone in a process that has not scheduled one yet.
+	// The ordinary schedule is refreshed_at + soa_refresh, which the row above
+	// already says.
+	NextAttemptAt int64 `json:"next_attempt_at"`
+	// Failures counts consecutive failed attempts *in this process*; a
+	// success resets it to 0.
+	Failures int `json:"failures"`
+}
+
+// zoneResponse pairs a zone with the scheduler's view of it. A server built
+// without a scheduler — every test server with no business opening a TCP
+// connection to a primary — reports the zeroes, which is the truthful answer
+// for a process where nothing is scheduling anything.
+func (s *Server) zoneResponse(z store.Zone) zoneResponse {
+	out := zoneResponse{Zone: z}
+	if s.deps.ZoneRefresher == nil {
+		return out
+	}
+	st, ok := s.deps.ZoneRefresher.Status(z.ID)
+	if !ok {
+		return out
+	}
+	out.Failures = st.Failures
+	if !st.NotBefore.IsZero() {
+		out.NextAttemptAt = st.NotBefore.UnixMilli()
+	}
+	return out
 }
 
 func (s *Server) handleZoneGet(w http.ResponseWriter, r *http.Request) {
@@ -418,7 +470,7 @@ func (s *Server) handleZoneGet(w http.ResponseWriter, r *http.Request) {
 		storeErr(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, z)
+	writeJSON(w, http.StatusOK, s.zoneResponse(z))
 }
 
 // zoneCreate mirrors groupCreate's pointer-for-optional pattern (see
@@ -622,6 +674,113 @@ func (s *Server) handleZoneCreate(w http.ResponseWriter, r *http.Request) {
 	s.notifyZones()
 	zone.ID = id
 	created(w, resourceURL("zones", id), zone)
+}
+
+// zoneClone is the whole request body: the one thing a copy cannot inherit.
+type zoneClone struct {
+	Name string `json:"name"`
+}
+
+// handleZoneClone creates a second zone from an existing one: the same
+// configuration and the same records under a different apex.
+//
+// It exists because that is what a second site, a staging domain or a
+// vanity alias actually is, and building one by hand is thirty record
+// writes and one forgotten allow_transfer — the kind of near-copy where the
+// thing that gets missed is whichever field was not on screen.
+//
+// **Everything is copied verbatim except the name and the serial.** The
+// records need no rewriting at all: they are stored relative to the apex
+// ("@", "bifrost"), so they already mean the same thing under a different
+// one. The SOA's two names are copied as they stand because they name
+// *servers* rather than anything inside the zone, and rewriting them would
+// silently repoint the copy at a nameserver nobody chose. rdata is copied
+// as it stands for the mirror of that reason: an absolute target in it is a
+// deliberate absolute target, and a clone is not the place to guess which
+// ones were meant to follow the apex.
+//
+// The serial restarts at 1, like any other new zone: a serial is this
+// zone's name for a version of its own contents, and inheriting one would
+// claim a publishing history the copy does not have.
+//
+// What is deliberately *not* copied is the transfer history — refreshed_at,
+// expires_at, last_error and the rest are simply never set on the new row.
+// A clone has pulled nothing, and a stamp saying otherwise would put it on
+// screen as serving a copy it does not hold.
+func (s *Server) handleZoneClone(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(r)
+	if !ok {
+		errJSON(w, http.StatusBadRequest, "bad id")
+		return
+	}
+	src, err := s.deps.Store.Zones().Zone(r.Context(), id)
+	if err != nil {
+		storeErr(w, err)
+		return
+	}
+	// A built-in is seeded by a migration and refused on create (see the
+	// zone-type block above), so a copy of one is a zone this API would not
+	// have made in the first place. 409 rather than 400 for the reason
+	// recordWriteRefusal gives: the request is well formed and the caller is
+	// permitted, and what refuses it is which zone was addressed.
+	if strings.EqualFold(src.Type, "internal") {
+		errJSON(w, http.StatusConflict, "built-in zones cannot be cloned")
+		return
+	}
+	body, ok := decodeOr400[zoneClone](w, r)
+	if !ok {
+		return
+	}
+	name, ok := normalizeZoneName(body.Name)
+	if !ok {
+		errJSON(w, http.StatusBadRequest, "name must be a valid domain name")
+		return
+	}
+
+	recs, err := s.deps.Store.Zones().Records(r.Context(), id)
+	if err != nil {
+		storeErr(w, err)
+		return
+	}
+
+	now := time.Now().UnixMilli()
+	zone := src
+	zone.ID = 0
+	zone.Name = name
+	zone.SOASerial = 1
+	zone.ExpiresAt, zone.RefreshedAt, zone.LastAttempt, zone.LastError = 0, 0, 0, ""
+	zone.LastXfrAt, zone.LastXfrPeer, zone.LastXfrError = 0, "", ""
+	zone.CreatedAt, zone.ModifiedAt = now, now
+
+	newID, err := s.deps.Store.Zones().AddZone(r.Context(), zone)
+	if err != nil {
+		storeErrDup(w, err, "a zone with that name already exists")
+		return
+	}
+	zone.ID = newID
+
+	if len(recs) > 0 {
+		for i := range recs {
+			recs[i].ID = 0
+			recs[i].ZoneID = newID
+		}
+		// One transaction for the whole record set, through the same call the
+		// import and the transfer install use: a half-copied zone is worse
+		// than no copy, because it looks like a finished one. The zone row
+		// goes in the same statement group and is written back unchanged.
+		if err := s.deps.Store.Zones().ReplaceRecords(r.Context(), zone, nil, nil, recs); err != nil {
+			// The zone row already committed, so this cannot be undone into
+			// "nothing happened". Saying so is better than a 500 the caller
+			// cannot reconcile with a zone that now exists — same reasoning
+			// as handleZoneCreate's apex NS.
+			slog.Error("copying records into a cloned zone failed",
+				"source", id, "clone", newID, "err", err)
+		}
+	}
+
+	s.reloadZones(r)
+	s.notifyZones()
+	created(w, resourceURL("zones", newID), zone)
 }
 
 // zonePatch is groupPatch's pointer-per-field pattern extended to every zone

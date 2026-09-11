@@ -1108,7 +1108,7 @@ be wrong.
 |---|---|
 | **5936** | AXFR is TCP-only (§4.2 leaves UDP undefined); SOA first and last, never in between (§2.2); messages carry enough RRs to amortize the overhead (§2.2); NOTAUTH when not authoritative (§2.2.1); OPT echoed in the first response message (§2.2.5) |
 | **1995** | IXFR falls back to a full AXFR when no delta is available (§2); a UDP IXFR whose reply does not fit is answered with a single SOA (§2) |
-| **1996** | NOTIFY is a hint, not an instruction — the secondary still checks the SOA before transferring (§4.7), and the answer-section SOA is never acted on: §3.7–3.8, "In no case shall the answer section of a NOTIFY request be used to update a slave's local data, or to indicate that a zone transfer needs to be undertaken, or to change the slave's zone refresh timers." The sender retransmits until a response, a timeout, or ICMP port unreachable (§3.6), and any response ends the round whatever its rcode (§4.8). **One deliberate divergence:** §3.10 says a NOTIFY from a host that is not a known master "should ignore the request"; dnsaur answers REFUSED instead — reasoning in §9.10.2 |
+| **1996** | NOTIFY is a hint, not an instruction — the secondary still checks the SOA before transferring (§4.7), and the answer-section SOA is never acted on: §3.7–3.8, "In no case shall the answer section of a NOTIFY request be used to update a slave's local data, or to indicate that a zone transfer needs to be undertaken, or to change the slave's zone refresh timers." The sender retransmits until a response, a timeout, or ICMP port unreachable (§3.6), and any response ends the round whatever its rcode (§4.8). **One deliberate divergence:** §3.10 says a NOTIFY from a host that is not a known master "should ignore the request"; dnsaur answers REFUSED instead — reasoning in §9.10.2. Since 2026-09-11 "known master" also admits a message that verified under the zone's own `tsig_key_id`, whatever its source address, so a primary behind NAT can notify — also §9.10.2 |
 | **8945** | TSIG: signed request, signed reply, time-window enforcement, and an unsigned request rejected rather than ignored; every message of a multi-message response signed, timers-only after the first; BADKEY and BADSIG reported in an unsigned reply (§5.2.1 and §5.2.2, each "This response MUST be unsigned", both pointing at §5.3.2 for the shape of an error return rather than for that sentence), BADTIME in a *signed* one carrying the client's time in Time Signed and ours in Other Data (§5.2.3) |
 | **1982** | Serial arithmetic is circular — comparison is not `<` |
 | **1034 §4.3.5** | A secondary past its SOA expire must stop answering for the zone |
@@ -1190,7 +1190,7 @@ the table below is directly a test table, one case per row, as §9.5.5's is.
 | no zone at that apex | NOTAUTH | |
 | zone is a type with no master to re-ask — `primary`, `forwarder`, `internal` | NOTAUTH | |
 | zone is disabled | NOTAUTH | |
-| source address matched no entry in `primaries` | REFUSED | |
+| source address matched no entry in `primaries`, **and** the message did not verify under the zone's own `tsig_key_id` | REFUSED | |
 | zone names a TSIG key and the message is unsigned | REFUSED | |
 | TSIG present, key unknown or algorithm mismatched | REFUSED | TSIG RR, BADKEY (17), **unsigned** |
 | TSIG present, MAC did not verify | REFUSED | TSIG RR, BADSIG (16), **unsigned** |
@@ -1231,6 +1231,19 @@ Where these come from, and where they are ours:
   numbers: a NOTIFY is roughly 50 bytes and a REFUSED reply roughly the same,
   so there is no amplification, and 1:1 reflection is not a useful attack
   primitive. It is a SHOULD, not a MUST. Recorded in §9.9.
+- **A TSIG that verified under the zone's own key stands in for the source
+  address** (decided 2026-09-11). The source row above is the weaker of the
+  two checks: an address can be spoofed and a MAC cannot, and the key named
+  on the zone is specifically the one that zone's master signs with. Refusing
+  a NOTIFY that verified under it left a primary behind NAT unable to notify
+  at all — its packets arrive from the NAT's address, which is not the one
+  anybody would write in `primaries`, and the only remedy was to list an
+  address that is not the primary's. Nothing else is widened: from an
+  unlisted source, an unsigned message, one signed under a key this zone does
+  not name, and one whose MAC did not verify are all refused exactly as
+  before, and the TSIG rows below still fire on their own terms. A server
+  with no key store attached cannot resolve the id and refuses, which is the
+  closed direction.
 - **Nothing here is rate-limited by rcode.** The throttle that matters is on
   the work a NOTIFY causes, not on the reply, and it is §9.10.3's.
 

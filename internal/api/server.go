@@ -60,6 +60,13 @@ type Reloader interface {
 // satisfies it as written.
 type ZoneRefresher interface {
 	Refresh(ctx context.Context, zoneID int64) (zones.TransferResult, error)
+	// Status is the scheduler's process-local view of one zone: when the next
+	// attempt is allowed and how many have failed in a row. It reports false
+	// for a zone this process has not scheduled yet.
+	//
+	// No context: it reads memory the scheduler already holds, never the
+	// store, which is also why the two zone reads may call it per row.
+	Status(zoneID int64) (zones.RefreshStatus, bool)
 }
 
 // ResolverStatus reports state of the running resolver that the dashboard

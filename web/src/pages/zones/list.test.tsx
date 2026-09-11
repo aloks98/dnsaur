@@ -37,6 +37,8 @@ function zone(overrides: Partial<Zone> = {}): Zone {
     last_xfr_error: "",
     notify_to: "",
     forward_to: "",
+    next_attempt_at: 0,
+    failures: 0,
     created_at: Date.now() - 86_400_000,
     modified_at: Date.now() - 60_000,
     ...overrides,
@@ -1947,4 +1949,74 @@ test("a row's record count is not requested until the row is on screen", async (
 
   act(() => shown[1]());
   await waitFor(() => expect(reads(paths, "/api/v1/zones/2/records")).toBe(1));
+});
+
+// ── Clone ─────────────────────────────────────────────────────────────────
+
+test("cloning a zone asks for the new name, then POSTs it", async () => {
+  const user = userEvent.setup();
+  let body: unknown;
+  mockZones([zone({ id: 7, name: "e412.in" })]);
+  server.use(
+    http.post("/api/v1/zones/7/clone", async ({ request }) => {
+      body = await request.json();
+      return HttpResponse.json({ id: 8 }, { status: 201 });
+    }),
+  );
+
+  renderWithProviders(<ZonesList />);
+  await waitFor(() => expect(zoneRows()).toHaveLength(1));
+
+  const menu = await rowMenu(zoneRows()[0], "e412.in");
+  fireEvent.click(within(menu).getByRole("menuitem", { name: "Clone" }));
+
+  const dialog = await screen.findByRole("dialog");
+  // The field opens blank rather than pre-filled with the source's name: the
+  // one value that cannot be reused is the one being asked for.
+  const field = within(dialog).getByLabelText(/new zone name/i);
+  expect(field).toHaveValue("");
+  await user.type(field, "e412.dev");
+  await user.click(within(dialog).getByRole("button", { name: /^clone$/i }));
+
+  await waitFor(() => expect(body).toEqual({ name: "e412.dev" }));
+});
+
+// The server owns the name rules, so its refusal is what the dialog shows —
+// not a second copy of them in the browser.
+test("a refused clone keeps the dialog open and says why", async () => {
+  const user = userEvent.setup();
+  mockZones([zone({ id: 7, name: "e412.in" })]);
+  server.use(
+    http.post("/api/v1/zones/7/clone", () =>
+      HttpResponse.json({ error: "a zone with that name already exists" }, { status: 409 }),
+    ),
+  );
+  const errorSpy = vi.spyOn(toast, "error");
+
+  renderWithProviders(<ZonesList />);
+  await waitFor(() => expect(zoneRows()).toHaveLength(1));
+
+  const menu = await rowMenu(zoneRows()[0], "e412.in");
+  fireEvent.click(within(menu).getByRole("menuitem", { name: "Clone" }));
+  const dialog = await screen.findByRole("dialog");
+  await user.type(within(dialog).getByLabelText(/new zone name/i), "taken.example");
+  await user.click(within(dialog).getByRole("button", { name: /^clone$/i }));
+
+  await waitFor(() =>
+    expect(errorSpy).toHaveBeenCalledWith("a zone with that name already exists"),
+  );
+  expect(screen.getByRole("dialog")).toBeInTheDocument();
+});
+
+// A built-in has no menu at all, so there is nothing to hide — but a clone of
+// one is refused by the server, and the disclosure's rows must keep offering
+// nothing rather than gaining an action that 409s.
+test("a built-in zone offers no clone", async () => {
+  const user = userEvent.setup();
+  mockZones([zone({ id: 2, name: "localhost", type: "internal" })]);
+
+  renderWithProviders(<ZonesList />);
+  await user.click(await screen.findByRole("button", { name: /1 built-in zone/i }));
+
+  expect(screen.queryByRole("button", { name: /Actions for localhost/ })).not.toBeInTheDocument();
 });

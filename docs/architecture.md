@@ -365,7 +365,7 @@ The gate, in order:
 |---|---|---|
 | `FORMERR` | — | not a single SOA question |
 | `NOTAUTH` | — | no zone at that apex, the zone is a type with no master to re-ask (`primary`, `forwarder`, `internal` — a `secondary` and a `stub` both pull from one), or it's disabled |
-| `REFUSED` | — | the peer's address isn't one of the zone's configured `primaries` |
+| `REFUSED` | — | the peer's address isn't one of the zone's configured `primaries`, **and** the message didn't verify under the zone's own `tsig_key_id` |
 | `REFUSED` | `BADKEY` | the TSIG names an unknown key or algorithm |
 | `REFUSED` | `BADSIG` | the TSIG signature didn't verify |
 | `REFUSED` | `BADTIME` | the TSIG timestamp is outside the fudge window |
@@ -382,6 +382,15 @@ Two things in that table are deliberate, not incidental:
   `primaries` list with one address wrong, and a NOTIFY and its refusal are
   both ~50 bytes, so answering costs nothing an attacker could turn into
   amplification.
+- **A TSIG that verified under the zone's own key stands in for the source
+  address.** It is the stronger of the two checks — an address can be spoofed
+  and a MAC cannot, and the key on the zone is the one that zone's master
+  signs with — so a signed NOTIFY is accepted from wherever it arrives. This
+  is what lets a primary behind NAT notify at all: its packets reach us from
+  the NAT's address, which is not the one anybody would put in `primaries`.
+  Nothing else is widened. From an unlisted source, an unsigned message, one
+  signed under a key the zone does not name, and one whose MAC did not verify
+  are all still refused, and a server with no key store attached refuses too.
 - **The three TSIG rows (`BADKEY`/`BADSIG`/`BADTIME`) fire whether or not
   the zone names a key at all** — they are *not* gated on `tsig_key_id`
   being set. RFC 8945 §5.2.1/§5.2.2 make them mandatory regardless of local
@@ -467,6 +476,16 @@ none of them has to know the `Notifier` exists at all.
 shape — an automatic path skipping a rule the human path enforces — as this
 project's most repeated defect, and the serial-derived queue is the
 deliberate answer to it here.
+
+One pass's sends run **concurrently, bounded at 8 at a time**. They are
+independent — one socket and one queue row each — and the cost of one is a
+send timeout against a target that is up and not answering. Sent one at a
+time, that silence was paid for by every target behind it in the list, on
+every pass, for as long as it lasted: one mothballed secondary delayed every
+other zone's notification by seconds it had no reason to spend. Nothing about
+what is sent or recorded changes — each target still gets one packet and its
+own row's outcome — and the bound is there so a server with hundreds of
+targets cannot open a socket per target at once.
 
 `Notifier.Wake()` (`internal/app.App.NotifyZones`, called from several
 `internal/api` write paths — zone create/patch/delete, record

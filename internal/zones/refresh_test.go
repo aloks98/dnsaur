@@ -1601,3 +1601,109 @@ func TestAStubWithNoFetcherConfiguredIsRecordedNotSkipped(t *testing.T) {
 		t.Errorf("status = %+v (tracked = %v), want one recorded failure", st, ok)
 	}
 }
+
+// What actually changed is the one thing a transfer log line has to carry.
+// The serial on its own says a new version arrived; "+1/-1" says whether it
+// was a routine re-sign or somebody deleting a nameserver, and it is the
+// difference between reading the log and going to look at the zone.
+//
+// It is Info because it is the whole account of a change to served data. The
+// unchanged case stays at Debug, where a refresh that found nothing belongs.
+func TestAChangedInstallLogsTheSerialAndTheRecordDelta(t *testing.T) {
+	primary := startTestPrimary(t, transferApex, primaryZoneRRs(t))
+	f := newTransferFixture(t, primary.addr, 0)
+	ref := f.refresher()
+	logs := captureLogs(t)
+
+	f.refreshDue(t, ref)
+
+	first := transferChangeLines(logs())
+	if len(first) != 1 {
+		t.Fatalf("the first transfer logged %d change lines, want 1: %v", len(first), first)
+	}
+	// A zone created through the API sits at serial 1 with no records, so the
+	// first transfer is five additions and nothing else.
+	want := map[string]any{
+		// slog widens every integer attribute, so the wants are spelled in the
+		// types that come back out of a Record rather than the ones passed in.
+		"zone": transferApex, "old_serial": uint64(1), "new_serial": uint64(primarySerial),
+		"added": int64(5), "removed": int64(0), "changed": int64(0),
+	}
+	for k, v := range want {
+		if got := first[0][k]; got != v {
+			t.Errorf("the first transfer logged %s = %v (%T), want %v (%T)", k, got, got, v, v)
+		}
+	}
+
+	// A second primary at the next serial, one record swapped for another.
+	rrs := primaryZoneRRs(t)
+	soa := mustRR(t, fmt.Sprintf("%s. 900 IN SOA ns1.%s. hostadmin.%s. %d %d 300 %d 900",
+		transferApex, transferApex, transferApex, primarySerial+1, primaryRefresh, primaryExpire))
+	moved := []dns.RR{soa}
+	for _, rr := range rrs[1 : len(rrs)-1] {
+		if rr.Header().Name == "bifrost."+transferApex+"." && rr.String() != "" &&
+			strings.HasSuffix(rr.String(), "10.9.0.11") {
+			continue
+		}
+		moved = append(moved, rr)
+	}
+	moved = append(moved, mustRR(t, fmt.Sprintf("nas.%s. 300 IN A 10.9.0.20", transferApex)), soa)
+	second := startTestPrimary(t, transferApex, moved)
+	f.updateZone(t, func(z *store.Zone) { z.Primaries = second.addr })
+
+	f.advance(primaryRefresh * time.Second)
+	f.refreshDue(t, ref)
+
+	lines := transferChangeLines(logs())
+	if len(lines) != 2 {
+		t.Fatalf("after the second transfer there were %d change lines, want 2: %v", len(lines), lines)
+	}
+	want = map[string]any{
+		"zone": transferApex, "old_serial": uint64(primarySerial), "new_serial": uint64(primarySerial + 1),
+		"added": int64(1), "removed": int64(1), "changed": int64(0),
+	}
+	for k, v := range want {
+		if got := lines[1][k]; got != v {
+			t.Errorf("the second transfer logged %s = %v (%T), want %v (%T)", k, got, got, v, v)
+		}
+	}
+}
+
+// A refresh that found the zone already current installs nothing, so there is
+// no delta to report and no line to report it on.
+func TestAnUnchangedRefreshLogsNoChangeLine(t *testing.T) {
+	primary := startTestPrimary(t, transferApex, primaryZoneRRs(t))
+	f := newTransferFixture(t, primary.addr, 0)
+	ref := f.refresher()
+
+	f.refreshDue(t, ref)
+	logs := captureLogs(t)
+
+	// The same primary at the same serial: the transfer re-runs (this fake
+	// answers no SOA probe, so the schedule falls through to a full AXFR) and
+	// the diff comes out empty.
+	f.advance(primaryRefresh * time.Second)
+	f.refreshDue(t, ref)
+
+	if lines := transferChangeLines(logs()); len(lines) != 0 {
+		t.Errorf("a transfer that changed nothing logged %d change lines, want 0: %v", len(lines), lines)
+	}
+}
+
+// transferChangeLines is every Info-or-louder record for a transfer that
+// installed a change, with its attributes flattened for comparison.
+func transferChangeLines(recs []slog.Record) []map[string]any {
+	var out []map[string]any
+	for _, r := range recs {
+		if r.Message != "zone transferred with changes" || r.Level < slog.LevelInfo {
+			continue
+		}
+		attrs := map[string]any{}
+		r.Attrs(func(a slog.Attr) bool {
+			attrs[a.Key] = a.Value.Any()
+			return true
+		})
+		out = append(out, attrs)
+	}
+	return out
+}

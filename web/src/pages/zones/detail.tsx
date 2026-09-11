@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { Link, useNavigate, useParams } from "react-router";
 import {
   AlertCircle,
@@ -43,6 +43,7 @@ import {
   FormItem,
   FormMessage,
   Input,
+  Kbd,
   NativeSelect,
   NativeSelectOption,
   Skeleton,
@@ -60,6 +61,7 @@ import {
   useDeleteZoneRecord,
   useRecordsFollowTransfers,
   useRefreshZone,
+  useSetZoneRecordsTTL,
   useUpdateZone,
   useUpdateZoneRecord,
   useZone,
@@ -73,6 +75,7 @@ import { StaleDataAlert } from "../../components/stale-data-alert";
 import { NotFound } from "../not-found";
 import { ZONE_TYPE_VARIANT } from "./zone-type-variant";
 import { formatDuration, relativeTime } from "../../lib/format";
+import { RenameDialog } from "../dialogs";
 import { ZoneFileActions } from "./zone-file-actions";
 import {
   forwardTargets,
@@ -80,6 +83,7 @@ import {
   lastTransferError,
   nextRefreshAt,
   retryIntervalMs,
+  schedulerNote,
   transferErrorLead,
   transferState,
 } from "../../lib/zones";
@@ -248,6 +252,21 @@ const GRID = "grid grid-cols-[224px_96px_84px_1fr_92px] items-center gap-3.5 px-
 const MAX_TTL = 2147483647;
 /** The top of a uint32, mirroring zonePatch's SOA fields (internal/api/zones_handlers.go). */
 const MAX_UINT32 = 4294967295;
+
+/**
+ * The bulk-TTL dialog's one field, spelled as `name` because that is the key
+ * the shared one-field dialog carries (RenameDialog, pages/dialogs.tsx). The
+ * rule is recordFormSchema's ttl rule verbatim — one number, one ceiling —
+ * because it is the same value being written by a different route, and two
+ * spellings of RFC 2181 §8 in one file is one too many.
+ */
+const bulkTTLSchema = z.object({
+  name: z
+    .string()
+    .trim()
+    .regex(/^\d+$/, "TTL must be a whole number of seconds")
+    .refine((v) => Number(v) <= MAX_TTL, "TTL must not exceed 2147483647"),
+});
 
 const recordFormSchema = z.object({
   // Blank is a legitimate value — the server folds "" and the zone's own
@@ -808,6 +827,7 @@ function SoaField({
   name,
   label,
   unit,
+  copyable = false,
 }: {
   control: Control<SoaFormValues>;
   name: keyof SoaFormValues;
@@ -815,6 +835,13 @@ function SoaField({
   /** Present on the four interval fields, all of which are seconds — which
    * is also what makes them the numeric ones. */
   unit?: string;
+  /** Whether the field's current value gets a copy button beside it.
+   *
+   * The two name fields only. They are what gets pasted into somebody else's
+   * config — a registrar's NS form, another server's zone — while the four
+   * intervals are numbers read off the screen and typed, and four more
+   * buttons in this grid would bury the two that matter. */
+  copyable?: boolean;
 }) {
   return (
     <FormField
@@ -823,14 +850,22 @@ function SoaField({
       render={({ field }) => (
         <FormItem className="contents">
           <SoaFieldShell label={label} unit={unit}>
-            <FormControl>
-              <Input
-                {...field}
-                aria-label={label}
-                inputMode={unit === undefined ? undefined : "numeric"}
-                className="font-mono"
-              />
-            </FormControl>
+            <div className="flex min-w-0 items-center gap-1">
+              <FormControl>
+                <Input
+                  {...field}
+                  aria-label={label}
+                  inputMode={unit === undefined ? undefined : "numeric"}
+                  className="font-mono"
+                />
+              </FormControl>
+              {/* The value being edited, not the saved one: what is on screen
+                  is what the button should hand over, and an unsaved edit is
+                  still the thing the operator is looking at. */}
+              {copyable && field.value !== "" && (
+                <CopyButton value={field.value} label={`Copy ${label.toLowerCase()}`} />
+              )}
+            </div>
             <FormMessage />
           </SoaFieldShell>
         </FormItem>
@@ -953,8 +988,8 @@ function SoaBand({ zone }: { zone: Zone }) {
                   </Button>
                 </div>
                 <div className="grid grid-cols-4 gap-x-[18px] gap-y-4 pb-4">
-                  <SoaField control={form.control} name="soa_ns" label="Primary NS" />
-                  <SoaField control={form.control} name="soa_mbox" label="Responsible" />
+                  <SoaField control={form.control} name="soa_ns" label="Primary NS" copyable />
+                  <SoaField control={form.control} name="soa_mbox" label="Responsible" copyable />
                   {/* Not editable, but the value IS shown (Task 12 fix round 1:
                   an earlier draft of the artboard notes said only "AUTO",
                   omitting the number — corrected). The serial itself is the
@@ -968,6 +1003,10 @@ function SoaBand({ zone }: { zone: Zone }) {
                       <span className="ml-auto font-mono text-[9.5px] tracking-[0.14em] text-muted-foreground/70 uppercase">
                         AUTO
                       </span>
+                      {/* The one SOA value an operator reads *out* of this
+                          page rather than into it: it is what a `dig` against
+                          a secondary is compared with. */}
+                      <CopyButton value={String(zone.soa_serial)} label="Copy serial" />
                     </div>
                   </SoaFieldShell>
                   <SoaField control={form.control} name="soa_refresh" label="Refresh" unit="s" />
@@ -1013,6 +1052,17 @@ function SoaBand({ zone }: { zone: Zone }) {
 function TransferBand({ zone, asOf }: { zone: Zone; asOf: number }) {
   const state = transferState(zone);
   const failure = lastTransferError(zone);
+  /**
+   * What the scheduler in the running process says about this zone: when its
+   * next attempt falls, and how many have failed in a row. Empty for a
+   * healthy zone, and empty after a restart even for one that is not — see
+   * schedulerNote. It is shown beside the dated failure below rather than
+   * instead of it, for exactly that reason.
+   *
+   * asOf rather than Date.now(), like the countdown above: render reads no
+   * clock, and the number is anchored to the answer it came with.
+   */
+  const scheduled = schedulerNote(zone, asOf);
   /**
    * A disabled zone is outside all of this, and has to be checked before any
    * of it — the same order the zones list checks it in.
@@ -1114,7 +1164,7 @@ function TransferBand({ zone, asOf }: { zone: Zone; asOf: number }) {
   // A disabled zone always explains itself, whatever its transfer state:
   // "nothing is happening here" is the one thing the fields above cannot say
   // on their own.
-  const showNote = disabled || state !== "fresh";
+  const showNote = disabled || state !== "fresh" || scheduled !== "";
   // One tone for the whole note line, so the icon, the label, the error and
   // the tint cannot disagree. Muted is the disabled case and is deliberately
   // neither of the alarm colours: nothing here needs fixing.
@@ -1212,6 +1262,16 @@ function TransferBand({ zone, asOf }: { zone: Zone; asOf: number }) {
               >
                 {note}
               </span>
+              {/* The scheduler's own two facts, last on the line because
+                  they are the only ones on it that a restart forgets. */}
+              {scheduled !== "" && (
+                <span
+                  data-testid="scheduler-note"
+                  className="shrink-0 font-mono text-[11px] text-muted-foreground"
+                >
+                  {scheduled}
+                </span>
+              )}
             </div>
             {/* The message in full, dim, on its own line — omitted when the
                 lead already is the whole of it, since a short error would
@@ -1573,6 +1633,9 @@ function AllowTransferBand({ zone }: { zone: Zone }) {
           >
             {hasAcl ? zone.allow_transfer : "No peer may transfer this zone."}
           </span>
+          {/* Only with something to copy — an empty ACL is a stated fact, not
+              a value. Same rule the primaries row follows. */}
+          {hasAcl && <CopyButton value={zone.allow_transfer} label="Copy allow transfer" />}
           {/* What the last inbound *request* did — independent of the ACL
               beside it: a peer can be refused today under a value that used
               to admit it, so the history stays on screen either way. */}
@@ -1693,6 +1756,14 @@ function UpstreamRow({ zone }: { zone: Zone }) {
    * expired.
    */
   const failure = forwarder ? null : lastTransferError(zone);
+  // See TransferBand's own `scheduled`: process-local, so it sits beside the
+  // dated failure below rather than standing in for it.
+  //
+  // A stub only. A forwarder has no schedule at all, and a secondary's
+  // TransferBand sits directly above this row and already carries it — two
+  // copies of one countdown in one header group is the duplication every
+  // other band here is careful to avoid.
+  const scheduled = zone.type === "stub" ? schedulerNote(zone) : "";
   const upstreams = forwardTargets(saved);
   let note = "";
   if (forwarder) {
@@ -1780,6 +1851,17 @@ function UpstreamRow({ zone }: { zone: Zone }) {
                   ? "Answering nothing until the first fetch succeeds."
                   : `serving what arrived ${relativeTime(zone.refreshed_at)}`}
               </span>
+              {/* The running scheduler's account of the retrying — the one
+                  thing the dated error beside it cannot say. A stub has no
+                  transfer band, so this row is where it belongs for one. */}
+              {scheduled !== "" && (
+                <span
+                  data-testid="scheduler-note"
+                  className="shrink-0 font-mono text-[11px] text-muted-foreground"
+                >
+                  {scheduled}
+                </span>
+              )}
             </div>
           </div>
         ) : null
@@ -2081,6 +2163,7 @@ function NotifyBand({ zone }: { zone: Zone }) {
           >
             {hasValue ? zone.notify_to : "No targets are notified."}
           </span>
+          {hasValue && <CopyButton value={zone.notify_to} label="Copy notify targets" />}
           {/* Doubles as the disclosure: with anything to expand it is a real
               button (Enter/Space-operable, aria-expanded carries the state);
               with nothing to show it is inert text rather than a control
@@ -2168,6 +2251,22 @@ export function ZoneDetail() {
   return <ZoneDetailFor zoneId={zoneId} />;
 }
 
+/**
+ * Whether this page may write records into a zone of this type — the whole
+ * of `recordsReadOnly` below, as a function, because the keyboard shortcut
+ * that opens the add band has to ask it before the loaded/unloaded branch
+ * the rest of the type flags live behind. One spelling for one rule: two
+ * would be two chances to disagree about whether a control exists and
+ * whether the key that opens it works.
+ *
+ * `primary` is the only type left once the four that own their contents
+ * elsewhere are taken out — see recordsReadOnly for which and why — and an
+ * unloaded zone is read-only, because nothing is known about it yet.
+ */
+function recordsAreReadOnly(type: Zone["type"] | undefined): boolean {
+  return type !== "primary";
+}
+
 function ZoneDetailFor({ zoneId }: { zoneId: number }) {
   const navigate = useNavigate();
 
@@ -2182,6 +2281,10 @@ function ZoneDetailFor({ zoneId }: { zoneId: number }) {
   const deleteZone = useDeleteZone();
   const deleteRecord = useDeleteZoneRecord();
 
+  /** The filter field, so `/` can put the caret in it. A ref rather than an
+   * id lookup: the bar is not rendered for a routing type, and a ref that is
+   * null says so without a query that finds nothing. */
+  const filterRef = useRef<HTMLInputElement>(null);
   const [nameFilter, setNameFilter] = useState("");
   const [typeFilter, setTypeFilter] = useState<"" | RecordType>("");
   /**
@@ -2219,9 +2322,13 @@ function ZoneDetailFor({ zoneId }: { zoneId: number }) {
    * and drop any server error — a remount is all three at once, and a
    * still-mounted form would do none of them on its own. */
   const [addCue, setAddCue] = useState(0);
+  /** Whether the bulk-TTL prompt is open. It has no target of its own: what
+   * it applies to is the filtered set on screen when it was opened. */
+  const [ttlOpen, setTTLOpen] = useState(false);
   const [deleteZoneOpen, setDeleteZoneOpen] = useState(false);
   const [deleteRecordTarget, setDeleteRecordTarget] = useState<ZoneRecord | null>(null);
   const refreshZone = useRefreshZone();
+  const setRecordsTTL = useSetZoneRecordsTTL();
 
   /**
    * Ask for a transfer now.
@@ -2274,18 +2381,80 @@ function ZoneDetailFor({ zoneId }: { zoneId: number }) {
    * every other row inert around a form rendered nowhere, with no way out.
    */
   const editingRecord = shownRecords.find((r) => r.id === editingId) ?? null;
+  /** Whether either filter is narrowing the list — what makes "the filtered
+   * records" a set the user chose rather than the whole zone. */
+  const filtered = nameFilter.trim() !== "" || typeFilter !== "";
 
-  /** One form at a time — see `addOpen`'s comment. */
-  function openAdd() {
+  /** One form at a time — see `addOpen`'s comment.
+   *
+   * useCallback because the keyboard listener below names it: setState
+   * functions are stable, so this is too, and the listener is installed once
+   * rather than torn down and re-added on every render. */
+  const openAdd = useCallback(() => {
     setEditingId(null);
     setAddOpen(true);
     setAddCue((c) => c + 1);
-  }
+  }, []);
 
   function openEdit(target: ZoneRecord) {
     setAddOpen(false);
     setEditingId(target.id);
   }
+
+  /** The `n` shortcut's gate, asked before the branch below that would make
+   * it unreachable from an effect. Same rule as `recordsReadOnly`. */
+  const readOnly = recordsAreReadOnly(zone.data?.type);
+
+  /**
+   * The three keys the record grid is worth having: `/` to filter, `n` to
+   * add, Esc to close whatever is open.
+   *
+   * On the window, like the command palette's own listener, because they are
+   * about the page rather than about whichever element happens to hold focus.
+   *
+   * **`/` and `n` are inert while focus is in a field**, and that is not
+   * politeness: "n" belongs in a record name and "/" in a filter, so a
+   * shortcut that fired there would eat the text being typed. Esc is
+   * deliberately *not* gated that way — the form it closes is where the focus
+   * already is, so a rule that skipped fields would make it close nothing.
+   *
+   * Esc also stands down while a dialog is open. The dialog closes itself on
+   * that key, and taking the record form down behind it would leave the page
+   * a step further back than one press asked for.
+   */
+  useEffect(() => {
+    function onKeyDown(event: KeyboardEvent) {
+      if (event.metaKey || event.ctrlKey || event.altKey) return;
+
+      if (event.key === "Escape") {
+        if (document.querySelector("[role='dialog'],[role='alertdialog']")) return;
+        setAddOpen(false);
+        setEditingId(null);
+        return;
+      }
+
+      const target = event.target as HTMLElement | null;
+      if (
+        target instanceof HTMLInputElement ||
+        target instanceof HTMLTextAreaElement ||
+        target instanceof HTMLSelectElement ||
+        target?.isContentEditable === true
+      ) {
+        return;
+      }
+      if (event.key === "/" && filterRef.current) {
+        event.preventDefault();
+        filterRef.current.focus();
+        return;
+      }
+      if (event.key === "n" && !readOnly) {
+        event.preventDefault();
+        openAdd();
+      }
+    }
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [openAdd, readOnly]);
 
   /**
    * Either filter changing closes an in-progress edit, discarding it.
@@ -2303,6 +2472,30 @@ function ZoneDetailFor({ zoneId }: { zoneId: number }) {
    */
   function onFiltersTouched() {
     setEditingId(null);
+  }
+
+  /**
+   * Retune the filtered set to one TTL.
+   *
+   * The ids are read at submit time from what is on screen, so the request
+   * says exactly what the button said — and the server's own refusal (the
+   * RRSet rule, a TTL past the RFC 2181 ceiling) is shown in its words rather
+   * than pre-empted by a second copy of the rule here.
+   */
+  function onConfirmTTL(value: string) {
+    setRecordsTTL.mutate(
+      { zoneId, ids: shownRecords.map((r) => r.id), ttl: Number(value) },
+      {
+        onSuccess: () => {
+          toast.success(
+            `TTL set on ${shownRecords.length} ${shownRecords.length === 1 ? "record" : "records"}`,
+          );
+          setTTLOpen(false);
+        },
+        onError: (err) =>
+          toast.error(err instanceof ApiError ? err.message : "Couldn't set the TTL"),
+      },
+    );
   }
 
   function onConfirmDeleteZone() {
@@ -2448,7 +2641,7 @@ function ZoneDetailFor({ zoneId }: { zoneId: number }) {
    * one is inert rather than lost, which is not a 409's complaint to make.
    * Hiding the control is the whole of the guard there.
    */
-  const recordsReadOnly = isInternal || isSecondary || isRouting;
+  const recordsReadOnly = recordsAreReadOnly(z.type);
 
   let body: ReactNode;
   if (records.isPending) {
@@ -2688,6 +2881,7 @@ function ZoneDetailFor({ zoneId }: { zoneId: number }) {
       {!isRouting && (
         <div className="flex shrink-0 items-center gap-3 border-b border-border px-4 py-2.5">
           <Input
+            ref={filterRef}
             value={nameFilter}
             onChange={(e) => {
               setNameFilter(e.target.value);
@@ -2717,9 +2911,34 @@ function ZoneDetailFor({ zoneId }: { zoneId: number }) {
               ))}
             </NativeSelect>
           </div>
-          <span className="ml-auto font-mono text-[10.5px] text-muted-foreground">
+          {/* Plain, and only for the keys that actually do something here: a
+              zone whose records are read-only has no add band for `n` to
+              open. */}
+          <span
+            data-testid="record-shortcuts"
+            className="ml-auto flex shrink-0 items-center gap-1.5 text-[10.5px] text-muted-foreground"
+          >
+            <Kbd>/</Kbd> filter
+            {!recordsReadOnly && (
+              <>
+                <Kbd>n</Kbd> add record
+              </>
+            )}
+          </span>
+          <span className="font-mono text-[10.5px] text-muted-foreground">
             {shownRecords.length} {shownRecords.length === 1 ? "record" : "records"}
           </span>
+          {/* Only while a filter is on, and only where records may be
+              written. With no filter the button would read as "retune the
+              whole zone", which is a much larger claim than one press has any
+              way to confirm — and the set it names has to be the one on
+              screen for the count in its own label to mean anything. */}
+          {!recordsReadOnly && filtered && shownRecords.length > 0 && (
+            <Button type="button" size="sm" variant="ghost" onClick={() => setTTLOpen(true)}>
+              Set TTL for {shownRecords.length} filtered{" "}
+              {shownRecords.length === 1 ? "record" : "records"}
+            </Button>
+          )}
         </div>
       )}
 
@@ -2780,6 +2999,21 @@ function ZoneDetailFor({ zoneId }: { zoneId: number }) {
           </div>
         </>
       )}
+
+      <RenameDialog
+        targetId={ttlOpen ? z.id : null}
+        title="Set TTL"
+        description={`Every one of the ${shownRecords.length} records this filter shows gets this TTL. Records outside the filter keep theirs.`}
+        label="TTL (seconds)"
+        initialName=""
+        placeholder="300"
+        schema={bulkTTLSchema}
+        submitLabel="Set TTL"
+        pendingLabel="Saving…"
+        isPending={setRecordsTTL.isPending}
+        onSubmit={onConfirmTTL}
+        onClose={() => setTTLOpen(false)}
+      />
 
       <AlertDialog open={deleteZoneOpen} onOpenChange={setDeleteZoneOpen}>
         <AlertDialogContent>

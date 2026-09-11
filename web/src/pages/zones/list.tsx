@@ -53,6 +53,7 @@ import { ApiError } from "../../api/client";
 import type { Zone } from "../../api/types";
 import {
   useCreateZone,
+  useCloneZone,
   useDeleteZone,
   useRecordsFollowTransfers,
   useRefreshZone,
@@ -64,6 +65,7 @@ import { useTSIGKeys } from "../../hooks/use-tsig-keys";
 import { StaleDataAlert } from "../../components/stale-data-alert";
 import { relativeTime } from "../../lib/format";
 import { dnsNameSchema } from "../../lib/dns-name";
+import { RenameDialog } from "../dialogs";
 import { lastTransferError, pullsFromAMaster, pullState, transferErrorLead } from "../../lib/zones";
 import { ZONE_TYPE_VARIANT } from "./zone-type-variant";
 
@@ -87,6 +89,13 @@ const CREATABLE_TYPES = [
   "stub",
   "forwarder",
 ] as const satisfies readonly Zone["type"][];
+
+/** The clone dialog's one field. Same rule the create row applies to the
+ * same value, and for the same reason: the server decides, this only saves a
+ * round trip that would always 400. */
+const cloneSchema = z.object({
+  name: dnsNameSchema("Enter a domain name, e.g. example.com"),
+});
 
 const addZoneSchema = z
   .object({
@@ -878,10 +887,12 @@ function StatusCell({
  */
 function ZoneRow({
   zone,
+  onClone,
   onDelete,
 }: {
   zone: Zone;
   /** Absent for a built-in zone, which has no menu to hold the action. */
+  onClone?: () => void;
   onDelete?: () => void;
 }) {
   const isInternal = zone.type === "internal";
@@ -1051,6 +1062,12 @@ function ZoneRow({
                     <DropdownMenuSeparator />
                   </>
                 )}
+                {/* A second site's zone is this one with a different apex:
+                    the same hosts, the same ACL, the same notify targets.
+                    The server does the copying (POST /zones/{id}/clone) —
+                    this only asks for the one value a copy cannot inherit. */}
+                <DropdownMenuItem onClick={onClone}>Clone</DropdownMenuItem>
+                <DropdownMenuSeparator />
                 <DropdownMenuItem onClick={onToggleEnabled} disabled={updateZone.isPending}>
                   {zone.enabled ? "Disable" : "Enable"}
                 </DropdownMenuItem>
@@ -1127,6 +1144,7 @@ function BuiltinsDisclosure({ zones }: { zones: Zone[] }) {
 export function ZonesList() {
   const zones = useZones();
   const deleteZone = useDeleteZone();
+  const cloneZone = useCloneZone();
   // The Records column is the one thing here a transfer changes that the
   // zones response does not carry, so it follows the zone rather than
   // polling on its own — see useRecordsFollowTransfers.
@@ -1134,6 +1152,7 @@ export function ZonesList() {
 
   const [addOpen, setAddOpen] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<Zone | null>(null);
+  const [cloneTarget, setCloneTarget] = useState<Zone | null>(null);
 
   const all = useMemo(() => zones.data ?? [], [zones.data]);
   // The header count and the empty state must count only the user's own
@@ -1158,6 +1177,27 @@ export function ZonesList() {
       },
       onError: () => toast.error(`Couldn't delete ${target.name}`),
     });
+  }
+
+  /**
+   * The name rules are the server's, so a refusal is shown in its own words
+   * and the dialog stays open on the value that was typed. The only rule
+   * checked here is the shape of a domain name, which saves a round trip that
+   * would always 400 — the same division AddZoneRow draws.
+   */
+  function onConfirmClone(name: string) {
+    if (!cloneTarget) return;
+    cloneZone.mutate(
+      { id: cloneTarget.id, name },
+      {
+        onSuccess: (created) => {
+          toast.success(`Cloned to ${created.name}`);
+          setCloneTarget(null);
+        },
+        onError: (err) =>
+          toast.error(err instanceof ApiError ? err.message : `Couldn't clone ${cloneTarget.name}`),
+      },
+    );
   }
 
   let body: ReactNode;
@@ -1190,7 +1230,12 @@ export function ZonesList() {
       <>
         {mine.length > 0 &&
           mine.map((zone) => (
-            <ZoneRow key={zone.id} zone={zone} onDelete={() => setDeleteTarget(zone)} />
+            <ZoneRow
+              key={zone.id}
+              zone={zone}
+              onClone={() => setCloneTarget(zone)}
+              onDelete={() => setDeleteTarget(zone)}
+            />
           ))}
         {builtins.length > 0 && <BuiltinsDisclosure zones={builtins} />}
         {mine.length === 0 && (
@@ -1250,6 +1295,33 @@ export function ZonesList() {
       </div>
 
       {addOpen && <AddZoneRow onClose={() => setAddOpen(false)} />}
+
+      {/* Blank rather than pre-filled with the source's name: the one value a
+          copy cannot inherit is the one being asked for, and a field holding
+          a name the server will refuse is a field that has to be cleared
+          before it can be used. */}
+      <RenameDialog
+        targetId={cloneTarget?.id ?? null}
+        title="Clone this zone"
+        description={
+          cloneTarget && (
+            <>
+              Everything in <span className="font-medium text-foreground">{cloneTarget.name}</span>{" "}
+              — its SOA settings, transfer configuration and every record — is copied under the new
+              name. The serial starts at 1.
+            </>
+          )
+        }
+        label="New zone name"
+        initialName=""
+        placeholder="e412.dev"
+        schema={cloneSchema}
+        submitLabel="Clone"
+        pendingLabel="Cloning…"
+        isPending={cloneZone.isPending}
+        onSubmit={onConfirmClone}
+        onClose={() => setCloneTarget(null)}
+      />
 
       <div className="min-h-0 flex-1 overflow-y-auto">{body}</div>
 

@@ -589,3 +589,74 @@ func TestPassReconcilesOnlyTheZonesWhoseTargetsChanged(t *testing.T) {
 		t.Errorf("a pass after the rows were deleted reconciled again (%d in total, want 3)", got)
 	}
 }
+
+// One pass, one packet per target, and no target waiting on another's
+// timeout.
+//
+// The sends are independent — different sockets, different rows — and the
+// only thing they share is the pass they happen in. Run one at a time, a
+// target that is up and silent costs a full send timeout, and everything
+// behind it in the list waits that out: two silent secondaries in front of a
+// live one delayed every notification to that live one by four seconds, on
+// every pass, for as long as they stayed silent.
+//
+// The real UDP sender, not the fake one, because the fake never blocks and so
+// cannot tell a concurrent pass from a serial one.
+func TestNotifyPassSendsToTargetsConcurrently(t *testing.T) {
+	// oneTimeout mirrors testNotifySendTimeout (notifysend.go), which is what
+	// NewUDPSenderForTest waits per address.
+	const oneTimeout = time.Second
+
+	silentA := newNotifyResponder(t, dns.RcodeSuccess, true)
+	silentB := newNotifyResponder(t, dns.RcodeSuccess, true)
+	// Last in the list on purpose: sent one at a time it is the one that pays
+	// for both silences.
+	live := newNotifyResponder(t, dns.RcodeSuccess, false)
+
+	f := newNotifierFixture(t, strings.Join([]string{silentA.addr, silentB.addr, live.addr}, ", "), 10)
+	n := zones.NewNotifier(f.st.Zones(), f.st.Notifies(), f.st.TSIGKeys(),
+		zones.WithNotifyNow(func() time.Time { return f.clock }),
+		zones.WithNotifySender(zones.NewUDPSenderForTest()))
+
+	done := make(chan error, 1)
+	go func() { done <- n.Pass(context.Background()) }()
+
+	// Half a timeout: unreachable if the live target is queued behind two
+	// silent ones, and a thousandfold more than it needs when it is not.
+	deadline := time.Now().Add(oneTimeout / 2)
+	for live.received.Load() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("the live target had received nothing after %v; "+
+				"it is waiting out the silent targets' timeouts", oneTimeout/2)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	if err := <-done; err != nil {
+		t.Fatalf("Pass: %v", err)
+	}
+
+	// Concurrency is not permission to skip anyone: every target is still
+	// tried once in the pass.
+	for name, r := range map[string]*notifyResponder{"silentA": silentA, "silentB": silentB, "live": live} {
+		if got := r.received.Load(); got != 1 {
+			t.Errorf("%s received %d notifies, want 1", name, got)
+		}
+	}
+
+	// And the per-target bookkeeping is what it was: the one that answered is
+	// delivered at the zone's serial, the two that did not carry a first
+	// attempt and the reason.
+	for _, row := range f.rows(t) {
+		switch row.Target {
+		case live.addr:
+			if row.NotifiedSerial != 10 || row.LastError != "" {
+				t.Errorf("the live target's row = %+v, want serial 10 delivered and no error", row)
+			}
+		default:
+			if row.Attempts != 1 || row.LastError == "" {
+				t.Errorf("%s's row = %+v, want one recorded attempt and its error", row.Target, row)
+			}
+		}
+	}
+}

@@ -36,6 +36,8 @@ function zone(overrides: Partial<Zone> = {}): Zone {
     last_xfr_error: "",
     notify_to: "",
     forward_to: "",
+    next_attempt_at: 0,
+    failures: 0,
     created_at: Date.now() - 86_400_000,
     modified_at: Date.now() - 60_000,
     ...overrides,
@@ -3103,4 +3105,277 @@ test("a double-clicked Save sends one request", async () => {
   release();
   await waitFor(() => expect(screen.queryByTestId("record-form-row")).not.toBeInTheDocument());
   expect(puts).toBe(1);
+});
+
+// ── The scheduler's own view, beside the durable one ──────────────────────
+
+/**
+ * `next_attempt_at` and `failures` come from the running process rather than
+ * a column, so they are the two things the last-error line cannot say: when
+ * the retry actually falls, and how many have gone the same way. They sit
+ * beside that line rather than replacing it, because a restart forgets them
+ * and the line does not.
+ */
+test("a failing secondary says when the next attempt falls and how many have failed", async () => {
+  renderZoneDetail({
+    zone: secondary({
+      last_error: "dial tcp 203.0.113.9:53: connect: connection refused",
+      last_attempt: Date.now() - 60_000,
+      // 4m30s, so the flooring in formatDuration reads 4m however long the
+      // render takes rather than tipping to 3m on a slow one.
+      next_attempt_at: Date.now() + 4 * 60_000 + 30_000,
+      failures: 3,
+    }),
+  });
+  await screen.findByText("e412.in");
+
+  expect(screen.getByTestId("scheduler-note").textContent).toBe(
+    "next attempt in 4m · 3 failed attempts",
+  );
+});
+
+test("a healthy secondary has no scheduler note", async () => {
+  renderZoneDetail({ zone: secondary() });
+  await screen.findByText("e412.in");
+
+  expect(screen.queryByTestId("scheduler-note")).not.toBeInTheDocument();
+});
+
+// A stub has no transfer band; its failures are reported on the primaries
+// row, and that is where the same two facts belong for one.
+test("a failing stub says the same beside its fetch error", async () => {
+  renderZoneDetail({
+    zone: stub({
+      refreshed_at: Date.now() - 3 * 86_400_000,
+      last_error: "i/o timeout",
+      last_attempt: Date.now() - 12 * 60_000,
+      next_attempt_at: Date.now() + 90_000,
+      failures: 2,
+    }),
+    records: NS_SET,
+  });
+  await screen.findByText("ad.corp.example");
+
+  expect(screen.getByTestId("scheduler-note").textContent).toBe(
+    "next attempt in 1m · 2 failed attempts",
+  );
+});
+
+// ── Bulk TTL over the filtered set ────────────────────────────────────────
+
+/**
+ * The action is on the filter bar and only while a filter is on, because the
+ * filtered set is the only thing it can mean: with no filter it would read as
+ * "retune the whole zone", which is a much bigger claim than the button has
+ * any way to confirm.
+ */
+test("the bulk TTL action appears only while a filter narrows the list", async () => {
+  const user = userEvent.setup();
+  renderZoneDetail({
+    zone: zone(),
+    records: [
+      record({ id: 1, name: "web", rdata: "10.0.0.1" }),
+      record({ id: 2, name: "nas", rdata: "10.0.0.9" }),
+    ],
+  });
+  await screen.findByText("example.com");
+
+  expect(screen.queryByRole("button", { name: /set ttl/i })).not.toBeInTheDocument();
+
+  await user.type(screen.getByLabelText(/filter by name/i), "web");
+
+  expect(
+    await screen.findByRole("button", { name: /set ttl for 1 filtered record$/i }),
+  ).toBeInTheDocument();
+});
+
+test("setting the TTL PATCHes exactly the filtered ids", async () => {
+  const user = userEvent.setup();
+  let body: unknown;
+  server.use(
+    http.patch("/api/v1/zones/1/records", async ({ request }) => {
+      body = await request.json();
+      return new HttpResponse(null, { status: 204 });
+    }),
+  );
+  renderZoneDetail({
+    zone: zone(),
+    records: [
+      record({ id: 1, name: "web", rdata: "10.0.0.1" }),
+      record({ id: 2, name: "web", rdata: "10.0.0.2" }),
+      record({ id: 3, name: "nas", rdata: "10.0.0.9" }),
+    ],
+  });
+  await screen.findByText("example.com");
+  await user.type(screen.getByLabelText(/filter by name/i), "web");
+
+  await user.click(await screen.findByRole("button", { name: /set ttl for 2 filtered records/i }));
+  const dialog = await screen.findByRole("dialog");
+  await user.type(within(dialog).getByLabelText(/ttl/i), "60");
+  await user.click(within(dialog).getByRole("button", { name: /^set ttl$/i }));
+
+  // The ids the grid is showing, not a filter the server would have to
+  // re-derive: the row the user can see is the row that changes.
+  await waitFor(() => expect(body).toEqual({ ids: [1, 2], ttl: 60 }));
+});
+
+// The RRSet rule is the server's, and its refusal is the one worth showing:
+// a client-side copy of RFC 2181 §5.2 would be a second rule to drift.
+test("a refused bulk TTL keeps the dialog open and shows the server's reason", async () => {
+  const user = userEvent.setup();
+  server.use(
+    http.patch("/api/v1/zones/1/records", () =>
+      HttpResponse.json({ error: "records in the same RRSet must share one TTL" }, { status: 409 }),
+    ),
+  );
+  const errorSpy = vi.spyOn(toast, "error");
+  renderZoneDetail({
+    zone: zone(),
+    records: [
+      record({ id: 1, name: "web", rdata: "10.0.0.1" }),
+      record({ id: 2, name: "web", rdata: "10.0.0.2" }),
+    ],
+  });
+  await screen.findByText("example.com");
+  await user.type(screen.getByLabelText(/filter by name/i), "web");
+  await user.click(await screen.findByRole("button", { name: /set ttl for 2 filtered records/i }));
+  const dialog = await screen.findByRole("dialog");
+  await user.type(within(dialog).getByLabelText(/ttl/i), "60");
+  await user.click(within(dialog).getByRole("button", { name: /^set ttl$/i }));
+
+  await waitFor(() =>
+    expect(errorSpy).toHaveBeenCalledWith("records in the same RRSet must share one TTL"),
+  );
+  expect(screen.getByRole("dialog")).toBeInTheDocument();
+});
+
+// A secondary's records are its primary's, and the server 409s every write
+// into one — so the control that would produce that 409 is not drawn, the
+// same rule the add and edit controls already follow.
+test("a zone whose records are read-only offers no bulk TTL", async () => {
+  renderZoneDetail({
+    zone: secondary(),
+    records: [record({ id: 1, zone_id: 1, name: "web", rdata: "10.0.0.1" })],
+  });
+  await screen.findByText("e412.in");
+
+  expect(screen.queryByRole("button", { name: /set ttl/i })).not.toBeInTheDocument();
+});
+
+// ── Copy buttons ──────────────────────────────────────────────────────────
+
+/**
+ * The values on this page that get copied into somebody else's config — a
+ * primary's ACL entry, a notify target, the SOA's two names, the serial an
+ * operator is comparing against `dig` — get a button rather than a
+ * select-and-drag over mono text in a truncating cell.
+ */
+test("the SOA band's names and serial carry copy buttons", async () => {
+  const user = userEvent.setup();
+  renderZoneDetail({ zone: zone({ soa_serial: 42 }) });
+  await screen.findByText("example.com");
+
+  // The fields live inside the collapsed SOA section.
+  await user.click(screen.getByRole("button", { name: /^soa$/i }));
+
+  expect(screen.getByRole("button", { name: /copy primary ns/i })).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: /copy responsible/i })).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: /copy serial/i })).toBeInTheDocument();
+});
+
+test("allow_transfer and notify_to carry copy buttons when they have a value", async () => {
+  renderZoneDetail({
+    zone: zone({ allow_transfer: "10.0.0.0/24, key:ns2.", notify_to: "10.0.0.2:53" }),
+  });
+  await screen.findByText("example.com");
+
+  expect(screen.getByRole("button", { name: /copy allow transfer/i })).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: /copy notify targets/i })).toBeInTheDocument();
+});
+
+// Nothing to copy is not a button that copies nothing — the same rule the
+// primaries row already follows for an empty value.
+test("an empty allow_transfer and notify_to carry no copy button", async () => {
+  renderZoneDetail({ zone: zone({ allow_transfer: "", notify_to: "" }) });
+  await screen.findByText("example.com");
+
+  expect(screen.queryByRole("button", { name: /copy allow transfer/i })).not.toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: /copy notify targets/i })).not.toBeInTheDocument();
+});
+
+// ── Keyboard shortcuts ────────────────────────────────────────────────────
+
+test("/ focuses the record filter", async () => {
+  renderZoneDetail({ zone: zone(), records: [record({ id: 1 })] });
+  await screen.findByText("example.com");
+
+  fireEvent.keyDown(document.body, { key: "/" });
+
+  expect(screen.getByLabelText(/filter by name/i)).toHaveFocus();
+});
+
+test("n opens the add-record row and Esc closes it", async () => {
+  renderZoneDetail({ zone: zone(), records: [record({ id: 1 })] });
+  await screen.findByText("example.com");
+  expect(screen.queryByLabelText(/zone record name/i)).not.toBeInTheDocument();
+
+  fireEvent.keyDown(document.body, { key: "n" });
+  const name = await screen.findByLabelText(/zone record name/i);
+
+  // Esc from inside the form, which is where the focus already is: a
+  // shortcut that only worked with focus somewhere else could never close
+  // the thing it just opened.
+  fireEvent.keyDown(name, { key: "Escape" });
+  await waitFor(() => expect(screen.queryByLabelText(/zone record name/i)).not.toBeInTheDocument());
+});
+
+test("Esc closes an open edit row", async () => {
+  const user = userEvent.setup();
+  renderZoneDetail({ zone: zone(), records: [record({ id: 1, name: "bifrost" })] });
+  await screen.findByText("example.com");
+  await user.click(screen.getByRole("button", { name: /edit bifrost A 10.0.0.1/i }));
+  await screen.findByLabelText(/zone record name/i);
+
+  fireEvent.keyDown(document.body, { key: "Escape" });
+
+  await waitFor(() => expect(screen.queryByLabelText(/zone record name/i)).not.toBeInTheDocument());
+});
+
+// A shortcut that fires while someone is typing is a shortcut that eats their
+// text: "n" belongs in a record name, and "/" in a filter.
+test("the shortcuts are inert while focus is in a field", async () => {
+  const user = userEvent.setup();
+  renderZoneDetail({ zone: zone(), records: [record({ id: 1 })] });
+  await screen.findByText("example.com");
+
+  const filter = screen.getByLabelText(/filter by name/i);
+  await user.type(filter, "n");
+
+  expect(filter).toHaveValue("n");
+  expect(screen.queryByLabelText(/zone record name/i)).not.toBeInTheDocument();
+});
+
+// A zone whose records are written elsewhere has no add band to open, so the
+// shortcut that opens one must not appear to work.
+test("n does nothing on a zone whose records are read-only", async () => {
+  renderZoneDetail({
+    zone: secondary(),
+    records: [record({ id: 1, zone_id: 1 })],
+  });
+  await screen.findByText("e412.in");
+
+  fireEvent.keyDown(document.body, { key: "n" });
+
+  expect(screen.queryByLabelText(/zone record name/i)).not.toBeInTheDocument();
+});
+
+test("the filter bar says what the two keys do", async () => {
+  renderZoneDetail({ zone: zone(), records: [record({ id: 1 })] });
+  await screen.findByText("example.com");
+
+  const hint = screen.getByTestId("record-shortcuts");
+  expect(hint).toHaveTextContent("/");
+  expect(hint).toHaveTextContent(/filter/i);
+  expect(hint).toHaveTextContent("n");
+  expect(hint).toHaveTextContent(/add/i);
 });
