@@ -1093,10 +1093,16 @@ func (a *App) Forget(ctx context.Context, instanceID string) error {
 	return a.replicas.Forget(ctx, instanceID)
 }
 
-// replicaHookTimeout bounds the registry reads behind the two hooks below.
-// Both run on a DNS path — a transfer's gate, a notify pass — so a store
-// that has stopped answering costs that path two seconds and "no replicas"
-// rather than holding it.
+// replicaHookTimeout bounds the store reads behind the two hooks below. Both
+// run on a DNS path — a transfer's gate, a notify pass — so a store that has
+// stopped answering costs that path two seconds rather than holding it.
+//
+// It bounds the reads, not the wait for the registry's own lock: Register and
+// Forget hold that across a settings read and write, so a registration
+// arriving at the same moment can hold this hook up for as long as the store
+// takes to serve it (SQLite's busy timeout is five seconds). A TryLock fast
+// path would trade that for refusing a transfer that should have been
+// allowed, which is the worse of the two.
 const replicaHookTimeout = 2 * time.Second
 
 // replicaMayTransfer is zones.ReplicaAllow (§6): the request signed with the
@@ -1135,20 +1141,27 @@ func (a *App) replicaMayTransfer(keyName string, peer netip.Addr) bool {
 // intervals buys a round of retries per zone per serial bump for as long as
 // it stays away, and buys nothing: its own refresh timer collects the zone
 // when it returns.
-func (a *App) replicaNotifyTargets(ctx context.Context) []zones.NotifyTarget {
+func (a *App) replicaNotifyTargets(ctx context.Context) ([]zones.NotifyTarget, error) {
 	ctx, cancel := context.WithTimeout(ctx, replicaHookTimeout)
 	defer cancel()
+	// The registry first, and its error returned rather than logged: the
+	// targets are reconciled into zone_notifies, so a read that failed must
+	// not reach the notifier as "this main has no replicas" (see
+	// zones.ReplicaTargets). It is also the read that answers whether the
+	// key lookup below is worth making at all.
+	reps, err := a.replicas.List(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if len(reps) == 0 {
+		return nil, nil
+	}
 	// No designated key means no replica is following this main's zones at
 	// all: a replica's derived secondaries transfer under the sync key, so
 	// there is nothing an unsigned NOTIFY would usefully invite.
 	syncKey := a.replicas.SyncKeyName(ctx)
 	if syncKey == "" {
-		return nil
-	}
-	reps, err := a.replicas.List(ctx)
-	if err != nil {
-		slog.Warn("reading the registered replicas failed; notifying none of them", "err", err)
-		return nil
+		return nil, nil
 	}
 	var out []zones.NotifyTarget
 	for _, r := range reps {
@@ -1167,7 +1180,7 @@ func (a *App) replicaNotifyTargets(ctx context.Context) []zones.NotifyTarget {
 		}
 		out = append(out, ts...)
 	}
-	return out
+	return out, nil
 }
 
 // replicaIP is the address a registered replica's dns_addr names.

@@ -687,7 +687,7 @@ var syncTarget = zones.NotifyTarget{
 // replicaTargets is the WithReplicaTargets hook, standing in for the App
 // method that reads the replica registry.
 func replicaTargets(ts ...zones.NotifyTarget) zones.NotifyOption {
-	return zones.WithReplicaTargets(func(context.Context) []zones.NotifyTarget { return ts })
+	return zones.WithReplicaTargets(func(context.Context) ([]zones.NotifyTarget, error) { return ts, nil })
 }
 
 // addSecondary puts a serving secondary beside the fixture's primary, so a
@@ -760,5 +760,44 @@ func TestAReplicaAlreadyInNotifyToIsToldOnce(t *testing.T) {
 	}
 	if got := len(f.rows(t)); got != 1 {
 		t.Errorf("created %d rows for one replica, want 1", got)
+	}
+}
+
+// A registry that will not answer is not "no replicas". Read that way, the
+// pass would reconcile every primary zone against a list its replicas are
+// missing from — deleting the rows their delivery history lives in, and
+// re-notifying them from scratch when the registry came back. So the pass
+// fails, exactly as a failed zone or queue read does, having written
+// nothing.
+func TestNotifierFailsThePassWhenTheReplicaRegistryFails(t *testing.T) {
+	failing := false
+	f := newNotifierFixture(t, "10.0.0.2:53", 47,
+		zones.WithReplicaTargets(func(context.Context) ([]zones.NotifyTarget, error) {
+			if failing {
+				return nil, errors.New("sync.replicas is unreadable")
+			}
+			return []zones.NotifyTarget{syncTarget}, nil
+		}))
+	xfrKey(t, f.st, syncTarget.Key, dns.HmacSHA256)
+
+	f.pass(t)
+	if got := len(f.rows(t)); got != 2 {
+		t.Fatalf("got %d rows, want the notify_to target and the replica", got)
+	}
+	if got := f.sender.count(); got != 2 {
+		t.Fatalf("sent %d notifies, want 2", got)
+	}
+
+	failing = true
+	if err := f.n.Pass(context.Background()); err == nil {
+		// Not fatal: the rows below are the damage this guards against, and
+		// a pass that swallowed the error should report both.
+		t.Error("Pass returned nil with the registry failing: the failure was read as an empty list")
+	}
+	if got := len(f.rows(t)); got != 2 {
+		t.Errorf("got %d rows after a failed registry read, want the 2 that were already there", got)
+	}
+	if got := f.sender.count(); got != 2 {
+		t.Errorf("sent %d notifies in total, want the original 2", got)
 	}
 }

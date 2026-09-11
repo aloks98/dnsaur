@@ -2434,6 +2434,14 @@ func TestRegisteredReplicaMayTransferWithoutAnACLEntry(t *testing.T) {
 		withReplicaAllow(func(string, netip.Addr) bool { return false }))
 	xfrKey(t, g.st, syncName, dns.HmacSHA256)
 	assertRcode(t, g.exchangeSigned(t, xfrApex, syncName, dns.HmacSHA256, syncSecret, time.Now().Unix()), dns.RcodeRefused)
+
+	// An unsigned request, against a hook that admits everything it is
+	// asked about. It is never asked: a peer that presented no signature is
+	// only an address, and an address alone is what allow_transfer is for.
+	// The clause authenticates a replica by its key, so there has to be one.
+	h := newXFRFixture(t, xfrZone(""), xfrRecords(),
+		withReplicaAllow(func(string, netip.Addr) bool { return true }))
+	assertRcode(t, h.exchange(t, xfrApex, dns.TypeAXFR), dns.RcodeRefused)
 }
 
 // The implicit allow is the main handing out the zones it authors (§6). A

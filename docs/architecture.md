@@ -256,8 +256,7 @@ read:
 | Rcode | Means |
 |---|---|
 | `NOTAUTH` | dnsaur doesn't hold that zone — wrong or disabled apex, or a type (`internal`/`stub`/`forwarder`) that holds no data to send — or the request's TSIG didn't verify |
-| `REFUSED` | dnsaur holds the zone, but the peer's address or key isn't in its `allow_transfer` |
-| `REFUSED` | …unless the zone is a `primary` and the peer is a registered replica signed with the sync key, which config sync admits beside the ACL rather than by rewriting it — `docs/superpowers/specs/2026-09-11-config-sync-design.md` §6 |
+| `REFUSED` | dnsaur holds the zone, but the peer's address or key isn't in its `allow_transfer` — unless the zone is a `primary` and the peer is a registered replica signed with the sync key, which config sync admits beside the ACL rather than by rewriting it (`docs/superpowers/specs/2026-09-11-config-sync-design.md` §6) |
 | `SERVFAIL` | the zone is a `secondary` dnsaur can't currently vouch for (nothing transferred yet, or past `expires_at`), or the server is already at its concurrent-transfer limit |
 | `NOTIMP` | the AXFR arrived over UDP, which RFC 5936 §4.2 leaves undefined. Checked *after* every row above, so a peer outside the ACL is still told `REFUSED` rather than told about the transport |
 | `FORMERR` | the query isn't a well-formed transfer request — in practice, a class other than IN. The other half of that rule, a question count other than one, is answered `FORMERR` by miekg's own accept function before dnsaur sees the message at all |

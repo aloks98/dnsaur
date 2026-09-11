@@ -121,7 +121,12 @@ func WithNotifySender(s Sender) NotifyOption {
 // It is asked once per pass rather than once per zone — the answer is the
 // same for every zone, and a pass is the unit the rest of this file already
 // takes its snapshots in.
-type ReplicaTargets func(ctx context.Context) []NotifyTarget
+//
+// An error fails the whole pass. It must never be reported as an empty list:
+// the targets are reconciled into zone_notifies, so a registry that will not
+// answer would delete every replica's row and its delivery history with it —
+// the one failure mode a durable queue exists to avoid.
+type ReplicaTargets func(ctx context.Context) ([]NotifyTarget, error)
 
 // WithReplicaTargets installs that clause. Production passes it on a main;
 // without it a zone tells exactly what its notify_to names.
@@ -226,8 +231,9 @@ func (n *Notifier) Wake() {
 // is a zone being deleted, which takes them with it (ON DELETE CASCADE), and
 // a zone that no longer exists is not in `all` either.
 //
-// The error reported is a failure to *read* — the zone list, or the queue
-// itself. A zone whose notify_to will not parse, or whose reconcile failed,
+// The error reported is a failure to *read* — the zone list, the queue
+// itself, or the replica registry every primary zone's targets are widened
+// from. A zone whose notify_to will not parse, or whose reconcile failed,
 // is recorded against that zone and does not fail the pass, because one bad
 // zone must not stop the others being told.
 func (n *Notifier) Pass(ctx context.Context) error {
@@ -241,7 +247,12 @@ func (n *Notifier) Pass(ctx context.Context) error {
 	// sixteen identical answers.
 	var replicas []NotifyTarget
 	if n.replicaTargets != nil {
-		replicas = n.replicaTargets(ctx)
+		var err error
+		if replicas, err = n.replicaTargets(ctx); err != nil {
+			// Before the queue is read and long before anything is written:
+			// see ReplicaTargets for why this may not become an empty list.
+			return fmt.Errorf("reading the registered replicas: %w", err)
+		}
 	}
 
 	// One query, before anything is written: what every zone's rows are now.

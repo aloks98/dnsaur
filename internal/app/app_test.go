@@ -2,11 +2,14 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1783,5 +1786,110 @@ func TestReloadSettingsRebuildsTheForwarder(t *testing.T) {
 	}
 	if a.fwd.forwarder() == before {
 		t.Fatal("ReloadSettings left the previous forwarder serving")
+	}
+}
+
+// TestAppAnswersTheReplicaHooks pins the two hooks the zones layer asks §6's
+// questions through: who may transfer a primary zone without an
+// allow_transfer entry, and who every primary zone notifies.
+//
+// The registry is the real one, read through the settings row it writes, so
+// what these assert is the whole path from a registration to a transfer's
+// gate.
+func TestAppAnswersTheReplicaHooks(t *testing.T) {
+	ctx := context.Background()
+	a := newTestApp(t)
+	syncKey := dns.CanonicalName("sync.example")
+	id, err := a.Store().TSIGKeys().Create(ctx, store.TSIGKey{
+		Name: syncKey, Algorithm: dns.HmacSHA256,
+		Secret:    "dGhlLXN5bmMta2V5LXNlY3JldC1vZi1zb21lLWxlbmd0aA==",
+		CreatedAt: time.Now().UnixMilli(),
+	})
+	if err != nil {
+		t.Fatalf("TSIGKeys().Create: %v", err)
+	}
+	mustSetting(t, a, "sync.tsig_key_id", strconv.FormatInt(id, 10))
+
+	// Three registrations, written as the registry stores them so one can be
+	// backdated past the staleness cutoff (three intervals) without waiting
+	// for it. The hostname one is the case the transfer gate deliberately
+	// cannot answer: localhost is 127.0.0.1 to everything that resolves, and
+	// the gate does not resolve.
+	now := time.Now().UnixMilli()
+	registerReplicas(t, a, map[string]api.Replica{
+		"r-ip":    {DNSAddr: "10.0.0.6:53", LastSeen: now},
+		"r-host":  {DNSAddr: "localhost:53", LastSeen: now},
+		"r-stale": {DNSAddr: "10.0.0.9:53", LastSeen: now - int64(10*time.Minute/time.Millisecond)},
+	})
+
+	ip := netip.MustParseAddr("10.0.0.6")
+	if !a.replicaMayTransfer(syncKey, ip) {
+		t.Error("a registered replica signing with the sync key was not admitted")
+	}
+	// Stale is not a reason to refuse data: a box catching up after an
+	// outage is exactly the one that looks stale.
+	if !a.replicaMayTransfer(syncKey, netip.MustParseAddr("10.0.0.9")) {
+		t.Error("a stale replica was refused its transfer")
+	}
+	if a.replicaMayTransfer(syncKey, netip.MustParseAddr("127.0.0.1")) {
+		t.Error("a replica registered by hostname matched an address: the gate resolved a name")
+	}
+	if a.replicaMayTransfer(dns.CanonicalName("other.example"), ip) {
+		t.Error("a key the main has not designated was admitted")
+	}
+	if a.replicaMayTransfer("", ip) {
+		t.Error("an unsigned request's empty key name was admitted")
+	}
+
+	targets, err := a.replicaNotifyTargets(ctx)
+	if err != nil {
+		t.Fatalf("replicaNotifyTargets: %v", err)
+	}
+	got := map[string]string{}
+	for _, tgt := range targets {
+		got[tgt.Addr()] = tgt.Key
+	}
+	// The hostname is a usable notify target — it is resolved at send time,
+	// where a lookup is allowed — and the stale one is not: notifying a box
+	// that has been silent for three intervals only buys retries.
+	if len(got) != 2 || got["10.0.0.6:53"] != syncKey || got["localhost:53"] != syncKey {
+		t.Fatalf("notify targets = %v, want 10.0.0.6:53 and localhost:53 under %s", got, syncKey)
+	}
+
+	// With no key designated there is nothing to sign with, and nothing on
+	// the replica side that follows this main's zones.
+	mustSetting(t, a, "sync.tsig_key_id", "0")
+	if a.replicaMayTransfer(syncKey, ip) {
+		t.Error("a transfer was admitted with no sync key designated")
+	}
+	targets, err = a.replicaNotifyTargets(ctx)
+	if err != nil {
+		t.Fatalf("replicaNotifyTargets: %v", err)
+	}
+	if len(targets) != 0 {
+		t.Errorf("notify targets = %v with no sync key designated, want none", targets)
+	}
+}
+
+// registerReplicas writes the registry's settings row directly, which is how
+// a replica's last_seen can be put in the past: Register dates it itself, on
+// purpose, so that a clock skew cannot decide whether a box looks stale.
+func registerReplicas(t *testing.T, a *App, reps map[string]api.Replica) {
+	t.Helper()
+	for id, r := range reps {
+		r.InstanceID = id
+		reps[id] = r
+	}
+	raw, err := json.Marshal(reps)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	mustSetting(t, a, "sync.replicas", string(raw))
+}
+
+func mustSetting(t *testing.T, a *App, key, value string) {
+	t.Helper()
+	if err := a.Store().Settings().SetInternal(context.Background(), key, value); err != nil {
+		t.Fatalf("SetInternal(%s): %v", key, err)
 	}
 }
