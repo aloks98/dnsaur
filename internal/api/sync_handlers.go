@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"strconv"
 	"time"
@@ -205,7 +206,8 @@ func (s *Server) handleReplicaRegister(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusBadRequest, "instance_id required")
 		return
 	}
-	if err := hostPort(body.DNSAddr); err != nil {
+	addr := withClientHost(body.DNSAddr, s.clientIP(r))
+	if err := hostPort(addr); err != nil {
 		errJSON(w, http.StatusBadRequest, "dns_addr "+err.Error())
 		return
 	}
@@ -215,7 +217,7 @@ func (s *Server) handleReplicaRegister(w http.ResponseWriter, r *http.Request) {
 	}
 	err := s.deps.Sync.Register(r.Context(), Replica{
 		InstanceID:     body.InstanceID,
-		DNSAddr:        body.DNSAddr,
+		DNSAddr:        addr,
 		VersionApplied: body.VersionApplied,
 		LastSeen:       time.Now().UnixMilli(),
 	})
@@ -224,6 +226,27 @@ func (s *Server) handleReplicaRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// withClientHost fills in a registration whose dns_addr names a port and no
+// host, which is what a replica sends when its dns_listen is the default
+// ":53" — a wildcard is what it binds, and it has no way to know which of its
+// addresses this main can reach it on.
+//
+// The connection does know: the request arrived from that box. clientIP is
+// the same address the login throttle attributes a request to, so it is the
+// forwarded one only when the request came from a trusted proxy — which is
+// also the only case where the socket's peer is not the replica itself.
+//
+// Anything else is returned untouched, including a value that names neither:
+// filling a host into something that is not an address would turn a typo
+// into a plausible-looking entry the operator never wrote.
+func withClientHost(addr, clientIP string) string {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil || host != "" || clientIP == "" {
+		return addr
+	}
+	return net.JoinHostPort(clientIP, port)
 }
 
 func (s *Server) handleReplicaForget(w http.ResponseWriter, r *http.Request) {

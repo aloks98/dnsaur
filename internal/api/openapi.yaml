@@ -4276,9 +4276,12 @@ paths:
                 dns_addr:
                   type: string
                   description: >
-                    host:port where this replica answers DNS. The host is
-                    required -- an empty host means "every interface" to
-                    something binding a socket, and names nothing to dial.
+                    host:port where this replica answers DNS. A value with no
+                    host (":53", which is what a replica on the default
+                    dns_listen has to send) is completed with the address
+                    this request arrived from, since that is where this main
+                    can reach that box; anything else is taken as sent, and a
+                    value that is not an address at all is refused.
                 version_applied: { type: integer, format: int64 }
               example: { instance_id: "V1StGXR8Z5jdHi6BmyT", dns_addr: "10.0.0.6:53", version_applied: 412 }
       responses:

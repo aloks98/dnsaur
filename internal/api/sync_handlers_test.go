@@ -159,7 +159,7 @@ func TestRegisterReplicaValidatesAddr(t *testing.T) {
 
 	for _, bad := range []string{
 		`{"instance_id":"r1","dns_addr":"not-an-addr","version_applied":3}`,
-		`{"instance_id":"r1","dns_addr":":53","version_applied":3}`,
+		`{"instance_id":"r1","dns_addr":"","version_applied":3}`,
 		`{"instance_id":"","dns_addr":"10.0.0.6:53","version_applied":3}`,
 	} {
 		if w := tokenReq(t, h, "POST", "/api/v1/sync/replicas", bad, write); w.Code != http.StatusBadRequest {
@@ -188,6 +188,35 @@ func TestRegisterReplicaValidatesAddr(t *testing.T) {
 	}
 	if len(fs.forgotten) != 1 || fs.forgotten[0] != "r1" {
 		t.Errorf("forgotten = %v", fs.forgotten)
+	}
+}
+
+// TestRegisterReplicaFillsTheHostFromTheConnection: a replica whose
+// dns_listen is the default ":53" has no address to name, and the request it
+// registers over came from exactly the address the main can reach it on.
+// Without this, the default install registers something the main's own
+// validator refuses, and never gets the implicit transfer allow (§6).
+func TestRegisterReplicaFillsTheHostFromTheConnection(t *testing.T) {
+	srv, s, _ := testServer(t)
+	fs := &fakeSync{}
+	srv.deps.Sync = fs
+	h := srv.Handler()
+	_ = login(t, srv, s)
+	write := apiToken(t, srv, "write")
+
+	req := httptest.NewRequest("POST", "/api/v1/sync/replicas",
+		strings.NewReader(`{"instance_id":"r1","dns_addr":":53","version_applied":3}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+write)
+	req.RemoteAddr = "10.0.0.6:41234"
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNoContent || len(fs.registered) != 1 {
+		t.Fatalf("register: %d %+v", w.Code, fs.registered)
+	}
+	if got := fs.registered[0].DNSAddr; got != "10.0.0.6:53" {
+		t.Fatalf("dns_addr = %q, want the connection's address on the port it sent", got)
 	}
 }
 

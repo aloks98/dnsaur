@@ -1090,11 +1090,13 @@ turns on the implicit transfer allow — an AXFR for a `primary` zone is
 accepted when it verified under the main's `sync.tsig_key_id` **and** came
 from a registered replica's `dns_addr` — and adds that address as a NOTIFY
 target for every primary zone. Neither edits an ACL, so `allow_transfer`
-still says exactly what the operator wrote. Errors: 400 `invalid json`, 400
-`instance_id required`, 400 `dns_addr must be a host:port address: ...` /
-`dns_addr must name a host, not just a port` / `dns_addr port must be
-numeric, 1-65535`, 503 `sync unavailable` (no sync subsystem is running on
-this instance).
+still says exactly what the operator wrote. A `dns_addr` with no host
+(`:53` — what a replica listening on every interface has to send) is
+completed with the address the request arrived from, which is where this
+main can reach that box. Errors: 400 `invalid json`, 400 `instance_id
+required`, 400 `dns_addr must be a host:port address: ...` / `dns_addr must
+name a host, not just a port` / `dns_addr port must be numeric, 1-65535`,
+503 `sync unavailable` (no sync subsystem is running on this instance).
 
 `last_seen` is stamped by the main, never sent by the replica — a clock skew
 on the replica must not decide whether it looks stale. A replica not seen for
