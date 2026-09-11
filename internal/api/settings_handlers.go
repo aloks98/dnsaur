@@ -340,24 +340,17 @@ func (s *Server) handleSettingsGet(w http.ResponseWriter, r *http.Request) {
 		storeErr(w, err)
 		return
 	}
-	// The rollup's watermark and the pause state are bookkeeping, not
-	// configuration, and nothing may edit them — but they are named by key,
-	// not by prefix: stats.* also holds stats.retention_days and blocking.*
-	// holds blocking.mode and blocking.ttl, which are ordinary settings the
-	// screen has to be able to read.
-	//
-	// sync.replicas is the same kind of bookkeeping as the watermark: the
-	// main's registry of who pulls from it, written by registrations rather
-	// than by anyone editing settings, and reported by GET /sync/status in
-	// a shape the screen can use.
+	// Bookkeeping is not configuration and nothing may edit it — the rollup
+	// watermark, the pause state, and the sync subsystem's notes about
+	// replicas and pulls. internalSetting names them one by one rather than
+	// by prefix, and says why.
 	//
 	// sync.token is editable and is still stripped, for the opposite reason:
 	// it is the credential this instance pulls its config with, and a GET
 	// that hands a credential back to everyone who can read settings is the
 	// leak #54 closed for TSIG secrets. The screen shows set/not set instead.
 	for k := range all {
-		if strings.HasPrefix(k, "instance.") || k == store.StatsWatermarkKey ||
-			k == filter.PausesKey || k == syncTokenSetting || k == syncReplicasSetting {
+		if strings.HasPrefix(k, "instance.") || internalSetting(k) || k == syncTokenSetting {
 			delete(all, k)
 		}
 	}

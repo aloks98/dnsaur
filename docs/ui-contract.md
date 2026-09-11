@@ -290,8 +290,13 @@ plain 401.
 
 #### `GET /api/v1/settings`
 A flat object; **every value is a string**, including numbers. Keys prefixed
-`instance.` are stripped, as is `stats.watermark` by name — the rollup's own
-bookkeeping. `stats.retention_days` is an ordinary setting and is returned.
+`instance.` are stripped, as are the bookkeeping rows by name —
+`stats.watermark`, `blocking.pauses`, `sync.replicas`, and a replica's
+`sync.applied_version`, `sync.applied_at`, `sync.last_pull_at` and
+`sync.last_error` — and `sync.token`, which is a credential. `PUT` refuses
+all of them but the token. `stats.retention_days` and
+`sync.interval_seconds` share those prefixes, are ordinary settings, and are
+returned.
 
 ```json
 {

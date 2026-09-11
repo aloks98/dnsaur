@@ -8,6 +8,9 @@ import (
 	"net/http"
 	"strconv"
 	"time"
+
+	"github.com/aloks98/dnsaur/internal/filter"
+	"github.com/aloks98/dnsaur/internal/store"
 )
 
 // Syncer is what this package needs from the sync subsystem: a replica's
@@ -173,6 +176,14 @@ const (
 	// bookkeeping, not configuration, and stripped from GET /settings for
 	// the reason the rollup watermark is.
 	syncReplicasSetting = "sync.replicas"
+	// The other half of that bookkeeping, written by a replica about its
+	// own pulls (internal/confsync). Same treatment, same reason: the Sync
+	// band reads them from GET /sync/status, which reports them in a shape
+	// the screen can use, and no PUT may write them.
+	syncAppliedVersionSetting = "sync.applied_version"
+	syncAppliedAtSetting      = "sync.applied_at"
+	syncLastPullAtSetting     = "sync.last_pull_at"
+	syncLastErrorSetting      = "sync.last_error"
 )
 
 func (s *Server) handleSyncBundle(w http.ResponseWriter, r *http.Request) {
@@ -206,6 +217,9 @@ func (s *Server) handleReplicaRegister(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusBadRequest, "instance_id required")
 		return
 	}
+	// clientIP falls back to RemoteAddr verbatim when that is not an address
+	// at all (a unix socket), and a dns_addr completed from it then fails
+	// hostPort below — closed, with the 400 saying so, never registered.
 	addr := withClientHost(body.DNSAddr, s.clientIP(r))
 	if err := hostPort(addr); err != nil {
 		errJSON(w, http.StatusBadRequest, "dns_addr "+err.Error())
@@ -247,6 +261,24 @@ func withClientHost(addr, clientIP string) string {
 		return addr
 	}
 	return net.JoinHostPort(clientIP, port)
+}
+
+// internalSetting reports whether a row in the settings table is
+// bookkeeping rather than configuration: written by the server about itself,
+// editable by nobody (none of these is in editableSettings, so PUT answers
+// "setting not editable"), and reported — where it is reported at all — by
+// an endpoint of its own.
+//
+// Named by key rather than by prefix, because every one of these prefixes
+// also holds real settings: stats.retention_days, blocking.mode,
+// sync.interval_seconds.
+func internalSetting(key string) bool {
+	switch key {
+	case store.StatsWatermarkKey, filter.PausesKey, syncReplicasSetting,
+		syncAppliedVersionSetting, syncAppliedAtSetting, syncLastPullAtSetting, syncLastErrorSetting:
+		return true
+	}
+	return false
 }
 
 func (s *Server) handleReplicaForget(w http.ResponseWriter, r *http.Request) {

@@ -203,8 +203,10 @@ Full parameter/response detail lives in `internal/api/openapi.yaml`
   `POST /auth/totp/start`, `POST /auth/totp/confirm`,
   `POST /auth/totp/disable`.
 - **Settings** — `GET /settings` (flat key→string map of all editable
-  settings; `instance.*` keys and `stats.watermark` are internal and
-  omitted),
+  settings; `instance.*` keys, the bookkeeping rows — `stats.watermark`,
+  `blocking.pauses`, `sync.replicas`, `sync.applied_version`,
+  `sync.applied_at`, `sync.last_pull_at`, `sync.last_error` — and the
+  write-only `sync.token` are omitted),
   `PUT /settings` (`{key, value}` for one, or a flat
   `{"<key>": "<value>", ...}` map for several at once; editable keys:
   `upstreams`, `upstream.strategy`, `blocking.mode`, `blocking.ttl`,
