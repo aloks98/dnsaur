@@ -2,7 +2,9 @@ package store
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"maps"
@@ -226,8 +228,8 @@ const (
 // sequences behind them have to be advanced on postgres.
 var syncedTables = []string{"groups", "clients", "lists", "rules", "tsig_keys", "zones"}
 
-// parkedKeys are the unique natural keys a bundle rewrites, and parkKeys is
-// what stops two of them *swapping* from wedging a replica.
+// parkedKeys are the unique natural keys a bundle rewrites, and parking them
+// is what stops two of them *swapping* from wedging a replica.
 //
 // A swap is not a delete-and-recreate, so pruning first does not help: a
 // matcher moved from one client to another while both rows survive leaves the
@@ -236,19 +238,22 @@ var syncedTables = []string{"groups", "clients", "lists", "rules", "tsig_keys", 
 // same bundle fails in exactly the same place, so the replica never applies
 // that config again.
 //
-// Each of these columns is therefore parked on a value derived from the row's
-// own id before any upsert runs. It is one statement per table rather than a
-// predicate per row, and that is the stronger version rather than the lazier
-// one: every surviving row is parked, so no real key is left in the column to
-// collide with, and no two parked values can match because ids do not. (A
-// group genuinely named "import:3" is a value, so a per-row park that skipped
-// unchanged rows could still collide with it.) The upserts then write the
-// bundle's values into a column holding nothing but parked names, and the
-// bundle's own values are unique because the main's indexes said so.
+// Each of these columns is therefore emptied of real values before any upsert
+// runs: every surviving row is parked on parkedKey(nonce, id), one statement
+// per table. Rows that survive the prune are exactly the bundle's, so each
+// parked value is overwritten before the commit — except the built-in zones,
+// which the prune exempts and this must too, or an import would rename
+// localhost.
 //
-// Rows that survive the prune are exactly the bundle's, so every parked value
-// is overwritten before the commit — except the built-in zones, which the
-// prune exempts and this must too, or an import would rename localhost.
+// The nonce is why it is generated per import rather than being a constant
+// like "import:". Parked values cannot collide with each other, because ids
+// do not, but they *can* collide with a value the bundle is about to write: a
+// group named "import:2" beside a group of id 2 is a legal configuration, and
+// upserting the first one would land on the second one's sentinel before the
+// second one is reached. Three of these columns could not hold such a value,
+// but groups.name is free text and the mechanism must not rest on that — so
+// the sentinel is made impossible to type instead, by carrying 128 bits of
+// randomness drawn this instant.
 var parkedKeys = []struct{ table, column, where string }{
 	{table: "groups", column: "name"},
 	{table: "clients", column: "matcher"},
@@ -314,8 +319,12 @@ func (s *sqlStore) ImportBundle(ctx context.Context, b Bundle) error {
 
 	// Every surviving row's unique natural key goes out of the way before
 	// anything is written back into it — see parkedKeys.
+	nonce, err := importNonce()
+	if err != nil {
+		return err
+	}
 	for _, park := range parkedKeys {
-		if _, err := tx.ExecContext(ctx, `UPDATE `+park.table+` SET `+park.column+` = 'import:' || id`+park.where); err != nil {
+		if _, err := tx.ExecContext(ctx, `UPDATE `+park.table+` SET `+park.column+` = '`+nonce+`:' || id`+park.where); err != nil {
 			return fmt.Errorf("parking %s.%s: %w", park.table, park.column, err)
 		}
 	}
@@ -492,6 +501,22 @@ func (s *sqlStore) pruneMissing(ctx context.Context, tx *sql.Tx, table string, k
 func (s *sqlStore) execTx(ctx context.Context, tx *sql.Tx, q string, args ...any) error {
 	_, err := tx.ExecContext(ctx, s.q(q), args...)
 	return wrapDBErr(err)
+}
+
+// importNonce is one import's share of randomness, 128 bits as hex. See
+// parkedKeys for what it is for.
+//
+// Hex is the point of the encoding, not decoration: the nonce goes into the
+// parking statement as a literal (it is concatenated with the row's id in
+// SQL, and a bound parameter beside `|| id` has no unambiguous type on
+// postgres), so it has to be drawn from an alphabet that cannot close a
+// string. [0-9a-f] is.
+func importNonce() (string, error) {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", fmt.Errorf("import nonce: %w", err)
+	}
+	return hex.EncodeToString(b[:]), nil
 }
 
 // resetSequenceSQL sets table's id sequence to the largest id in it. The

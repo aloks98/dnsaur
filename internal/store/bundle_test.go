@@ -539,6 +539,104 @@ func TestImportBundleSurvivesAUniqueKeySwap(t *testing.T) {
 	})
 }
 
+// TestImportBundleSurvivesASentinelShapedName is the other half of the swap
+// problem, and the reason the parking sentinel carries a nonce rather than a
+// constant prefix. Parked values cannot collide with each other, but they can
+// collide with a value the bundle is about to write: a group named after the
+// sentinel another row is parked on is a legal configuration, and under a
+// constant prefix the upsert lands on it before that row is reached — the
+// same permanent wedge, reached by typing a name.
+func TestImportBundleSurvivesASentinelShapedName(t *testing.T) {
+	forEachDriver(t, func(t *testing.T, s Store) {
+		ctx := t.Context()
+		one, two := newFixture(), newFixture()
+		g1, err := s.Clients().AddGroup(ctx, one.group)
+		if err != nil {
+			t.Fatal(err)
+		}
+		g2, err := s.Clients().AddGroup(ctx, two.group)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Exactly what a constant "import:" prefix would park g2 on, sitting
+		// on g2 itself as an ordinary name — groups.name is free text.
+		sentinel := fmt.Sprintf("import:%d", g2)
+		if err := s.Clients().RenameGroup(ctx, g2, sentinel); err != nil {
+			t.Fatal(err)
+		}
+
+		b, err := s.ExportBundle(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// The main moved that name onto the lower id, which is upserted
+		// first, while g2 is still parked.
+		for i := range b.Groups {
+			switch b.Groups[i].ID {
+			case g1:
+				b.Groups[i].Name = sentinel
+			case g2:
+				b.Groups[i].Name = two.group
+			}
+		}
+		if err := s.ImportBundle(ctx, b); err != nil {
+			t.Fatalf("import of a bundle whose value matches a parking sentinel: %v", err)
+		}
+
+		groups, err := s.Clients().Groups(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		names := map[int64]string{}
+		for _, g := range groups {
+			names[g.ID] = g.Name
+		}
+		if names[g1] != sentinel || names[g2] != two.group {
+			t.Errorf("group names after the import = %q / %q, want %q / %q", names[g1], names[g2], sentinel, two.group)
+		}
+	})
+}
+
+// TestImportBundleSurvivesATSIGKeyNameSwap is the swap on a third table, put
+// here because all five parked columns share one code path and a swap of a
+// key name is the one an operator is most likely to perform for real —
+// rotating which key a pair of zones transfers under.
+func TestImportBundleSurvivesATSIGKeyNameSwap(t *testing.T) {
+	forEachDriver(t, func(t *testing.T, s Store) {
+		ctx := t.Context()
+		one, two := newFixture(), newFixture()
+		k1, err := s.TSIGKeys().Create(ctx, TSIGKey{Name: one.key, Algorithm: "hmac-sha256.", Secret: "c2VjcmV0"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		k2, err := s.TSIGKeys().Create(ctx, TSIGKey{Name: two.key, Algorithm: "hmac-sha512.", Secret: "b3RoZXI="})
+		if err != nil {
+			t.Fatal(err)
+		}
+		b, err := s.ExportBundle(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i := range b.TSIGKeys {
+			switch b.TSIGKeys[i].ID {
+			case k1:
+				b.TSIGKeys[i].Name = two.key
+			case k2:
+				b.TSIGKeys[i].Name = one.key
+			}
+		}
+		if err := s.ImportBundle(ctx, b); err != nil {
+			t.Fatalf("import of a bundle that swaps two TSIG key names: %v", err)
+		}
+		if k, ok, err := s.TSIGKeys().Get(ctx, k1); err != nil || !ok || k.Name != two.key || k.Secret != "c2VjcmV0" {
+			t.Errorf("key %d after the swap = %+v (ok %v, err %v), want name %q with its own secret", k1, k, ok, err, two.key)
+		}
+		if k, ok, err := s.TSIGKeys().Get(ctx, k2); err != nil || !ok || k.Name != one.key || k.Secret != "b3RoZXI=" {
+			t.Errorf("key %d after the swap = %+v (ok %v, err %v), want name %q with its own secret", k2, k, ok, err, one.key)
+		}
+	})
+}
+
 // TestLocalSettingKey pins §4.3's table. It is the one place that decides
 // what never leaves an instance, and the cost of a wrong answer is a replica
 // listening on the main's certificate paths or pointing at itself as its own
