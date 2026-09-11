@@ -208,10 +208,14 @@ const (
 	// Definition columns only. soa_serial, refreshed_at, expires_at and the
 	// last_* pairs are transfer state: what this box pulled and when, which
 	// no config pull may revise — a serving secondary must not be made to
-	// forget what it transferred (§5). soa_serial and the two timestamps are
-	// in the INSERT, because a row being created here has no transfer state
-	// to keep, but never in DO UPDATE; the last_* columns are in neither,
-	// exactly as AddZone leaves them to NoteTransferAttempt.
+	// forget what it transferred (§5).
+	//
+	// So DO UPDATE names none of them. The INSERT names soa_serial (with
+	// created_at, and the definition columns), because a row being created
+	// here has no transfer state to keep and the serial is where its first
+	// comparison starts; refreshed_at, expires_at and the last_* columns are
+	// in neither, left to default for a new row exactly as AddZone leaves
+	// them to the transfer path and NoteTransferAttempt.
 	upsertZoneSQL = `INSERT INTO zones (id, name, type, enabled, soa_ns, soa_mbox, soa_serial, soa_refresh, soa_retry, soa_expire, soa_minimum, soa_ttl, primaries, tsig_key_id, allow_transfer, notify_to, forward_to, created_at, modified_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT (id) DO UPDATE SET name = excluded.name, type = excluded.type, enabled = excluded.enabled, soa_ns = excluded.soa_ns, soa_mbox = excluded.soa_mbox, soa_refresh = excluded.soa_refresh, soa_retry = excluded.soa_retry, soa_expire = excluded.soa_expire, soa_minimum = excluded.soa_minimum, soa_ttl = excluded.soa_ttl, primaries = excluded.primaries, tsig_key_id = excluded.tsig_key_id, allow_transfer = excluded.allow_transfer, notify_to = excluded.notify_to, forward_to = excluded.forward_to, modified_at = excluded.modified_at`
@@ -221,6 +225,37 @@ const (
 // syncedTables are the tables whose ids come from the main, in the order the
 // sequences behind them have to be advanced on postgres.
 var syncedTables = []string{"groups", "clients", "lists", "rules", "tsig_keys", "zones"}
+
+// parkedKeys are the unique natural keys a bundle rewrites, and parkKeys is
+// what stops two of them *swapping* from wedging a replica.
+//
+// A swap is not a delete-and-recreate, so pruning first does not help: a
+// matcher moved from one client to another while both rows survive leaves the
+// row-by-row upsert hitting the unique index halfway through. The transaction
+// rolls back, and — this is the part that matters — every later poll of the
+// same bundle fails in exactly the same place, so the replica never applies
+// that config again.
+//
+// Each of these columns is therefore parked on a value derived from the row's
+// own id before any upsert runs. It is one statement per table rather than a
+// predicate per row, and that is the stronger version rather than the lazier
+// one: every surviving row is parked, so no real key is left in the column to
+// collide with, and no two parked values can match because ids do not. (A
+// group genuinely named "import:3" is a value, so a per-row park that skipped
+// unchanged rows could still collide with it.) The upserts then write the
+// bundle's values into a column holding nothing but parked names, and the
+// bundle's own values are unique because the main's indexes said so.
+//
+// Rows that survive the prune are exactly the bundle's, so every parked value
+// is overwritten before the commit — except the built-in zones, which the
+// prune exempts and this must too, or an import would rename localhost.
+var parkedKeys = []struct{ table, column, where string }{
+	{table: "groups", column: "name"},
+	{table: "clients", column: "matcher"},
+	{table: "lists", column: "url"},
+	{table: "tsig_keys", column: "name"},
+	{table: "zones", column: "name", where: ` WHERE type <> '` + zoneTypeInternal + `'`},
+}
 
 // ImportBundle replaces every synced table with b's rows, keeping b's ids, in
 // one transaction, and bumps config_version once. Partial application is not
@@ -275,6 +310,14 @@ func (s *sqlStore) ImportBundle(ctx context.Context, b Bundle) error {
 	// disagreeing with nothing to say so, so it is refused.
 	if err := s.refuseBuiltinCollision(ctx, tx, zoneIDs); err != nil {
 		return err
+	}
+
+	// Every surviving row's unique natural key goes out of the way before
+	// anything is written back into it — see parkedKeys.
+	for _, park := range parkedKeys {
+		if _, err := tx.ExecContext(ctx, `UPDATE `+park.table+` SET `+park.column+` = 'import:' || id`+park.where); err != nil {
+			return fmt.Errorf("parking %s.%s: %w", park.table, park.column, err)
+		}
 	}
 
 	// Upserts run parents before children, so a client, rule or assignment

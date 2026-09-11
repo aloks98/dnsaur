@@ -396,6 +396,149 @@ func TestImportBundleLeavesLocalSettingsAlone(t *testing.T) {
 	})
 }
 
+// TestImportBundleKeepsAZonesTransferState is §5's "a zone whose derived
+// secondary already exists keeps its transfer state". A config pull that
+// reverted soa_serial, refreshed_at or expires_at would make a serving
+// secondary forget what it transferred — and a serial pushed backwards is the
+// one inconsistency nothing downstream can detect.
+func TestImportBundleKeepsAZonesTransferState(t *testing.T) {
+	forEachDriver(t, func(t *testing.T, s Store) {
+		ctx := t.Context()
+		f := newFixture()
+		zid, err := s.Zones().AddZone(ctx, Zone{Name: f.zone, Type: "secondary", Enabled: true, Primaries: "10.0.0.1:53"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		// The bundle is taken before this box transfers anything, so it
+		// carries the zone's starting state — serial 1, never refreshed.
+		b, err := s.ExportBundle(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// A transfer lands, through the writers that own these columns.
+		z, err := s.Zones().Zone(ctx, zid)
+		if err != nil {
+			t.Fatal(err)
+		}
+		const (
+			serial      = 2026091101
+			refreshedAt = 1757580000000
+			expiresAt   = 1758184800000
+		)
+		z.SOASerial, z.RefreshedAt, z.ExpiresAt, z.ModifiedAt = serial, refreshedAt, expiresAt, refreshedAt
+		if err := s.Zones().UpdateZone(ctx, z); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Zones().NoteTransferAttempt(ctx, zid, refreshedAt, "primary refused the key"); err != nil {
+			t.Fatal(err)
+		}
+
+		// Meanwhile the main edited a definition column, and that is the
+		// only thing the import may move.
+		for i := range b.Zones {
+			if b.Zones[i].ID == zid {
+				b.Zones[i].NotifyTo = "10.0.0.9:53"
+			}
+		}
+		if err := s.ImportBundle(ctx, b); err != nil {
+			t.Fatal(err)
+		}
+
+		after, err := s.Zones().Zone(ctx, zid)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if after.NotifyTo != "10.0.0.9:53" {
+			t.Errorf("notify_to after the import = %q, want the bundle's definition", after.NotifyTo)
+		}
+		if after.SOASerial != serial || after.RefreshedAt != refreshedAt || after.ExpiresAt != expiresAt {
+			t.Errorf("transfer state after the import = serial %d, refreshed %d, expires %d; want %d/%d/%d untouched",
+				after.SOASerial, after.RefreshedAt, after.ExpiresAt, serial, refreshedAt, expiresAt)
+		}
+		if after.LastError != "primary refused the key" || after.LastAttempt != refreshedAt {
+			t.Errorf("last attempt after the import = %q at %d, want the failure this box recorded", after.LastError, after.LastAttempt)
+		}
+	})
+}
+
+// TestImportBundleSurvivesAUniqueKeySwap is the swap the prune cannot help
+// with: a matcher or a group name moved between two rows that both survive.
+// Applied row by row it hits the unique index halfway through — and because
+// the bundle does not change, every later poll would fail in the same place,
+// so the replica would never apply that config at all.
+func TestImportBundleSurvivesAUniqueKeySwap(t *testing.T) {
+	forEachDriver(t, func(t *testing.T, s Store) {
+		ctx := t.Context()
+		one, two := newFixture(), newFixture()
+		g1, err := s.Clients().AddGroup(ctx, one.group)
+		if err != nil {
+			t.Fatal(err)
+		}
+		g2, err := s.Clients().AddGroup(ctx, two.group)
+		if err != nil {
+			t.Fatal(err)
+		}
+		c1, err := s.Clients().AddClient(ctx, Client{Name: "a", Matcher: one.matcher, GroupID: g1})
+		if err != nil {
+			t.Fatal(err)
+		}
+		c2, err := s.Clients().AddClient(ctx, Client{Name: "b", Matcher: two.matcher, GroupID: g2})
+		if err != nil {
+			t.Fatal(err)
+		}
+		b, err := s.ExportBundle(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// The main swapped both pairs; this box still holds them the other
+		// way round.
+		for i := range b.Groups {
+			switch b.Groups[i].ID {
+			case g1:
+				b.Groups[i].Name = two.group
+			case g2:
+				b.Groups[i].Name = one.group
+			}
+		}
+		for i := range b.Clients {
+			switch b.Clients[i].ID {
+			case c1:
+				b.Clients[i].Matcher = two.matcher
+			case c2:
+				b.Clients[i].Matcher = one.matcher
+			}
+		}
+		if err := s.ImportBundle(ctx, b); err != nil {
+			t.Fatalf("import of a bundle that swaps two unique keys: %v", err)
+		}
+
+		groups, err := s.Clients().Groups(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		names := map[int64]string{}
+		for _, g := range groups {
+			names[g.ID] = g.Name
+		}
+		if names[g1] != two.group || names[g2] != one.group {
+			t.Errorf("group names after the swap = %q / %q, want %q / %q", names[g1], names[g2], two.group, one.group)
+		}
+		clients, err := s.Clients().Clients(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		matchers := map[int64]string{}
+		for _, c := range clients {
+			matchers[c.ID] = c.Matcher
+		}
+		if matchers[c1] != two.matcher || matchers[c2] != one.matcher {
+			t.Errorf("client matchers after the swap = %q / %q, want %q / %q", matchers[c1], matchers[c2], two.matcher, one.matcher)
+		}
+	})
+}
+
 // TestLocalSettingKey pins §4.3's table. It is the one place that decides
 // what never leaves an instance, and the cost of a wrong answer is a replica
 // listening on the main's certificate paths or pointing at itself as its own
