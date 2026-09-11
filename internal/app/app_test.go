@@ -227,12 +227,20 @@ func newTestApp(t *testing.T, opts ...testAppOption) *App {
 // shut down when the test ends.
 func newTestAppOn(t *testing.T, driver string, opts ...testAppOption) *App {
 	t.Helper()
+	return newTestAppWith(t, testConfigOn(t, driver), opts...)
+}
+
+// newTestAppWith is newTestAppOn with the config handed in rather than
+// derived, for a test that needs a listen address the driver's default
+// config does not name.
+func newTestAppWith(t *testing.T, cfg *config.Config, opts ...testAppOption) *App {
+	t.Helper()
 	ctx := context.Background()
 	settings := map[string]string{}
 	for _, o := range opts {
 		o(settings)
 	}
-	a, err := New(ctx, testConfigOn(t, driver), "test")
+	a, err := New(ctx, cfg, "test")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -306,10 +314,17 @@ func digAQuiet(addr, name string) string {
 // gets that guarantee instead of sleeping and hoping.
 func waitFor(t *testing.T, what string, cond func() bool) {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
+	waitUntil(t, 5*time.Second, what, cond)
+}
+
+// waitUntil is waitFor with the deadline named by the caller, for the cases
+// where the thing waited on has a bound of its own that is longer.
+func waitUntil(t *testing.T, within time.Duration, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(within)
 	for !cond() {
 		if time.Now().After(deadline) {
-			t.Fatalf("timed out waiting for %s", what)
+			t.Fatalf("timed out after %s waiting for %s", within, what)
 		}
 		time.Sleep(time.Millisecond)
 	}
