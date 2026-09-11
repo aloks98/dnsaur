@@ -41,6 +41,18 @@ const (
 	// group, client, rule, list assignment, key and zone the main has.
 	probeTimeout = 10 * time.Second
 	fetchTimeout = 60 * time.Second
+	// maxProbeBytes is how much of a small answer is read: the version
+	// probe's body, and as much of any error response as is drained to keep
+	// the connection reusable. A peer that answers a two-field document with
+	// more than this is not a peer this build understands.
+	maxProbeBytes = 64 << 10
+	// maxBundleBytes is the same for the bundle, which is the only large
+	// answer: every group, client, list, rule, key and zone definition the
+	// main holds. Homelab-sized configurations are kilobytes; the cap is
+	// three orders of magnitude above that, and exists so a peer that
+	// answers with a stream instead of a document cannot be decoded into
+	// this box's memory until it runs out.
+	maxBundleBytes = 32 << 20
 	// peerReadTimeout bounds PeerURL's settings read. That read is on the
 	// API's write path, so it may not hang: five seconds is far beyond a
 	// healthy answer and short of a stuck one.
@@ -178,6 +190,10 @@ func (r *Replica) pollInterval(ctx context.Context) time.Duration {
 // PullOnce is one cycle. It records what happened — in memory for the status
 // endpoint and in the store for the next process — and returns the same
 // error it recorded, so the caller can log it once.
+//
+// Not safe for concurrent callers: two cycles at once would both fetch and
+// both import, and the second would overwrite the first's bookkeeping. Run
+// is the only caller, and it is one goroutine.
 func (r *Replica) PullOnce(ctx context.Context) error {
 	// The one key that decides whether there is anything to do, before the
 	// whole settings table is read for the rest of them: this runs every
@@ -200,6 +216,12 @@ func (r *Replica) PullOnce(ctx context.Context) error {
 	}
 
 	s := api.SyncStatus{Role: "replica"}
+	// The last version the main was known to hold. A probe that fails
+	// leaves it standing: "behind by N" is what the Sync band shows, and a
+	// main that has gone down must not read as one this box is level with.
+	r.mu.Lock()
+	s.PeerVersion = r.last.PeerVersion
+	r.mu.Unlock()
 	s.AppliedVersion, _ = strconv.ParseInt(all[appliedVersionSetting], 10, 64)
 	s.AppliedAt, _ = strconv.ParseInt(all[appliedAtSetting], 10, 64)
 	// A box that has never applied anything pulls whatever the main has,
@@ -243,7 +265,7 @@ func (r *Replica) record(ctx context.Context, key, value string) {
 func (r *Replica) pull(ctx context.Context, peer string, all map[string]string, applied bool, s *api.SyncStatus) error {
 	token := all[tokenSetting]
 	var probe syncVersion
-	if err := r.get(ctx, probeTimeout, peer+versionPath, token, &probe); err != nil {
+	if err := r.get(ctx, probeTimeout, maxProbeBytes, peer+versionPath, token, &probe); err != nil {
 		return err
 	}
 	s.PeerVersion = probe.ConfigVersion
@@ -263,7 +285,7 @@ func (r *Replica) pull(ctx context.Context, peer string, all map[string]string, 
 	}
 
 	var b store.Bundle
-	if err := r.get(ctx, fetchTimeout, peer+bundlePath, token, &b); err != nil {
+	if err := r.get(ctx, fetchTimeout, maxBundleBytes, peer+bundlePath, token, &b); err != nil {
 		return err
 	}
 	if err := Validate(b); err != nil {
@@ -271,7 +293,12 @@ func (r *Replica) pull(ctx context.Context, peer string, all map[string]string, 
 	}
 	if b.ConfigVersion != probe.ConfigVersion {
 		// A write landed between the two requests. Nothing is applied half
-		// a version late: the next cycle sees the newer one (§3).
+		// a version late: the next cycle sees the newer one (§3). Said out
+		// loud, because a cycle that fetched a whole bundle and applied
+		// none of it is otherwise indistinguishable from one that found
+		// nothing to do.
+		slog.Info("config sync: the peer's version moved while the bundle was being fetched, retrying next cycle",
+			"peer", peer, "probed", probe.ConfigVersion, "bundle", b.ConfigVersion)
 		return nil
 	}
 	b.Zones = DeriveZones(b.Zones, primaryDNS(all[primaryDNSKey], peer), b.SyncKey)
@@ -358,7 +385,7 @@ type syncVersion struct {
 }
 
 // get reads one JSON document from the peer under its own deadline.
-func (r *Replica) get(ctx context.Context, timeout time.Duration, url, token string, out any) error {
+func (r *Replica) get(ctx context.Context, timeout time.Duration, limit int64, url, token string, out any) error {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
@@ -376,7 +403,21 @@ func (r *Replica) get(ctx context.Context, timeout time.Duration, url, token str
 		drain(resp)
 		return statusErr(url, resp)
 	}
-	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
+	return decodeLimited(resp.Body, limit, url, out)
+}
+
+// decodeLimited reads one JSON document, and refuses a body over limit
+// rather than decoding the prefix that fits. The reader is given one byte
+// more than the cap, so "nothing left" is exactly "there was more".
+func decodeLimited(body io.Reader, limit int64, url string, out any) error {
+	lr := &io.LimitedReader{R: body, N: limit + 1}
+	err := json.NewDecoder(lr).Decode(out)
+	if lr.N <= 0 {
+		// Checked before err, because the error a truncated document
+		// produces describes the truncation rather than its cause.
+		return fmt.Errorf("%s: the answer is larger than the %d byte cap", url, limit)
+	}
+	if err != nil {
 		return fmt.Errorf("%s: %w", url, err)
 	}
 	return nil
@@ -395,7 +436,7 @@ func setBearer(req *http.Request, token string) {
 // drain reads what is left of an error response so the connection can go
 // back to the idle pool, bounded because a peer answering 500 with a
 // gigabyte of HTML is not something to read in full.
-func drain(resp *http.Response) { _, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10)) }
+func drain(resp *http.Response) { _, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxProbeBytes)) }
 
 // statusErr turns a refusal into the sentence the Sync band shows.
 func statusErr(url string, resp *http.Response) error {

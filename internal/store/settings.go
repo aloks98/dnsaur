@@ -78,25 +78,16 @@ func (st *settingsStore) SetMany(ctx context.Context, values map[string]string) 
 	if len(values) == 0 {
 		return nil
 	}
-	tx, err := st.s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	for _, key := range slices.Sorted(maps.Keys(values)) {
-		if _, err := tx.ExecContext(ctx, st.s.q(settingUpsert), key, values[key]); err != nil {
-			return err
+	// configWrite owns the transaction, the bump and the publish — the same
+	// three steps every other configuration write goes through (crud.go).
+	return st.s.configWrite(ctx, func(tx *sql.Tx) error {
+		for _, key := range slices.Sorted(maps.Keys(values)) {
+			if _, err := tx.ExecContext(ctx, st.s.q(settingUpsert), key, values[key]); err != nil {
+				return err
+			}
 		}
-	}
-	v, err := bumpVersionTx(ctx, tx)
-	if err != nil {
-		return err
-	}
-	if err := tx.Commit(); err != nil {
-		return err
-	}
-	st.s.hub.publish(v)
-	return nil
+		return nil
+	})
 }
 
 // bumpVersionTx advances config_version inside tx and returns the new value.

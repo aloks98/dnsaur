@@ -262,6 +262,105 @@ func TestReplicaAppliesEvenWhenRegisterFails(t *testing.T) {
 	}
 }
 
+// TestReplicaSkipsABundleThatMovedUnderTheProbe: a write landing between the
+// two requests makes the bundle a different version from the one the probe
+// reported. Applying it would stamp this box with a version it does not
+// hold, so the cycle stops and the next one picks the newer one up (§3).
+func TestReplicaSkipsABundleThatMovedUnderTheProbe(t *testing.T) {
+	ctx := t.Context()
+	mainSt := openStore(t)
+	if _, err := mainSt.Clients().AddGroup(ctx, "kids"); err != nil {
+		t.Fatalf("AddGroup: %v", err)
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/v1/sync/version", func(w http.ResponseWriter, _ *http.Request) {
+		v, _ := mainSt.Settings().ConfigVersion(ctx)
+		_ = json.NewEncoder(w).Encode(map[string]any{"config_version": v, "instance_id": "main-1"})
+	})
+	mux.HandleFunc("GET /api/v1/sync/bundle", func(w http.ResponseWriter, _ *http.Request) {
+		b, _ := mainSt.ExportBundle(ctx)
+		// The write that landed between the probe and this read.
+		b.ConfigVersion++
+		_ = json.NewEncoder(w).Encode(b)
+	})
+	ts := httptest.NewServer(mux)
+	t.Cleanup(ts.Close)
+
+	rep := openStore(t)
+	mustSet(t, rep, "sync.peer_url", ts.URL)
+	reloads := &countingReloader{}
+	r := NewReplica(rep, reloads, "replica-1", "10.0.0.6:53")
+
+	if err := r.PullOnce(ctx); err != nil {
+		t.Fatalf("PullOnce: %v", err)
+	}
+	if gs, _ := rep.Clients().Groups(ctx); len(gs) != 0 {
+		t.Fatalf("a bundle that moved under the probe was applied: %+v", gs)
+	}
+	if reloads.clients != 0 {
+		t.Fatalf("reloads %+v", reloads)
+	}
+	if v, found, _ := rep.Settings().Get(ctx, "sync.applied_version"); found {
+		t.Fatalf("sync.applied_version = %q, want no version marked applied", v)
+	}
+}
+
+// TestReplicaKeepsThePeerVersionWhenTheProbeFails: "behind by N" is what the
+// Sync band shows, and a main that has gone down must not make the replica
+// report that it is level with it.
+func TestReplicaKeepsThePeerVersionWhenTheProbeFails(t *testing.T) {
+	ctx := t.Context()
+	mainSt := openStore(t)
+	if _, err := mainSt.Clients().AddGroup(ctx, "kids"); err != nil {
+		t.Fatalf("AddGroup: %v", err)
+	}
+	ts := fakeMain(t, mainSt, "", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	})
+	rep := openStore(t)
+	mustSet(t, rep, "sync.peer_url", ts.URL)
+	r := NewReplica(rep, &countingReloader{}, "replica-1", "10.0.0.6:53")
+
+	if err := r.PullOnce(ctx); err != nil {
+		t.Fatalf("PullOnce: %v", err)
+	}
+	want := r.Status().PeerVersion
+	if want == 0 {
+		t.Fatal("the main reported version 0; this test needs a version to lose")
+	}
+
+	ts.Close() // the main goes away
+	if err := r.PullOnce(ctx); err == nil {
+		t.Fatal("a pull against a dead peer succeeded")
+	}
+	st := r.Status()
+	if st.PeerVersion != want {
+		t.Fatalf("peer_version = %d after a failed probe, want the last one known (%d)", st.PeerVersion, want)
+	}
+	if st.LastError == "" || st.AppliedVersion != want {
+		t.Fatalf("status %+v", st)
+	}
+}
+
+// TestDecodeLimitedRefusesAnOversizeBody: a peer that answers with more than
+// the cap is an error naming the cap, not a truncated document decoded as if
+// it were the whole thing.
+func TestDecodeLimitedRefusesAnOversizeBody(t *testing.T) {
+	var out map[string]string
+	body := `{"key":"` + strings.Repeat("x", 64) + `"}`
+	if err := decodeLimited(strings.NewReader(body), 16, "http://main.example/b", &out); err == nil ||
+		!strings.Contains(err.Error(), "16") {
+		t.Fatalf("err = %v, want a refusal naming the cap", err)
+	}
+	out = nil
+	if err := decodeLimited(strings.NewReader(body), 1<<20, "http://main.example/b", &out); err != nil {
+		t.Fatalf("a body inside the cap: %v", err)
+	}
+	if out["key"] == "" {
+		t.Fatalf("decoded %+v", out)
+	}
+}
+
 // TestReplicaIdlesWithoutPeer: a main runs the same worker. It must not
 // pull, and it must come back to look again soon enough that setting a peer
 // starts a pull without a restart.

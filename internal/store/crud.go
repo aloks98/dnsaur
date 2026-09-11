@@ -6,12 +6,14 @@ import (
 	"errors"
 )
 
-// configWrite is every write to a table that travels in a bundle: groups,
-// clients, lists and their group assignments, rules, TSIG keys and zone
-// definitions. Each of them advances config_version in its own transaction
-// and publishes the new value after the commit, because that counter is what
-// a replica polls to decide whether the main's configuration moved (the
-// config-sync design, §3) and what this box's own settings watcher wakes on.
+// configWrite is every write that changes this instance's configuration:
+// settings (through settingsStore.SetMany), and every table that travels in
+// a bundle — groups, clients, lists and their group assignments, rules, TSIG
+// keys and zone definitions. Each of them advances config_version in its own
+// transaction and publishes the new value after the commit, because that
+// counter is what a replica polls to decide whether the main's configuration
+// moved (the config-sync design, §3) and what this box's own settings
+// watcher wakes on.
 //
 // Records, serial bumps and the transfer-state writers are deliberately not
 // in it: none of them is in a bundle, and moving the counter for a
@@ -20,8 +22,9 @@ import (
 //
 // The three wrappers below are the whole vocabulary — an insert, a write
 // that must match one row, and a conditional write that may legitimately
-// match none. They share bumpVersionTx with settingsStore.SetMany and
-// ImportBundle, which are the two other places a version moves.
+// match none. ImportBundle is the one caller that does not go through them:
+// it is a hundred statements under one bump, so it holds its own
+// transaction and calls bumpVersionTx itself.
 func (s *sqlStore) configWrite(ctx context.Context, fn func(tx *sql.Tx) error) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {

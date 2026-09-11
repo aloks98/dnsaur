@@ -1069,11 +1069,18 @@ func (a *App) Status() api.SyncStatus {
 	if a.replica.PeerURL() != "" {
 		return a.replica.Status()
 	}
-	// context.Background, not a request's: Status has no context to take
-	// (it answers a status endpoint and a background warning strip alike),
-	// and the reads behind it are two settings rows.
-	return a.replicas.Status(context.Background())
+	// Status takes no context — it answers a status endpoint and a
+	// background warning strip alike — so the deadline is made here rather
+	// than inherited. Five seconds, as Replica.PeerURL bounds its own read:
+	// the work behind it is two settings rows, and a handler may not hang
+	// on a store that has stopped answering.
+	ctx, cancel := context.WithTimeout(context.Background(), syncStatusTimeout)
+	defer cancel()
+	return a.replicas.Status(ctx)
 }
+
+// syncStatusTimeout bounds the store reads behind GET /sync/status on a main.
+const syncStatusTimeout = 5 * time.Second
 
 func (a *App) Register(ctx context.Context, r api.Replica) error {
 	return a.replicas.Register(ctx, r)
