@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -15,20 +16,28 @@ import (
 	"github.com/miekg/dns"
 )
 
+// notifySend is one NOTIFY as it would have gone on the wire: where, for
+// which zone, and under which TSIG key ("" for unsigned).
+type notifySend struct{ target, zone, key string }
+
 // fakeSender records what would have gone on the wire and fails on demand.
 type fakeSender struct {
 	mu   sync.Mutex
-	sent []string // "target|zone"
+	sent []notifySend
 	err  error
 }
 
-func (f *fakeSender) Send(_ context.Context, target zones.NotifyTarget, zone string, _ *store.TSIGKey) error {
+func (f *fakeSender) Send(_ context.Context, target zones.NotifyTarget, zone string, key *store.TSIGKey) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.err != nil {
 		return f.err
 	}
-	f.sent = append(f.sent, target.Addr()+"|"+zone)
+	name := ""
+	if key != nil {
+		name = key.Name
+	}
+	f.sent = append(f.sent, notifySend{target: target.Addr(), zone: zone, key: name})
 	return nil
 }
 
@@ -36,6 +45,12 @@ func (f *fakeSender) count() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return len(f.sent)
+}
+
+func (f *fakeSender) sends() []notifySend {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.sent)
 }
 
 // newNotifierFixture builds a Notifier over a real store with one primary
@@ -48,7 +63,7 @@ type notifierFixture struct {
 	clock  time.Time
 }
 
-func newNotifierFixture(t *testing.T, notifyTo string, serial uint32) *notifierFixture {
+func newNotifierFixture(t *testing.T, notifyTo string, serial uint32, opts ...zones.NotifyOption) *notifierFixture {
 	t.Helper()
 	ctx := context.Background()
 	st := openTestStore(t)
@@ -67,8 +82,10 @@ func newNotifierFixture(t *testing.T, notifyTo string, serial uint32) *notifierF
 		clock: time.Date(2026, 9, 2, 12, 0, 0, 0, time.UTC),
 	}
 	f.n = zones.NewNotifier(st.Zones(), st.Notifies(), st.TSIGKeys(),
-		zones.WithNotifyNow(func() time.Time { return f.clock }),
-		zones.WithNotifySender(f.sender))
+		append([]zones.NotifyOption{
+			zones.WithNotifyNow(func() time.Time { return f.clock }),
+			zones.WithNotifySender(f.sender),
+		}, opts...)...)
 	return f
 }
 
@@ -658,5 +675,90 @@ func TestNotifyPassSendsToTargetsConcurrently(t *testing.T) {
 				t.Errorf("%s's row = %+v, want one recorded attempt and its error", row.Target, row)
 			}
 		}
+	}
+}
+
+// syncTarget is a registered replica as the App hands one to the notifier:
+// the address it answers DNS on, signed with the main's designated sync key.
+var syncTarget = zones.NotifyTarget{
+	Host: "10.0.0.6", Port: 53, Key: dns.CanonicalName("sync." + notifyApex),
+}
+
+// replicaTargets is the WithReplicaTargets hook, standing in for the App
+// method that reads the replica registry.
+func replicaTargets(ts ...zones.NotifyTarget) zones.NotifyOption {
+	return zones.WithReplicaTargets(func(context.Context) []zones.NotifyTarget { return ts })
+}
+
+// addSecondary puts a serving secondary beside the fixture's primary, so a
+// pass has one zone of each kind to decide about.
+func addSecondary(t *testing.T, f *notifierFixture) {
+	t.Helper()
+	_, err := f.st.Zones().AddZone(context.Background(), store.Zone{
+		Name: "loaned." + notifyApex, Type: "secondary", Enabled: true,
+		Primaries: "10.0.0.9:53", SOANS: "ns1.loaned." + notifyApex,
+		SOAMbox: "hostmaster.loaned." + notifyApex, SOASerial: 12,
+		SOARefresh: 3600, SOARetry: 600, SOAExpire: 604800, SOAMinimum: 300, SOATTL: 900,
+		RefreshedAt: f.clock.Add(-time.Hour).UnixMilli(),
+		ExpiresAt:   f.clock.Add(time.Hour).UnixMilli(),
+	})
+	if err != nil {
+		t.Fatalf("AddZone: %v", err)
+	}
+}
+
+// §6 of docs/superpowers/specs/2026-09-11-config-sync-design.md: every
+// primary zone notifies every registered replica, signed with the sync key,
+// without the operator adding the replica to each zone's notify_to. A
+// secondary is someone else's zone on loan and gets none.
+func TestNotifierTellsRegisteredReplicasWithoutANotifyToEntry(t *testing.T) {
+	f := newNotifierFixture(t, "", 47, replicaTargets(syncTarget))
+	xfrKey(t, f.st, syncTarget.Key, dns.HmacSHA256)
+	addSecondary(t, f)
+
+	f.pass(t)
+
+	sends := f.sender.sends()
+	if len(sends) != 1 {
+		t.Fatalf("sent %d notifies, want 1 — the replica for the primary zone only: %v", len(sends), sends)
+	}
+	if sends[0].target != "10.0.0.6:53" || sends[0].zone != notifyApex {
+		t.Errorf("notified %s about %s, want 10.0.0.6:53 about %s", sends[0].target, sends[0].zone, notifyApex)
+	}
+	if sends[0].key != syncTarget.Key {
+		t.Errorf("notify signed under %q, want the sync key %q", sends[0].key, syncTarget.Key)
+	}
+	// Delivery is tracked like any other target's, which is what prunes the
+	// row when the operator forgets the replica.
+	rows := f.rows(t)
+	if len(rows) != 1 || rows[0].Target != "10.0.0.6:53" || rows[0].NotifiedSerial != 47 {
+		t.Fatalf("rows = %+v, want one row for 10.0.0.6:53 delivered at serial 47", rows)
+	}
+
+	// And a replica the operator has removed loses its row on the next pass,
+	// rather than being notified forever.
+	f.n = zones.NewNotifier(f.st.Zones(), f.st.Notifies(), f.st.TSIGKeys(),
+		zones.WithNotifyNow(func() time.Time { return f.clock }),
+		zones.WithNotifySender(f.sender))
+	f.pass(t)
+	if got := len(f.rows(t)); got != 0 {
+		t.Errorf("a forgotten replica left %d rows behind, want 0", got)
+	}
+}
+
+// A replica the operator also wrote into notify_to by hand is one target,
+// not two: the address is the row identity, so the implicit entry and the
+// written one are the same target and the pass sends one packet.
+func TestAReplicaAlreadyInNotifyToIsToldOnce(t *testing.T) {
+	f := newNotifierFixture(t, "10.0.0.6:53", 47, replicaTargets(syncTarget))
+	xfrKey(t, f.st, syncTarget.Key, dns.HmacSHA256)
+
+	f.pass(t)
+
+	if got := f.sender.count(); got != 1 {
+		t.Errorf("sent %d notifies to one replica, want 1", got)
+	}
+	if got := len(f.rows(t)); got != 1 {
+		t.Errorf("created %d rows for one replica, want 1", got)
 	}
 }

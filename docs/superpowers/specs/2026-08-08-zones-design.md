@@ -1113,6 +1113,13 @@ be wrong.
 | **1982** | Serial arithmetic is circular — comparison is not `<` |
 | **1034 §4.3.5** | A secondary past its SOA expire must stop answering for the zone |
 
+Since 2026-09-11 two of the gates above are also widened by configuration
+outside the zone: a registered replica signing with the main's
+`sync.tsig_key_id` key transfers any `primary` zone, and every `primary` zone
+notifies every registered non-stale replica — neither rewrites the zone's own
+`allow_transfer` or `notify_to`. See
+`docs/superpowers/specs/2026-09-11-config-sync-design.md` §6.
+
 ### 9.10 Milestone D4: NOTIFY, both directions
 
 Designed 2026-09-02, once D1–D3 had landed and the two halves could be costed

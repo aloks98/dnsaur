@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"slices"
 	"strings"
@@ -271,7 +272,8 @@ func New(ctx context.Context, cfg *config.Config, version string) (*App, error) 
 	zoneRes := a.zoneLookup()
 	// Built before the Transferrer, which takes its Wake for the cascade.
 	a.notifier = zones.NewNotifier(st.Zones(), st.Notifies(), st.TSIGKeys(),
-		zones.WithNotifyResolver(zoneRes))
+		zones.WithNotifyResolver(zoneRes),
+		zones.WithReplicaTargets(a.replicaNotifyTargets))
 	// The transfer republishes the served snapshot itself: a zone installed
 	// into the store that nothing reloaded is answering from the copy it just
 	// replaced. The key store is passed live, not a snapshot, for the same
@@ -317,7 +319,8 @@ func New(ctx context.Context, cfg *config.Config, version string) (*App, error) 
 	// us. It reads a.resolver's live snapshot, so a zone this server
 	// authors is transferred as of its last reload, the same data an
 	// ordinary query would get.
-	a.xfrOut = zones.NewTransferServer(a.resolver, st.Zones())
+	a.xfrOut = zones.NewTransferServer(a.resolver, st.Zones(),
+		zones.WithReplicaAllow(a.replicaMayTransfer))
 	// The inbound half. It shares the Refresher the scheduler drives, so a
 	// notify-triggered transfer takes the same per-zone lock a scheduled one
 	// does rather than racing it.
@@ -1088,6 +1091,105 @@ func (a *App) Register(ctx context.Context, r api.Replica) error {
 
 func (a *App) Forget(ctx context.Context, instanceID string) error {
 	return a.replicas.Forget(ctx, instanceID)
+}
+
+// replicaHookTimeout bounds the registry reads behind the two hooks below.
+// Both run on a DNS path — a transfer's gate, a notify pass — so a store
+// that has stopped answering costs that path two seconds and "no replicas"
+// rather than holding it.
+const replicaHookTimeout = 2 * time.Second
+
+// replicaMayTransfer is zones.ReplicaAllow (§6): the request signed with the
+// key sync.tsig_key_id designates, from a box registered as a replica.
+//
+// A stale replica still matches. Stale means nothing has been heard from it
+// for three intervals, which is exactly the state a box coming back from an
+// outage is in — refusing it the data it is behind on would be the wrong way
+// round. NOTIFY is where staleness is acted on, below.
+func (a *App) replicaMayTransfer(keyName string, peer netip.Addr) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), replicaHookTimeout)
+	defer cancel()
+	syncKey := a.replicas.SyncKeyName(ctx)
+	if syncKey == "" || !strings.EqualFold(keyName, syncKey) {
+		return false
+	}
+	reps, err := a.replicas.List(ctx)
+	if err != nil {
+		slog.Warn("reading the registered replicas failed; the transfer is left to allow_transfer",
+			"peer", peer, "err", err)
+		return false
+	}
+	for _, r := range reps {
+		if ip, ok := replicaIP(r.DNSAddr); ok && ip == peer {
+			return true
+		}
+	}
+	return false
+}
+
+// replicaNotifyTargets is zones.ReplicaTargets (§6): every registered
+// replica that is not stale, signed with the sync key.
+//
+// Staleness is acted on here and not in the transfer gate because the two
+// cost different things. Notifying a box that has been silent for three
+// intervals buys a round of retries per zone per serial bump for as long as
+// it stays away, and buys nothing: its own refresh timer collects the zone
+// when it returns.
+func (a *App) replicaNotifyTargets(ctx context.Context) []zones.NotifyTarget {
+	ctx, cancel := context.WithTimeout(ctx, replicaHookTimeout)
+	defer cancel()
+	// No designated key means no replica is following this main's zones at
+	// all: a replica's derived secondaries transfer under the sync key, so
+	// there is nothing an unsigned NOTIFY would usefully invite.
+	syncKey := a.replicas.SyncKeyName(ctx)
+	if syncKey == "" {
+		return nil
+	}
+	reps, err := a.replicas.List(ctx)
+	if err != nil {
+		slog.Warn("reading the registered replicas failed; notifying none of them", "err", err)
+		return nil
+	}
+	var out []zones.NotifyTarget
+	for _, r := range reps {
+		if r.Stale {
+			continue
+		}
+		// dns_addr is exactly the `host:port` half of one notify_to entry, so
+		// it is read by that format's own parser rather than assembled here:
+		// an address the format cannot express is dropped with a line saying
+		// so, instead of becoming a target nothing can ever send to.
+		ts, err := zones.ParseNotifyTo(r.DNSAddr + " key:" + syncKey)
+		if err != nil {
+			slog.Warn("a registered replica's dns_addr is not a usable notify target",
+				"instance_id", r.InstanceID, "dns_addr", r.DNSAddr, "err", err)
+			continue
+		}
+		out = append(out, ts...)
+	}
+	return out
+}
+
+// replicaIP is the address a registered replica's dns_addr names.
+//
+// dns_addr is validated as host:port, which permits a hostname, and a
+// hostname here never matches: resolving one would put a DNS lookup inside
+// the gate of the server that answers DNS — the same rule that keeps
+// allow_transfer's parser pure (see zones/notifyto.go). Such a replica is
+// simply not covered by the implicit allow, and its transfers are decided by
+// allow_transfer as they were before it registered.
+func replicaIP(dnsAddr string) (netip.Addr, bool) {
+	host, _, err := net.SplitHostPort(dnsAddr)
+	if err != nil {
+		return netip.Addr{}, false
+	}
+	ip, err := netip.ParseAddr(host)
+	if err != nil {
+		return netip.Addr{}, false
+	}
+	// Unmapped, because the peer a transfer arrives from is (see peerAddr):
+	// ::ffff:10.0.0.6 and 10.0.0.6 are one address, and must compare equal.
+	return ip.Unmap(), true
 }
 
 func (a *App) Shutdown(ctx context.Context) error {

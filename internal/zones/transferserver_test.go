@@ -10,6 +10,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"net/netip"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -127,6 +128,15 @@ func withMaxConcurrentTransfers(n int) xfrOption {
 func withTransferHold(fn func()) xfrOption {
 	return func(c *xfrConfig) {
 		c.server = append(c.server, zones.WithTransferHook(fn))
+	}
+}
+
+// withReplicaAllow installs the hook that admits a registered replica's
+// pull (§6 of the config-sync design), standing in for the App method that
+// answers it from the replica registry.
+func withReplicaAllow(f zones.ReplicaAllow) xfrOption {
+	return func(c *xfrConfig) {
+		c.server = append(c.server, zones.WithReplicaAllow(f))
 	}
 }
 
@@ -2388,4 +2398,55 @@ func TestTheSlotIsFreedBeforeTheStateWrite(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("the first transfer never returned after its state write completed")
 	}
+}
+
+// §6 of docs/superpowers/specs/2026-09-11-config-sync-design.md: a replica
+// registered with its main transfers every primary zone on the strength of
+// the sync key alone. The zone here is untouched — allow_transfer is the ""
+// every zone is created with — because the point of the clause is that
+// adding a replica does not mean editing each zone's ACL.
+func TestRegisteredReplicaMayTransferWithoutAnACLEntry(t *testing.T) {
+	syncName := dns.CanonicalName("sync." + xfrApex)
+	otherName := dns.CanonicalName("ns2." + xfrApex)
+	f := newXFRFixture(t, xfrZone(""), xfrRecords(),
+		withReplicaAllow(func(key string, peer netip.Addr) bool {
+			return key == syncName && peer.IsLoopback()
+		}))
+	syncSecret := xfrKey(t, f.st, syncName, dns.HmacSHA256)
+	otherSecret := xfrKey(t, f.st, otherName, dns.HmacSHA256)
+
+	rrs, err := f.axfr(t, xfrApex, syncName, syncSecret)
+	if err != nil {
+		t.Fatalf("axfr signed with the sync key: %v", err)
+	}
+	if len(rrs) != 4 {
+		t.Fatalf("got %d RRs (%v), want the SOA, both enabled records and the closing SOA", len(rrs), rrNames(rrs))
+	}
+
+	// The same peer under a key the main has not designated. The clause is
+	// about one key, not about "any signature from a box we have heard of".
+	assertRcode(t, f.exchangeSigned(t, xfrApex, otherName, dns.HmacSHA256, otherSecret, time.Now().Unix()), dns.RcodeRefused)
+
+	// And the sync key from a box that is not registered: knowing the secret
+	// is not the whole of the rule, or a replica the operator removed would
+	// keep transferring.
+	g := newXFRFixture(t, xfrZone(""), xfrRecords(),
+		withReplicaAllow(func(string, netip.Addr) bool { return false }))
+	xfrKey(t, g.st, syncName, dns.HmacSHA256)
+	assertRcode(t, g.exchangeSigned(t, xfrApex, syncName, dns.HmacSHA256, syncSecret, time.Now().Unix()), dns.RcodeRefused)
+}
+
+// The implicit allow is the main handing out the zones it authors (§6). A
+// secondary holds someone else's data on loan, and the operator's
+// allow_transfer is the only thing that says who may have a copy of it.
+func TestTheReplicaAllowDoesNotReachASecondaryZone(t *testing.T) {
+	syncName := dns.CanonicalName("sync." + xfrApex)
+	base := time.Now()
+	z := secondaryZone(base.Add(-time.Hour).UnixMilli(), base.Add(time.Hour).UnixMilli())
+	z.AllowTransfer = ""
+	f := newXFRFixture(t, z, xfrRecords(),
+		withReplicaAllow(func(string, netip.Addr) bool { return true }))
+	secret := xfrKey(t, f.st, syncName, dns.HmacSHA256)
+
+	assertRcode(t, f.exchangeSigned(t, xfrApex, syncName, dns.HmacSHA256, secret, time.Now().Unix()), dns.RcodeRefused)
 }

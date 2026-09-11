@@ -69,6 +69,13 @@ type TransferServer struct {
 	// sees WriteTimeout in the library's docs would otherwise assume this
 	// cap is redundant with it.
 	slots chan struct{}
+	// replicaAllow is the config-sync clause beside the ACL: §6 of
+	// docs/superpowers/specs/2026-09-11-config-sync-design.md lets a replica
+	// registered with this main transfer any primary zone on the strength of
+	// the sync key, so registering one does not mean editing every zone's
+	// allow_transfer. nil — a main with no replicas, and every other
+	// build — means the ACL is the whole of the rule.
+	replicaAllow ReplicaAllow
 	// hold, when set, runs once a transfer has taken its slot and is about
 	// to stream, before anything is written. It exists for tests: this
 	// package's tests are external (package zones_test, see now above), so
@@ -123,6 +130,18 @@ func WithMaxConcurrentTransfers(n int) TransferServerOption {
 		}
 		t.slots = make(chan struct{}, n)
 	}
+}
+
+// ReplicaAllow answers whether a transfer of a primary zone, verified under
+// keyName from peer, is a registered replica's pull. internal/app answers it
+// from the replica registry: the key is the one sync.tsig_key_id designates,
+// and the peer is the host of some registered replica's dns_addr.
+type ReplicaAllow func(keyName string, peer netip.Addr) bool
+
+// WithReplicaAllow installs that clause. Production passes it on a main;
+// without it a transfer is decided by allow_transfer alone.
+func WithReplicaAllow(f ReplicaAllow) TransferServerOption {
+	return func(t *TransferServer) { t.replicaAllow = f }
 }
 
 // WithTransferHook installs the hook a test holds a transfer open with; see
@@ -602,10 +621,27 @@ func (t *TransferServer) decide(q *dns.Msg, peer netip.Addr, key string, tsigErr
 		// one would make a typo silently widen the ACL.
 		return z, &refusal{rcode: dns.RcodeRefused, reason: fmt.Sprintf("allow_transfer does not parse, refusing every transfer: %v", err)}
 	}
-	if !ACLAllows(entries, peer, key) {
+	if !ACLAllows(entries, peer, key) && !t.replicaMayPull(z, peer, key, tsigErr) {
 		return z, &refusal{rcode: dns.RcodeRefused, reason: "peer matches no allow_transfer entry"}
 	}
 	return z, nil
+}
+
+// replicaMayPull is §6's clause, asked only once allow_transfer has already
+// refused: it widens who may transfer and never narrows it, so a zone whose
+// ACL admits the peer never reaches this at all.
+//
+// Primary zones only. A secondary holds another server's data on loan, and
+// who may have a copy of that is the operator's allow_transfer to say; the
+// remaining types were refused further up, having no zone to hand over.
+//
+// The signature is the whole of the authentication: key is non-empty only
+// when TSIG verified (dnssrv.RequireTSIG returns the name or an error, never
+// both), and tsigErr is checked beside it so this stays closed if that ever
+// stops being true.
+func (t *TransferServer) replicaMayPull(z *Zone, peer netip.Addr, key string, tsigErr error) bool {
+	return t.replicaAllow != nil && key != "" && tsigErr == nil &&
+		strings.EqualFold(z.Type, "primary") && t.replicaAllow(key, peer)
 }
 
 // zoneAnswer builds the whole answer section of a transfer: the SOA, every

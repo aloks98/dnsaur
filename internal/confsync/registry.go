@@ -121,13 +121,16 @@ func (g *Registry) Status(ctx context.Context) api.SyncStatus {
 	} else {
 		s.Replicas = reps
 	}
-	s.SyncKey = g.syncKeyName(ctx)
+	s.SyncKey = g.SyncKeyName(ctx)
 	return s
 }
 
-// syncKeyName resolves sync.tsig_key_id to the key's owner name, "" when no
-// key is designated or the id names none.
-func (g *Registry) syncKeyName(ctx context.Context) string {
+// SyncKeyName resolves sync.tsig_key_id to the key's owner name, "" when no
+// key is designated or the id names none. Exported because the zones hooks
+// in internal/app are the same question asked on the DNS side: the key a
+// registered replica's transfer must be signed with, and the one a NOTIFY to
+// it is signed under (§6).
+func (g *Registry) SyncKeyName(ctx context.Context) string {
 	id, err := g.st.Settings().GetInt(ctx, syncKeySetting)
 	if err != nil || id == 0 {
 		return ""
