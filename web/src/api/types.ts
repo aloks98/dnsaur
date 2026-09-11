@@ -388,3 +388,13 @@ export interface TSIGKey {
 }
 
 export type Settings = Record<string, string>;
+
+/**
+ * POST /backup's answer: the file the server wrote, on the server's own
+ * filesystem. Nothing here is fetchable — no endpoint serves the file — so
+ * the path is shown for an operator to copy it off the box themselves.
+ */
+export interface BackupResult {
+  path: string;
+  bytes: number;
+}

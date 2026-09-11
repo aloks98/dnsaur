@@ -41,10 +41,20 @@ seconds, so it appears only once the page has been watching for ten seconds and
 falls back to zero when the stream goes quiet. The page of history the feed
 opens with doesn't count towards it.
 
+The rail panels' `All →` goes where their numbers came from: **Top blocked**
+opens the query log filtered to blocked rows, **Top client IPs** opens
+Groups & clients.
+
 The **query volume** chart is hourly whatever the window, and the window's
 oldest hour is only partly covered — stats buckets are whole hours, so the
 server drops that one rather than reporting a fraction of it. A 24-hour window
 is therefore 24 bars, not 25, and a 1-hour window is the current hour alone.
+
+The top bar's **DNS OK** readout, on every screen, is `GET /health` polled
+every 30 seconds — the one thing that says the resolver is answering at all.
+Hovering it shows the version of the build that answered, which is the
+number to quote when something looks wrong; it is not in the label, because
+the readout is skimmed for one word.
 
 ---
 
@@ -74,6 +84,18 @@ expired you get the login screen rather than a button that can't work.
 How much lands here is set by `qlog.privacy`, and how long it stays is set by
 `qlog.retention_days` — a background pruner deletes rows older than the cutoff.
 Setting retention to `0` prunes everything on the next pass.
+
+**The filters live in the URL.** `?decision=blocked`, `?type=AAAA`,
+`?client=192.168.1.10`, `?q=ads` — alone or together — are applied on
+arrival, so a filtered view is a link you can bookmark or send to someone,
+and the dashboard's **Top blocked** panel's `All →` opens the log already
+filtered to blocks. Changing a filter here replaces the URL rather than
+pushing a new one, so **Back** leaves the screen instead of walking you
+through one filter change at a time.
+
+The time range is the exception: it stays out of the URL. It is a pair of
+absolute timestamps, unreadable in a link, and one that would quietly age
+into a window retention has already emptied.
 
 The **client** filter matches the stored `client_ip` exactly, so it is
 unavailable unless `qlog.privacy` is `full`: `anon` masks the last octet on the
@@ -791,6 +813,7 @@ moment you save.
 | **Query log** | How much per-query detail is recorded, how long the rows are kept, and how long the hourly totals behind the dashboard outlive them |
 | **Lists** | How often subscriptions refresh |
 | **Protocols** | Whether clients can reach dnsaur over DNS-over-TLS / DNS-over-HTTPS, and the certificate both present |
+| **Backup** | Not a setting — a button that copies the database now (see Backup below) |
 
 **Upstream strategy** is one of:
 
@@ -841,6 +864,28 @@ the next reconcile.
 The three states that mean something is wrong — a failed bind, an expiring
 certificate, and the upstream-encryption downgrade — also appear as banners
 across the top of every screen, not just this one.
+
+### Backup
+
+**Back up now** writes a copy of the database into
+`<data_dir>/backups/dnsaur-<UTC timestamp>.db` and shows the path and size
+of the file it wrote. The copy is taken with SQLite's `VACUUM INTO`, so it
+is a consistent database rather than a file caught mid-write, and nothing
+has to be stopped first.
+
+The path is shown because the file stays on the server. Nothing serves it
+over HTTP, so **getting it somewhere that isn't this machine is still your
+job** — that is the half of a backup this button does not do.
+
+**Nothing is scheduled and nothing is deleted.** Each press leaves another
+file behind, and old ones are yours to remove. A resolver that filled its
+own disk on a timer would be a worse failure than the one backups exist to
+survive.
+
+On `storage.driver: postgres` the button reports what the server said:
+`backups are a sqlite feature; use pg_dump for postgres`. That is not an
+omission — `pg_dump` already does this better than a button could, and a
+half-copy of a postgres database is worse than none.
 
 ### Saving
 

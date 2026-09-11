@@ -549,6 +549,11 @@ function ResolverStatusCell() {
     // <output> rather than a div with role="status": same implicit role,
     // same polite live region, one fewer ARIA attribute to keep honest.
     <output
+      // The build that is answering, from the same /health poll — no second
+      // request, and no second fact in a label the eye skims for one word.
+      // A native `title` rather than a Tooltip: this cell is a live region,
+      // and a hover card inside one gets re-announced on every update.
+      title={health.data ? `dnsaur ${health.data.version}` : undefined}
       className={cn(
         CELL,
         "border-l border-l-border text-xs font-medium tracking-wider",

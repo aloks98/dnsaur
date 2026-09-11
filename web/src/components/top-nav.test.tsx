@@ -364,6 +364,19 @@ test("the resolver readout names its subject and reports GET /health honestly", 
   expect(screen.getByRole("status")).not.toHaveTextContent(/resolving/i);
 });
 
+// The version is already in the answer this cell polls every 30s, so which
+// build is running is one hover away instead of a question for the log. It
+// stays out of the label: the cell reports liveness, and a version number
+// beside "DNS OK" would be a second fact in a readout the eye skims.
+test("the resolver readout carries the running version in its tooltip", async () => {
+  renderTopNav();
+  await waitFor(() => expect(screen.getByRole("status")).toHaveTextContent(/dns ok/i));
+
+  // "dev" is what the handler answers, i.e. what GET /health reported.
+  expect(screen.getByRole("status")).toHaveAttribute("title", "dnsaur dev");
+  expect(screen.getByRole("status")).not.toHaveTextContent("dev");
+});
+
 test("an unreachable resolver says so rather than staying green", async () => {
   server.use(http.get("/api/v1/health", () => HttpResponse.json({ error: "x" }, { status: 500 })));
 

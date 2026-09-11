@@ -34,6 +34,7 @@ import {
   type DateSelectorPeriodType,
   type DateSelectorValue,
 } from "@e412/rnui-react";
+import { useSearchParams } from "react-router";
 import type { Client, List, QueryEntry, Rule } from "../api/types";
 import { StaleDataAlert } from "../components/stale-data-alert";
 import { useClients } from "../hooks/use-clients";
@@ -253,7 +254,34 @@ interface FilterState {
   to?: number;
 }
 
-const NO_FILTERS: FilterState = { q: "", decision: "", type: "", client: "" };
+/**
+ * The four filters that live in the URL.
+ *
+ * A filtered view is then a link: the dashboard's panels deep-link into this
+ * screen with one already applied, and a search worth showing somebody can
+ * be sent to them. They are also the page's only copy of those four values —
+ * a `useState` beside them would be a second source of truth that a deep
+ * link arriving at a mounted page could not update.
+ *
+ * The time range is deliberately not among them. It is two epoch-ms bounds
+ * from a picker that keeps its own selection, so a URL carrying them would
+ * hold a pair of absolute timestamps nobody can read and that age into a
+ * window `qlog.retention_days` has already emptied.
+ */
+const URL_FILTERS = ["q", "decision", "type", "client"] as const;
+
+function filtersFromParams(
+  params: URLSearchParams,
+  range: Pick<FilterState, "from" | "to">,
+): FilterState {
+  return {
+    q: params.get("q") ?? "",
+    decision: params.get("decision") ?? "",
+    type: params.get("type") ?? "",
+    client: params.get("client") ?? "",
+    ...range,
+  };
+}
 
 function toSearchFilter(filters: FilterState, q: string): QuerySearchFilter {
   return {
@@ -1236,7 +1264,12 @@ function Footer({
 // --- page --------------------------------------------------------------------
 
 export function QueryLog() {
-  const [filters, setFilters] = useState<FilterState>(NO_FILTERS);
+  // `replace`, everywhere the filters are written: they are a view setting,
+  // not a navigation, and typing eight characters into the search box is not
+  // eight entries in the back stack.
+  const [params, setParams] = useSearchParams();
+  const [range, setRange] = useState<Pick<FilterState, "from" | "to">>({});
+  const filters = useMemo(() => filtersFromParams(params, range), [params, range]);
   // Light debounce so the domain box doesn't fire a LIKE query per keystroke.
   // The other four are discrete selections, so they apply immediately.
   const [debouncedQ, setDebouncedQ] = useState("");
@@ -1401,8 +1434,23 @@ export function QueryLog() {
     setRailDismissed(true);
   }, []);
   const patchFilters = useCallback(
-    (patch: Partial<FilterState>) => setFilters((f) => ({ ...f, ...patch })),
-    [],
+    (patch: Partial<FilterState>) =>
+      setParams(
+        (prev) => {
+          const next = new URLSearchParams(prev);
+          for (const key of URL_FILTERS) {
+            const value = patch[key];
+            if (value === undefined) continue;
+            // An empty filter is an absent parameter, not `?decision=`: the
+            // URL says what is being filtered on and nothing else.
+            if (value) next.set(key, value);
+            else next.delete(key);
+          }
+          return next;
+        },
+        { replace: true },
+      ),
+    [setParams],
   );
 
   /**
@@ -1415,21 +1463,27 @@ export function QueryLog() {
    * debounce and rebuild the search filter for nothing.
    */
   const applyTimeRange = useCallback((value: DateSelectorValue) => {
-    const range = toEpochRange(value);
-    setFilters((f) =>
-      // Assigning both bounds, never spreading a partial: `range` carries an
-      // explicit `undefined` for whichever end this operator leaves open, and
-      // that has to overwrite whatever the last selection put there.
-      f.from === range.from && f.to === range.to ? f : { ...f, from: range.from, to: range.to },
-    );
+    const next = toEpochRange(value);
+    // Replacing both bounds, never merging: `next` carries an explicit
+    // undefined for whichever end this operator leaves open, and that has to
+    // overwrite whatever the last selection put there.
+    setRange((prev) => (prev.from === next.from && prev.to === next.to ? prev : next));
   }, []);
 
   const clearFilters = useCallback(() => {
-    setFilters(NO_FILTERS);
+    setParams(
+      (prev) => {
+        const next = new URLSearchParams(prev);
+        for (const key of URL_FILTERS) next.delete(key);
+        return next;
+      },
+      { replace: true },
+    );
+    setRange({});
     // The DateSelector keeps its own selection; remount it so the trigger
     // stops claiming a range the page is no longer filtering on.
     setResetToken((n) => n + 1);
-  }, []);
+  }, [setParams]);
 
   // The debounced `q` lags the box by 300ms, so "anything typed at all"
   // isn't the same question as "anything is being searched for": the Clear

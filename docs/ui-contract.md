@@ -327,6 +327,27 @@ does not have to.
 
 Full key list, defaults and reload behaviour in §3.9.
 
+#### `POST /api/v1/backup`
+Write scope. Takes a copy of the database with SQLite's `VACUUM INTO` and
+answers **201** with the file it wrote, plus a `Location` header carrying the
+same path:
+
+```json
+{"path":"/var/lib/dnsaur/backups/dnsaur-20260911T140822Z.db","bytes":2411724}
+```
+
+`path` is on the **server's** filesystem and no endpoint serves it, so the
+settings page shows it rather than offering a download. The directory is
+created `0700`; the copy is renamed into place, so an interrupted backup
+leaves nothing that reads as a complete one. No schedule, no retention.
+
+| Status | Error string |
+|---|---|
+| 409 | `backups are a sqlite feature; use pg_dump for postgres` |
+| 500 | `couldn't write the backup: <os error>` |
+
+The 409 is shown verbatim: the tool to run instead is the useful half of it.
+
 #### `GET /api/v1/resolver/status`
 Server state, not a setting — deliberately not folded into the flat map
 above.
@@ -1759,7 +1780,7 @@ an inline script because the served CSP is `script-src 'self'` with no
 |---|---|
 | **Filtering → Groups & Clients** | CRUD works, but the per-group "Lists (n)" menu has **no error state**: it's disabled only while `isPending`, not on `isError`, and its toggle rebuilds the assignment set from `groupLists.data ?? []`. If that read failed, clicking one list PUTs `[thatOne]` and **silently drops every other assignment**. |
 | **Filtering → Lists** | The table leads with the list's `name`; the URL is a muted second line and stays in the row's `title`. Actions (toggle, rename, delete) are labelled by name. The **Status** column replaces the old "Last refreshed" one and carries the badge plus a plain-language line per `last_status`. |
-| **Dashboard health** | Reduced to the shell's two row-1 readouts (blocking state, and `DNS OK`/`DNS down` from `GET /health`). Filter-list freshness moved off the dashboard with the redesign and now lives only on Filtering → Lists. The spec's "upstreams healthy" signal **has no code at all** — there is no upstream-health endpoint. |
+| **Dashboard health** | Reduced to the shell's two row-1 readouts (blocking state, and `DNS OK`/`DNS down` from `GET /health`, whose `version` is the readout's `title`). Filter-list freshness moved off the dashboard with the redesign and now lives only on Filtering → Lists. The spec's "upstreams healthy" signal **has no code at all** — there is no upstream-health endpoint. |
 | **Settings** | 12 keys work. The spec's "storage (read-only info)" section is absent, with a code comment noting no endpoint exists to source it. |
 | **Account** | TOTP, tokens and password are complete: the Password section holds a current/new/confirm form and a **Log out everywhere** action (`POST /auth/password`, `DELETE /auth/sessions`, §2.2). |
 | **Command palette** | Navigates to the 9 leaf pages only, grouped by nav section. The spec's "quick actions (pause, block a domain)" don't exist. |

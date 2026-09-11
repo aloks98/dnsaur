@@ -45,8 +45,24 @@ func run(ctx context.Context) error {
 	if err := lvl.UnmarshalText([]byte(cfg.LogLevel)); err != nil {
 		return err
 	}
-	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: lvl})))
+	// config.Load refuses any other format, so json is the only value this
+	// can fall through to — and it is also the one every install that
+	// predates log_format was already emitting.
+	opts := &slog.HandlerOptions{Level: lvl}
+	var h slog.Handler = slog.NewJSONHandler(os.Stderr, opts)
+	if cfg.LogFormat == "text" {
+		h = slog.NewTextHandler(os.Stderr, opts)
+	}
+	slog.SetDefault(slog.New(h))
 	slog.Info("dnsaur starting", "version", Version)
+	// One line per bootstrap key, with where the value came from. An operator
+	// debugging a setting that "isn't being applied" is usually looking at a
+	// file the process never read, and the only way to see that from the log
+	// was to notice a value that happened to differ from what they wrote.
+	// Config.Effective is what decides what is safe to print.
+	for _, e := range cfg.Effective() {
+		slog.Info("config", "key", e.Key, "value", e.Value, "source", e.Source)
+	}
 
 	a, err := app.New(ctx, cfg, Version)
 	if err != nil {

@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -277,5 +278,78 @@ func TestSQLiteDSNAppliesPragmasToAURIWithAQuery(t *testing.T) {
 	}
 	if fk != 1 {
 		t.Error("foreign_keys is off: the pragmas did not survive being appended to a DSN that already had a query")
+	}
+}
+
+// A backup has to be a database that opens and carries the rows, not a copy
+// of a file caught mid-write — which is why it is VACUUM INTO rather than an
+// io.Copy of the DSN's path: there is a WAL beside that file, and everything
+// still in it would be missing from the copy.
+func TestBackupSQLite(t *testing.T) {
+	ctx := context.Background()
+	s := openSQLite(t)
+	if _, err := s.Clients().AddGroup(ctx, "kids"); err != nil {
+		t.Fatal(err)
+	}
+
+	dir := filepath.Join(t.TempDir(), "backups")
+	path, size, err := s.Backup(ctx, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if filepath.Dir(path) != dir {
+		t.Errorf("backup landed in %s, want %s", filepath.Dir(path), dir)
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if size != fi.Size() || size == 0 {
+		t.Errorf("reported %d bytes, the file is %d", size, fi.Size())
+	}
+	// The file is the whole install's data, so the directory it is written
+	// into must not be readable by anyone else.
+	di, err := os.Stat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := di.Mode().Perm(); perm != 0o700 {
+		t.Errorf("backups directory is %o, want 700", perm)
+	}
+	// One file: the temp name is renamed into place, never left behind.
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Errorf("backups directory holds %d entries, want the backup alone", len(entries))
+	}
+
+	// The real check: it opens as a database, and the row is in it.
+	b, err := Open(ctx, "sqlite", path)
+	if err != nil {
+		t.Fatalf("the backup does not open as a database: %v", err)
+	}
+	defer func() { _ = b.Close() }()
+	groups, err := b.Clients().Groups(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, g := range groups {
+		found = found || g.Name == "kids"
+	}
+	if !found {
+		t.Errorf("the backup is missing a row written before it was taken: %v", groups)
+	}
+}
+
+// VACUUM INTO is sqlite's, and postgres has pg_dump. Answering anything else
+// — an empty file, a silent success — would hand the operator a backup that
+// is not one.
+func TestBackupPostgresRefused(t *testing.T) {
+	s := openPostgres(t)
+	if _, _, err := s.Backup(context.Background(), t.TempDir()); !errors.Is(err, ErrNoBackup) {
+		t.Fatalf("postgres backup error = %v, want ErrNoBackup", err)
 	}
 }

@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "../api/client";
-import type { ResolverStatus, Settings } from "../api/types";
+import type { BackupResult, ResolverStatus, Settings } from "../api/types";
 import { somethingIsWrong } from "../lib/serving";
 
 // Canonical settings-domain hooks — GET /settings (Settings page, Task 12)
@@ -80,6 +80,13 @@ export function useResolverStatus() {
       return somethingIsWrong(query.state.data) ? TROUBLE_POLL_MS : false;
     },
   });
+}
+
+// POST /backup — writes a copy of the database on the server and answers
+// with the file it wrote. Nothing to invalidate: it creates a file, not a
+// row, and no query reads the backups directory.
+export function useBackup() {
+  return useMutation({ mutationFn: () => api.post<BackupResult>("/backup") });
 }
 
 export function useUpdateSetting() {

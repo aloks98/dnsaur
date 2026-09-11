@@ -36,6 +36,10 @@ var (
 	// would revert whatever the other writer changed. See
 	// ZoneStore.UpdateZoneIfUnchanged.
 	ErrStale = errors.New("modified since read")
+	// ErrNoBackup is Backup on a driver that has no in-process way to take
+	// one. Its message is what the API hands the operator verbatim, because
+	// the useful half of the answer is what to run instead.
+	ErrNoBackup = errors.New("backups are a sqlite feature; use pg_dump for postgres")
 )
 
 // MissingRef names the row a write referenced that does not exist, for the
@@ -90,6 +94,10 @@ type Store interface {
 	// connections have all gone away is exactly the state a readiness probe
 	// exists to notice, and it is not visible from a cached value.
 	Ping(ctx context.Context) error
+	// Backup writes a copy of the database into dir and reports the file it
+	// wrote and how big it is. sqlite only — ErrNoBackup comes back on
+	// postgres, which has pg_dump and needs no help from this process.
+	Backup(ctx context.Context, dir string) (path string, size int64, err error)
 	Clients() ClientStore
 	Filters() FilterStore
 	Settings() SettingsStore

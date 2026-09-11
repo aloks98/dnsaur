@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"log/slog"
 	"net/netip"
+	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"github.com/knadh/koanf/parsers/yaml"
@@ -26,6 +28,10 @@ type Config struct {
 	HTTPListen string   `yaml:"http_listen"`
 	DataDir    string   `yaml:"data_dir"`
 	LogLevel   string   `yaml:"log_level"`
+	// LogFormat picks the slog handler: "json" (the default, and what every
+	// install that predates this key was already emitting) or "text", which
+	// is what a human reading `journalctl` actually wants.
+	LogFormat string `yaml:"log_format"`
 	// TrustedProxies are the networks a reverse proxy in front of dnsaur
 	// may connect from. A request arriving from one of them has its
 	// X-Forwarded-Proto and X-Forwarded-For headers believed; a request
@@ -41,6 +47,71 @@ type Config struct {
 		Driver string `yaml:"driver"`
 		DSN    string `yaml:"dsn"`
 	} `yaml:"storage"`
+	// Sources records where each key's value came from — "file" or "env",
+	// with a key absent meaning it was never set and kept its default. It is
+	// what Effective reports and the startup log prints; koanf merges its
+	// layers into one map and keeps no provenance of its own, so it is
+	// tracked here as the layers go in.
+	//
+	// Tagged "-" for the same reason TrustedProxies is: it is not a key the
+	// decoder can read from the file.
+	Sources map[string]string `yaml:"-"`
+}
+
+// Entry is one bootstrap key as it ended up: the value in force, and where
+// that value came from.
+type Entry struct{ Key, Value, Source string }
+
+// Effective is the whole bootstrap configuration, one entry per key, for the
+// line-per-key startup log in cmd/dnsaur. The values are the ones in force
+// after normalising and defaulting rather than the raw text, so the log
+// shows what the server is actually running on — which is the point: a value
+// printed without its source never distinguishes one the operator set from
+// one they got by not setting it.
+//
+// Everything here prints as-is. Listen addresses, paths and the
+// trusted-proxies list are operational facts an operator needs in the log,
+// and none of them is a credential. storage.dsn is the exception and the
+// only one today: `postgres://user:password@host` carries one, so it goes
+// through redactDSN. A bootstrap key added later that can hold a secret
+// needs the same treatment — logs get shipped somewhere else.
+func (c *Config) Effective() []Entry {
+	proxies := make([]string, 0, len(c.TrustedProxies))
+	for _, p := range c.TrustedProxies {
+		proxies = append(proxies, p.String())
+	}
+	out := []Entry{
+		{Key: "dns_listen", Value: strings.Join(c.DNSListen, ",")},
+		{Key: "http_listen", Value: c.HTTPListen},
+		{Key: "data_dir", Value: c.DataDir},
+		{Key: "log_level", Value: c.LogLevel},
+		{Key: "log_format", Value: c.LogFormat},
+		{Key: "trusted_proxies", Value: strings.Join(proxies, ",")},
+		{Key: "storage.driver", Value: c.Storage.Driver},
+		{Key: "storage.dsn", Value: redactDSN(c.Storage.DSN)},
+	}
+	for i := range out {
+		if src := c.Sources[out[i].Key]; src != "" {
+			out[i].Source = src
+			continue
+		}
+		out[i].Source = "default"
+	}
+	return out
+}
+
+// dsnPassword matches the keyword/value DSN spelling pgx also accepts
+// ("host=db password=hunter2"), which is not a URL and so is invisible to
+// net/url.
+var dsnPassword = regexp.MustCompile(`(?i)password=\S+`)
+
+func redactDSN(dsn string) string {
+	if u, err := url.Parse(dsn); err == nil && u.User != nil {
+		if _, ok := u.User.Password(); ok {
+			return u.Redacted() // net/url's own "xxxxx"
+		}
+	}
+	return dsnPassword.ReplaceAllString(dsn, "password=xxxxx")
 }
 
 // listenAddrs reads dns_listen from every shape it can arrive in and
@@ -114,6 +185,7 @@ func Load(path string) (*Config, error) {
 		"http_listen": ":8080",
 		"data_dir":    "./data",
 		"log_level":   "info",
+		"log_format":  "json",
 		"storage": map[string]interface{}{
 			"driver": "sqlite",
 		},
@@ -126,10 +198,23 @@ func Load(path string) (*Config, error) {
 	// the operator named and that is not there is a typo, and starting on
 	// defaults leaves it running with none of the configuration they wrote
 	// and nothing saying so.
+	//
+	// Loaded into a koanf of its own and merged, rather than straight into
+	// k: the file's own keys are exactly what Sources has to record as
+	// coming from the file, and a merged map no longer says which layer
+	// each key arrived on.
+	sources := map[string]string{}
 	switch _, err := os.Stat(path); {
 	case err == nil:
-		if err := k.Load(file.Provider(path), yaml.Parser()); err != nil {
+		fk := koanf.New(".")
+		if err := fk.Load(file.Provider(path), yaml.Parser()); err != nil {
 			return nil, fmt.Errorf("parse %s: %w", path, err)
+		}
+		for _, key := range fk.Keys() {
+			sources[key] = "file"
+		}
+		if err := k.Merge(fk); err != nil {
+			return nil, fmt.Errorf("merge %s: %w", path, err)
 		}
 	case errors.Is(err, os.ErrNotExist) && path == DefaultPath:
 	default:
@@ -142,6 +227,7 @@ func Load(path string) (*Config, error) {
 		"DNSAUR_HTTP_LISTEN":    "http_listen",
 		"DNSAUR_DATA_DIR":       "data_dir",
 		"DNSAUR_LOG_LEVEL":      "log_level",
+		"DNSAUR_LOG_FORMAT":     "log_format",
 		"DNSAUR_STORAGE_DRIVER": "storage.driver",
 		"DNSAUR_STORAGE_DSN":    "storage.dsn",
 	}
@@ -150,6 +236,7 @@ func Load(path string) (*Config, error) {
 			if err := k.Set(koanfKey, v); err != nil {
 				return nil, fmt.Errorf("set %s: %w", koanfKey, err)
 			}
+			sources[koanfKey] = "env"
 		}
 	}
 
@@ -157,6 +244,7 @@ func Load(path string) (*Config, error) {
 		if err := k.Set("trusted_proxies", strings.Split(v, ",")); err != nil {
 			return nil, fmt.Errorf("set trusted_proxies: %w", err)
 		}
+		sources["trusted_proxies"] = "env"
 	}
 
 	// Handle DNSAUR_DNS_LISTEN specially (comma-separated list). The entries
@@ -166,6 +254,7 @@ func Load(path string) (*Config, error) {
 		if err := k.Set("dns_listen", strings.Split(v, ",")); err != nil {
 			return nil, fmt.Errorf("set dns_listen: %w", err)
 		}
+		sources["dns_listen"] = "env"
 	}
 
 	// koanf fills the plain fields straight from their yaml tags. The two
@@ -173,7 +262,7 @@ func Load(path string) (*Config, error) {
 	// so what those return is what the caller gets: dns_listen accepts a
 	// scalar as the one-element list it plainly means, and trusted_proxies
 	// accepts a bare address as the single host it plainly means.
-	c := &Config{}
+	c := &Config{Sources: sources}
 	if err := k.UnmarshalWithConf("", c, koanf.UnmarshalConf{Tag: "yaml"}); err != nil {
 		return nil, fmt.Errorf("decode config: %w", err)
 	}
@@ -195,6 +284,13 @@ func Load(path string) (*Config, error) {
 	var lvl slog.Level
 	if err := lvl.UnmarshalText([]byte(c.LogLevel)); err != nil {
 		return nil, fmt.Errorf("unknown log_level %q: must be one of debug, info, warn, error", c.LogLevel)
+	}
+	// Checked here rather than where the handler is built, for the reason
+	// log_level is: cmd/dnsaur picks a handler from this value and has no
+	// way to refuse one, so an unreadable format would silently stay json
+	// and an operator who asked for text logs would get none.
+	if c.LogFormat != "json" && c.LogFormat != "text" {
+		return nil, fmt.Errorf("unknown log_format %q: must be one of text, json", c.LogFormat)
 	}
 	if c.Storage.Driver != "sqlite" && c.Storage.Driver != "postgres" {
 		return nil, fmt.Errorf("unknown storage driver %q", c.Storage.Driver)

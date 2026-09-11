@@ -16,7 +16,8 @@ export function relativeTime(epochMs: number): string {
 }
 
 /** A file size as `812 B` / `4.1 KB` / `2.3 MB` — the size shown beside a
- * chosen zone file's name in the import dialog. Binary units (1024), since
+ * chosen zone file's name in the import dialog, and beside the backup a
+ * settings-page press just wrote. Binary units (1024), since
  * the number describes bytes held in memory rather than anything a disk or a
  * transfer rate reports. */
 export function formatBytes(bytes: number): string {

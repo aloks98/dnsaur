@@ -909,9 +909,12 @@ test("each rail panel offers a way through to the full list", async () => {
   renderWithProviders(<Dashboard />);
   await screen.findByText("ads.tracker.example");
 
+  // Deep-linked, not just pointed at the screen: the panel counts blocks, so
+  // the log it opens is filtered to blocks. Landing on an unfiltered tail
+  // meant re-picking the filter the panel was already about.
   expect(
     screen.getByRole("link", { name: /all blocked domains in the query log/i }),
-  ).toHaveAttribute("href", "/queries");
+  ).toHaveAttribute("href", "/queries?decision=blocked");
   expect(screen.getByRole("link", { name: /all clients in groups & clients/i })).toHaveAttribute(
     "href",
     "/filtering/clients",

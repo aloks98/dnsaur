@@ -13,6 +13,9 @@ data_dir: "/var/lib/dnsaur"
 
 log_level: "info"
 
+# "json" (the default) or "text" — key=value lines, for reading in journalctl.
+# log_format: "text"
+
 storage:
   driver: sqlite
 

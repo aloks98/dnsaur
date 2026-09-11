@@ -1260,6 +1260,57 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
 
+  /backup:
+    post:
+      tags: [Settings]
+      summary: Write a backup of the database into <data_dir>/backups
+      description: >
+        Takes a consistent copy of the SQLite database with `VACUUM INTO`,
+        so it includes everything still in the WAL and needs no quiescing,
+        and answers with the file it wrote. The directory is created 0700
+        and the copy is renamed into place, so an interrupted backup leaves
+        no half file. `Location` carries the same filesystem path as `path`
+        — the file is on the server's disk and no endpoint serves it.
+
+
+        SQLite only: a postgres install is answered 409, since pg_dump is
+        the tool for that and this process has no business reimplementing
+        it. There is no schedule and no retention — the file is named for
+        the moment it was taken and nothing deletes it.
+      responses:
+        "201":
+          description: Created
+          headers:
+            Location:
+              description: The backup's path on the server's filesystem, same as `path`.
+              schema: { type: string }
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [path, bytes]
+                properties:
+                  path: { type: string, example: "/var/lib/dnsaur/backups/dnsaur-20260911T140822Z.db" }
+                  bytes: { type: integer, format: int64 }
+        "401":
+          description: authentication required
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "403":
+          $ref: "#/components/responses/ReadOnlyToken"
+        "409":
+          description: >
+            the storage driver is postgres; use pg_dump
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "500":
+          description: the copy could not be written (no space, unwritable data_dir)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
   /blocking:
     get:
       tags: [Blocking]

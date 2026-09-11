@@ -146,6 +146,10 @@ type Deps struct {
 	// Static serves the embedded web dashboard on non-/api paths. Nil
 	// disables it (e.g. tests that don't care about the SPA).
 	Static fs.FS
+	// DataDir is config.Config.DataDir — the directory this instance owns.
+	// POST /backup writes into a "backups" subdirectory of it, which is the
+	// one thing this package uses it for.
+	DataDir string
 	// TrustedProxies are the networks a reverse proxy in front of this
 	// server may connect from (config.Config.TrustedProxies). A request
 	// arriving from one of them has its X-Forwarded-* headers believed;

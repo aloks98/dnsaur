@@ -243,6 +243,19 @@ Full parameter/response detail lives in `internal/api/openapi.yaml`
   [`docs/configuration.md`](configuration.md#encrypted-serving) for the
   full story, including why a bind failure surfaces here rather than only
   in the log.
+- **Backup** — `POST /backup` (write scope). Takes a copy of the database
+  with SQLite's `VACUUM INTO`, into `<data_dir>/backups/dnsaur-<UTC
+  timestamp>.db`, and answers `201 {path, bytes}` with `Location` carrying
+  that same path. The directory is created `0700`, and the copy is written
+  under a temp name and renamed, so an interrupted backup never leaves a
+  half file that reads as a complete one. `VACUUM INTO` reads through a
+  transaction, so the copy includes everything still in the WAL and nothing
+  has to be stopped first — it does hold SQLite's single connection while
+  it runs, so other queries wait. The file stays on the server's disk; no
+  endpoint serves it, and copying it somewhere else is the operator's job.
+  **There is no schedule and no retention** — nothing deletes an old
+  backup. On `storage.driver: postgres` the answer is `409` with
+  `backups are a sqlite feature; use pg_dump for postgres`.
 - **Blocking** — `GET /blocking?group_id=` or `?client_id=` (pause status,
   answering `{paused_until, scope}` where `scope` is `global`, `group` or
   `client`), `POST /blocking/pause` (`{[group_id | client_id,] minutes}`,

@@ -1291,7 +1291,10 @@ export function Dashboard() {
           <RailPanel
             title="Top blocked"
             note="blocked only"
-            allTo="/queries"
+            // The panel counts blocks, so the log it opens counts blocks:
+            // the filter is in the URL (see pages/queries.tsx's URL_FILTERS)
+            // and applies on arrival.
+            allTo="/queries?decision=blocked"
             allLabel="All blocked domains in the query log"
             className="border-b border-border"
           >

@@ -6,7 +6,7 @@ dnsaur has two layers of configuration:
 
 - A small **bootstrap YAML file** (plus environment overrides) for the
   things needed before a database connection exists: listen addresses,
-  storage driver/DSN, data directory, log level.
+  storage driver/DSN, data directory, log level and format.
 - **Everything else** lives in a `settings` table in the database, seeded
   with defaults on first run and managed at runtime via the REST API
   (`GET`/`PUT /api/v1/settings` — see [`docs/api.md`](api.md)). Most of
@@ -23,6 +23,7 @@ over built-in defaults, then overridden by environment variables.
 | `http_listen` | `DNSAUR_HTTP_LISTEN` | `:8080` | Address the REST API *and* the web dashboard listen on — both are served by the same HTTP server (the dashboard is a static SPA embedded into the binary; the API answers under `/api/v1`, everything else falls through to the dashboard, see [`docs/architecture.md`](architecture.md)) |
 | `data_dir` | `DNSAUR_DATA_DIR` | `./data` | Directory for the SQLite DB file and cached blocklist downloads |
 | `log_level` | `DNSAUR_LOG_LEVEL` | `info` | slog level: `debug`, `info`, `warn` or `error`. Anything else is refused at startup |
+| `log_format` | `DNSAUR_LOG_FORMAT` | `json` | slog handler: `json` (machine-readable, what a log shipper wants) or `text` (`key=value` lines, what a human reading `journalctl` wants). Anything else is refused at startup |
 | `storage.driver` | `DNSAUR_STORAGE_DRIVER` | `sqlite` | `sqlite` or `postgres` |
 | `storage.dsn` | `DNSAUR_STORAGE_DSN` | `<data_dir>/dnsaur.db` (sqlite) | Data source name; **required** when `storage.driver` is `postgres` |
 | `trusted_proxies` | `DNSAUR_TRUSTED_PROXIES` (comma-separated) | *(empty)* | Networks a reverse proxy in front of dnsaur may connect from, as CIDRs (a bare address means that one host). A request arriving from one of them has its `X-Forwarded-Proto` and `X-Forwarded-For` believed; every other request does not. See Behind a reverse proxy below |
@@ -34,6 +35,7 @@ dns_listen: [":53"]
 http_listen: ":8080"
 data_dir: "/var/lib/dnsaur"
 log_level: "info"
+log_format: "json"   # or "text"
 trusted_proxies: []   # e.g. ["10.0.0.0/8", "192.168.1.5"]
 storage:
   driver: sqlite
@@ -67,12 +69,39 @@ server that answers nothing (see
   nothing. There is no DNS server without an address to serve it on.
 - **An unknown `log_level`.** `verbose` used to be silently `info`, so an
   operator who asked for debug output got none and nothing said why.
+- **An unknown `log_format`**, for the same reason: `cmd/dnsaur` picks a
+  handler from the value and has no way to refuse one, so anything but
+  `text` or `json` would silently stay `json`.
 - **An unknown `storage.driver`**, and a `postgres` driver with no
   `storage.dsn`.
 - **A `trusted_proxies` entry that is not an IP address or CIDR.** Dropping
   it silently would leave the operator with a proxy they believe is trusted,
   a session cookie shipping without `Secure`, and nothing anywhere saying
   why.
+
+### What startup logs
+
+Once the config loads, dnsaur logs one `config` line per bootstrap key at
+INFO, carrying the value in force and where it came from — `file`, `env` or
+`default`:
+
+```
+{"level":"INFO","msg":"config","key":"http_listen","value":":8080","source":"default"}
+{"level":"INFO","msg":"config","key":"data_dir","value":"/var/lib/dnsaur","source":"file"}
+{"level":"INFO","msg":"config","key":"log_level","value":"debug","source":"env"}
+```
+
+The source is the half that matters. A setting that "isn't being applied" is
+usually a file the process never read — a typo'd `-config`, a container
+where the bind mount landed somewhere else, an env var left over from an
+earlier run — and a value printed on its own can't distinguish one that was
+set from one that defaulted.
+
+The values are the ones actually in force, after normalising (`dns_listen`
+trimmed and split) and defaulting (`storage.dsn` filled in from `data_dir`),
+so the log shows what the server is running on rather than what was typed.
+`storage.dsn` is printed with any password replaced by `xxxxx`; nothing else
+in the bootstrap config is a credential.
 
 ### In a container
 

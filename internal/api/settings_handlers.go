@@ -4,6 +4,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"log/slog"
 	"maps"
 	"net"
 	"net/http"
@@ -192,9 +193,46 @@ func (s *Server) settingsRoutes() {
 	s.route("GET /api/v1/settings", s.requireAuth(s.handleSettingsGet))
 	s.route("PUT /api/v1/settings", s.requireAuth(s.handleSettingsPut))
 	s.route("GET /api/v1/resolver/status", s.requireAuth(s.handleResolverStatus))
+	s.route("POST /api/v1/backup", s.requireAuth(s.handleBackup))
 	s.route("GET /api/v1/blocking", s.requireAuth(s.handleBlockingGet))
 	s.route("POST /api/v1/blocking/pause", s.requireAuth(s.handlePause))
 	s.route("DELETE /api/v1/blocking/pause", s.requireAuth(s.handleResume))
+}
+
+// handleBackup writes a copy of the database into <data_dir>/backups and
+// answers with the file it wrote — the path is the point, since copying it
+// off the box is what the operator does next and nothing else says where it
+// went. Location carries the same path: it is where the new thing is, even
+// though no endpoint serves it (the file is on the server's disk, and an
+// endpoint that streamed the whole database out over HTTP would be a
+// different feature with a different set of questions).
+//
+// No schedule and no retention: the file is named for the moment it was
+// taken and left alone after that. A timer that fills a disk on its own is
+// worse than a button.
+//
+// The 409 is postgres, which the store reports by refusing (store.ErrNoBackup)
+// — it has pg_dump and does not need this process to reimplement it.
+func (s *Server) handleBackup(w http.ResponseWriter, r *http.Request) {
+	path, size, err := s.deps.Store.Backup(r.Context(), filepath.Join(s.deps.DataDir, "backups"))
+	switch {
+	case errors.Is(err, store.ErrNoBackup):
+		errJSON(w, http.StatusConflict, err.Error())
+	case err != nil:
+		// Named rather than folded into "storage unavailable": every failure
+		// here is about the filesystem — a full disk, a data_dir the process
+		// cannot write — and the operator needs to know it was the copy that
+		// failed, not the database.
+		slog.Error("backup failed", "err", err)
+		errJSON(w, http.StatusInternalServerError, "couldn't write the backup: "+err.Error())
+	default:
+		created(w, path, backupResult{Path: path, Bytes: size})
+	}
+}
+
+type backupResult struct {
+	Path  string `json:"path"`
+	Bytes int64  `json:"bytes"`
 }
 
 func (s *Server) handleSettingsGet(w http.ResponseWriter, r *http.Request) {

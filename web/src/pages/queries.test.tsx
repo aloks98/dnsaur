@@ -4,6 +4,7 @@ import { toast } from "sonner";
 import { afterEach, beforeAll, beforeEach, expect, test, vi } from "vitest";
 import { fireEvent, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { useLocation } from "react-router";
 import { server } from "../test/msw-server";
 import { renderWithProviders } from "../test/render";
 import { FakeEventSource } from "../test/fake-event-source";
@@ -70,8 +71,24 @@ afterEach(() => vi.restoreAllMocks());
  * asserted directly against the store instead, which is both stronger and
  * doesn't tie this file to the chrome's markup.
  */
-function renderQueryLog() {
-  return renderWithProviders(<QueryLog />, { route: "/queries" });
+function renderQueryLog(route = "/queries") {
+  return renderWithProviders(
+    <>
+      <QueryLog />
+      <LocationSearch />
+    </>,
+    { route },
+  );
+}
+
+/** The router's current query string, so a test can read what the page wrote
+ * back into the URL. */
+function LocationSearch() {
+  return <span data-testid="search">{useLocation().search}</span>;
+}
+
+function urlSearch() {
+  return screen.getByTestId("search").textContent;
 }
 
 /**
@@ -1952,4 +1969,45 @@ test("no entry action when the matched entry is the queried name itself", async 
   expect(
     within(inspector()).queryByRole("button", { name: /allow this entry/i }),
   ).not.toBeInTheDocument();
+});
+
+// The dashboard's panels deep-link into this screen (pages/dashboard.tsx's
+// ALL arrow), so a filter named in the URL has to be the filter the page
+// opens with — not a default the arriving link then has to be re-typed over.
+test("a filter named in the URL is applied on arrival", async () => {
+  const urls: string[] = [];
+  server.use(
+    http.get("/api/v1/queries", ({ request }) => {
+      urls.push(request.url);
+      return HttpResponse.json([
+        entry({ id: 12, q_name: "ads.example", decision: "blocked", rule_id: 5 }),
+      ]);
+    }),
+  );
+
+  renderQueryLog("/queries?decision=blocked");
+
+  expect(await screen.findByText("ads.example")).toBeInTheDocument();
+  expect(screen.getByRole("combobox", { name: /decision/i })).toHaveValue("blocked");
+  expect(urls.at(-1) ?? "").toContain("decision=blocked");
+});
+
+// And the other direction: a filter applied here is a link. `replace`, so
+// Back leaves the screen instead of walking one filter change at a time.
+test("changing a filter writes it to the URL", async () => {
+  const user = userEvent.setup();
+  server.use(http.get("/api/v1/queries", () => HttpResponse.json([])));
+
+  renderQueryLog();
+  await firstSource();
+
+  await user.selectOptions(screen.getByRole("combobox", { name: /decision/i }), "blocked");
+  await waitFor(() => expect(urlSearch()).toContain("decision=blocked"));
+
+  await user.selectOptions(screen.getByRole("combobox", { name: /^type/i }), "AAAA");
+  await waitFor(() => expect(urlSearch()).toContain("type=AAAA"));
+  expect(urlSearch()).toContain("decision=blocked");
+
+  await user.click(screen.getByRole("button", { name: /clear filters/i }));
+  await waitFor(() => expect(urlSearch()).toBe(""));
 });

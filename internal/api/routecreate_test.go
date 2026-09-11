@@ -34,7 +34,10 @@ var noLocationRoutes = map[string]string{
 	"POST /api/v1/auth/totp/confirm": "turns 2FA on for the existing account; 204.",
 	"POST /api/v1/auth/totp/disable": "turns 2FA off for the existing account; 204.",
 	"POST /api/v1/blocking/pause":    "sets a pause on an existing scope; 204.",
-	"POST /api/v1/filters/refresh":   "starts background work; 202, and there is no new row.",
+	"POST /api/v1/backup": "writes a file, not a row. It does answer 201 with a Location — the " +
+		"path of the backup on the server's disk — but there is no id and no URL that serves it, " +
+		"so the id-based probe below has nothing to check. See TestBackupNamesTheFileItWrote.",
+	"POST /api/v1/filters/refresh": "starts background work; 202, and there is no new row.",
 	"POST /api/v1/filters/lists/{id}/refresh": "refreshes the list the URL already names; 202 with " +
 		"that same row.",
 	"POST /api/v1/zones/{id}/refresh": "transfers into the zone the URL already names; 200.",

@@ -41,11 +41,12 @@ import {
 } from "@e412/rnui-react";
 import { ApiError } from "../api/client";
 import type { Settings } from "../api/types";
-import { useSettings, useUpdateSetting } from "../hooks/use-settings";
+import { useBackup, useSettings, useUpdateSetting } from "../hooks/use-settings";
 import { ProtocolsField } from "../components/protocols-field";
 import { StaleDataAlert } from "../components/stale-data-alert";
 import { UpstreamsField } from "../components/upstreams-field";
 import { WARNING_STRIP_TINT } from "../components/warning-strip";
+import { formatBytes } from "../lib/format";
 import { rhfName } from "../lib/rhf-name";
 import { parseUpstreams } from "../lib/upstreams";
 
@@ -1056,6 +1057,7 @@ function SettingsForm({ settings }: { settings: Settings }) {
               </section>
             );
           })}
+          <BackupBand />
         </div>
       </form>
 
@@ -1082,6 +1084,60 @@ function SettingsForm({ settings }: { settings: Settings }) {
         </AlertDialogContent>
       </AlertDialog>
     </Form>
+  );
+}
+
+/**
+ * The one band on this page that does something now instead of saving a
+ * value, which is why it is not a SETTING_GROUPS entry: nothing here is a
+ * key, so it has no dirty state and no place in the unsaved-changes count.
+ *
+ * The path is the whole answer. The file stays on the server's disk — no
+ * endpoint serves it — so copying it somewhere that isn't this machine is
+ * the operator's next move, and they need to know where it went.
+ *
+ * A postgres install is answered 409 by the server with the tool to run
+ * instead, and that sentence is shown as the server wrote it: "couldn't
+ * back up" would drop the only actionable half of it.
+ */
+function BackupBand() {
+  const backup = useBackup();
+
+  return (
+    <section className="grid grid-cols-[288px_1fr] border-b border-border">
+      <div className="flex flex-col items-start gap-2 border-r border-border p-5">
+        <h2 className="font-heading text-base font-semibold">Backup</h2>
+        <p className="text-xs text-pretty text-muted-foreground">
+          Writes a copy of the database into the data directory. SQLite only; nothing is scheduled
+          and nothing is deleted.
+        </p>
+      </div>
+      <div className="flex flex-col items-start gap-3 px-5 py-4">
+        {/* type="button": this sits inside the settings form, and a bare
+            button in a form submits it. */}
+        <Button
+          type="button"
+          variant="outline"
+          disabled={backup.isPending}
+          onClick={() => backup.mutate()}
+        >
+          {backup.isPending ? "Backing up…" : "Back up now"}
+        </Button>
+        {backup.data && (
+          <p className="text-xs text-muted-foreground">
+            <span className="font-mono break-all text-foreground">{backup.data.path}</span> ·{" "}
+            {formatBytes(backup.data.bytes)}
+          </p>
+        )}
+        {backup.error && (
+          <p className="text-xs text-destructive">
+            {backup.error instanceof ApiError
+              ? backup.error.message
+              : "Couldn't write the backup — try again"}
+          </p>
+        )}
+      </div>
+    </section>
   );
 }
 

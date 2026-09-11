@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"crypto/tls"
 	"encoding/json"
 	"net/http"
@@ -511,6 +512,64 @@ func putSetting(t *testing.T, ts *zoneTestServer, key, value string) *httptest.R
 // raw body — errJSON JSON-encodes the message, so quotes and paths in it
 // are escaped on the wire and a raw match on rec.Body would never see the
 // unescaped substring back. E1 lost time to exactly that.
+// POST /backup is the one write that produces a file rather than a row, so
+// the answer has to name the file: copying it off the box is the operator's
+// next step and nothing else tells them where it went.
+func TestBackupNamesTheFileItWrote(t *testing.T) {
+	dir := t.TempDir()
+	srv, s, _ := testServer(t, func(d *Deps) { d.DataDir = dir })
+	cookie := login(t, srv, s)
+
+	w := doReq(t, srv.Handler(), "POST", "/api/v1/backup", "", cookie)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("POST /backup = %d %s, want 201", w.Code, strings.TrimSpace(w.Body.String()))
+	}
+	var got struct {
+		Path  string `json:"path"`
+		Bytes int64  `json:"bytes"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal %s: %v", w.Body, err)
+	}
+	if want := filepath.Join(dir, "backups"); filepath.Dir(got.Path) != want {
+		t.Errorf("backup written to %s, want a file in %s", got.Path, want)
+	}
+	fi, err := os.Stat(got.Path)
+	if err != nil {
+		t.Fatalf("the path in the response names no file: %v", err)
+	}
+	if got.Bytes != fi.Size() {
+		t.Errorf("reported %d bytes, the file is %d", got.Bytes, fi.Size())
+	}
+	if loc := w.Header().Get("Location"); loc != got.Path {
+		t.Errorf("Location = %q, want the backup's path %q", loc, got.Path)
+	}
+}
+
+// The postgres answer. A wrapper rather than a real postgres store because
+// what is under test here is the mapping — store.ErrNoBackup has to become
+// the 409 that names pg_dump, not the 503 every other store failure becomes
+// — and internal/store's TestBackupPostgresRefused already pins that a real
+// postgres store is what produces it.
+type noBackupStore struct{ store.Store }
+
+func (noBackupStore) Backup(context.Context, string) (string, int64, error) {
+	return "", 0, store.ErrNoBackup
+}
+
+func TestBackupOnPostgresSaysWhatToRunInstead(t *testing.T) {
+	srv, s, _ := testServer(t, func(d *Deps) { d.Store = noBackupStore{d.Store} })
+	cookie := login(t, srv, s)
+
+	w := doReq(t, srv.Handler(), "POST", "/api/v1/backup", "", cookie)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("POST /backup on postgres = %d, want 409", w.Code)
+	}
+	if msg := settingsErr(t, w); !strings.Contains(msg, "pg_dump") {
+		t.Errorf("error = %q, want it to name pg_dump — that is the actionable half", msg)
+	}
+}
+
 func settingsErr(t *testing.T, rec *httptest.ResponseRecorder) string {
 	t.Helper()
 	var got struct {

@@ -237,3 +237,75 @@ func TestValidLogLevelsAccepted(t *testing.T) {
 		}
 	}
 }
+
+// log_format defaults to json, because every install that predates the key
+// was logging json and an upgrade must not change what their log shipper is
+// parsing. An unreadable value is refused for the same reason log_level is:
+// silently falling back leaves an operator who asked for text logs reading
+// json and nothing saying why.
+func TestLogFormat(t *testing.T) {
+	if c, err := Load(noConfigFile(t)); err != nil || c.LogFormat != "json" {
+		t.Fatalf("default log_format = %q (%v), want json", c.LogFormat, err)
+	}
+	for _, f := range []string{"text", "json"} {
+		t.Setenv("DNSAUR_LOG_FORMAT", f)
+		c, err := Load(noConfigFile(t))
+		if err != nil || c.LogFormat != f {
+			t.Errorf("log_format %q: %v (got %q)", f, err, c.LogFormat)
+		}
+	}
+	t.Setenv("DNSAUR_LOG_FORMAT", "logfmt")
+	_, err := Load(noConfigFile(t))
+	if err == nil {
+		t.Fatal("log_format \"logfmt\" was accepted")
+	}
+	for _, want := range []string{"text", "json"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error should name the accepted formats, missing %q: %v", want, err)
+		}
+	}
+}
+
+// The startup log has to say where each bootstrap value came from:
+// "log_level=info" on its own never distinguishes a level the operator set
+// from the one they got by not setting it, which is the whole question when
+// the config file turns out not to be the one being read. A file+env mix is
+// where that gets reported wrong, so it is what this pins.
+func TestEffectiveReportsSourcePerKey(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "c.yaml")
+	body := "http_listen: \":9999\"\ndata_dir: /var/lib/dnsaur\n" +
+		"storage:\n  driver: postgres\n  dsn: postgres://dnsaur:hunter2@db/dnsaur\n"
+	if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("DNSAUR_HTTP_LISTEN", ":7777")
+	c, err := Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got := map[string]Entry{}
+	for _, e := range c.Effective() {
+		got[e.Key] = e
+	}
+	for key, want := range map[string]string{
+		"http_listen":     "env",
+		"data_dir":        "file",
+		"storage.driver":  "file",
+		"storage.dsn":     "file",
+		"dns_listen":      "default",
+		"log_level":       "default",
+		"trusted_proxies": "default",
+	} {
+		if got[key].Source != want {
+			t.Errorf("%s came from %q, want %q", key, got[key].Source, want)
+		}
+	}
+	if got["http_listen"].Value != ":7777" {
+		t.Errorf("http_listen value = %q, want the env's :7777", got["http_listen"].Value)
+	}
+	// The one bootstrap value that can carry a credential.
+	if strings.Contains(got["storage.dsn"].Value, "hunter2") {
+		t.Errorf("the DSN's password reached the startup log: %q", got["storage.dsn"].Value)
+	}
+}

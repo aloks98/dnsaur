@@ -844,3 +844,59 @@ test("Discard after a partial failure keeps what was saved", async () => {
   expect(screen.getByLabelText(/^blocked response ttl/i)).toHaveValue("45");
   expect(screen.getByLabelText(/^retention \(days\)/i)).toHaveValue("90");
 });
+
+// The backup band is the one thing on this page that acts instead of saving,
+// and the path is the whole answer: the file is on the server's disk and
+// copying it off is the operator's next move.
+test("Back up now writes a backup and says where it went", async () => {
+  const user = userEvent.setup();
+  mockSettings(fullSettings());
+  let posted = 0;
+  server.use(
+    http.post("/api/v1/backup", () => {
+      posted += 1;
+      return HttpResponse.json(
+        { path: "/var/lib/dnsaur/backups/dnsaur-20260911T140822Z.db", bytes: 2_411_724 },
+        { status: 201 },
+      );
+    }),
+  );
+
+  renderWithProviders(<SettingsPage />);
+  await screen.findByText("Upstreams");
+
+  await user.click(screen.getByRole("button", { name: /back up now/i }));
+
+  expect(
+    await screen.findByText("/var/lib/dnsaur/backups/dnsaur-20260911T140822Z.db"),
+  ).toBeInTheDocument();
+  expect(screen.getByText(/2\.3 MB/)).toBeInTheDocument();
+  expect(posted).toBe(1);
+  // It is an action, not a field: nothing about it belongs to the form's
+  // unsaved-changes count.
+  expect(screen.getByText("All changes saved")).toBeInTheDocument();
+});
+
+// The 409 names the tool to run instead, which is the useful half, so it is
+// shown as the server wrote it rather than reworded into "couldn't back up".
+test("a postgres install is shown the server's own pg_dump answer", async () => {
+  const user = userEvent.setup();
+  mockSettings(fullSettings());
+  server.use(
+    http.post("/api/v1/backup", () =>
+      HttpResponse.json(
+        { error: "backups are a sqlite feature; use pg_dump for postgres" },
+        { status: 409 },
+      ),
+    ),
+  );
+
+  renderWithProviders(<SettingsPage />);
+  await screen.findByText("Upstreams");
+
+  await user.click(screen.getByRole("button", { name: /back up now/i }));
+
+  expect(
+    await screen.findByText("backups are a sqlite feature; use pg_dump for postgres"),
+  ).toBeInTheDocument();
+});

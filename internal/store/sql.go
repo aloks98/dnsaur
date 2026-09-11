@@ -3,7 +3,10 @@ package store
 import (
 	"context"
 	"database/sql"
+	"os"
+	"path/filepath"
 	"strings"
+	"time"
 )
 
 type sqlStore struct {
@@ -24,6 +27,49 @@ func (s *sqlStore) Tokens() TokenStore             { return &tokenStore{s} }
 func (s *sqlStore) Zones() ZoneStore               { return &zoneStore{s} }
 func (s *sqlStore) TSIGKeys() TSIGKeyStore         { return &tsigKeyStore{s} }
 func (s *sqlStore) Notifies() NotifyStore          { return &notifyStore{s: s} }
+
+// Backup takes sqlite's own consistent copy — VACUUM INTO, which reads the
+// database through a transaction, so it includes whatever is still in the
+// WAL and needs no quiescing. Copying the DSN's file instead would miss
+// exactly that.
+//
+// The copy is written under a temp name and renamed, so an interrupted
+// backup leaves no half file that reads as a complete one, and the
+// directory is created 0700: it is the whole install's data, query log
+// included.
+//
+// It holds sqlite's one connection (Open caps the pool at 1) for as long as
+// the copy takes, so every other query waits on it. That is the price of a
+// backup nobody has to schedule around, and the reason this is on demand
+// rather than on a timer.
+func (s *sqlStore) Backup(ctx context.Context, dir string) (string, int64, error) {
+	if s.dialect != "sqlite" {
+		return "", 0, ErrNoBackup
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", 0, err
+	}
+	path := filepath.Join(dir, "dnsaur-"+time.Now().UTC().Format("20060102T150405Z")+".db")
+	// VACUUM INTO refuses to write over an existing file, so a leftover from
+	// an interrupted run has to go before this one can start.
+	tmp := path + ".part"
+	if err := os.Remove(tmp); err != nil && !os.IsNotExist(err) {
+		return "", 0, err
+	}
+	if _, err := s.db.ExecContext(ctx, "VACUUM INTO ?", tmp); err != nil {
+		_ = os.Remove(tmp)
+		return "", 0, err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return "", 0, err
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		return "", 0, err
+	}
+	return path, fi.Size(), nil
+}
 
 func (s *sqlStore) q(q string) string { return rebind(s.dialect, q) }
 

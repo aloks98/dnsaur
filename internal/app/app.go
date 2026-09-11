@@ -849,6 +849,7 @@ func (a *App) Start(ctx context.Context) error {
 		ResolverStatus: a,
 		Version:        a.version, Static: web.Dist(),
 		TrustedProxies: a.cfg.TrustedProxies,
+		DataDir:        a.cfg.DataDir,
 	})
 	ln, err := net.Listen("tcp", a.cfg.HTTPListen)
 	if err != nil {
