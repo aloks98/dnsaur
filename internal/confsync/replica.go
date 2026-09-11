@@ -215,12 +215,20 @@ func (r *Replica) PullOnce(ctx context.Context) error {
 		return fmt.Errorf("reading the sync settings: %w", err)
 	}
 
-	s := api.SyncStatus{Role: "replica"}
-	// The last version the main was known to hold. A probe that fails
+	s := api.SyncStatus{Role: "replica", PeerURL: peer}
+	// The last version this peer was known to hold. A probe that fails
 	// leaves it standing: "behind by N" is what the Sync band shows, and a
 	// main that has gone down must not read as one this box is level with.
+	//
+	// Only while it is the same peer, though. A replica re-pointed at
+	// another main knows nothing about the new one until it answers, and
+	// carrying the old one's number over would report a version from a box
+	// this one no longer follows, for as long as the new peer is
+	// unreachable.
 	r.mu.Lock()
-	s.PeerVersion = r.last.PeerVersion
+	if r.last.PeerURL == peer {
+		s.PeerVersion = r.last.PeerVersion
+	}
 	r.mu.Unlock()
 	s.AppliedVersion, _ = strconv.ParseInt(all[appliedVersionSetting], 10, 64)
 	s.AppliedAt, _ = strconv.ParseInt(all[appliedAtSetting], 10, 64)

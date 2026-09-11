@@ -340,6 +340,17 @@ func TestReplicaKeepsThePeerVersionWhenTheProbeFails(t *testing.T) {
 	if st.LastError == "" || st.AppliedVersion != want {
 		t.Fatalf("status %+v", st)
 	}
+
+	// Re-pointed at another main: the version carried forward belonged to
+	// the old one, and reporting it against a new peer that has not
+	// answered yet would be a number from the wrong box.
+	mustSet(t, rep, "sync.peer_url", "http://127.0.0.1:1")
+	if err := r.PullOnce(ctx); err == nil {
+		t.Fatal("a pull against a dead peer succeeded")
+	}
+	if st := r.Status(); st.PeerVersion != 0 || st.LastError == "" {
+		t.Fatalf("status %+v after re-pointing, want no peer version yet", st)
+	}
 }
 
 // TestDecodeLimitedRefusesAnOversizeBody: a peer that answers with more than
