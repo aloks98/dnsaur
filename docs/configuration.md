@@ -199,6 +199,11 @@ the DB, bumps a config version, and live components reload automatically —
 | `serve.doh.listen` | `:443` | Address the DoH listener binds — same `host:port` grammar as `serve.dot.listen` |
 | `serve.tls.cert` | *(empty)* | Absolute path to the PEM certificate DoT and DoH both present. Empty means neither protocol can be enabled yet |
 | `serve.tls.key` | *(empty)* | Absolute path to the PEM private key matching `serve.tls.cert` |
+| `sync.peer_url` | *(empty)* | The main instance this one follows, as an absolute `http`/`https` URL. Empty means this instance is a main and accepts writes; non-empty makes it a replica, which pulls the main's configuration and refuses local writes to anything that configuration covers. Clearing it is the promotion. Setting it requires `sync.token` |
+| `sync.token` | *(empty)* | The write-scope API token, minted on the main, that this replica pulls with. **Never returned by `GET /api/v1/settings`** — it is a credential, and the settings screen shows only whether one is set |
+| `sync.interval_seconds` | `30` | How often a replica probes the main's config version. **Minimum 5** — below that the probe costs the main more than the drift it removes |
+| `sync.primary_dns` | *(empty)* | `host:port` where the main answers DNS; the address a replica's derived secondary zones transfer from. The host is required. Empty means the peer URL's host on port 53 |
+| `sync.tsig_key_id` | `0` | On a main: the TSIG key replicas transfer under. `0` means none is designated, and creating the key and setting this is the one manual step on the main. Must name a key that exists |
 
 **†** — Restart-required exception. `cache.*` sizing/TTL settings and
 `lists.refresh_hours` are read once at startup (the cache and the
@@ -214,7 +219,9 @@ later phase.
 
 Two internal key prefixes (`instance.*` and future `stats.*` bookkeeping)
 are not meant to be user-edited and are excluded from the settings API
-(`GET /api/v1/settings`).
+(`GET /api/v1/settings`). `sync.token` is excluded from that read too, and
+is the only *editable* key that is: a read must not be a way to copy the
+credential out.
 
 ## Encrypted upstreams
 

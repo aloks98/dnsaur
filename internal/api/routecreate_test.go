@@ -43,6 +43,10 @@ var noLocationRoutes = map[string]string{
 	"POST /api/v1/zones/{id}/refresh": "transfers into the zone the URL already names; 200.",
 	"POST /api/v1/zones/{id}/file": "replaces the records of the zone the URL already names; 200 " +
 		"with a summary of what it imported.",
+	"POST /api/v1/sync/replicas": "records a replica the caller already has an id for, in the " +
+		"main's own settings; there is no row and no URL that serves one. DELETE " +
+		"/sync/replicas/{instance_id} is the only address a replica has, and the caller minted " +
+		"that id itself.",
 }
 
 // createProbe is one POST that must answer 201 + Location: the URL to send

@@ -12,10 +12,10 @@ import (
 
 func (s *Server) tsigKeysRoutes() {
 	s.route("GET /api/v1/tsig-keys", s.requireAuth(s.handleTSIGKeysList))
-	s.route("POST /api/v1/tsig-keys", s.requireAuth(s.handleTSIGKeyCreate))
+	s.route("POST /api/v1/tsig-keys", s.requireAuth(s.managed(s.handleTSIGKeyCreate)))
 	s.route("GET /api/v1/tsig-keys/{id}", s.requireAuth(s.handleTSIGKeyGet))
-	s.route("PUT /api/v1/tsig-keys/{id}", s.requireAuth(s.handleTSIGKeyUpdate))
-	s.route("DELETE /api/v1/tsig-keys/{id}", s.requireAuth(s.handleTSIGKeyDelete))
+	s.route("PUT /api/v1/tsig-keys/{id}", s.requireAuth(s.managed(s.handleTSIGKeyUpdate)))
+	s.route("DELETE /api/v1/tsig-keys/{id}", s.requireAuth(s.managed(s.handleTSIGKeyDelete)))
 }
 
 // tsigAlgorithms is the set of algorithms miekg/dns can actually sign and

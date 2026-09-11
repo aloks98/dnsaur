@@ -52,6 +52,11 @@ func defaultSettings() map[string]string {
 		"serve.doh.listen":      ":443",
 		"serve.tls.cert":        "",
 		"serve.tls.key":         "",
+		"sync.peer_url":         "",
+		"sync.token":            "",
+		"sync.interval_seconds": "30",
+		"sync.primary_dns":      "",
+		"sync.tsig_key_id":      "0",
 	}
 }
 

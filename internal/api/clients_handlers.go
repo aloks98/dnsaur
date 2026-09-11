@@ -13,13 +13,13 @@ import (
 
 func (s *Server) clientsRoutes() {
 	s.route("GET /api/v1/groups", s.requireAuth(s.handleGroupsList))
-	s.route("POST /api/v1/groups", s.requireAuth(s.handleGroupCreate))
-	s.route("PATCH /api/v1/groups/{id}", s.requireAuth(s.handleGroupPatch))
-	s.route("DELETE /api/v1/groups/{id}", s.requireAuth(s.handleGroupDelete))
+	s.route("POST /api/v1/groups", s.requireAuth(s.managed(s.handleGroupCreate)))
+	s.route("PATCH /api/v1/groups/{id}", s.requireAuth(s.managed(s.handleGroupPatch)))
+	s.route("DELETE /api/v1/groups/{id}", s.requireAuth(s.managed(s.handleGroupDelete)))
 	s.route("GET /api/v1/clients", s.requireAuth(s.handleClientsList))
-	s.route("POST /api/v1/clients", s.requireAuth(s.handleClientCreate))
-	s.route("PUT /api/v1/clients/{id}", s.requireAuth(s.handleClientPut))
-	s.route("DELETE /api/v1/clients/{id}", s.requireAuth(s.handleClientDelete))
+	s.route("POST /api/v1/clients", s.requireAuth(s.managed(s.handleClientCreate)))
+	s.route("PUT /api/v1/clients/{id}", s.requireAuth(s.managed(s.handleClientPut)))
+	s.route("DELETE /api/v1/clients/{id}", s.requireAuth(s.managed(s.handleClientDelete)))
 }
 
 func pathID(r *http.Request) (int64, bool) {

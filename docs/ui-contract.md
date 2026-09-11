@@ -63,11 +63,25 @@ Nothing warns first — treat 401 as "log in again", which the SPA already does.
 
 **Scopes** — a `read` token is rejected on any method other than GET/HEAD with
 **403** `read-only token` (`Server.requireAuth`, same function). Enforcement is
-method-based with one exception on the read side: `GET /tsig-keys` and
+method-based with two exceptions on the read side: `GET /tsig-keys` and
 `GET /tsig-keys/{id}` blank a `read` token's `secret` and set
-`secret_redacted: true` (§2.10). Session cookies are always minted `write`, so
-a browser session is never 403'd for scope — the SPA has no 403 handling and
-doesn't need any.
+`secret_redacted: true` (§2.10), and `GET /sync/bundle` refuses a `read` token
+outright with **403** `write scope required` (§2.11) — the bundle *is* every
+TSIG secret on the box, so there is nothing left to redact. Session cookies are
+always minted `write`, so a browser session is never 403'd for scope — the SPA
+has no 403 handling and doesn't need any.
+
+**Managed by a main** — an instance with `sync.peer_url` set is a replica, and
+every write to configuration its main owns is refused with **409**
+`managed by <peer_url>` before the handler runs (`Server.managed`,
+`internal/api/sync_handlers.go`): groups, clients, filter lists, rules, TSIG
+keys, zones and zone records, and `PUT /settings` for any key outside the
+instance-local set. The peer URL in the string is verbatim what
+`sync.peer_url` holds, so the screen can print it as-is. Two writes stay
+available because they are operational rather than configuration —
+`POST /filters/lists/{id}/refresh` and `POST /zones/{id}/refresh` — and so do
+this box's own account, sessions, tokens, backups and pauses. On a main (the
+default, no `sync.peer_url`) none of this is reachable. See §2.11.
 
 **CSRF** — a cookie-authenticated non-GET/HEAD request whose `Sec-Fetch-Site`
 header is `cross-site` is refused with **403** `cross-site request`
@@ -360,7 +374,8 @@ above.
     "dot": { "enabled": true, "listening": true, "addr": "[::]:853" },
     "doh": { "enabled": true, "listening": true, "addr": "[::]:443" }
   },
-  "certificate": { "not_after": "2026-11-14T00:00:00Z", "expiring_soon": false }
+  "certificate": { "not_after": "2026-11-14T00:00:00Z", "expiring_soon": false },
+  "sync": { "role": "main" }
 }
 ```
 
@@ -377,6 +392,13 @@ unless they disagree. A failed bind is retried server-side every 30s.
 use: absent when neither protocol is enabled, when no paths are set, and
 when none has ever loaded. That is a different fact from "not expiring
 soon", and conflating them would put an expiry warning on a fresh install.
+
+`sync` is **always present** and is the same object `GET /sync/status`
+answers on its own (§2.11 and §3.13). It rides here so the warning strip can
+show "behind by N", a failed pull, a peer reached over plain HTTP or a stale
+replica without a second round trip. An instance with no sync configured
+reads as `{"role": "main"}` and nothing else — the `omitempty` on every other
+field means a main with no replicas is exactly that one key.
 
 **Polling.** The dashboard polls this while `somethingIsWrong`
 (`web/src/lib/serving.ts`) — a downgrade, either protocol enabled and not
@@ -1036,6 +1058,50 @@ three.
 
 ---
 
+### 2.11 Sync
+
+Two dnsaur instances serving one network keep the same configuration: the
+**main** is the one that accepts writes, a **replica** is any instance with
+`sync.peer_url` set, and there is no third mode. A replica pulls, applies,
+and refuses local writes to anything the bundle carries (§1, *Managed by a
+main*); clearing `sync.peer_url` is the promotion.
+
+| Endpoint | Scope | Success | Notes |
+|---|---|---|---|
+| `GET /sync/version` | any | 200 `{config_version, instance_id}` | the cheap probe; the bundle is only fetched when the version moved |
+| `GET /sync/bundle` | **write** | 200 the bundle | **403** `write scope required` for a `read` token |
+| `GET /sync/status` | any | 200 the status object | answers on both roles |
+| `POST /sync/replicas` | write | 204 | `{instance_id, dns_addr, version_applied}`; idempotent |
+| `DELETE /sync/replicas/{instance_id}` | write | 204 | idempotent — an id that is not registered is already in the state asked for |
+
+`GET /sync/bundle` is the one `GET` in this API that scope refuses rather
+than redacts, and the reason is the body: settings (everything except the
+instance-local `instance.*`, `serve.*`, `sync.*` and `stats.watermark`),
+groups, clients, lists with their group assignments, rules, **TSIG keys with
+their secrets**, and zone *definitions*. Zone records are deliberately
+absent — a replica gets those by AXFR. Ids in it are the main's and the
+replica keeps them, so a `group_id`, or a query log row's `rule_id`, names
+the same row on both boxes.
+
+`POST /sync/replicas` is not bookkeeping. Registering an address is what
+turns on the implicit transfer allow — an AXFR for a `primary` zone is
+accepted when it verified under the main's `sync.tsig_key_id` **and** came
+from a registered replica's `dns_addr` — and adds that address as a NOTIFY
+target for every primary zone. Neither edits an ACL, so `allow_transfer`
+still says exactly what the operator wrote. Errors: 400 `invalid json`, 400
+`instance_id required`, 400 `dns_addr must be a host:port address: ...` /
+`dns_addr must name a host, not just a port` / `dns_addr port must be
+numeric, 1-65535`, 503 `sync unavailable` (no sync subsystem is running on
+this instance).
+
+`last_seen` is stamped by the main, never sent by the replica — a clock skew
+on the replica must not decide whether it looks stale. A replica not seen for
+three intervals is shown as stale and **never removed automatically**; the
+operator removes one, because a box that is down for an afternoon is not a
+box whose transfer allow should quietly disappear.
+
+---
+
 ## 3. Entities
 
 ### 3.1 Query log row
@@ -1405,6 +1471,11 @@ Full editable allowlist. Values are always strings on the wire.
 | `qlog.retention_days` | `90` | int ≥ 0 | **hot, delayed** — re-read per prune run, so it lands on the next 24h tick |
 | `qlog.privacy` | `full` | `full` \| `anon` \| `none` | **hot**, read per query |
 | `stats.retention_days` | `365` | int ≥ 1 | **hot, delayed** — same prune run as `qlog.retention_days` |
+| `sync.peer_url` | *(empty)* | empty, or an absolute `http`/`https` URL | **hot** — it is what makes this instance a replica, and clearing it is the promotion |
+| `sync.token` | *(empty)* | any string — **write-only, never in `GET /settings`** | **hot** |
+| `sync.interval_seconds` | `30` | int ≥ 5 | **hot** |
+| `sync.primary_dns` | *(empty)* | empty, or `host:port` with the **host present** | **hot** |
+| `sync.tsig_key_id` | `0` | `0`, or the id of an existing TSIG key | **hot** |
 
 No upper bound on any integer key. Two have a lower bound above zero, and
 both are rejected with `must be a whole number, one or more`:
@@ -1412,10 +1483,22 @@ both are rejected with `must be a whole number, one or more`:
 `stats.retention_days`, where `0` would delete every hourly bucket on the
 next prune. `blocking.mode` treats **anything ≠ `nxdomain`** as null-ip.
 
+`sync.peer_url` requires `sync.token` to be non-empty — already stored, or
+sent in the same map. The handler judges `sync.token` before `sync.peer_url`
+for exactly that reason, the same way it judges the certificate before the
+enable that needs it, so the Sync band can save both in one request. The
+rejection is `invalid value for sync.peer_url: set sync.token first`.
+`sync.tsig_key_id` is checked against the keys that exist:
+`invalid value for sync.tsig_key_id: no TSIG key has that id`.
+
 Non-editable keys that exist but are stripped from `GET /settings`:
 `instance.id`, `stats.watermark`, `blocking.pauses` (the stored pause state,
 see [Blocking pause](#blocking-pause) — the other `blocking.*` keys above are
-ordinary settings and stay visible).
+ordinary settings and stay visible). `sync.token` is stripped too and is the
+only *editable* key that is: it is the credential this instance pulls its
+config with, so a read must not be a way to copy it out. The band shows
+**set** / **not set** from whether the key is absent, and writes it like any
+other setting.
 
 ### 3.10 Tokens
 
@@ -1448,6 +1531,33 @@ Computed and discarded, so the UI cannot have them: the matched
 rule/list pattern, the parser's skipped-line count, and the query-log dropped
 count. Also note **there is no join returning a client or group *name* alongside
 a query row** — the UI must resolve `client_id` itself against `GET /clients`.
+
+### 3.13 Sync status
+
+One shape for both roles; read `role` first, since every other field is
+`omitempty` and a main with no replicas is `{"role": "main"}` and nothing
+else. From `GET /sync/status` and from `GET /resolver/status`'s `sync`.
+
+```json
+{"role":"replica","peer_url":"https://main.lan","peer_version":412,
+ "applied_version":411,"applied_at":1757580000000,"last_pull_at":1757580030000,
+ "last_error":"","plain_http":false}
+{"role":"main","sync_key":"xfer.e412.in.",
+ "replicas":[{"instance_id":"V1StGXR8Z5jdHi6BmyT","dns_addr":"10.0.0.6:53",
+              "version_applied":412,"last_seen":1757580030000,"stale":false}]}
+```
+
+| Field | Role | Meaning |
+|---|---|---|
+| `role` | both | `main` or `replica`. Derived from `sync.peer_url`, not stored as a mode |
+| `peer_url` | replica | verbatim what `sync.peer_url` holds; the same string the 409 quotes |
+| `peer_version` | replica | the main's `config_version` at the last probe — `peer_version - applied_version` is "behind by N" |
+| `applied_version`, `applied_at` | replica | the last bundle actually applied, and unix ms of when |
+| `last_pull_at` | replica | unix ms of the last attempt, successful or not |
+| `last_error` | replica | why the last pull failed, `""` when it did not. A failed pull leaves the previous config in force — DNS is unaffected |
+| `plain_http` | replica | the peer is `http://`, so the bundle (TSIG secrets included) crosses in the clear on every pull. Persistent while it is true; there is no certificate subsystem and this warning is the whole mitigation |
+| `sync_key` | main | the **name** of the TSIG key replicas transfer under, or `""` when none is designated |
+| `replicas[]` | main | `instance_id`, `dns_addr`, `version_applied`, `last_seen` (unix ms, stamped by the main), `stale` |
 
 ---
 

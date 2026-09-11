@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -8,6 +9,7 @@ import (
 	"maps"
 	"net"
 	"net/http"
+	"net/url"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -43,6 +45,11 @@ var editableSettings = map[string]func(string) error{
 	"serve.doh.listen":      listenAddr,
 	"serve.tls.cert":        absPathOrEmpty,
 	"serve.tls.key":         absPathOrEmpty,
+	"sync.peer_url":         peerURL,
+	"sync.token":            anyString,
+	"sync.interval_seconds": syncInterval,
+	"sync.primary_dns":      hostPortOrEmpty,
+	"sync.tsig_key_id":      nonNegInt,
 }
 
 // validUpstreams runs the same parser applySettings runs, so a value that
@@ -125,6 +132,63 @@ func absPathOrEmpty(v string) error {
 	return errors.New("must be an absolute path")
 }
 
+// peerURL is the grammar for sync.peer_url: empty (this instance is a main)
+// or an absolute http/https URL naming the main it follows. Absolute because
+// the replica dials it from a background worker with no request to resolve a
+// relative reference against; the two schemes because there is no third one
+// the pull loop speaks.
+func peerURL(v string) error {
+	if v == "" {
+		return nil
+	}
+	u, err := url.Parse(v)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return errors.New("must be an absolute http or https URL")
+	}
+	return nil
+}
+
+// anyString accepts whatever was sent, for sync.token: it is a credential
+// minted on another box, and this one has no grammar to judge it by. An
+// empty value is how a replica clears it.
+func anyString(string) error { return nil }
+
+// syncInterval is the replica's poll period in seconds. The floor is not
+// taste: below a few seconds the version probe costs the main more than the
+// drift it removes, and a mistyped 0 is an interval time.NewTicker refuses
+// to build at all.
+func syncInterval(v string) error {
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil || n < 5 {
+		return errors.New("must be a whole number of seconds, five or more")
+	}
+	return nil
+}
+
+// hostPort is listenAddr with the host required. listenAddr describes an
+// address this instance *binds*, where an empty host means every interface;
+// these are addresses it connects to — a replica's DNS socket, the main's —
+// and "every interface" names nothing to dial.
+func hostPort(v string) error {
+	if err := listenAddr(v); err != nil {
+		return err
+	}
+	if host, _, _ := net.SplitHostPort(v); host == "" {
+		return errors.New("must name a host, not just a port")
+	}
+	return nil
+}
+
+// hostPortOrEmpty is hostPort with empty allowed, for sync.primary_dns:
+// unset means the replica derives the address from its peer URL's host on
+// port 53.
+func hostPortOrEmpty(v string) error {
+	if v == "" {
+		return nil
+	}
+	return hostPort(v)
+}
+
 // validateCrossField runs after the per-key validator, with the value that
 // is about to be written and the store's current values for everything
 // else. It exists because "enable DoT" is only valid against the state of
@@ -135,8 +199,18 @@ func absPathOrEmpty(v string) error {
 // same "fail at the save that caused it" reasoning as the upstreams
 // validator, rather than waiting until the unrelated later save that
 // happens to flip enabled to true.
-func validateCrossField(key, value string, current map[string]string) error {
+func (s *Server) validateCrossField(ctx context.Context, key, value string, current map[string]string) error {
 	switch key {
+	case "sync.peer_url":
+		if value != "" && current["sync.token"] == "" {
+			// A peer with no credential is a replica that pulls a 401
+			// forever, and the settings screen sends both together — which
+			// is what settingsPhases judging sync.token first is for.
+			return errors.New("set sync.token first")
+		}
+		return nil
+	case "sync.tsig_key_id":
+		return s.validSyncKey(ctx, value)
 	case "serve.dot.enabled", "serve.doh.enabled":
 		if value != "true" {
 			// Disabling never requires a certificate: an operator must
@@ -246,8 +320,14 @@ func (s *Server) handleSettingsGet(w http.ResponseWriter, r *http.Request) {
 	// not by prefix: stats.* also holds stats.retention_days and blocking.*
 	// holds blocking.mode and blocking.ttl, which are ordinary settings the
 	// screen has to be able to read.
+	//
+	// sync.token is editable and is still stripped, for the opposite reason:
+	// it is the credential this instance pulls its config with, and a GET
+	// that hands a credential back to everyone who can read settings is the
+	// leak #54 closed for TSIG secrets. The screen shows set/not set instead.
 	for k := range all {
-		if strings.HasPrefix(k, "instance.") || k == store.StatsWatermarkKey || k == filter.PausesKey {
+		if strings.HasPrefix(k, "instance.") || k == store.StatsWatermarkKey ||
+			k == filter.PausesKey || k == syncTokenSetting {
 			delete(all, k)
 		}
 	}
@@ -275,6 +355,10 @@ type resolverStatus struct {
 	// Certificate is the loaded certificate's expiry, or absent entirely
 	// when none has ever loaded successfully.
 	Certificate *certificateStatus `json:"certificate,omitempty"`
+	// Sync is this instance's relationship to a main, or its own replicas.
+	// Always present — "role" alone is a fact every screen needs — and on a
+	// server with no sync subsystem it reads as a main with no replicas.
+	Sync SyncStatus `json:"sync"`
 }
 
 // servingStatus carries DoT and DoH's api.ProtocolStatus side by side.
@@ -306,6 +390,7 @@ func (s *Server) handleResolverStatus(w http.ResponseWriter, r *http.Request) {
 			out.Certificate = &certificateStatus{NotAfter: notAfter, ExpiringSoon: expiringSoon}
 		}
 	}
+	out.Sync = s.syncStatus()
 	writeJSON(w, http.StatusOK, out)
 }
 
@@ -326,17 +411,29 @@ func protocolEnabledKey(key string) bool {
 //  3. serve.tls.key — one after the other, because the pair is only checked
 //     once both halves are present, and a mismatched pair sent together
 //     would otherwise be judged against whatever was stored before.
-//  4. Everything else. Independent of each other and of the certificate.
-//  5. Enables last, against a certificate that is now in place.
+//  4. sync.token — the credential sync.peer_url is judged against, for the
+//     same reason the certificate comes before the enable that needs it:
+//     alphabetically peer_url would otherwise be judged first, against a
+//     token this very request is about to supply.
+//  5. Everything else. Independent of each other and of the credentials.
+//  6. Enables last, against a certificate that is now in place.
 //
 // Every key falls in exactly one phase: it either turns a protocol on or
-// off (1 or 5), is one half of the certificate (2 or 3), or is neither (4).
+// off (1 or 6), is a credential a later key depends on (2, 3 or 4), or is
+// neither (5).
 var settingsPhases = []func(key, value string) bool{
 	func(k, v string) bool { return protocolEnabledKey(k) && v != "true" },
 	func(k, _ string) bool { return k == "serve.tls.cert" },
 	func(k, _ string) bool { return k == "serve.tls.key" },
-	func(k, _ string) bool { return !protocolEnabledKey(k) && k != "serve.tls.cert" && k != "serve.tls.key" },
+	func(k, _ string) bool { return k == "sync.token" },
+	func(k, _ string) bool { return !protocolEnabledKey(k) && !stagedFirst(k) },
 	func(k, v string) bool { return protocolEnabledKey(k) && v == "true" },
+}
+
+// stagedFirst names the credentials phases 2-4 judge, because a key later in
+// the same write is validated against them.
+func stagedFirst(k string) bool {
+	return k == "serve.tls.cert" || k == "serve.tls.key" || k == "sync.token"
 }
 
 // orderSettings sorts the keys of a write into settingsPhases order, sorted
@@ -407,6 +504,19 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusBadRequest, "no settings to write")
 		return
 	}
+	// The replica guard, key by key rather than route-wide (spec §7): the
+	// local keys of §4.3 describe this box and stay writable — clearing
+	// sync.peer_url is the promotion — while everything else belongs to the
+	// main. One synced key refuses the whole write, like every other
+	// rejection here: half of a save is a state nobody chose.
+	if peer := s.peerURL(); peer != "" {
+		for key := range values {
+			if !store.LocalSettingKey(key) {
+				errJSON(w, http.StatusConflict, "managed by "+peer)
+				return
+			}
+		}
+	}
 	// The per-key validators only ever see one value each. Whether the
 	// result is coherent — enabling DoT against a certificate that is
 	// missing or broken — needs the rest of the configuration, so the
@@ -429,7 +539,13 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 			errJSON(w, http.StatusBadRequest, "invalid value for "+key+": "+err.Error())
 			return
 		}
-		if err := validateCrossField(key, value, current); err != nil {
+		if err := s.validateCrossField(r.Context(), key, value, current); err != nil {
+			if errors.Is(err, errStorage) {
+				// The value was never judged, so saying it is invalid would
+				// be a claim this handler cannot make.
+				storeErr(w, err)
+				return
+			}
 			// Same shape as the per-key rejection above: one handler, one
 			// error format, whether or not the field that failed is the one
 			// the message names.

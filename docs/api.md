@@ -54,6 +54,17 @@ curl or any HTTP client.
 - `GET /health`, `GET /readyz` and `GET /openapi.yaml` are
   unauthenticated; every other endpoint requires auth (`401` if
   missing/invalid).
+- **On a replica, writes to synced configuration are `409
+  {"error": "managed by <peer_url>"}`.** An instance with `sync.peer_url`
+  set follows another instance's configuration, so groups, clients, filter
+  lists, rules, TSIG keys, zones and zone records are read-only on it, as is
+  `PUT /settings` for any key outside the instance-local set. The answer
+  comes before the handler runs, so nothing was written. The two refresh
+  operations (`POST /filters/lists/{id}/refresh`,
+  `POST /zones/{id}/refresh`) are operational rather than configuration and
+  stay available, and so do this box's own account, sessions, tokens,
+  backups and pauses. Clearing `sync.peer_url` is the promotion and lifts
+  the refusal — see Sync below.
 
 ## Auth model
 
@@ -199,7 +210,8 @@ Full parameter/response detail lives in `internal/api/openapi.yaml`
   `cache.serve_stale_for`, `lists.refresh_hours`, `qlog.retention_days`,
   `qlog.privacy`, `stats.retention_days`, `serve.dot.enabled`, `serve.dot.listen`,
   `serve.doh.enabled`, `serve.doh.listen`, `serve.tls.cert`,
-  `serve.tls.key` — see [`docs/configuration.md`](configuration.md) for
+  `serve.tls.key`, `sync.peer_url`, `sync.token`, `sync.interval_seconds`,
+  `sync.primary_dns`, `sync.tsig_key_id` — see [`docs/configuration.md`](configuration.md) for
   what each means and which require a restart to take effect). **A map is
   all-or-nothing**: every key is validated before any of them is written,
   the write lands in one transaction, and there is one config-version bump
@@ -223,8 +235,18 @@ Full parameter/response detail lives in `internal/api/openapi.yaml`
   `stats.retention_days`, also 1 and up, because `0` would have the next
   prune delete every hourly bucket the dashboard reads. There is no separate
   "upstreams" resource — upstream servers live in the `upstreams` setting.
+  The five `sync.*` keys configure this instance's relationship to a main:
+  `sync.peer_url` is empty (this is a main) or an absolute `http`/`https`
+  URL, and setting it non-empty requires `sync.token` — already stored, or
+  sent in the same map, which is why `sync.token` is judged before it.
+  `sync.token` is the one editable key `GET /settings` never returns: it is
+  the credential this instance pulls with, so the screen shows set/not set
+  and a read is not a way to copy it out. `sync.interval_seconds` is 5 or
+  more, `sync.primary_dns` is `host:port` with the host required (empty
+  means "the peer URL's host on port 53"), and `sync.tsig_key_id` is `0` or
+  the id of a TSIG key that exists.
 - **Resolver status** — `GET /resolver/status`
-  (`{encryption_downgraded, reason, serving, certificate}`). Server state
+  (`{encryption_downgraded, reason, serving, certificate, sync}`). Server state
   rather than a setting, which is why it is not in the `GET /settings`
   map. `encryption_downgraded`/`reason` cover the upstream side exactly as
   before: true when the stored `upstreams` value named `tls://` or
@@ -761,6 +783,49 @@ Full parameter/response detail lives in `internal/api/openapi.yaml`
   24 and is capped at 8784 (24 × 366): a larger window overflowed the
   duration arithmetic and asked for a span in the future, which answers
   nothing.
+- **Sync** — `GET /sync/version`, `GET /sync/bundle`, `GET /sync/status`,
+  `POST /sync/replicas`, `DELETE /sync/replicas/{instance_id}`. Two dnsaur
+  instances serve one network so either can answer when the other is down;
+  these are how the second one keeps the same configuration as the first.
+  An instance with `sync.peer_url` set is a **replica** and pulls; the
+  instance it points at is the **main** and does not learn anything it did
+  not already know, except that a replica exists.
+  `GET /sync/version` answers `{config_version, instance_id}` — the cheap
+  probe a replica makes every `sync.interval_seconds`, so the bundle is
+  only fetched when the version moved. Any scope.
+  `GET /sync/bundle` answers the whole synced configuration: settings
+  (everything except the instance-local `instance.*`, `serve.*`, `sync.*`
+  and `stats.watermark`), groups, clients, lists with their group
+  assignments, rules, TSIG keys and zone *definitions*. Zone records are
+  deliberately absent — a replica gets those by AXFR, on the schedule the
+  SOA gives. Ids are the main's and are kept on the replica, so a
+  `group_id` or a query log's `rule_id` means the same row on both boxes.
+  **It needs write scope, not read.** Scope is enforced by method
+  everywhere else and this is a `GET`, but the body carries every TSIG
+  secret on the box — the same credentials a read token stopped being
+  handed through `GET /tsig-keys` — so a read-scoped token is `403
+  {"error": "write scope required"}`.
+  `POST /sync/replicas` (`{instance_id, dns_addr, version_applied}` → 204)
+  is what a replica calls after applying a bundle. Registration is what
+  turns on the implicit transfer allow — an AXFR for a primary zone is
+  accepted when it verified under the main's `sync.tsig_key_id` **and**
+  came from a registered replica's `dns_addr` — and adds that address as a
+  NOTIFY target for every primary zone, so neither needs an ACL edit and
+  `allow_transfer` still says exactly what the operator wrote. `dns_addr`
+  must be `host:port` with the host present; `last_seen` is stamped by the
+  main rather than sent, so a replica's clock cannot decide whether it
+  looks stale. Write scope, for the same reason: an unauthenticated peer
+  must not be able to register itself into a transfer allow.
+  `DELETE /sync/replicas/{instance_id}` removes one — the operator's
+  action, since a replica that stopped pulling is shown as stale and never
+  removed automatically. Both are idempotent.
+  `GET /sync/status` answers the same object `GET /resolver/status` carries
+  as `sync`: `role` (`main` or `replica`), and then either the replica half
+  (`peer_url`, `peer_version`, `applied_version`, `applied_at`,
+  `last_pull_at`, `last_error`, `plain_http`) or the main half (`sync_key`,
+  `replicas[]` with `instance_id`, `dns_addr`, `version_applied`,
+  `last_seen`, `stale`). An instance with no sync configured reads as a
+  main with no replicas.
 - **Tokens** — `GET /tokens` (list this user's API tokens; session tokens
   and hashes are never included), `POST /tokens`
   (`{name, scope[, expires_at]}`, returns the plaintext token once

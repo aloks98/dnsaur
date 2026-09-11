@@ -81,6 +81,10 @@ var unauthenticatedRoutes = map[string]string{
 var knownRouteParams = map[string]bool{
 	"id":  true,
 	"rid": true,
+	// A replica registers under its own instance.id, which is an opaque
+	// string rather than a row id — so any value routes, and "1" (what the
+	// probes substitute) is as good as any other.
+	"instance_id": true,
 }
 
 // catchAllProbePath is the concrete URL used to exercise the method-less

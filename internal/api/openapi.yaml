@@ -17,6 +17,16 @@ info:
     signing credential in the clear is not something "read-only"
     should cover. The Authorization scheme name is matched
     case-insensitively per RFC 9110 §11.1.
+    An instance with the "sync.peer_url" setting is a replica: it follows
+    another instance's configuration, and every write to a resource that
+    configuration covers -- groups, clients, filter lists, rules, TSIG keys,
+    zones, zone records -- is refused with 409 {"error": "managed by
+    <peer_url>"} before the handler runs, as is PUT /settings for any key
+    outside the instance-local set. The two refresh operations
+    (/filters/lists/{id}/refresh, /zones/{id}/refresh) stay available because
+    they are operational rather than configuration, and so do this box's own
+    account, sessions, tokens, backups and pauses. Clearing sync.peer_url
+    lifts the refusal; see the Sync tag.
     There is no separate "upstreams" resource: upstream DNS servers are
     configured via the "upstreams" key in /settings (a comma-separated
     list), alongside "upstream.strategy". Each entry is plain by default
@@ -43,6 +53,7 @@ tags:
   - name: Stats
   - name: Tokens
   - name: TSIG Keys
+  - name: Sync
 components:
   securitySchemes:
     cookieAuth:
@@ -526,6 +537,105 @@ components:
             key the server holds. Always present, so an empty secret you may
             not see is distinguishable from one that was never set.
         created_at: { type: integer, format: int64, description: unix ms }
+    Replica:
+      type: object
+      description: >
+        One replica registered with this main, as POST /sync/replicas
+        recorded it.
+      properties:
+        instance_id: { type: string, description: the replica's own instance.id }
+        dns_addr:
+          type: string
+          description: >
+            host:port where the replica answers DNS. It is what the transfer
+            server matches an incoming AXFR's peer address against, and what
+            a NOTIFY for a primary zone is additionally sent to.
+        version_applied: { type: integer, format: int64 }
+        last_seen:
+          type: integer
+          format: int64
+          description: >
+            unix ms of the last registration, stamped by this main rather
+            than sent by the replica -- a clock skew on the replica must not
+            decide whether it looks stale.
+        stale:
+          type: boolean
+          description: >
+            nothing heard for three sync intervals. Never a reason to delete
+            the entry; an operator removes one deliberately.
+    SyncStatus:
+      type: object
+      description: >
+        This instance's sync state, from GET /sync/status and embedded in GET
+        /resolver/status. One shape serves both roles: read "role" to know
+        which half of it is filled in. An instance with no sync configured
+        reads as role "main" with no replicas.
+      properties:
+        role: { type: string, enum: [main, replica] }
+        peer_url: { type: string, description: replica only; the main it follows }
+        peer_version: { type: integer, format: int64, description: the main's config version at the last probe }
+        applied_version: { type: integer, format: int64 }
+        applied_at: { type: integer, format: int64, description: unix ms }
+        last_pull_at: { type: integer, format: int64, description: unix ms }
+        last_error:
+          type: string
+          description: >
+            why the last pull failed; empty when it succeeded. A failed pull
+            leaves the previously applied configuration in force.
+        plain_http:
+          type: boolean
+          description: >
+            the peer is reached over http://, so the bundle -- which carries
+            TSIG secrets -- crosses the network in the clear on every pull.
+        sync_key: { type: string, description: main only; the name of the TSIG key replicas transfer under }
+        replicas:
+          type: array
+          description: main only
+          items: { $ref: "#/components/schemas/Replica" }
+    Bundle:
+      type: object
+      description: >
+        One instance's synced configuration, the document a replica pulls and
+        applies in a single transaction. Ids are the main's and are kept on
+        the replica, so a foreign key means the same thing on both boxes.
+        Zone *records* are deliberately absent: a replica gets those by AXFR.
+      properties:
+        format:
+          type: integer
+          description: >
+            the bundle version. A replica refuses a format it does not know
+            rather than applying the part of it it happens to understand.
+        config_version: { type: integer, format: int64 }
+        instance_id: { type: string, description: the box this bundle came from }
+        settings:
+          type: object
+          additionalProperties: { type: string }
+          description: >
+            every setting except the instance-local ones (instance.*,
+            serve.*, sync.*, stats.watermark), which describe the box rather
+            than the service.
+        sync_key:
+          type: integer
+          format: int64
+          description: >
+            the main's sync.tsig_key_id, 0 when none is designated. Not a
+            setting the replica stores -- it is what its derived secondary
+            zones sign their transfers with.
+        groups: { type: array, items: { type: object, description: "as GET /groups returns them" } }
+        clients: { type: array, items: { type: object, description: "as GET /clients returns them" } }
+        lists:
+          type: array
+          description: as GET /filters/lists returns them, each with a "groups" array of group ids
+          items: { $ref: "#/components/schemas/List" }
+        rules: { type: array, items: { type: object, description: "as GET /groups/{id}/rules returns them" } }
+        tsig_keys:
+          type: array
+          description: secrets in the clear, which is why this endpoint needs write scope
+          items: { $ref: "#/components/schemas/TSIGKey" }
+        zones:
+          type: array
+          description: definitions only, never of type internal
+          items: { $ref: "#/components/schemas/Zone" }
     ZoneNotify:
       type: object
       description: >
@@ -606,6 +716,15 @@ components:
         write whose Sec-Fetch-Site is cross-site ({"error": "cross-site
         request"}) -- CSRF defence in depth behind SameSite=Strict. Bearer
         requests are never checked for the latter.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    ManagedByMain:
+      description: >
+        this instance is a replica (sync.peer_url is set) and the request
+        writes configuration its main owns: {"error": "managed by
+        <peer_url>"}. Answered before the handler runs, so nothing was
+        written. Clear sync.peer_url to promote this instance and lift it.
       content:
         application/json:
           schema: { $ref: "#/components/schemas/Error" }
@@ -1053,6 +1172,14 @@ paths:
         — and "error" carries the bind failure in that case.
 
 
+        "sync" is this instance's relationship to a main, or its own list of
+        replicas -- the same object GET /sync/status answers, carried here so
+        the warning strip can show "behind by N", a failed pull, a peer
+        reached over plain HTTP, or a stale replica without a second round
+        trip. Always present; an instance with no sync configured reads as
+        role "main" with no replicas.
+
+
         "certificate" is present only once a certificate has actually loaded
         successfully; it is absent on a fresh install or while the configured
         pair has never once read cleanly, which is a different fact from
@@ -1084,6 +1211,7 @@ paths:
                       expiring_soon:
                         type: boolean
                         description: true when not_after falls within the 14-day warning window
+                  sync: { $ref: "#/components/schemas/SyncStatus" }
                 example:
                   encryption_downgraded: true
                   reason: 'upstream "tls://1.1.1.1:853": missing "#name"'
@@ -1093,6 +1221,7 @@ paths:
                   certificate:
                     not_after: "2026-10-01T00:00:00Z"
                     expiring_soon: false
+                  sync: { role: replica, peer_url: "https://main.lan", peer_version: 412, applied_version: 412 }
         "401":
           description: authentication required
           content:
@@ -1149,7 +1278,12 @@ paths:
         ("true" or "false", exactly those two strings), serve.dot.listen,
         serve.doh.listen ("host:port", host may be empty for all
         interfaces, port numeric 1-65535), serve.tls.cert, serve.tls.key
-        (an absolute path, or empty to unset). All other keys are rejected.
+        (an absolute path, or empty to unset), sync.peer_url (an absolute
+        http/https URL, or empty), sync.token (any string; never returned by
+        GET /settings), sync.interval_seconds (int, 5 or more),
+        sync.primary_dns ("host:port" with the host required, or empty),
+        sync.tsig_key_id (0, or the id of an existing TSIG key).
+        All other keys are rejected.
 
 
         "upstreams" is a comma-separated list of entries, each plain
@@ -1191,7 +1325,13 @@ paths:
         protocols being turned off, then the certificate path, then the key
         path, then everything else, then protocols being turned on. That is
         what lets a certificate pair and the enable that depends on it
-        travel in one request.
+        travel in one request, and a sync peer URL alongside the token it is
+        judged against.
+
+
+        Setting "sync.peer_url" to a non-empty value requires "sync.token" to
+        be non-empty, either already stored or supplied in the same request.
+        "sync.tsig_key_id" must name a TSIG key that exists, or be 0.
       requestBody:
         required: true
         content:
@@ -1234,6 +1374,11 @@ paths:
                         - serve.doh.listen
                         - serve.tls.cert
                         - serve.tls.key
+                        - sync.peer_url
+                        - sync.token
+                        - sync.interval_seconds
+                        - sync.primary_dns
+                        - sync.tsig_key_id
                     value: { type: string }
       responses:
         "204":
@@ -1254,6 +1399,8 @@ paths:
               schema: { $ref: "#/components/schemas/Error" }
         "403":
           $ref: "#/components/responses/ReadOnlyToken"
+        "409":
+          $ref: "#/components/responses/ManagedByMain"
         "503":
           description: storage unavailable
           content:
@@ -3987,6 +4134,209 @@ paths:
               schema: { $ref: "#/components/schemas/Error" }
         "503":
           description: storage unavailable
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /sync/version:
+    get:
+      tags: [Sync]
+      summary: This instance's config version and identity
+      description: >
+        The probe a replica makes every sync.interval_seconds. It is the
+        cheap half of the pull loop: a few hundred bytes that say whether
+        anything changed, so the bundle is only fetched when the version
+        moved.
+
+
+        Any scope. It discloses a counter and this box's instance.id, which
+        is also how a replica misconfigured to follow itself can tell.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  config_version: { type: integer, format: int64 }
+                  instance_id: { type: string }
+                example: { config_version: 412, instance_id: "V1StGXR8Z5jdHi6BmyT" }
+        "401":
+          description: authentication required
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503":
+          description: storage unavailable
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /sync/bundle:
+    get:
+      tags: [Sync]
+      summary: This instance's whole synced configuration
+      description: >
+        The document a replica applies in one transaction. See the Bundle
+        schema for what it carries and what it deliberately does not (zone
+        records, which travel by AXFR, and every instance-local setting).
+
+
+        **Write scope**, not read. Scope is enforced by method everywhere
+        else, and this is a GET -- but the body carries every TSIG secret on
+        the box, the same credentials a read token stopped being given
+        through GET /tsig-keys. A read-scoped token is answered 403
+        {"error": "write scope required"}.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Bundle" }
+        "401":
+          description: authentication required
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "403":
+          description: >
+            read-scoped token: {"error": "write scope required"}. The body is
+            a credential, so the method does not decide this one.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503":
+          description: storage unavailable
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /sync/status:
+    get:
+      tags: [Sync]
+      summary: This instance's sync state
+      description: >
+        Answers on both kinds of instance; read "role" to know which half of
+        the object is filled in. An instance with no sync subsystem behind it
+        reads as a main with no replicas, which is what it is.
+
+
+        The same object is embedded in GET /resolver/status as "sync", for
+        the warning strip; this endpoint is what the settings screen's Sync
+        band reads on its own.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SyncStatus" }
+        "401":
+          description: authentication required
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /sync/replicas:
+    post:
+      tags: [Sync]
+      summary: Register a replica with this main
+      description: >
+        A replica calls this after applying a bundle. Registration is what
+        turns on the implicit transfer allow -- an AXFR for a primary zone is
+        accepted when it verified under the sync key *and* came from a
+        registered replica's dns_addr -- and adds that address as a NOTIFY
+        target for every primary zone. Neither requires the operator to edit
+        an ACL, and allow_transfer still says exactly what they wrote.
+
+
+        Idempotent: registering an instance_id that is already known updates
+        its address, applied version and last-seen. last_seen is stamped by
+        this main rather than sent, so a replica's clock cannot decide
+        whether it looks stale.
+
+
+        Write scope, for the reason above: an unauthenticated peer must not
+        be able to register itself into a transfer allow.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [instance_id, dns_addr]
+              properties:
+                instance_id: { type: string }
+                dns_addr:
+                  type: string
+                  description: >
+                    host:port where this replica answers DNS. The host is
+                    required -- an empty host means "every interface" to
+                    something binding a socket, and names nothing to dial.
+                version_applied: { type: integer, format: int64 }
+              example: { instance_id: "V1StGXR8Z5jdHi6BmyT", dns_addr: "10.0.0.6:53", version_applied: 412 }
+      responses:
+        "204":
+          description: No Content
+        "400":
+          description: >
+            invalid json; "instance_id required"; or a dns_addr that is not a
+            host:port address
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401":
+          description: authentication required
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "403":
+          $ref: "#/components/responses/ReadOnlyToken"
+        "503":
+          description: >
+            no sync subsystem is running on this instance, or storage is
+            unavailable
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /sync/replicas/{instance_id}:
+    parameters:
+      - name: instance_id
+        in: path
+        required: true
+        schema: { type: string }
+    delete:
+      tags: [Sync]
+      summary: Remove a registered replica
+      description: >
+        The operator's action from the Sync band. A replica that stopped
+        pulling is shown as stale and never removed automatically -- a box
+        that is down for an afternoon is not a box whose transfer allow
+        should quietly disappear.
+
+
+        Idempotent: an instance_id that is not registered is already in the
+        state the caller asked for, so it answers 204 rather than 404.
+      responses:
+        "204":
+          description: No Content
+        "400":
+          description: instance_id required
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401":
+          description: authentication required
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "403":
+          $ref: "#/components/responses/ReadOnlyToken"
+        "503":
+          description: >
+            no sync subsystem is running on this instance, or storage is
+            unavailable
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }

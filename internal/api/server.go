@@ -142,7 +142,11 @@ type Deps struct {
 	// behind it. The handler then answers "nothing wrong", which is the
 	// truthful answer for a server that has no forwarder to have downgraded.
 	ResolverStatus ResolverStatus
-	Version        string
+	// Sync may be nil, and is in every test server with no App behind it.
+	// A nil Syncer is a main that follows nobody: the write guard lifts and
+	// the status endpoint answers role "main" with no replicas. See Syncer.
+	Sync    Syncer
+	Version string
 	// Static serves the embedded web dashboard on non-/api paths. Nil
 	// disables it (e.g. tests that don't care about the SPA).
 	Static fs.FS
@@ -244,6 +248,7 @@ func (s *Server) registerRoutes() {
 	s.zoneFileRoutes()
 	s.tsigKeysRoutes()
 	s.notifiesRoutes()
+	s.syncRoutes()
 	// Later tasks append their routes here.
 	//
 	// This catch-all is registered through route() like everything else —
