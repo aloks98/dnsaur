@@ -58,13 +58,15 @@ curl or any HTTP client.
   {"error": "managed by <peer_url>"}`.** An instance with `sync.peer_url`
   set follows another instance's configuration, so groups, clients, filter
   lists, rules, TSIG keys, zones and zone records are read-only on it, as is
-  `PUT /settings` for any key outside the instance-local set. The answer
-  comes before the handler runs, so nothing was written. The two refresh
-  operations (`POST /filters/lists/{id}/refresh`,
-  `POST /zones/{id}/refresh`) are operational rather than configuration and
-  stay available, and so do this box's own account, sessions, tokens,
-  backups and pauses. Clearing `sync.peer_url` is the promotion and lifts
-  the refusal — see Sync below.
+  `PUT /settings` for any key outside the instance-local set. A blocking
+  pause is refused too: the pause state is persisted to the synced
+  `blocking.pauses` setting, because a pause is a decision about the network
+  and clients reach either box. The answer comes before the handler runs, so
+  nothing was written. The two refresh operations
+  (`POST /filters/lists/{id}/refresh`, `POST /zones/{id}/refresh`) are
+  operational rather than configuration and stay available, and so do this
+  box's own account, sessions, tokens and backups. Clearing `sync.peer_url`
+  is the promotion and lifts the refusal — see Sync below.
 
 ## Auth model
 

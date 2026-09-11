@@ -165,6 +165,9 @@ const (
 	// syncTokenSetting is the credential a replica pulls with. Editable,
 	// and stripped from GET /settings — see handleSettingsGet.
 	syncTokenSetting = "sync.token"
+	// syncPeerURLSetting is the main this instance follows, and the one
+	// setting that decides which kind of instance it is.
+	syncPeerURLSetting = "sync.peer_url"
 )
 
 func (s *Server) handleSyncBundle(w http.ResponseWriter, r *http.Request) {

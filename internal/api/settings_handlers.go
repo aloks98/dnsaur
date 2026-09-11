@@ -45,8 +45,8 @@ var editableSettings = map[string]func(string) error{
 	"serve.doh.listen":      listenAddr,
 	"serve.tls.cert":        absPathOrEmpty,
 	"serve.tls.key":         absPathOrEmpty,
-	"sync.peer_url":         peerURL,
-	"sync.token":            anyString,
+	syncPeerURLSetting:      peerURL,
+	syncTokenSetting:        anyString,
 	"sync.interval_seconds": syncInterval,
 	"sync.primary_dns":      hostPortOrEmpty,
 	"sync.tsig_key_id":      nonNegInt,
@@ -137,6 +137,13 @@ func absPathOrEmpty(v string) error {
 // the replica dials it from a background worker with no request to resolve a
 // relative reference against; the two schemes because there is no third one
 // the pull loop speaks.
+//
+// Scheme and host and nothing else. The pull loop joins "/api/v1/sync/..."
+// onto this value, so a path, a query or a fragment would either be dropped
+// silently or build a URL nobody meant; credentials in it would be a second
+// secret stored in a field that is not treated as one. A lone trailing slash
+// is the one extra accepted, and handleSettingsPut strips it before the
+// value is judged or stored.
 func peerURL(v string) error {
 	if v == "" {
 		return nil
@@ -144,6 +151,9 @@ func peerURL(v string) error {
 	u, err := url.Parse(v)
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 		return errors.New("must be an absolute http or https URL")
+	}
+	if u.Path != "" || u.RawQuery != "" || u.Fragment != "" || u.User != nil {
+		return errors.New("must be a scheme and host only, with no path, query or credentials")
 	}
 	return nil
 }
@@ -201,12 +211,23 @@ func hostPortOrEmpty(v string) error {
 // happens to flip enabled to true.
 func (s *Server) validateCrossField(ctx context.Context, key, value string, current map[string]string) error {
 	switch key {
-	case "sync.peer_url":
-		if value != "" && current["sync.token"] == "" {
+	case syncPeerURLSetting:
+		if value != "" && current[syncTokenSetting] == "" {
 			// A peer with no credential is a replica that pulls a 401
 			// forever, and the settings screen sends both together — which
 			// is what settingsPhases judging sync.token first is for.
 			return errors.New("set sync.token first")
+		}
+		return nil
+	case syncTokenSetting:
+		if value == "" && current[syncPeerURLSetting] != "" {
+			// The same rule from the other side, and the reason the two
+			// have to be checked in both directions: emptying the token
+			// under a configured peer leaves a replica that pulls a 401
+			// forever, which is the state the rule above refuses to create.
+			// Clearing both at once still works — settingsPhases judges a
+			// peer being cleared first, with the protocol disables.
+			return errors.New("clear sync.peer_url first")
 		}
 		return nil
 	case "sync.tsig_key_id":
@@ -269,8 +290,12 @@ func (s *Server) settingsRoutes() {
 	s.route("GET /api/v1/resolver/status", s.requireAuth(s.handleResolverStatus))
 	s.route("POST /api/v1/backup", s.requireAuth(s.handleBackup))
 	s.route("GET /api/v1/blocking", s.requireAuth(s.handleBlockingGet))
-	s.route("POST /api/v1/blocking/pause", s.requireAuth(s.handlePause))
-	s.route("DELETE /api/v1/blocking/pause", s.requireAuth(s.handleResume))
+	// The pause state is persisted to the blocking.pauses settings row,
+	// which the bundle carries: a pause is a decision about the network,
+	// and clients reach either box. So it is synced configuration, and a
+	// replica setting one would have it overwritten by the next apply.
+	s.route("POST /api/v1/blocking/pause", s.requireAuth(s.managed(s.handlePause)))
+	s.route("DELETE /api/v1/blocking/pause", s.requireAuth(s.managed(s.handleResume)))
 }
 
 // handleBackup writes a copy of the database into <data_dir>/backups and
@@ -406,7 +431,8 @@ func protocolEnabledKey(key string) bool {
 // web/src/pages/settings.tsx) moved to the end that can enforce them:
 //
 //  1. Disables first. Nothing below can be refused for a protocol that is
-//     already off.
+//     already off — or for a peer that is already gone, which is what lets
+//     "stop following" clear sync.peer_url and sync.token in one request.
 //  2. serve.tls.cert, then
 //  3. serve.tls.key — one after the other, because the pair is only checked
 //     once both halves are present, and a mismatched pair sent together
@@ -418,22 +444,27 @@ func protocolEnabledKey(key string) bool {
 //  5. Everything else. Independent of each other and of the credentials.
 //  6. Enables last, against a certificate that is now in place.
 //
-// Every key falls in exactly one phase: it either turns a protocol on or
-// off (1 or 6), is a credential a later key depends on (2, 3 or 4), or is
-// neither (5).
+// Every key falls in exactly one phase: it either turns a protocol or a
+// peer off (1), turns a protocol on (6), is a credential a later key
+// depends on (2, 3 or 4), or is none of those (5).
 var settingsPhases = []func(key, value string) bool{
-	func(k, v string) bool { return protocolEnabledKey(k) && v != "true" },
+	func(k, v string) bool { return (protocolEnabledKey(k) && v != "true") || clearingPeer(k, v) },
 	func(k, _ string) bool { return k == "serve.tls.cert" },
 	func(k, _ string) bool { return k == "serve.tls.key" },
-	func(k, _ string) bool { return k == "sync.token" },
-	func(k, _ string) bool { return !protocolEnabledKey(k) && !stagedFirst(k) },
+	func(k, _ string) bool { return k == syncTokenSetting },
+	func(k, v string) bool { return !protocolEnabledKey(k) && !stagedFirst(k) && !clearingPeer(k, v) },
 	func(k, v string) bool { return protocolEnabledKey(k) && v == "true" },
 }
+
+// clearingPeer reports whether this write stops following a main — the
+// promotion. It is a disable, so it belongs in phase 1 beside the protocol
+// ones rather than in phase 5 with everything else.
+func clearingPeer(k, v string) bool { return k == syncPeerURLSetting && v == "" }
 
 // stagedFirst names the credentials phases 2-4 judge, because a key later in
 // the same write is validated against them.
 func stagedFirst(k string) bool {
-	return k == "serve.tls.cert" || k == "serve.tls.key" || k == "sync.token"
+	return k == "serve.tls.cert" || k == "serve.tls.key" || k == syncTokenSetting
 }
 
 // orderSettings sorts the keys of a write into settingsPhases order, sorted
@@ -503,6 +534,13 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 	if len(values) == 0 {
 		errJSON(w, http.StatusBadRequest, "no settings to write")
 		return
+	}
+	// The peer URL is stored with no trailing slash: the pull loop joins
+	// "/api/v1/sync/..." onto it, and "https://main.lan//api/v1/..." is a
+	// URL nobody meant. Normalised before validation, so the value that is
+	// judged is the value that is stored.
+	if v, ok := values[syncPeerURLSetting]; ok {
+		values[syncPeerURLSetting] = strings.TrimRight(v, "/")
 	}
 	// The replica guard, key by key rather than route-wide (spec §7): the
 	// local keys of §4.3 describe this box and stay writable — clearing

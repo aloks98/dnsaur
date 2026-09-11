@@ -75,13 +75,15 @@ has no 403 handling and doesn't need any.
 every write to configuration its main owns is refused with **409**
 `managed by <peer_url>` before the handler runs (`Server.managed`,
 `internal/api/sync_handlers.go`): groups, clients, filter lists, rules, TSIG
-keys, zones and zone records, and `PUT /settings` for any key outside the
-instance-local set. The peer URL in the string is verbatim what
-`sync.peer_url` holds, so the screen can print it as-is. Two writes stay
+keys, zones and zone records, **both `/blocking/pause` writes** (the pause
+state lives in the synced `blocking.pauses` setting — a pause is a decision
+about the network, and clients reach either box), and `PUT /settings` for any
+key outside the instance-local set. The peer URL in the string is verbatim
+what `sync.peer_url` holds, so the screen can print it as-is. Two writes stay
 available because they are operational rather than configuration —
 `POST /filters/lists/{id}/refresh` and `POST /zones/{id}/refresh` — and so do
-this box's own account, sessions, tokens, backups and pauses. On a main (the
-default, no `sync.peer_url`) none of this is reachable. See §2.11.
+this box's own account, sessions, tokens and backups. On a main (the default,
+no `sync.peer_url`) none of this is reachable. See §2.11.
 
 **CSRF** — a cookie-authenticated non-GET/HEAD request whose `Sec-Fetch-Site`
 header is `cross-site` is refused with **403** `cross-site request`
@@ -440,8 +442,8 @@ mismatched pair stores with a 204.
 | Endpoint | Params | Success |
 |---|---|---|
 | `GET /blocking` | `group_id` **or** `client_id` int, optional, **default 0** | **200** `{"paused_until": <unix ms>, "scope": "global"\|"group"\|"client"}`, `paused_until` `0` and no `scope` when not paused |
-| `POST /blocking/pause` | body `{["group_id"\|"client_id": int,] "minutes": int}` | **204** |
-| `DELETE /blocking/pause` | `group_id` **or** `client_id` query, optional, default 0 | **204**, unconditionally |
+| `POST /blocking/pause` | body `{["group_id"\|"client_id": int,] "minutes": int}` | **204**; **409** `managed by <peer>` on a replica (§1) |
+| `DELETE /blocking/pause` | `group_id` **or** `client_id` query, optional, default 0 | **204**, unconditionally; **409** on a replica |
 
 `minutes` must be **1–1440**, else 400 `minutes must be 1-1440`. Ids are
 **not validated** — an id naming nothing is accepted, and a non-numeric one
@@ -1483,11 +1485,22 @@ both are rejected with `must be a whole number, one or more`:
 `stats.retention_days`, where `0` would delete every hourly bucket on the
 next prune. `blocking.mode` treats **anything ≠ `nxdomain`** as null-ip.
 
-`sync.peer_url` requires `sync.token` to be non-empty — already stored, or
-sent in the same map. The handler judges `sync.token` before `sync.peer_url`
-for exactly that reason, the same way it judges the certificate before the
-enable that needs it, so the Sync band can save both in one request. The
-rejection is `invalid value for sync.peer_url: set sync.token first`.
+`sync.peer_url` is a **scheme and a host and nothing else** — the pull loop
+joins `/api/v1/sync/...` onto it, so a path, a query, a fragment or
+credentials are refused with `invalid value for sync.peer_url: must be a
+scheme and host only, with no path, query or credentials`. A lone trailing
+slash is accepted and stripped before the value is stored, so
+`https://main.lan/` reads back as `https://main.lan`.
+
+The peer and the token are checked **in both directions**. Setting
+`sync.peer_url` non-empty requires `sync.token` — already stored, or sent in
+the same map (`invalid value for sync.peer_url: set sync.token first`), and
+clearing `sync.token` while a peer is configured is refused the same way
+(`invalid value for sync.token: clear sync.peer_url first`); either state
+would be a replica that pulls a 401 forever. The handler judges `sync.token`
+before `sync.peer_url` so the Sync band can save both in one request, and
+judges a peer *being cleared* before either, so "stop following" can send
+`{"sync.peer_url": "", "sync.token": ""}` in one request too.
 `sync.tsig_key_id` is checked against the keys that exist:
 `invalid value for sync.tsig_key_id: no TSIG key has that id`.
 

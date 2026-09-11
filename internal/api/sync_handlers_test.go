@@ -278,9 +278,7 @@ var syncUnguardedWrites = map[string]string{
 	"PUT /api/v1/settings": "key by key, not route-wide: the local keys of §4.3 stay writable on " +
 		"a replica — clearing sync.peer_url is the promotion — and everything else is refused " +
 		"inside the handler. TestReplicaRefusesSyncedWrites checks both halves below.",
-	"POST /api/v1/backup":           "copies this box's own database to this box's own disk.",
-	"POST /api/v1/blocking/pause":   "engine state, not a row this API writes.",
-	"DELETE /api/v1/blocking/pause": "same.",
+	"POST /api/v1/backup": "copies this box's own database to this box's own disk.",
 
 	"POST /api/v1/filters/refresh": "downloads the lists this box already has; the replica keeps " +
 		"its own copies current, which is how a list it has never seen ever gets fetched (§5).",
@@ -477,6 +475,43 @@ func TestSyncSettingsValidation(t *testing.T) {
 	}
 	if got, _, _ := s.Settings().Get(t.Context(), "sync.peer_url"); got != "https://main.lan" {
 		t.Errorf("sync.peer_url = %q", got)
+	}
+
+	// Scheme and host only: the pull loop joins "/api/v1/sync/..." onto this
+	// value, so anything else in it builds a URL nobody meant.
+	for _, bad := range []string{
+		"https://main.lan/dnsaur", "https://main.lan?x=1",
+		"https://main.lan#frag", "https://admin:pw@main.lan",
+	} {
+		if w := single("sync.peer_url", bad); w.Code != http.StatusBadRequest {
+			t.Errorf("PUT sync.peer_url=%q = %d %s, want 400", bad, w.Code, strings.TrimSpace(w.Body.String()))
+		}
+	}
+	// A trailing slash is the one extra accepted, and it is normalised away
+	// rather than stored — "https://main.lan//api/v1/sync/version" is not a
+	// URL anybody meant.
+	if w := single("sync.peer_url", "https://main.lan/"); w.Code != http.StatusNoContent {
+		t.Fatalf("trailing slash = %d %s, want 204", w.Code, strings.TrimSpace(w.Body.String()))
+	}
+	if got, _, _ := s.Settings().Get(t.Context(), "sync.peer_url"); got != "https://main.lan" {
+		t.Errorf("stored sync.peer_url = %q, want the trailing slash stripped", got)
+	}
+
+	// The token rule holds from the other side too: emptying it under a
+	// configured peer leaves a replica that pulls a 401 forever.
+	if w := single("sync.token", ""); w.Code != http.StatusBadRequest {
+		t.Errorf("clearing the token under a peer = %d %s, want 400", w.Code, strings.TrimSpace(w.Body.String()))
+	}
+	// Clearing both at once is "stop following", and must not be caught by
+	// that rule: a peer being cleared is judged before the token.
+	w = doReq(t, h, "PUT", "/api/v1/settings", `{"sync.peer_url":"","sync.token":""}`, cookie)
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("stop following = %d %s, want 204", w.Code, strings.TrimSpace(w.Body.String()))
+	}
+	for _, key := range []string{"sync.peer_url", "sync.token"} {
+		if got, _, _ := s.Settings().Get(t.Context(), key); got != "" {
+			t.Errorf("%s = %q after stopping, want empty", key, got)
+		}
 	}
 
 	// An existing key id is accepted; the replica uses the main's id, so
