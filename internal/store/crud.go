@@ -6,6 +6,107 @@ import (
 	"errors"
 )
 
+// configWrite is every write to a table that travels in a bundle: groups,
+// clients, lists and their group assignments, rules, TSIG keys and zone
+// definitions. Each of them advances config_version in its own transaction
+// and publishes the new value after the commit, because that counter is what
+// a replica polls to decide whether the main's configuration moved (the
+// config-sync design, §3) and what this box's own settings watcher wakes on.
+//
+// Records, serial bumps and the transfer-state writers are deliberately not
+// in it: none of them is in a bundle, and moving the counter for a
+// secondary's hourly refresh would have the whole fleet pull an identical
+// bundle every hour.
+//
+// The three wrappers below are the whole vocabulary — an insert, a write
+// that must match one row, and a conditional write that may legitimately
+// match none. They share bumpVersionTx with settingsStore.SetMany and
+// ImportBundle, which are the two other places a version moves.
+func (s *sqlStore) configWrite(ctx context.Context, fn func(tx *sql.Tx) error) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback() //nolint:errcheck // undoes everything unless Commit ran
+	if err := fn(tx); err != nil {
+		return err
+	}
+	v, err := bumpVersionTx(ctx, tx)
+	if err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	s.hub.publish(v)
+	return nil
+}
+
+// configInsert is insert for a synced table: the new row id, and the version
+// moved in the same transaction.
+func (s *sqlStore) configInsert(ctx context.Context, q string, args ...any) (int64, error) {
+	var id int64
+	err := s.configWrite(ctx, func(tx *sql.Tx) error {
+		if s.dialect == "postgres" {
+			return wrapDBErr(tx.QueryRowContext(ctx, s.q(q+" RETURNING id"), args...).Scan(&id))
+		}
+		res, err := tx.ExecContext(ctx, s.q(q), args...)
+		if err != nil {
+			return wrapDBErr(err)
+		}
+		id, err = res.LastInsertId()
+		return err
+	})
+	if err != nil {
+		return 0, err
+	}
+	return id, nil
+}
+
+// configExecOne is execOne for a synced table. A statement that matched no
+// row is ErrNotFound and rolls back, so the version does not move for a
+// write that changed nothing.
+func (s *sqlStore) configExecOne(ctx context.Context, q string, args ...any) error {
+	n, err := s.configExecN(ctx, q, args...)
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// configExecN is configExecOne for a statement whose predicate may
+// legitimately match nothing — an optimistic update, a delete guarded by a
+// reference check — and which answers that case itself. The version moves
+// only when a row actually changed.
+func (s *sqlStore) configExecN(ctx context.Context, q string, args ...any) (int64, error) {
+	var n int64
+	err := s.configWrite(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx, s.q(q), args...)
+		if err != nil {
+			return wrapDBErr(err)
+		}
+		if n, err = res.RowsAffected(); err != nil {
+			return err
+		}
+		if n == 0 {
+			return errNoRows
+		}
+		return nil
+	})
+	if errors.Is(err, errNoRows) {
+		return 0, nil
+	}
+	return n, err
+}
+
+// errNoRows unwinds configWrite's transaction from inside fn when the
+// statement matched nothing. It never reaches a caller: configExecN turns it
+// back into (0, nil), and the two callers above decide what that means.
+var errNoRows = errors.New("no rows affected")
+
 // execOne runs a statement expected to affect exactly one row.
 func (s *sqlStore) execOne(ctx context.Context, q string, args ...any) error {
 	res, err := s.db.ExecContext(ctx, s.q(q), args...)
@@ -39,31 +140,31 @@ func execOneTx(ctx context.Context, tx *sql.Tx, dialect, q string, args ...any) 
 }
 
 func (c *clientStore) UpdateClient(ctx context.Context, cl Client) error {
-	return c.s.execOne(ctx, `UPDATE clients SET name = ?, matcher = ?, group_id = ? WHERE id = ?`, cl.Name, cl.Matcher, cl.GroupID, cl.ID)
+	return c.s.configExecOne(ctx, `UPDATE clients SET name = ?, matcher = ?, group_id = ? WHERE id = ?`, cl.Name, cl.Matcher, cl.GroupID, cl.ID)
 }
 
 func (c *clientStore) DeleteClient(ctx context.Context, id int64) error {
-	return c.s.execOne(ctx, `DELETE FROM clients WHERE id = ?`, id)
+	return c.s.configExecOne(ctx, `DELETE FROM clients WHERE id = ?`, id)
 }
 
 func (c *clientStore) RenameGroup(ctx context.Context, id int64, name string) error {
-	return c.s.execOne(ctx, `UPDATE groups SET name = ? WHERE id = ?`, name, id)
+	return c.s.configExecOne(ctx, `UPDATE groups SET name = ? WHERE id = ?`, name, id)
 }
 
 func (c *clientStore) SetGroupEnabled(ctx context.Context, id int64, enabled bool) error {
-	return c.s.execOne(ctx, `UPDATE groups SET enabled = ? WHERE id = ?`, enabled, id)
+	return c.s.configExecOne(ctx, `UPDATE groups SET enabled = ? WHERE id = ?`, enabled, id)
 }
 
 func (c *clientStore) DeleteGroup(ctx context.Context, id int64) error {
 	if id == 1 {
 		return ErrInUse // the default group is structural
 	}
-	tx, err := c.s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
+	return c.s.configWrite(ctx, func(tx *sql.Tx) error {
+		return c.deleteGroup(ctx, tx, id)
+	})
+}
 
+func (c *clientStore) deleteGroup(ctx context.Context, tx *sql.Tx, id int64) error {
 	// Check for clients referencing this group
 	var n int64
 	if err := tx.QueryRowContext(ctx, c.s.q(`SELECT COUNT(*) FROM clients WHERE group_id = ?`), id).Scan(&n); err != nil {
@@ -96,38 +197,28 @@ func (c *clientStore) DeleteGroup(ctx context.Context, id int64) error {
 		}
 		return err
 	}
-
-	return tx.Commit()
+	return nil
 }
 
 func (f *filterStore) SetListEnabled(ctx context.Context, id int64, enabled bool) error {
-	return f.s.execOne(ctx, `UPDATE lists SET enabled = ? WHERE id = ?`, enabled, id)
+	return f.s.configExecOne(ctx, `UPDATE lists SET enabled = ? WHERE id = ?`, enabled, id)
 }
 
 func (f *filterStore) DeleteList(ctx context.Context, id int64) error {
-	tx, err := f.s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-
-	// Delete all group_lists associations for this list
-	if _, err := tx.ExecContext(ctx, f.s.q(`DELETE FROM group_lists WHERE list_id = ?`), id); err != nil {
-		return err
-	}
-
-	// Delete the list itself
-	if err := execOneTx(ctx, tx, f.s.dialect, `DELETE FROM lists WHERE id = ?`, id); err != nil {
-		return err
-	}
-
-	return tx.Commit()
+	return f.s.configWrite(ctx, func(tx *sql.Tx) error {
+		// Delete all group_lists associations for this list
+		if _, err := tx.ExecContext(ctx, f.s.q(`DELETE FROM group_lists WHERE list_id = ?`), id); err != nil {
+			return err
+		}
+		// Delete the list itself
+		return execOneTx(ctx, tx, f.s.dialect, `DELETE FROM lists WHERE id = ?`, id)
+	})
 }
 
 func (f *filterStore) UnassignList(ctx context.Context, groupID, listID int64) error {
-	return f.s.execOne(ctx, `DELETE FROM group_lists WHERE group_id = ? AND list_id = ?`, groupID, listID)
+	return f.s.configExecOne(ctx, `DELETE FROM group_lists WHERE group_id = ? AND list_id = ?`, groupID, listID)
 }
 
 func (f *filterStore) DeleteRule(ctx context.Context, id int64) error {
-	return f.s.execOne(ctx, `DELETE FROM rules WHERE id = ?`, id)
+	return f.s.configExecOne(ctx, `DELETE FROM rules WHERE id = ?`, id)
 }

@@ -178,6 +178,13 @@ against a fresh database. Changing them via `PUT /api/v1/settings` updates
 the DB, bumps a config version, and live components reload automatically —
 **except** the entries marked "restart required" below.
 
+The config version counts configuration changes, not settings writes: every
+write to a group, client, filter list or its assignments, rule, TSIG key or
+zone *definition* advances it too. It is what a replica polls
+(`GET /api/v1/sync/version`) to decide whether the main's configuration
+moved. Zone records, serial bumps and transfer bookkeeping do not advance
+it — none of them travels in a config bundle.
+
 | Key | Default | Meaning |
 |---|---|---|
 | `instance.id` | random UUID, generated per install | Stable identifier for this instance (used by future HA sync) |

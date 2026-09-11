@@ -88,11 +88,8 @@ func (st *settingsStore) SetMany(ctx context.Context, values map[string]string) 
 			return err
 		}
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE config_version SET version = version + 1 WHERE id = 1`); err != nil {
-		return err
-	}
-	var v int64
-	if err := tx.QueryRowContext(ctx, `SELECT version FROM config_version WHERE id = 1`).Scan(&v); err != nil {
+	v, err := bumpVersionTx(ctx, tx)
+	if err != nil {
 		return err
 	}
 	if err := tx.Commit(); err != nil {
@@ -100,6 +97,24 @@ func (st *settingsStore) SetMany(ctx context.Context, values map[string]string) 
 	}
 	st.s.hub.publish(v)
 	return nil
+}
+
+// bumpVersionTx advances config_version inside tx and returns the new value.
+// It is the one statement pair every version move shares — settings writes,
+// a bundle import, and every synced-table write through configWrite — so
+// that "what counts as a configuration change" is answered in one place
+// rather than in a dozen copies of two SQL statements.
+//
+// The caller publishes on the hub only after its commit: a subscriber that
+// reconfigured itself from a transaction that then rolled back would be
+// serving a config no box holds.
+func bumpVersionTx(ctx context.Context, tx *sql.Tx) (int64, error) {
+	if _, err := tx.ExecContext(ctx, `UPDATE config_version SET version = version + 1 WHERE id = 1`); err != nil {
+		return 0, err
+	}
+	var v int64
+	err := tx.QueryRowContext(ctx, `SELECT version FROM config_version WHERE id = 1`).Scan(&v)
+	return v, err
 }
 
 func (st *settingsStore) SetInternal(ctx context.Context, key, value string) error {

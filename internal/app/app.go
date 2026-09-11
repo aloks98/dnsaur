@@ -958,6 +958,15 @@ func (a *App) Start(ctx context.Context) error {
 				case <-c.Done():
 					return
 				case <-changes:
+					// Coalesce a burst into one pass. Every configuration
+					// write publishes here now, not only a settings write
+					// — adding twenty clients would otherwise rebuild the
+					// forwarder and recompile the whole ruleset twenty
+					// times, and the last pass is the only one whose result
+					// differs from the one before it.
+					for len(changes) > 0 {
+						<-changes
+					}
 					a.applySettings(c)
 					// Compile, do not download. A settings write can
 					// change which rules and lists a group enforces, so

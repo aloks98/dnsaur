@@ -391,15 +391,10 @@ func (s *sqlStore) ImportBundle(ctx context.Context, b Bundle) error {
 		}
 	}
 
-	// One bump for the whole apply, by the statement SetMany uses, and the
-	// hub is told only after the commit — a subscriber that reconfigured
-	// itself from a transaction that then rolled back would be serving a
-	// config no box holds.
-	if _, err := tx.ExecContext(ctx, `UPDATE config_version SET version = version + 1 WHERE id = 1`); err != nil {
-		return err
-	}
-	var v int64
-	if err := tx.QueryRowContext(ctx, `SELECT version FROM config_version WHERE id = 1`).Scan(&v); err != nil {
+	// One bump for the whole apply, through the helper every other version
+	// move shares.
+	v, err := bumpVersionTx(ctx, tx)
+	if err != nil {
 		return err
 	}
 	if err := tx.Commit(); err != nil {

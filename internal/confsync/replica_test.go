@@ -164,6 +164,30 @@ func TestReplicaPullsAppliesAndRegisters(t *testing.T) {
 	if v, _, _ := rep.Settings().Get(ctx, "blocking.mode"); v != "nxdomain" {
 		t.Fatalf("blocking.mode = %q, want the main's", v)
 	}
+
+	// A change that is not a settings write moves the version too, so the
+	// next cycle picks it up — the main adding a group is the commonest
+	// config change there is, and nothing about it touches settings.
+	guests, err := mainSt.Clients().AddGroup(ctx, "guests")
+	if err != nil {
+		t.Fatalf("AddGroup: %v", err)
+	}
+	if err := r.PullOnce(ctx); err != nil {
+		t.Fatalf("PullOnce after a group was added: %v", err)
+	}
+	gs, err = rep.Clients().Groups(ctx)
+	if err != nil {
+		t.Fatalf("Groups: %v", err)
+	}
+	found = false
+	for _, g := range gs {
+		if g.ID == guests && g.Name == "guests" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("a group added on the main was not pulled: %+v", gs)
+	}
 }
 
 // TestReplicaDerivesPrimaryDNSFromPeer pins §8's fallback: with

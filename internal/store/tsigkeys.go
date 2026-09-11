@@ -83,7 +83,7 @@ func (t *tsigKeyStore) ByName(ctx context.Context, name string) (TSIGKey, bool, 
 }
 
 func (t *tsigKeyStore) Create(ctx context.Context, k TSIGKey) (int64, error) {
-	return t.s.insert(ctx, `INSERT INTO tsig_keys (name, algorithm, secret, created_at) VALUES (?, ?, ?, ?)`,
+	return t.s.configInsert(ctx, `INSERT INTO tsig_keys (name, algorithm, secret, created_at) VALUES (?, ?, ?, ?)`,
 		k.Name, k.Algorithm, k.Secret, k.CreatedAt)
 }
 
@@ -108,16 +108,12 @@ func (t *tsigKeyStore) Create(ctx context.Context, k TSIGKey) (int64, error) {
 // in Delete, the predicate lives in the UPDATE rather than in a SELECT
 // before it, so nothing can slip between the check and the write.
 func (t *tsigKeyStore) Update(ctx context.Context, k TSIGKey) error {
-	res, err := t.s.db.ExecContext(ctx, t.s.q(
+	n, err := t.s.configExecN(ctx,
 		`UPDATE tsig_keys SET name = ?, algorithm = ?, secret = ? WHERE id = ?
 		   AND (name = ?
 		        OR (NOT EXISTS (`+aclKeyRef(t.s.dialect)+`)
-		            AND NOT EXISTS (`+notifyKeyRef(t.s.dialect)+`)))`),
+		            AND NOT EXISTS (`+notifyKeyRef(t.s.dialect)+`)))`,
 		k.Name, k.Algorithm, k.Secret, k.ID, k.Name)
-	if err != nil {
-		return wrapDBErr(err)
-	}
-	n, err := res.RowsAffected()
 	if err != nil {
 		return err
 	}
@@ -216,15 +212,11 @@ func notifyKeyRef(dialect string) string {
 // is a named failure reported against the attempt that suffered it, the
 // same way an unreachable primary surfaces — not silent breakage.
 func (t *tsigKeyStore) Delete(ctx context.Context, id int64) error {
-	res, err := t.s.db.ExecContext(ctx, t.s.q(
+	n, err := t.s.configExecN(ctx,
 		`DELETE FROM tsig_keys WHERE id = ?
 		   AND NOT EXISTS (SELECT 1 FROM zones WHERE zones.tsig_key_id = tsig_keys.id)
 		   AND NOT EXISTS (`+aclKeyRef(t.s.dialect)+`)
-		   AND NOT EXISTS (`+notifyKeyRef(t.s.dialect)+`)`), id)
-	if err != nil {
-		return wrapDBErr(err)
-	}
-	n, err := res.RowsAffected()
+		   AND NOT EXISTS (`+notifyKeyRef(t.s.dialect)+`)`, id)
 	if err != nil {
 		return err
 	}
