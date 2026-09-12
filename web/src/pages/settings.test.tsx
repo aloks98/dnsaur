@@ -5,6 +5,7 @@ import { act, fireEvent, screen, waitFor, within } from "@testing-library/react"
 import userEvent from "@testing-library/user-event";
 import { Link, Route, Routes } from "react-router";
 import { server } from "../test/msw-server";
+import { replicaHandlers } from "../test/msw-handlers";
 import { renderWithProviders } from "../test/render";
 import type { Settings } from "../api/types";
 import { SettingsPage } from "./settings";
@@ -33,6 +34,11 @@ function fullSettings(overrides: Partial<Settings> = {}): Settings {
     "serve.doh.listen": ":443",
     "serve.tls.cert": "",
     "serve.tls.key": "",
+    // sync.token is deliberately absent: GET /settings never returns it.
+    "sync.peer_url": "",
+    "sync.interval_seconds": "30",
+    "sync.primary_dns": "",
+    "sync.tsig_key_id": "0",
     ...overrides,
   };
 }
@@ -228,7 +234,10 @@ test("every section says whether it applies on save or waits for a restart", asy
   // Protocols included: reconcileServing (internal/app/serve.go) applies
   // every serve.* write live, on the same write that changed it.
   const restartSections = ["Cache", "Lists"];
-  const instantSections = ["Upstreams", "Blocking", "Query log", "Protocols"];
+  // Sync is instant for the same reason: the pull loop re-reads its peer,
+  // interval and primary address on every pass
+  // (internal/confsync/replica.go).
+  const instantSections = ["Upstreams", "Blocking", "Query log", "Protocols", "Sync"];
 
   for (const title of restartSections) {
     const section = screen.getByRole("heading", { name: title }).closest("section")!;
@@ -899,4 +908,36 @@ test("a postgres install is shown the server's own pg_dump answer", async () => 
   expect(
     await screen.findByText("backups are a sqlite feature; use pg_dump for postgres"),
   ).toBeInTheDocument();
+});
+
+// --- replica mode ---------------------------------------------------------
+
+// Spec §4.3/§7: the instance keys stay this box's to write, everything else
+// belongs to the main and answers 409. The screen has to draw that line
+// where the server draws it — a band left live whose every save is refused
+// is worse than one that says so up front.
+test("a replica keeps the local bands editable and shows the synced ones read-only", async () => {
+  mockSettings(fullSettings());
+  server.use(...replicaHandlers("https://main.lan"));
+
+  renderWithProviders(<SettingsPage />);
+
+  expect(await screen.findByText("Managed by https://main.lan")).toBeInTheDocument();
+
+  // Synced: the main's to change.
+  expect(screen.getByLabelText("Blocked response TTL (seconds)")).toBeDisabled();
+  expect(screen.getByLabelText("Retention (days)")).toBeDisabled();
+
+  // Local: still this box's own.
+  expect(screen.getByLabelText("DNS-over-TLS listen address")).toBeEnabled();
+  expect(screen.getByLabelText("Peer URL")).toBeEnabled();
+});
+
+test("a main leaves every band editable and shows no notice", async () => {
+  mockSettings(fullSettings());
+
+  renderWithProviders(<SettingsPage />);
+
+  expect(await screen.findByLabelText("Blocked response TTL (seconds)")).toBeEnabled();
+  expect(screen.queryByText(/^Managed by/)).not.toBeInTheDocument();
 });

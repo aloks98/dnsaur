@@ -813,6 +813,7 @@ moment you save.
 | **Query log** | How much per-query detail is recorded, how long the rows are kept, and how long the hourly totals behind the dashboard outlive them |
 | **Lists** | How often subscriptions refresh |
 | **Protocols** | Whether clients can reach dnsaur over DNS-over-TLS / DNS-over-HTTPS, and the certificate both present |
+| **Sync** | Whether this instance follows another's configuration, or serves its own (see Sync below) |
 | **Backup** | Not a setting — a button that copies the database now (see Backup below) |
 
 **Upstream strategy** is one of:
@@ -865,6 +866,108 @@ The three states that mean something is wrong — a failed bind, an expiring
 certificate, and the upstream-encryption downgrade — also appear as banners
 across the top of every screen, not just this one.
 
+### Sync
+
+Two dnsaur boxes on one network answer for each other when one is down, and
+sync is how the second one stays configured like the first. One instance is
+the **main** — it takes writes — and any instance with a peer URL set is a
+**replica**: it pulls the main's configuration on a timer, applies it, and
+stops accepting local writes to anything that configuration covers. There is
+no election and no third mode. Which one this box is comes straight from
+whether `sync.peer_url` is empty.
+
+Four fields are on the band whichever kind of box you are looking at,
+because filling them in is what turns a main into a replica:
+
+| Field | What it is |
+|---|---|
+| **Peer URL** | The main to follow — scheme and host, nothing else (`https://adam.dns.e412.in`). Empty means this box is a main |
+| **Token** | A write-scope API token minted **on the main**, which this box pulls with |
+| **Pull interval (seconds)** | How often the replica asks the main whether its configuration moved. Five or more |
+| **Primary DNS address** | Where the main answers DNS, as `host:port` — the address the derived secondary zones transfer from. Empty means the peer URL's host on port 53 |
+
+The token is never read back. `GET /settings` does not return it — it is a
+credential, and a screen that could show it would be a way to copy it out —
+so the box is empty every time the page loads and the band states what is
+stored instead: **Token: set** or **Token: not set**. Leaving the box empty
+on save leaves the stored token alone; typing in it replaces it.
+
+The peer and the token are only valid together, so save them together. A
+peer with no credential is a replica that pulls a 401 forever, which the
+server refuses to create from either direction.
+
+**On a main**, the band also carries:
+
+- **Sync key** — the TSIG key replicas sign their zone transfers with.
+  Creating that key (on **TSIG keys**) and picking it here is the one manual
+  step setting up a pair. `None` means no replica can transfer, which is the
+  default and is not a useful steady state for a pair that serves zones.
+- **One row per registered replica** — its instance id, where it answers
+  DNS, the configuration version it has applied, and when it was last heard
+  from. A replica registers itself after applying a bundle; registering is
+  also what lets its transfers through, so you never edit an ACL to add one.
+  **Forget** removes a row. Nothing removes one automatically — a box that is
+  down for an afternoon is not a box whose transfer permission should quietly
+  disappear — so a replica you have actually retired is yours to forget here.
+
+**On a replica**, the band instead says how far it has got — `applied 412 of
+412`, the version it holds against the version the main last reported — and
+offers **Stop following**.
+
+#### What a replica can still change
+
+Everything that describes *this box* rather than the service both boxes
+provide: the **Protocols** band (its own listen addresses and certificate),
+the **Sync** band itself, **Backup**, and its own account, sessions and API
+tokens. Those bands stay editable and save normally.
+
+Everything else is the main's. The **Upstreams**, **Blocking**, **Cache**,
+**Query log** and **Lists** bands render with their values and no controls,
+and so do Filtering, Zones and TSIG keys — each with one line at the top
+naming the box they came from:
+
+> Managed by https://adam.dns.e412.in
+
+Reading is never restricted. Filters, search, a revealed TSIG secret, a zone
+file export and both **Refresh now** actions all still work — refreshing a
+list or pulling a zone acts on this box's own copy and is not a change to
+the configuration the main owns. Pausing blocking is: the pause is stored as
+a setting and reaches both boxes, so it is set on the main.
+
+#### Promotion
+
+**Stop following** clears the peer URL and the token together, in one write.
+The moment it lands, the guard lifts and this box takes writes again — it is
+a main with whatever configuration it last applied.
+
+What it does not do is repoint any zone. The zones a replica derived from the
+main are still **secondaries**, and their primary may now be a box that is
+gone; each one stays a copy until you change its type on its own zone page.
+That is deliberately a per-zone decision: turning them all into primaries
+would be this screen guessing which ones you actually want this box to own.
+
+There is no split-brain to recover from either way, because only one box was
+ever taking writes.
+
+#### When something is wrong
+
+Three facts appear as banners across the top of every screen, and all three
+clear on their own:
+
+- **Last pull failed: <reason>** — the reason verbatim from the server. The
+  previously applied configuration is still in force; DNS is unaffected.
+- **Peer reached over plain HTTP** — the peer URL is `http://`, so every
+  pull sends the pull token and receives the whole bundle — **every TSIG
+  secret on the main included** — in the clear. There is no certificate
+  subsystem here to fix that for you; put the peer behind HTTPS.
+- **Replica <id> not seen for <duration>** — on the main, about a replica
+  that has missed three intervals. It has not been forgotten and its
+  transfer permission is intact; it simply is not answering.
+
+A replica that is merely *behind* is not a warning — that is what a pull
+interval looks like from the outside, and the Sync band's `applied n of m`
+is where that number belongs.
+
 ### Backup
 
 **Back up now** writes a copy of the database into
@@ -902,6 +1005,10 @@ that saved stops being counted as unsaved; one that was rejected keeps the
 value that was typed, stays marked unsaved and can be retried, and the toast
 names which. **Discard** after a partial save puts back what the server now
 holds, not what it held before the save.
+
+The one exception is **Stop following** on the Sync band, which writes the
+peer URL and the token in a single all-or-nothing request — half of that
+promotion is not a state to be left in.
 
 The page also re-reads the settings in the background, so a key saved from
 another tab arrives here on its own. A field you are editing is never taken

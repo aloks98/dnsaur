@@ -1759,6 +1759,93 @@ or not, so a rejected row blocks Save through the field's own schema (the same
 form holding the last valid one — an edit that looked applied, was silently
 discarded on save, and lost its row error on the resync.
 
+### 6.1 Replica mode: which controls are live
+
+Every screen reads `GET /resolver/status`'s `sync` block (§3.13) — already
+held by the shell for its banners, so this costs no request — and treats
+`role === "replica"` as "the write controls here are not this box's". The
+server refuses the write regardless (**409** `managed by <peer_url>`, §1);
+this is the screen agreeing with it up front instead of offering a form that
+can only fail.
+
+Each synced screen carries one line at the top, verbatim:
+
+> `Managed by <peer_url>`
+
+and nothing else. No explanation — that is [`docs/dashboard.md`](dashboard.md)'s
+job. **Navigation is never hidden and no read is disabled**: filters, search,
+sorting, a group selection, a revealed TSIG secret, an export and both
+"Refresh now" actions all stay live.
+
+| Screen | Disabled while managed | Still live |
+|---|---|---|
+| Filtering → Groups & clients | Add group, Add client, the group enabled switch, Rename, Delete, the per-group Lists assignment | group selection, counts, client matching help |
+| Filtering → Lists | Add list, the enabled switch, Rename, Delete | Refresh all, per-list Refresh, search and both filters |
+| Filtering → Rules | Add rule, Delete rule | group select, search, action filter |
+| Zones → list | New zone, Clone, Enable/Disable, Delete zone | the pull action (`Transfer now` / `Fetch now`), built-ins disclosure |
+| Zones → detail | Add record, record Edit/Delete, Set TTL, Save SOA, the transfer-ACL / primaries / notify-targets Edit pencils, Import, Enable/Disable zone, Delete zone | Export, Refresh now, the record filter, every band's readout |
+| TSIG keys | New key, Edit, Delete | Show/Hide a secret, Copy, the Used-by column |
+| Settings | every band whose keys are outside the instance-local set — Upstreams, Blocking, Cache, Query log, Lists | Protocols, Sync, Backup, and the Save bar for those |
+| Blocking pause (shell, group rows, client rows) | the whole control | the state it reads — `Blocking active` / `Paused · m:ss` |
+
+The Settings bands are gated by key, not by band: a band is read-only when
+any key in it is outside `instance.*` / `serve.*` / `sync.*`, which is the
+TypeScript mirror of `store.LocalSettingKey`. The band body is wrapped in a
+disabled `<fieldset>`, so a control added to one later is covered without
+anyone remembering to gate it.
+
+### 6.2 The Sync band
+
+Settings gains a **Sync** band, rendered wholesale (like Protocols) because
+half of what it shows is not a setting. Four fields render on both roles —
+`sync.peer_url`, `sync.token`, `sync.interval_seconds`, `sync.primary_dns` —
+because typing a peer and a token is how a main becomes a replica.
+
+`sync.token` is never returned by `GET /settings`, so the box is empty on
+every load and the band states what is stored instead, verbatim:
+
+> `Token: set` — `sync.peer_url` is non-empty
+> `Token: not set` — it is empty
+
+On a **replica** the band adds, verbatim:
+
+> `applied <applied_version> of <peer_version>`
+
+and a **`Stop following`** button. That button is the one place this page
+sends a settings *map* rather than one key per request:
+`PUT /settings {"sync.peer_url": "", "sync.token": ""}` — the pair is only
+valid together (§2.3), and all-or-nothing is exactly the shape promotion
+wants.
+
+On a **main** the band adds the `sync.tsig_key_id` select — every stored TSIG
+key by name, plus `None` for `0`, plus a `#<id>` option for a stored id the
+list cannot name, so saving an unrelated field never silently unsigns every
+transfer — and one row per registered replica (instance id, DNS address,
+applied version, last seen) with a `Forget` action sending
+`DELETE /sync/replicas/{instance_id}`. With none registered the band says
+`No replicas registered.`
+
+### 6.3 Sync's three shell banners
+
+The warning strip (`serving-banners.tsx`, mounted in the shell) gains three
+lines, derived by `syncBanners` in `lib/serving.ts`. That same function backs
+`somethingIsWrong`, which is what keeps the status poll running while any of
+them is up — a banner the poll did not watch would sit there until the
+operator navigated away and back.
+
+| Condition | Line (verbatim) |
+|---|---|
+| `sync.last_error` non-empty | `Last pull failed: <last_error>` |
+| `sync.plain_http` | `Peer reached over plain HTTP` |
+| a `replicas[]` entry with `stale: true` (one line each) | `Replica <instance_id> not seen for <duration>` |
+
+`<duration>` is `formatDuration(now - last_seen)` — `42m`, `1h 35m`, `2d 6h`
+— how long it has been quiet, not a wall-clock stamp the reader has to
+subtract from. A replica that is merely *behind* gets no banner: that is what
+a pull interval looks like from outside, and the Sync band's `applied n of m`
+already says it on the one screen where the number is worth reading. All
+three clear on their own.
+
 ---
 
 ## 7. Loading / empty / error states
@@ -1911,7 +1998,7 @@ an inline script because the served CSP is `script-src 'self'` with no
 | **Filtering → Groups & Clients** | CRUD works, but the per-group "Lists (n)" menu has **no error state**: it's disabled only while `isPending`, not on `isError`, and its toggle rebuilds the assignment set from `groupLists.data ?? []`. If that read failed, clicking one list PUTs `[thatOne]` and **silently drops every other assignment**. |
 | **Filtering → Lists** | The table leads with the list's `name`; the URL is a muted second line and stays in the row's `title`. Actions (toggle, rename, delete) are labelled by name. The **Status** column replaces the old "Last refreshed" one and carries the badge plus a plain-language line per `last_status`. |
 | **Dashboard health** | Reduced to the shell's two row-1 readouts (blocking state, and `DNS OK`/`DNS down` from `GET /health`, whose `version` is the readout's `title`). Filter-list freshness moved off the dashboard with the redesign and now lives only on Filtering → Lists. The spec's "upstreams healthy" signal **has no code at all** — there is no upstream-health endpoint. |
-| **Settings** | 12 keys work. The spec's "storage (read-only info)" section is absent, with a code comment noting no endpoint exists to source it. |
+| **Settings** | All 23 editable keys work, across seven bands (the last two — Protocols and Sync — rendered wholesale rather than as label+input rows). The spec's "storage (read-only info)" section is absent, with a code comment noting no endpoint exists to source it. |
 | **Account** | TOTP, tokens and password are complete: the Password section holds a current/new/confirm form and a **Log out everywhere** action (`POST /auth/password`, `DELETE /auth/sessions`, §2.2). |
 | **Command palette** | Navigates to the 9 leaf pages only, grouped by nav section. The spec's "quick actions (pause, block a domain)" don't exist. |
 

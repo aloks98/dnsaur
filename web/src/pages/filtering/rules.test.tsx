@@ -3,6 +3,7 @@ import { expect, test } from "vitest";
 import { screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { server } from "../../test/msw-server";
+import { replicaHandlers } from "../../test/msw-handlers";
 import { renderWithProviders } from "../../test/render";
 import type { Group, Rule } from "../../api/types";
 import { RulesTab } from "./rules";
@@ -362,4 +363,18 @@ test("the fixed-width grid sits in a horizontal scroll container", async () => {
   expect(scroller).not.toBeNull();
   expect(scroller!.className).toContain("overflow-x-auto");
   expect(scroller!.contains(rows()[0]!)).toBe(true);
+});
+
+// --- replica mode ---------------------------------------------------------
+
+test("a replica says who manages it and won't offer to add or delete a rule", async () => {
+  mockGroups([group()]);
+  mockRulesByGroup({ 1: [rule({ pattern: "ads.example" })] });
+  server.use(...replicaHandlers("https://main.lan"));
+
+  renderWithProviders(<RulesTab />);
+
+  expect(await screen.findByText("Managed by https://main.lan")).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Add rule" })).toBeDisabled();
+  expect(screen.getByRole("button", { name: "Delete rule ads.example" })).toBeDisabled();
 });

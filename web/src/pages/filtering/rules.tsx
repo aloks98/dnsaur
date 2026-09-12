@@ -30,6 +30,8 @@ import { ApiError } from "../../api/client";
 import type { Rule } from "../../api/types";
 import { useAddRule, useDeleteRule, useRules } from "../../hooks/use-filters";
 import { useGroups } from "../../hooks/use-groups";
+import { useManagedBy } from "../../hooks/use-sync";
+import { ManagedNotice } from "../../components/managed-notice";
 import { StaleDataAlert } from "../../components/stale-data-alert";
 import { DEFAULT_GROUP_ID } from "../../lib/query-rows";
 import { ConfirmDeleteDialog } from "../dialogs";
@@ -337,6 +339,7 @@ export function RulesTab() {
 
   const rules = useRules(groupId);
   const deleteRule = useDeleteRule();
+  const managedBy = useManagedBy();
   const [deleteTarget, setDeleteTarget] = useState<Rule | null>(null);
   const [addOpen, setAddOpen] = useState(false);
   const [search, setSearch] = useState("");
@@ -396,7 +399,12 @@ export function RulesTab() {
             nothing. */}
         <p className="text-sm text-muted-foreground">Lists still apply.</p>
         {!addOpen && (
-          <Button type="button" size="sm" onClick={() => setAddOpen(true)}>
+          <Button
+            type="button"
+            size="sm"
+            disabled={managedBy !== ""}
+            onClick={() => setAddOpen(true)}
+          >
             <Plus />
             Add rule
           </Button>
@@ -447,6 +455,7 @@ export function RulesTab() {
             size="sm"
             variant="ghost"
             aria-label={`Delete rule ${rule.pattern}`}
+            disabled={managedBy !== ""}
             onClick={() => setDeleteTarget(rule)}
           >
             Delete
@@ -462,6 +471,8 @@ export function RulesTab() {
     // so a narrow viewport clipped the right-hand columns with nothing to
     // scroll. On the column, so the header and the rows move together.
     <div data-slot="h-scroll" className="flex h-full min-h-0 flex-col overflow-x-auto">
+      {managedBy !== "" && <ManagedNotice peer={managedBy} />}
+
       <div className="flex shrink-0 flex-wrap items-center gap-3 border-b border-border px-4 py-2.5">
         <div className="flex items-center gap-1.5">
           <span className="font-mono text-xs tracking-widest text-muted-foreground uppercase">
@@ -504,7 +515,12 @@ export function RulesTab() {
         <div className="ml-auto flex items-center gap-2">
           <MatchOrderPopover />
           {!addOpen && (
-            <Button type="button" size="sm" onClick={() => setAddOpen(true)}>
+            <Button
+              type="button"
+              size="sm"
+              disabled={managedBy !== ""}
+              onClick={() => setAddOpen(true)}
+            >
               <Plus />
               Add rule
             </Button>

@@ -236,3 +236,90 @@ test("a protocol that is enabled and listening gets no banner", async () => {
   await settledStatus(result);
   expect(screen.queryByRole("alert")).not.toBeInTheDocument();
 });
+
+// Sync's own three facts (spec §8). Same shell mount and the same list, for
+// the same reason: an operator who never opens Settings still has to learn
+// that this box stopped taking its configuration from the main, that the
+// bundle — every TSIG secret on it — is travelling in the clear, or that a
+// replica of theirs has gone quiet.
+
+test("a failed pull shows the server's own reason in a shell banner", async () => {
+  mockResolverStatus({
+    serving: OFF_SERVING,
+    sync: {
+      role: "replica",
+      peer_url: "https://main.lan",
+      last_error: 'Get "https://main.lan/api/v1/sync/version": dial tcp: connection refused',
+    },
+  });
+
+  renderOnOtherRoute();
+
+  const alert = await screen.findByRole("alert");
+  expect(alert).toHaveTextContent(
+    'Last pull failed: Get "https://main.lan/api/v1/sync/version": dial tcp: connection refused',
+  );
+});
+
+test("a peer reached over plain http shows a shell banner", async () => {
+  mockResolverStatus({
+    serving: OFF_SERVING,
+    sync: { role: "replica", peer_url: "http://main.lan", plain_http: true },
+  });
+
+  renderOnOtherRoute();
+
+  expect(await screen.findByRole("alert")).toHaveTextContent("Peer reached over plain HTTP");
+});
+
+test("a stale replica shows a shell banner on the main, naming it and how long it has been quiet", async () => {
+  mockResolverStatus({
+    serving: OFF_SERVING,
+    sync: {
+      role: "main",
+      replicas: [
+        {
+          instance_id: "eve-2",
+          dns_addr: "10.0.0.6:53",
+          version_applied: 410,
+          last_seen: Date.now() - 95 * 60_000,
+          stale: true,
+        },
+        {
+          instance_id: "eve-3",
+          dns_addr: "10.0.0.7:53",
+          version_applied: 412,
+          last_seen: Date.now() - 30_000,
+          stale: false,
+        },
+      ],
+    },
+  });
+
+  renderOnOtherRoute();
+
+  // Only the stale one, and the duration is how long it has been quiet
+  // rather than a wall-clock stamp nobody can subtract from in their head.
+  const alerts = await screen.findAllByRole("alert");
+  expect(alerts).toHaveLength(1);
+  expect(alerts[0]).toHaveTextContent("Replica eve-2 not seen for 1h 35m");
+});
+
+test("a replica that is up to date over https gets no banner", async () => {
+  mockResolverStatus({
+    serving: OFF_SERVING,
+    sync: {
+      role: "replica",
+      peer_url: "https://main.lan",
+      peer_version: 412,
+      applied_version: 412,
+      last_pull_at: Date.now() - 20_000,
+    },
+  });
+
+  const result = renderOnOtherRoute();
+
+  expect(screen.getByText("Some other page")).toBeInTheDocument();
+  await settledStatus(result);
+  expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+});

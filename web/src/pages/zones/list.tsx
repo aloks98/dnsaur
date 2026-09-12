@@ -62,6 +62,8 @@ import {
   useZones,
 } from "../../hooks/use-zones";
 import { useTSIGKeys } from "../../hooks/use-tsig-keys";
+import { useManagedBy } from "../../hooks/use-sync";
+import { ManagedNotice } from "../../components/managed-notice";
 import { StaleDataAlert } from "../../components/stale-data-alert";
 import { relativeTime } from "../../lib/format";
 import { dnsNameSchema } from "../../lib/dns-name";
@@ -898,6 +900,10 @@ function ZoneRow({
   const isInternal = zone.type === "internal";
   const status = zoneStatus(zone);
   const warning = pullWarning(zone);
+  // Zone *definitions* travel in the bundle, so on a replica clone, enable,
+  // disable and delete are the main's. Pulling is not: a copy fetching its
+  // current version is this box's own operational act (spec §7).
+  const managedBy = useManagedBy();
   const pullVerb = pullVerbFor(zone);
   const refreshZone = useRefreshZone();
   const updateZone = useUpdateZone();
@@ -1066,16 +1072,25 @@ function ZoneRow({
                     the same hosts, the same ACL, the same notify targets.
                     The server does the copying (POST /zones/{id}/clone) —
                     this only asks for the one value a copy cannot inherit. */}
-                <DropdownMenuItem onClick={onClone}>Clone</DropdownMenuItem>
+                <DropdownMenuItem disabled={managedBy !== ""} onClick={onClone}>
+                  Clone
+                </DropdownMenuItem>
                 <DropdownMenuSeparator />
-                <DropdownMenuItem onClick={onToggleEnabled} disabled={updateZone.isPending}>
+                <DropdownMenuItem
+                  onClick={onToggleEnabled}
+                  disabled={updateZone.isPending || managedBy !== ""}
+                >
                   {zone.enabled ? "Disable" : "Enable"}
                 </DropdownMenuItem>
                 <DropdownMenuSeparator />
                 {/* The one item that cannot be undone, so it is the one item
                     behind a confirmation — and the only one drawn in the
                     destructive variant. */}
-                <DropdownMenuItem variant="destructive" onClick={onDelete}>
+                <DropdownMenuItem
+                  variant="destructive"
+                  disabled={managedBy !== ""}
+                  onClick={onDelete}
+                >
                   Delete zone
                 </DropdownMenuItem>
               </DropdownMenuContent>
@@ -1145,6 +1160,7 @@ export function ZonesList() {
   const zones = useZones();
   const deleteZone = useDeleteZone();
   const cloneZone = useCloneZone();
+  const managedBy = useManagedBy();
   // The Records column is the one thing here a transfer changes that the
   // zones response does not carry, so it follows the zone rather than
   // polling on its own — see useRecordsFollowTransfers.
@@ -1243,7 +1259,12 @@ export function ZonesList() {
             <p className="font-heading text-sm font-semibold">No zones yet</p>
             <p className="text-sm text-muted-foreground">Everything is forwarded upstream.</p>
             {!addOpen && (
-              <Button type="button" size="sm" onClick={() => setAddOpen(true)}>
+              <Button
+                type="button"
+                size="sm"
+                disabled={managedBy !== ""}
+                onClick={() => setAddOpen(true)}
+              >
                 <Plus />
                 New zone
               </Button>
@@ -1256,12 +1277,20 @@ export function ZonesList() {
 
   return (
     <div className="flex h-full min-h-0 flex-col">
+      {managedBy !== "" && <ManagedNotice peer={managedBy} />}
+
       <div className="flex shrink-0 items-center gap-2.5 border-b border-border bg-card px-4 py-2.5">
         <span className="font-mono text-xs text-muted-foreground">
           {mine.length} {mine.length === 1 ? "zone" : "zones"}
         </span>
         {!addOpen && (
-          <Button type="button" size="sm" className="ml-auto" onClick={() => setAddOpen(true)}>
+          <Button
+            type="button"
+            size="sm"
+            className="ml-auto"
+            disabled={managedBy !== ""}
+            onClick={() => setAddOpen(true)}
+          >
             <Plus />
             New zone
           </Button>

@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState, type ReactNode } from "react"
 import { useBlocker } from "react-router";
 import {
   Database,
+  Link2,
   ListChecks,
   Lock,
   ScrollText,
@@ -42,17 +43,21 @@ import {
 import { ApiError } from "../api/client";
 import type { Settings } from "../api/types";
 import { useBackup, useSettings, useUpdateSetting } from "../hooks/use-settings";
+import { useManagedBy } from "../hooks/use-sync";
+import { ManagedNotice } from "../components/managed-notice";
 import { ProtocolsField } from "../components/protocols-field";
 import { StaleDataAlert } from "../components/stale-data-alert";
+import { SyncField } from "../components/sync-field";
 import { UpstreamsField } from "../components/upstreams-field";
 import { WARNING_STRIP_TINT } from "../components/warning-strip";
 import { formatBytes } from "../lib/format";
+import { splitHostPort } from "../lib/hostport";
 import { rhfName } from "../lib/rhf-name";
 import { parseUpstreams } from "../lib/upstreams";
 
 // --- field model -------------------------------------------------------
 // One row per key in internal/api/settings_handlers.go's editableSettings
-// map — 18 keys, no more, no less (see the exhaustiveness note by
+// map — 23 keys, no more, no less (see the exhaustiveness note by
 // SETTING_GROUPS below). Each field's `schema` mirrors that map's check
 // function exactly, so a value accepted here is one PUT /settings will
 // also accept, and nothing rejected here would have been rejected there
@@ -191,23 +196,30 @@ const nonNegIntSchema = z
     if (!Number.isSafeInteger(n)) return fail("Too large.");
   });
 
-/** Mirrors editableSettings' positiveInt(...), which is nonNegInt with zero
- * refused. Two keys use it: lists.refresh_hours, whose interval becomes a
- * ticker, and 0 is not a slower schedule but one that cannot be built; and
- * stats.retention_days, where 0 would have the next prune delete every hourly
- * bucket there is. Saying so in the form saves a round trip to the same
- * rejection. */
-const positiveIntSchema = z
-  .string()
-  .trim()
-  .superRefine((value, ctx) => {
-    const fail = (message: string) => ctx.addIssue({ code: "custom", message });
-    if (!value) return fail("Required.");
-    if (!/^[+-]?\d+$/.test(value)) return fail("Numbers only — no units or separators.");
-    const n = Number(value);
-    if (n < 1) return fail("Must be 1 or more.");
-    if (!Number.isSafeInteger(n)) return fail("Too large.");
-  });
+/** nonNegIntSchema with a floor the server also enforces.
+ *
+ * `minIntSchema(1)` mirrors editableSettings' positiveInt(...): zero refused,
+ * for lists.refresh_hours, whose interval becomes a ticker and cannot be
+ * built from 0, and stats.retention_days, where 0 would have the next prune
+ * delete every hourly bucket there is. `minIntSchema(5)` mirrors
+ * syncInterval: below a few seconds a replica's version probe costs the main
+ * more than the drift it removes. Saying so in the form saves a round trip
+ * to the same rejection. */
+function minIntSchema(min: number) {
+  return z
+    .string()
+    .trim()
+    .superRefine((value, ctx) => {
+      const fail = (message: string) => ctx.addIssue({ code: "custom", message });
+      if (!value) return fail("Required.");
+      if (!/^[+-]?\d+$/.test(value)) return fail("Numbers only — no units or separators.");
+      const n = Number(value);
+      if (n < min) return fail(`Must be ${min} or more.`);
+      if (!Number.isSafeInteger(n)) return fail("Too large.");
+    });
+}
+
+const positiveIntSchema = minIntSchema(1);
 
 /** Mirrors editableSettings' `boolean`: exactly "true" or "false", not
  * anything strconv.ParseBool would also accept. In practice the only
@@ -249,6 +261,69 @@ const absPathOrEmptySchema = z
   .trim()
   .refine((v) => v === "" || v.startsWith("/"), "Must be an absolute path.");
 
+/** Mirrors editableSettings' peerURL for sync.peer_url: empty (this instance
+ * is a main), or an absolute http/https URL naming the main it follows —
+ * scheme and host and nothing else, because the pull loop joins
+ * "/api/v1/sync/..." onto it and would silently drop anything more.
+ *
+ * A lone trailing slash is accepted here for the same reason the server
+ * accepts it: handleSettingsPut strips it before the value is judged or
+ * stored. The WHATWG parser always reports `"/"` for an http(s) URL with no
+ * path, so this is the one shape where the two parsers' spelling differs and
+ * "/" has to be read as "no path". */
+const peerURLSchema = z
+  .string()
+  .trim()
+  .superRefine((value, ctx) => {
+    const fail = (message: string) => ctx.addIssue({ code: "custom", message });
+    if (value === "") return;
+    let parsed: URL;
+    try {
+      parsed = new URL(value);
+    } catch {
+      return fail("Must be an absolute http or https URL.");
+    }
+    if ((parsed.protocol !== "http:" && parsed.protocol !== "https:") || !parsed.host) {
+      return fail("Must be an absolute http or https URL.");
+    }
+    if (
+      (parsed.pathname !== "" && parsed.pathname !== "/") ||
+      parsed.search ||
+      parsed.hash ||
+      parsed.username ||
+      parsed.password
+    ) {
+      fail("Must be a scheme and host only, with no path, query or credentials.");
+    }
+  });
+
+/** Mirrors editableSettings' hostPortOrEmpty for sync.primary_dns: empty (the
+ * replica derives the address from its peer URL's host on port 53), or a
+ * host:port this instance *dials* — which is why the host is required here
+ * and optional in listenAddrSchema, where an empty one means every
+ * interface. The grammar itself is lib/hostport.ts's reading of Go's
+ * net.SplitHostPort, shared rather than re-derived. */
+const hostPortOrEmptySchema = z
+  .string()
+  .trim()
+  .superRefine((value, ctx) => {
+    const fail = (message: string) => ctx.addIssue({ code: "custom", message });
+    if (value === "") return;
+    const parsed = splitHostPort(value);
+    if (!parsed) return fail("Must be a host:port address.");
+    if (!parsed.host) return fail("Must name a host, not just a port.");
+    const port = Number(parsed.port);
+    if (!/^\d+$/.test(parsed.port) || port < 1 || port > 65535) {
+      fail("Port must be 1-65535.");
+    }
+  });
+
+/** Mirrors editableSettings' anyString for sync.token: it is a credential
+ * minted on the main, and this box has no grammar to judge it by. Empty is
+ * how a replica clears it — and how every load starts, since GET /settings
+ * never returns it. */
+const tokenSchema = z.string();
+
 // Fallback display defaults, matching docs/configuration.md's table —
 // used only if the server's GET /settings response is unexpectedly
 // missing a key (in practice every key is seeded on first run).
@@ -271,9 +346,14 @@ const SETTING_DEFAULTS: Record<string, string> = {
   "serve.doh.listen": ":443",
   "serve.tls.cert": "",
   "serve.tls.key": "",
+  "sync.peer_url": "",
+  "sync.token": "",
+  "sync.interval_seconds": "30",
+  "sync.primary_dns": "",
+  "sync.tsig_key_id": "0",
 };
 
-// Exhaustiveness: this must list exactly the 18 keys in
+// Exhaustiveness: this must list exactly the 23 keys in
 // internal/api/settings_handlers.go's editableSettings — no fewer (an
 // editable setting the admin can't reach) and no more (a PUT the server
 // would 400 with "setting not editable").
@@ -493,6 +573,49 @@ const SETTING_GROUPS: SettingGroup[] = [
     ],
     render: (control) => <ProtocolsField control={control} />,
   },
+  {
+    title: "Sync",
+    description: "Whether this instance follows another's configuration, or serves its own.",
+    icon: Link2,
+    // Rendered wholesale by sync-field.tsx (see SettingGroup.render's doc
+    // comment): three of the things in this band — what has been applied,
+    // who is registered, whether a token is stored — are not settings at
+    // all. None of the five need restartRequired: the pull loop re-reads
+    // every one of them on each pass (internal/confsync/replica.go).
+    fields: [
+      {
+        key: "sync.peer_url",
+        kind: "opaque",
+        label: "Peer URL",
+        schema: peerURLSchema,
+      },
+      {
+        key: "sync.token",
+        kind: "opaque",
+        label: "Pull token",
+        schema: tokenSchema,
+      },
+      {
+        key: "sync.interval_seconds",
+        kind: "opaque",
+        label: "Pull interval (seconds)",
+        schema: minIntSchema(5),
+      },
+      {
+        key: "sync.primary_dns",
+        kind: "opaque",
+        label: "Primary DNS address",
+        schema: hostPortOrEmptySchema,
+      },
+      {
+        key: "sync.tsig_key_id",
+        kind: "opaque",
+        label: "Sync key",
+        schema: nonNegIntSchema,
+      },
+    ],
+    render: (control) => <SyncField control={control} />,
+  },
 ];
 
 // No Storage/info section: there's no read-only endpoint (DB size, cache
@@ -505,17 +628,20 @@ const SETTING_GROUPS: SettingGroup[] = [
 const ALL_FIELDS: SettingField[] = SETTING_GROUPS.flatMap((group) => group.fields);
 
 /**
- * The order a multi-key save has to go out in.
+ * The order a multi-key save has to go out in — the same six phases
+ * `settingsPhases` (internal/api/settings_handlers.go) applies a map in.
  *
- * `PUT /api/v1/settings` now also takes a map of keys, applied in this very
+ * `PUT /api/v1/settings` also takes a map of keys, applied in that very
  * order server-side — but this page keeps sending one key per request, so a
  * save that is refused can report *which* field was refused and leave the
  * rest saved. A map is all-or-nothing, which is the wrong shape for a form
- * whose fields fail independently.
+ * whose fields fail independently. (The Sync band's "Stop following" is the
+ * one place that *wants* all-or-nothing, and it sends a map of its own —
+ * see hooks/use-sync.ts.)
  *
  * One key per request means `validateCrossField`
  * (internal/api/settings_handlers.go) re-reads the store on every one of
- * them. So three of these keys are only valid against values *other*
+ * them. So five of these keys are only valid against values *other*
  * requests in the same save are carrying, and firing them all at once means
  * each validator judges the others' values as they were before the save
  * started:
@@ -528,6 +654,9 @@ const ALL_FIELDS: SettingField[] = SETTING_GROUPS.flatMap((group) => group.field
  *   sees both values, and a mismatched pair stores with a 204.
  * - Blanking either path is refused while a protocol is enabled, so the
  *   disables have to land first.
+ * - `sync.peer_url` set non-empty is refused unless a `sync.token` is
+ *   already stored, and `sync.token` cleared is refused while a peer still
+ *   is — so the token lands before a peer is set, and after one is cleared.
  *
  * Each phase is dispatched concurrently and awaited before the next
  * begins. The two certificate phases hold one key each precisely so the
@@ -538,25 +667,43 @@ const ALL_FIELDS: SettingField[] = SETTING_GROUPS.flatMap((group) => group.field
  * field on the wire for a save that touches nothing encrypted at all.
  */
 const SAVE_PHASES: ((change: { apiKey: string; value: string }) => boolean)[] = [
-  // 1. Turning protocols off. Nothing below can be refused for a protocol
-  //    that is already off.
-  ({ apiKey, value }) => isProtocolEnabledKey(apiKey) && value !== "true",
+  // 1. Disables first — a protocol being turned off, and a peer being
+  //    cleared. Nothing below can be refused for a protocol that is already
+  //    off, or for a peer that is already gone.
+  ({ apiKey, value }) =>
+    (isProtocolEnabledKey(apiKey) && value !== "true") || isClearingPeer(apiKey, value),
   // 2, 3. The certificate pair, one then the other, so the second request
   //    is the one that sees a complete pair and actually runs
   //    tls.LoadX509KeyPair.
   ({ apiKey }) => apiKey === "serve.tls.cert",
   ({ apiKey }) => apiKey === "serve.tls.key",
-  // 4. Everything else — listen addresses and every setting outside the
-  //    Protocols group. Independent of each other and of the certificate.
-  ({ apiKey }) =>
-    !isProtocolEnabledKey(apiKey) && apiKey !== "serve.tls.cert" && apiKey !== "serve.tls.key",
-  // 5. Turning protocols on, last, against a certificate that is now
+  // 4. sync.token, the credential sync.peer_url is judged against — the
+  //    same reason the certificate comes before the enable that needs it.
+  ({ apiKey }) => apiKey === "sync.token",
+  // 5. Everything else — listen addresses, sync.peer_url being *set*, and
+  //    every setting outside those groups. Independent of each other and of
+  //    the credentials.
+  ({ apiKey, value }) =>
+    !isProtocolEnabledKey(apiKey) && !isStagedFirst(apiKey) && !isClearingPeer(apiKey, value),
+  // 6. Turning protocols on, last, against a certificate that is now
   //    stored and a listen address that is now current.
   ({ apiKey, value }) => isProtocolEnabledKey(apiKey) && value === "true",
 ];
 
 function isProtocolEnabledKey(apiKey: string): boolean {
   return apiKey === "serve.dot.enabled" || apiKey === "serve.doh.enabled";
+}
+
+/** The credentials a later phase's key is judged against. */
+function isStagedFirst(apiKey: string): boolean {
+  return apiKey === "serve.tls.cert" || apiKey === "serve.tls.key" || apiKey === "sync.token";
+}
+
+/** Stopping following a main — the promotion. It is a disable, so it belongs
+ * in phase 1 beside the protocol ones rather than in phase 5 with everything
+ * else: `sync.token` is refused while a peer is still configured. */
+function isClearingPeer(apiKey: string, value: string): boolean {
+  return apiKey === "sync.peer_url" && value === "";
 }
 
 type SettingsFormValues = Record<string, string>;
@@ -588,6 +735,22 @@ const SETTINGS_SCHEMA = z.object(
  */
 function groupNeedsRestart(group: SettingGroup): boolean {
   return group.fields.length > 0 && group.fields.every((f) => f.restartRequired);
+}
+
+/**
+ * The keys that describe *this box* rather than the configuration it shares
+ * — the TypeScript mirror of store.LocalSettingKey
+ * (internal/store/bundle.go's localPrefixes).
+ *
+ * A replica may still write these; every other key belongs to the main it
+ * follows and answers 409. Derived from the keys rather than declared per
+ * group so a setting moving between bands cannot leave the two disagreeing
+ * about who owns it.
+ */
+const LOCAL_SETTING_PREFIXES = ["instance.", "serve.", "sync."];
+
+function groupIsLocal(group: SettingGroup): boolean {
+  return group.fields.every((f) => LOCAL_SETTING_PREFIXES.some((p) => f.key.startsWith(p)));
 }
 
 /**
@@ -821,6 +984,7 @@ function SaveBar({
 
 function SettingsForm({ settings }: { settings: Settings }) {
   const updateSetting = useUpdateSetting();
+  const managedBy = useManagedBy();
   // The baseline — what the server last confirmed, per field — is state,
   // because render compares against it: the changed count, the per-field
   // dots and the leave guard are all derived from it. As a ref it could move
@@ -1001,6 +1165,8 @@ function SettingsForm({ settings }: { settings: Settings }) {
         onSubmit={(e) => void form.handleSubmit(onSubmit)(e)}
         noValidate
       >
+        {managedBy !== "" && <ManagedNotice peer={managedBy} />}
+
         <SaveBar
           hotCount={hotCount}
           restartCount={restartCount}
@@ -1011,6 +1177,24 @@ function SettingsForm({ settings }: { settings: Settings }) {
         <div className="min-h-0 flex-1 overflow-y-auto">
           {SETTING_GROUPS.map((group) => {
             const restart = groupNeedsRestart(group);
+            // A synced band on a replica: every key in it belongs to the
+            // main, so the form is shown with its values and none of its
+            // controls. A disabled <fieldset> rather than a `disabled` prop
+            // threaded through every input, radio and nested editor —
+            // that is the one thing the element is for, and it cannot miss
+            // a control the way a hand-maintained list would.
+            //
+            // Wrapped only when it is actually managed, never as an
+            // always-present `disabled={false}`: `display: contents` on a
+            // fieldset is the one part of this a browser has historically
+            // been allowed to ignore, and an unmanaged instance — which is
+            // most of them — should not be able to find that out.
+            const managed = managedBy !== "" && !groupIsLocal(group);
+            const body = group.render
+              ? group.render(form.control)
+              : group.fields.map((field) => (
+                  <SettingRow key={field.key} field={field} control={form.control} />
+                ));
             return (
               <section
                 key={group.title}
@@ -1048,11 +1232,13 @@ function SettingsForm({ settings }: { settings: Settings }) {
                         ),
                   )}
                 >
-                  {group.render
-                    ? group.render(form.control)
-                    : group.fields.map((field) => (
-                        <SettingRow key={field.key} field={field} control={form.control} />
-                      ))}
+                  {managed ? (
+                    <fieldset disabled className="contents">
+                      {body}
+                    </fieldset>
+                  ) : (
+                    body
+                  )}
                 </div>
               </section>
             );
@@ -1144,7 +1330,7 @@ function BackupBand() {
 // --- page ------------------------------------------------------------------
 
 /**
- * Settings — the 18 keys in internal/api/settings_handlers.go's
+ * Settings — the 23 keys in internal/api/settings_handlers.go's
  * editableSettings, saved together rather than one at a time.
  */
 export function SettingsPage() {

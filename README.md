@@ -34,7 +34,7 @@ of truth — if it's not listed as shipped, it doesn't work yet.
 | REST API + auth (sessions, scoped tokens, TOTP) | Shipped |
 | Web dashboard | Shipped |
 | Encrypted upstreams (DNS-over-TLS, DNS-over-HTTPS) | Shipped |
-| HA config sync (primary/replica) | Planned |
+| HA config sync (a replica pulls the main's configuration; the dashboard says who manages what) | Shipped |
 | DHCP | Planned |
 | Encrypted DNS serving (DoH/DoT for clients of dnsaur) | Shipped |
 | DNSSEC (validation and signing) | Deferred — see below |

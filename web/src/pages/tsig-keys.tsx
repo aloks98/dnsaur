@@ -41,6 +41,8 @@ import {
   useUpdateTSIGKey,
 } from "../hooks/use-tsig-keys";
 import { useZones } from "../hooks/use-zones";
+import { useManagedBy } from "../hooks/use-sync";
+import { ManagedNotice } from "../components/managed-notice";
 import { StaleDataAlert } from "../components/stale-data-alert";
 import { aclKeyNames } from "../lib/acl";
 import { dnsNameSchema } from "../lib/dns-name";
@@ -651,6 +653,11 @@ export function TSIGKeys() {
   const keys = useTSIGKeys();
   const zones = useZones();
   const deleteKey = useDeleteTSIGKey();
+  // Keys travel in the bundle, secrets included, so on a replica they are
+  // the main's to author. Revealing and copying a secret stays live: a
+  // replica holds the same key material and an operator may still need to
+  // read it out.
+  const managedBy = useManagedBy();
 
   /**
    * How many zones name each key — the USED BY column, and the in-use delete
@@ -779,7 +786,7 @@ export function TSIGKeys() {
           icon={<KeyRound />}
           title="No TSIG keys yet."
           action={
-            <Button type="button" size="sm" onClick={openCreate}>
+            <Button type="button" size="sm" disabled={managedBy !== ""} onClick={openCreate}>
               <Plus />
               New key
             </Button>
@@ -813,7 +820,9 @@ export function TSIGKeys() {
             onReveal={() => setRevealedId(revealedId === tsigKey.id ? null : tsigKey.id)}
             onEdit={() => openEdit(tsigKey.id)}
             onDelete={() => setDeletingId(tsigKey.id)}
-            dimActions={busy}
+            // On a replica for the same reason as while another row is
+            // being written: these are not the thing to click.
+            dimActions={busy || managedBy !== ""}
           />
         )}
         {deletingId === tsigKey.id && (
@@ -831,12 +840,20 @@ export function TSIGKeys() {
 
   return (
     <div className="flex h-full min-h-0 flex-col">
+      {managedBy !== "" && <ManagedNotice peer={managedBy} />}
+
       <div className="flex shrink-0 items-center gap-3 border-b border-border px-4 py-2.5">
         <span className="font-mono text-xs text-muted-foreground">
           {keys.data ? countLabel(keys.data.length) : ""}
         </span>
         {!addOpen && (
-          <Button type="button" size="sm" className="ml-auto" onClick={openCreate}>
+          <Button
+            type="button"
+            size="sm"
+            className="ml-auto"
+            disabled={managedBy !== ""}
+            onClick={openCreate}
+          >
             <Plus />
             New key
           </Button>

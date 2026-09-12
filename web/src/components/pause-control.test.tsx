@@ -5,6 +5,7 @@ import { expect, test, vi } from "vitest";
 import { act, fireEvent, screen, waitFor, within } from "@testing-library/react";
 import { blockingKeys } from "../hooks/use-blocking";
 import { server } from "../test/msw-server";
+import { replicaHandlers } from "../test/msw-handlers";
 import { renderWithProviders } from "../test/render";
 import { PauseControl } from "./pause-control";
 
@@ -265,4 +266,18 @@ test("a pause that arrives long after mount opens at its real remaining time", a
   } finally {
     vi.useRealTimers();
   }
+});
+
+// A pause is persisted to the synced `blocking.pauses` setting, so on a
+// replica it is a write the main owns and the server answers 409
+// (docs/api.md's replica note). The cell still *reads* — an operator here
+// has to be able to see that blocking is paused — so this asserts the state
+// is still on screen, not just that the control is dead.
+test("on a replica the control still reads the state but cannot change it", async () => {
+  server.use(...replicaHandlers("https://main.lan"));
+
+  renderWithProviders(<PauseControl />);
+
+  await screen.findByText("Blocking active");
+  await waitFor(() => expect(trigger()).toBeDisabled());
 });

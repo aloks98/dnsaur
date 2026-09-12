@@ -1,6 +1,6 @@
 import { TriangleAlert } from "lucide-react";
 import { useResolverStatus } from "../hooks/use-settings";
-import { expiringSoonDetail, servingState } from "../lib/serving";
+import { expiringSoonDetail, servingState, syncBanners } from "../lib/serving";
 import { WarningStrip } from "./warning-strip";
 
 /**
@@ -47,6 +47,9 @@ export function ServingBanners() {
         : `TLS certificate expires in ${days} day${days === 1 ? "" : "s"} — ${date}`,
     );
   }
+  // Config sync's own three (spec §8), derived in lib/serving.ts so the
+  // status poll that clears them reads the same predicate — see syncBanners.
+  banners.push(...syncBanners(status.data?.sync));
 
   return (
     <>

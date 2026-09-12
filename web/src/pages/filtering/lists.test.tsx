@@ -4,6 +4,7 @@ import { expect, test, vi } from "vitest";
 import { screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { server } from "../../test/msw-server";
+import { replicaHandlers } from "../../test/msw-handlers";
 import { renderWithProviders } from "../../test/render";
 import type { List } from "../../api/types";
 import { ListsTab } from "./lists";
@@ -563,4 +564,28 @@ test("the fixed-width grid sits in a horizontal scroll container", async () => {
   expect(scroller).not.toBeNull();
   expect(scroller!.className).toContain("overflow-x-auto");
   expect(scroller!.contains(screen.getByText("example.com hosts"))).toBe(true);
+});
+
+// --- replica mode ---------------------------------------------------------
+
+// Lists are synced (spec §4.2) but a refresh is not: re-fetching a list's
+// contents is an operational act on this box's own copy, which §7 keeps
+// allowed on a replica precisely so a stale copy can be repaired locally.
+test("a replica says who manages it, stops the list writes and keeps refresh", async () => {
+  server.use(http.get("/api/v1/filters/lists", () => HttpResponse.json([list()])));
+  server.use(...replicaHandlers("https://main.lan"));
+
+  renderWithProviders(<ListsTab />);
+
+  expect(await screen.findByText("Managed by https://main.lan")).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Add list" })).toBeDisabled();
+  expect(screen.getByRole("button", { name: /^Delete /, hidden: true })).toBeDisabled();
+  // rnui's Switch is a base-ui <span role="switch">, not a native control,
+  // so its disabled state is the ARIA one.
+  expect(screen.getByRole("switch", { name: /^Disable / })).toHaveAttribute(
+    "aria-disabled",
+    "true",
+  );
+  expect(screen.getByRole("button", { name: /^Refresh example/ })).toBeEnabled();
+  expect(screen.getByRole("button", { name: /Refresh all/ })).toBeEnabled();
 });

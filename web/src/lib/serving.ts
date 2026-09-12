@@ -1,4 +1,5 @@
-import type { CertificateStatus, ProtocolStatus, ResolverStatus } from "../api/types";
+import type { CertificateStatus, ProtocolStatus, ResolverStatus, SyncStatus } from "../api/types";
+import { formatDuration } from "./format";
 
 /**
  * A protocol's reality, reduced to the three states spec §8 and the
@@ -42,8 +43,41 @@ export function somethingIsWrong(status: ResolverStatus | undefined): boolean {
     status.encryption_downgraded ||
     servingState(status.serving.dot) === "failed" ||
     servingState(status.serving.doh) === "failed" ||
-    (status.certificate?.expiring_soon ?? false)
+    (status.certificate?.expiring_soon ?? false) ||
+    syncBanners(status.sync).length > 0
   );
+}
+
+/**
+ * Sync's three facts, as the lines the shell shows (spec §8) — one function
+ * so "we show a banner for this" and "we keep asking about this" cannot
+ * drift, which is exactly the drift `somethingIsWrong` exists to prevent.
+ *
+ * All three clear on their own: the next pull that succeeds empties
+ * `last_error`, an `https://` peer clears `plain_http`, and a replica that
+ * checks in stops being stale.
+ *
+ * Every line states the fact and stops. A replica that is merely *behind*
+ * gets no line at all: that is what a pull interval looks like from the
+ * outside, and the Sync band's "applied n of m" already says it on the one
+ * screen where the number is worth reading.
+ */
+export function syncBanners(sync: SyncStatus | undefined, now: number = Date.now()): string[] {
+  if (!sync) return [];
+  const lines: string[] = [];
+  if (sync.last_error) lines.push(`Last pull failed: ${sync.last_error}`);
+  // Persistent while it is true — the bundle carries every TSIG secret on
+  // the box, so a plaintext peer is not a transient wobble to wait out.
+  if (sync.plain_http) lines.push("Peer reached over plain HTTP");
+  for (const replica of sync.replicas ?? []) {
+    if (!replica.stale) continue;
+    // How long it has been quiet, not when it was last heard: an operator
+    // should not have to subtract a wall-clock stamp from now.
+    lines.push(
+      `Replica ${replica.instance_id} not seen for ${formatDuration(now - replica.last_seen)}`,
+    );
+  }
+  return lines;
 }
 
 const MONTHS = [

@@ -44,8 +44,10 @@ import {
   useRenameList,
   useToggleList,
 } from "../../hooks/use-filters";
+import { useManagedBy } from "../../hooks/use-sync";
 import { formatDuration, relativeTime } from "../../lib/format";
 import { deriveListName } from "../../lib/list-name";
+import { ManagedNotice } from "../../components/managed-notice";
 import { StaleDataAlert } from "../../components/stale-data-alert";
 import { ConfirmDeleteDialog, RenameDialog } from "../dialogs";
 
@@ -176,6 +178,7 @@ const renameListSchema = z.object({
 function AddListDialog() {
   const [open, setOpen] = useState(false);
   const addList = useAddList();
+  const managedBy = useManagedBy();
   const form = useForm<AddListValues>({
     resolver: zodResolver(addListSchema),
     defaultValues: ADD_LIST_DEFAULTS,
@@ -207,7 +210,7 @@ function AddListDialog() {
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogTrigger render={<Button type="button" size="sm" />}>
+      <DialogTrigger disabled={managedBy !== ""} render={<Button type="button" size="sm" />}>
         <Plus />
         Add list
       </DialogTrigger>
@@ -346,6 +349,11 @@ export function ListsTab() {
   const deleteList = useDeleteList();
   const refresh = useRefreshFilters();
   const refreshList = useRefreshList();
+  // Lists are synced; a refresh is not. Spec §7 keeps both "Refresh now"
+  // buttons live on a replica deliberately — re-fetching a list's contents
+  // is an operational act on this box's own copy, not a change to the
+  // configuration the main owns.
+  const managedBy = useManagedBy();
 
   const [search, setSearch] = useState("");
   const [kindFilter, setKindFilter] = useState<"" | List["kind"]>("");
@@ -486,7 +494,7 @@ export function ListsTab() {
           <span>
             <Switch
               checked={list.enabled}
-              disabled={togglingId === list.id}
+              disabled={togglingId === list.id || managedBy !== ""}
               onCheckedChange={(checked) => onToggle(list, checked)}
               aria-label={`${list.enabled ? "Disable" : "Enable"} ${list.name}`}
             />
@@ -530,6 +538,7 @@ export function ListsTab() {
               size="icon-sm"
               variant="ghost"
               aria-label={`Rename ${list.name}`}
+              disabled={managedBy !== ""}
               onClick={() => setRenameTarget(list)}
             >
               <Pencil />
@@ -539,6 +548,7 @@ export function ListsTab() {
               size="icon-sm"
               variant="ghost"
               aria-label={`Delete ${list.name}`}
+              disabled={managedBy !== ""}
               onClick={() => setDeleteTarget(list)}
             >
               <Trash2 />
@@ -556,6 +566,8 @@ export function ListsTab() {
     // scroll. On the column, not on the body, so the header row and the
     // rows below it move together.
     <div data-slot="h-scroll" className="flex h-full min-h-0 flex-col overflow-x-auto">
+      {managedBy !== "" && <ManagedNotice peer={managedBy} />}
+
       <div className="flex shrink-0 flex-wrap items-center gap-3 border-b border-border px-4 py-2.5">
         <Input
           value={search}

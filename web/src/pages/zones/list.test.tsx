@@ -7,6 +7,7 @@ import { useEffect } from "react";
 import { useForm } from "react-hook-form";
 import { Form } from "@e412/rnui-react";
 import { server } from "../../test/msw-server";
+import { replicaHandlers } from "../../test/msw-handlers";
 import { renderWithProviders } from "../../test/render";
 import type { Zone, ZoneRecord } from "../../api/types";
 import { CreateRowHint, TSIGKeyField, UpstreamField, ZonesList, type AddZoneValues } from "./list";
@@ -2019,4 +2020,34 @@ test("a built-in zone offers no clone", async () => {
   await user.click(await screen.findByRole("button", { name: /1 built-in zone/i }));
 
   expect(screen.queryByRole("button", { name: /Actions for localhost/ })).not.toBeInTheDocument();
+});
+
+// --- replica mode ---------------------------------------------------------
+
+// Zone *definitions* travel in the bundle; the records under a derived
+// secondary arrive by AXFR. So on a replica the list is a read, and the one
+// menu item that is not a write — "go and get the current version now" —
+// stays live (spec §7).
+test("a replica says who manages it and leaves only the pull action live", async () => {
+  mockZones([zone({ id: 1, name: "e412.in", type: "secondary", primaries: "10.0.0.5:53" })]);
+  server.use(...replicaHandlers("https://main.lan"));
+
+  renderWithProviders(<ZonesList />);
+
+  expect(await screen.findByText("Managed by https://main.lan")).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: /new zone/i })).toBeDisabled();
+
+  const menu = await rowMenu(zoneRows()[0], "e412.in");
+  expect(within(menu).getByRole("menuitem", { name: "Clone" })).toHaveAttribute(
+    "aria-disabled",
+    "true",
+  );
+  expect(within(menu).getByRole("menuitem", { name: "Delete zone" })).toHaveAttribute(
+    "aria-disabled",
+    "true",
+  );
+  expect(within(menu).getByRole("menuitem", { name: /Transfer now|Retry/ })).not.toHaveAttribute(
+    "aria-disabled",
+    "true",
+  );
 });

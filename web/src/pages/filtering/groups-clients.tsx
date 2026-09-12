@@ -47,6 +47,8 @@ import {
   useSetGroupLists,
   useToggleGroup,
 } from "../../hooks/use-groups";
+import { useManagedBy } from "../../hooks/use-sync";
+import { ManagedNotice } from "../../components/managed-notice";
 import { PauseControl } from "../../components/pause-control";
 import { StaleDataAlert } from "../../components/stale-data-alert";
 import { isValidIPv4, isValidIPv6, requiredText } from "../../lib/schemas";
@@ -307,6 +309,7 @@ function RenameGroupDialog({ group, onClose }: { group: Group | null; onClose: (
 function GroupListsCell({ group, allLists }: { group: Group; allLists: List[] }) {
   const groupLists = useGroupLists(group.id);
   const setGroupLists = useSetGroupLists();
+  const managedBy = useManagedBy();
   const assignedIds = useMemo(
     () => new Set(groupLists.data?.map((l) => l.id) ?? []),
     [groupLists.data],
@@ -351,7 +354,10 @@ function GroupListsCell({ group, allLists }: { group: Group; allLists: List[] })
 
   return (
     <DropdownMenu>
-      <DropdownMenuTrigger render={<Button type="button" variant="outline" size="sm" />}>
+      <DropdownMenuTrigger
+        disabled={managedBy !== ""}
+        render={<Button type="button" variant="outline" size="sm" />}
+      >
         {/* A single text node, not "Lists" + a sibling element — the ARIA
             name-from-content algorithm trims each child node's own
             contribution before concatenating with no separator, so splitting
@@ -411,6 +417,7 @@ function GroupRow({
 }) {
   const toggleGroup = useToggleGroup();
   const deleteGroup = useDeleteGroup();
+  const managedBy = useManagedBy();
   const [deleteOpen, setDeleteOpen] = useState(false);
   const isDefault = group.id === DEFAULT_GROUP_ID;
   // The server refuses the delete while any client still points at the group
@@ -447,7 +454,7 @@ function GroupRow({
         <span>
           <Switch
             checked={group.enabled}
-            disabled={toggleGroup.isPending}
+            disabled={toggleGroup.isPending || managedBy !== ""}
             onCheckedChange={(enabled) =>
               toggleGroup.mutate(
                 { id: group.id, enabled },
@@ -482,6 +489,7 @@ function GroupRow({
             size="icon-sm"
             variant="ghost"
             aria-label={`Rename ${group.name}`}
+            disabled={managedBy !== ""}
             onClick={onRename}
           >
             <Pencil />
@@ -490,7 +498,7 @@ function GroupRow({
             type="button"
             size="icon-sm"
             variant="ghost"
-            disabled={isDefault || inUse}
+            disabled={isDefault || inUse || managedBy !== ""}
             aria-label={`Delete ${group.name}`}
             onClick={() => setDeleteOpen(true)}
           >
@@ -733,6 +741,11 @@ export function GroupsClientsTab() {
   const clients = useClients();
   const lists = useLists();
   const deleteClient = useDeleteClient();
+  // Groups and clients are synced configuration (spec §4.2), so on a
+  // replica every write here is a 409 before the store is touched. The
+  // screen states whose they are and stops offering to change them; reads,
+  // filtering and the group selection all stay live.
+  const managedBy = useManagedBy();
 
   const [selectedGroup, setSelectedGroup] = useState<number | null>(null);
   const [addGroupOpen, setAddGroupOpen] = useState(false);
@@ -855,6 +868,7 @@ export function GroupsClientsTab() {
               size="sm"
               variant="ghost"
               aria-label={`Delete ${client.name || client.matcher}`}
+              disabled={managedBy !== ""}
               onClick={() => setDeleteTarget(client)}
             >
               Delete
@@ -872,6 +886,8 @@ export function GroupsClientsTab() {
     // them. The header rows and the rows themselves have to scroll together,
     // which is why this sits on the column rather than on each body.
     <div data-slot="h-scroll" className="flex h-full min-h-0 flex-col overflow-x-auto">
+      {managedBy !== "" && <ManagedNotice peer={managedBy} />}
+
       {(groups.isError && groups.data !== undefined) ||
       (clients.isError && clients.data !== undefined) ? (
         <div className="shrink-0 border-b border-border p-3">
@@ -895,7 +911,13 @@ export function GroupsClientsTab() {
         <div className="ml-auto flex items-center gap-2">
           <ClientMatchingPopover />
           {!addGroupOpen && (
-            <Button type="button" size="sm" variant="outline" onClick={() => setAddGroupOpen(true)}>
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              disabled={managedBy !== ""}
+              onClick={() => setAddGroupOpen(true)}
+            >
               <Plus />
               Add group
             </Button>
@@ -939,6 +961,7 @@ export function GroupsClientsTab() {
             size="sm"
             variant="outline"
             className="ml-auto"
+            disabled={managedBy !== ""}
             onClick={() => setAddClientOpen(true)}
           >
             <Plus />

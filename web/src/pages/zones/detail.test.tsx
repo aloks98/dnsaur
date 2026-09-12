@@ -5,6 +5,7 @@ import { act, fireEvent, screen, waitFor, within } from "@testing-library/react"
 import userEvent from "@testing-library/user-event";
 import { Route, Routes } from "react-router";
 import { server } from "../../test/msw-server";
+import { replicaHandlers } from "../../test/msw-handlers";
 import { renderWithProviders } from "../../test/render";
 import type { Zone, ZoneRecord } from "../../api/types";
 import type { ZoneNotify } from "../../hooks/use-zones";
@@ -3378,4 +3379,28 @@ test("the filter bar says what the two keys do", async () => {
   expect(hint).toHaveTextContent(/filter/i);
   expect(hint).toHaveTextContent("n");
   expect(hint).toHaveTextContent(/add/i);
+});
+
+// --- replica mode ---------------------------------------------------------
+
+// On a replica a primary zone is as read-only as a secondary is on a main:
+// every record write and every zone field belongs to the box this one
+// follows, and answers 409 before the store is touched (spec §7). Export
+// stays — reading is never refused.
+test("a replica says who manages it and leaves a primary zone read-only", async () => {
+  server.use(...replicaHandlers("https://main.lan"));
+  renderZoneDetail({
+    zone: zone({ id: 1, allow_transfer: "10.0.0.0/24" }),
+    records: [record({ id: 1, name: "bifrost" })],
+  });
+
+  expect(await screen.findByText("Managed by https://main.lan")).toBeInTheDocument();
+
+  expect(screen.queryByRole("button", { name: /add record/i })).not.toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: /^import$/i })).not.toBeInTheDocument();
+  expect(within(recordRows()[0]).queryByRole("button", { name: /^edit/i })).not.toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Delete zone" })).toBeDisabled();
+  expect(screen.getByRole("button", { name: "Disable zone" })).toBeDisabled();
+  expect(screen.getByRole("button", { name: "Edit allow transfer" })).toBeDisabled();
+  expect(screen.getByRole("button", { name: /^export$/i })).toBeEnabled();
 });

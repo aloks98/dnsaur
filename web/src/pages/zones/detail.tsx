@@ -71,6 +71,8 @@ import {
   type ZoneUpdateInput,
 } from "../../hooks/use-zones";
 import { useTSIGKeys } from "../../hooks/use-tsig-keys";
+import { useManagedBy } from "../../hooks/use-sync";
+import { ManagedNotice } from "../../components/managed-notice";
 import { StaleDataAlert } from "../../components/stale-data-alert";
 import { NotFound } from "../not-found";
 import { ZONE_TYPE_VARIANT } from "./zone-type-variant";
@@ -885,6 +887,7 @@ function SoaField({
 function SoaBand({ zone }: { zone: Zone }) {
   const [open, setOpen] = useState(false);
   const updateZone = useUpdateZone();
+  const managedBy = useManagedBy();
   const form = useForm<SoaFormValues>({
     resolver: zodResolver(soaFormSchema),
     defaultValues: soaDefaults(zone),
@@ -982,7 +985,7 @@ function SoaBand({ zone }: { zone: Zone }) {
                     type="submit"
                     size="sm"
                     variant="ghost"
-                    disabled={!form.formState.isDirty || updateZone.isPending}
+                    disabled={!form.formState.isDirty || updateZone.isPending || managedBy !== ""}
                   >
                     {updateZone.isPending ? "Saving…" : "Save SOA"}
                   </Button>
@@ -1446,6 +1449,10 @@ function InlineValueRow({
    * the row below it supplies one, which would otherwise double it. */
   closesGroup?: boolean;
 }) {
+  // Every row built on this — the transfer ACL, a copy's primaries, the
+  // notify targets — is a field on the zone, and a zone belongs to the main
+  // on a replica. One gate here rather than three at the call sites.
+  const managedBy = useManagedBy();
   return (
     <Form {...edit.form}>
       <form
@@ -1511,6 +1518,7 @@ function InlineValueRow({
                         title={editLabel}
                         aria-label={editLabel}
                         className="ml-auto shrink-0"
+                        disabled={managedBy !== ""}
                         onClick={edit.start}
                       >
                         <Pencil />
@@ -2262,9 +2270,13 @@ export function ZoneDetail() {
  * `primary` is the only type left once the four that own their contents
  * elsewhere are taken out — see recordsReadOnly for which and why — and an
  * unloaded zone is read-only, because nothing is known about it yet.
+ *
+ * `managed` is the fifth way records stop being this box's to write: a
+ * replica's records come from the main by AXFR, and a write to one is a 409
+ * before the store is touched (spec §7).
  */
-function recordsAreReadOnly(type: Zone["type"] | undefined): boolean {
-  return type !== "primary";
+function recordsAreReadOnly(type: Zone["type"] | undefined, managed: boolean): boolean {
+  return managed || type !== "primary";
 }
 
 function ZoneDetailFor({ zoneId }: { zoneId: number }) {
@@ -2280,6 +2292,10 @@ function ZoneDetailFor({ zoneId }: { zoneId: number }) {
   const updateZone = useUpdateZone();
   const deleteZone = useDeleteZone();
   const deleteRecord = useDeleteZoneRecord();
+  // Zone definitions and their records are the main's on a replica (spec
+  // §7). Reads, the filter, export and "Refresh now" all stay live —
+  // fetching the current version of a copy is this box's own act.
+  const managedBy = useManagedBy();
 
   /** The filter field, so `/` can put the caret in it. A ref rather than an
    * id lookup: the bar is not rendered for a routing type, and a ref that is
@@ -2403,7 +2419,7 @@ function ZoneDetailFor({ zoneId }: { zoneId: number }) {
 
   /** The `n` shortcut's gate, asked before the branch below that would make
    * it unreachable from an effect. Same rule as `recordsReadOnly`. */
-  const readOnly = recordsAreReadOnly(zone.data?.type);
+  const readOnly = recordsAreReadOnly(zone.data?.type, managedBy !== "");
 
   /**
    * The three keys the record grid is worth having: `/` to filter, `n` to
@@ -2641,7 +2657,7 @@ function ZoneDetailFor({ zoneId }: { zoneId: number }) {
    * one is inert rather than lost, which is not a 409's complaint to make.
    * Hiding the control is the whole of the guard there.
    */
-  const recordsReadOnly = recordsAreReadOnly(z.type);
+  const recordsReadOnly = recordsAreReadOnly(z.type, managedBy !== "");
 
   let body: ReactNode;
   if (records.isPending) {
@@ -2713,6 +2729,8 @@ function ZoneDetailFor({ zoneId }: { zoneId: number }) {
 
   return (
     <div className="flex h-full min-h-0 flex-col">
+      {managedBy !== "" && <ManagedNotice peer={managedBy} />}
+
       {/* Header band */}
       <div className="flex shrink-0 items-center gap-3 border-b border-border bg-card px-4 py-2.5">
         <Link
@@ -2803,7 +2821,7 @@ function ZoneDetailFor({ zoneId }: { zoneId: number }) {
                 size="sm"
                 variant="ghost"
                 onClick={onToggleEnabled}
-                disabled={updateZone.isPending}
+                disabled={updateZone.isPending || managedBy !== ""}
               >
                 {z.enabled ? "Disable zone" : "Enable zone"}
               </Button>
@@ -2811,6 +2829,7 @@ function ZoneDetailFor({ zoneId }: { zoneId: number }) {
                 type="button"
                 size="sm"
                 variant="ghost"
+                disabled={managedBy !== ""}
                 onClick={() => setDeleteZoneOpen(true)}
               >
                 Delete zone

@@ -18,6 +18,7 @@ import {
   type ZoneFileDiff,
   type ZoneRecordChange,
 } from "../../hooks/use-zones";
+import { useManagedBy } from "../../hooks/use-sync";
 import { formatBytes } from "../../lib/format";
 
 /** The most rows any one diff group lists before the rest collapse into a
@@ -242,6 +243,7 @@ export function ZoneFileActions({ zone }: { zone: Zone }) {
   const fileInput = useRef<HTMLInputElement>(null);
   const exportFile = useExportZoneFile();
   const importFile = useImportZoneFile();
+  const managedBy = useManagedBy();
   /**
    * Which request the dialog is currently interested in. Bumped when one is
    * started and again when the dialog closes, so a result that lands after
@@ -277,7 +279,9 @@ export function ZoneFileActions({ zone }: { zone: Zone }) {
    * is never refused. The exception is a forwarder, which holds nothing to
    * render into a file — see the header's own gate.
    */
-  const canImport = zone.type === "primary";
+  // Import rewrites the whole record set, so on a replica it is the main's
+  // — while export stays offered, because reading is never refused.
+  const canImport = zone.type === "primary" && managedBy === "";
 
   // A dry run or a commit is actually on the wire. This is the window in
   // which a second file selection would buy a second full parse-and-diff of

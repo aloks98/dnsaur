@@ -4,6 +4,7 @@ import { afterEach, expect, test, vi } from "vitest";
 import { screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { server } from "../test/msw-server";
+import { replicaHandlers } from "../test/msw-handlers";
 import { renderWithProviders } from "../test/render";
 import type { TSIGKey, Zone } from "../api/types";
 import { MASK, TSIGKeys } from "./tsig-keys";
@@ -752,4 +753,23 @@ test("a dimmed row's Edit and Delete are disabled, not merely unclickable", asyn
   edit.focus();
   await user.keyboard("{Enter}");
   expect(screen.queryByRole("button", { name: /stop editing other\.e412\.in\./i })).toBeNull();
+});
+
+// --- replica mode ---------------------------------------------------------
+
+// Keys travel in the bundle, secrets included (docs/api.md, Sync), so on a
+// replica they are the main's to author — but the same key material is here,
+// and reading it out stays this operator's to do.
+test("a replica says who manages it, stops key edits and still reveals a secret", async () => {
+  mockKeys([key({ id: 1, name: "xfer.e412.in.", secret: SECRET_256 })]);
+  mockZones([]);
+  server.use(...replicaHandlers("https://main.lan"));
+
+  renderWithProviders(<TSIGKeys />);
+
+  expect(await screen.findByText("Managed by https://main.lan")).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "New key" })).toBeDisabled();
+  expect(screen.getByRole("button", { name: "Edit xfer.e412.in." })).toBeDisabled();
+  expect(screen.getByRole("button", { name: "Delete xfer.e412.in." })).toBeDisabled();
+  expect(screen.getByRole("button", { name: "Show the secret for xfer.e412.in." })).toBeEnabled();
 });
