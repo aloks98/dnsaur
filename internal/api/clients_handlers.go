@@ -131,6 +131,12 @@ func (s *Server) handleGroupCreate(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	s.reloadClients(r)
+	// And the rulesets: a group's is built by the filter refresher and by
+	// nothing else, so a group created with lists — or created at all, since
+	// every later list write compiles for the groups that exist *now* —
+	// enforces nothing until this runs. The same pairing every list and rule
+	// write uses.
+	s.refreshFilters(r)
 	created(w, resourceURL("groups", id), store.Group{ID: id, Name: body.Name, Enabled: enabled})
 }
 
@@ -166,6 +172,9 @@ func (s *Server) handleGroupPatch(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	s.reloadClients(r)
+	// A disabled group is one the refresher compiles no ruleset for, so
+	// "enabled" only takes effect here.
+	s.refreshFilters(r)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -180,6 +189,9 @@ func (s *Server) handleGroupDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.reloadClients(r)
+	// The ruleset the deleted group owned goes with it, rather than staying
+	// in the engine under an id nothing resolves to any more.
+	s.refreshFilters(r)
 	w.WriteHeader(http.StatusNoContent)
 }
 

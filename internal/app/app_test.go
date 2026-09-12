@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -1945,5 +1947,63 @@ func TestASyncedTableWriteDoesNotReconcileTheSettings(t *testing.T) {
 	})
 	if a.fwd.forwarder() != before {
 		t.Fatal("a group add rebuilt the forwarder; nothing it wrote is a setting")
+	}
+}
+
+// TestAGroupWriteRecompilesTheRulesets: a group's ruleset is built by the
+// filter refresher and by nothing else, so the handler that creates, renames
+// or disables a group has to ask for a recompile the way the list and rule
+// handlers do. Without it a group created with lists has no ruleset at all —
+// its clients resolve unfiltered — and a group disabled goes on filtering,
+// both until something unrelated happens to move a setting.
+func TestAGroupWriteRecompilesTheRulesets(t *testing.T) {
+	ctx := context.Background()
+	const blocked = "ads.example.com"
+	listSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("0.0.0.0 " + blocked + "\n"))
+	}))
+	t.Cleanup(listSrv.Close)
+
+	a := newTestApp(t, withUpstreams(mockDNS(t, answerA("9.9.9.9"))), withLoopbackLists())
+	lid, err := a.Store().Filters().AddList(ctx, store.List{URL: listSrv.URL, Kind: "block", Enabled: true})
+	if err != nil {
+		t.Fatalf("AddList: %v", err)
+	}
+	// Downloaded before the group exists, so what the assertions below turn
+	// on is the ruleset being rebuilt and not the copy being fetched.
+	if err := a.RefreshFilters(ctx); err != nil {
+		t.Fatalf("RefreshFilters: %v", err)
+	}
+
+	token := writeAPIToken(t, a)
+	base := httpURL(t, a) + "/api/v1"
+	code, body := apiPost(t, base+"/groups", token,
+		`{"name":"kids","list_ids":[`+strconv.FormatInt(lid, 10)+`]}`)
+	if code != http.StatusCreated {
+		t.Fatalf("POST /groups = %d %s", code, body)
+	}
+	var created struct {
+		ID int64 `json:"id"`
+	}
+	if err := json.Unmarshal([]byte(body), &created); err != nil || created.ID == 0 {
+		t.Fatalf("POST /groups body %q: %v", body, err)
+	}
+	code, body = apiPost(t, base+"/clients", token,
+		`{"name":"laptop","matcher":"127.0.0.1","group_id":`+strconv.FormatInt(created.ID, 10)+`}`)
+	if code != http.StatusCreated {
+		t.Fatalf("POST /clients = %d %s", code, body)
+	}
+
+	if got := digA(t, a.DNSAddr(), blocked); got != "0.0.0.0" {
+		t.Fatalf("%s answers %s for a client in a group subscribed to a list that blocks it, want 0.0.0.0", blocked, got)
+	}
+
+	code, body = apiSend(t, http.MethodPatch, base+"/groups/"+strconv.FormatInt(created.ID, 10),
+		token, `{"enabled":false}`)
+	if code != http.StatusNoContent {
+		t.Fatalf("PATCH /groups = %d %s", code, body)
+	}
+	if got := digA(t, a.DNSAddr(), blocked); got != "9.9.9.9" {
+		t.Fatalf("%s answers %s after its group was disabled, want the upstream's 9.9.9.9", blocked, got)
 	}
 }

@@ -394,7 +394,14 @@ func mainStatus(t *testing.T, a *App, token string) api.SyncStatus {
 // the one call whose refusal is the point.
 func apiPost(t *testing.T, url, token, body string) (int, string) {
 	t.Helper()
-	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, url, strings.NewReader(body))
+	return apiSend(t, http.MethodPost, url, token, body)
+}
+
+// apiSend is apiPost for the other methods: a real request over the box's own
+// listener, answered by the same handler chain a browser reaches.
+func apiSend(t *testing.T, method, url, token, body string) (int, string) {
+	t.Helper()
+	req, err := http.NewRequestWithContext(t.Context(), method, url, strings.NewReader(body))
 	if err != nil {
 		t.Fatal(err)
 	}
