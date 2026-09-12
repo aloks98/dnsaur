@@ -987,6 +987,36 @@ test("a saved sync token is sent, then leaves the box empty and nothing unsaved"
   expect(screen.getByText(/all changes saved/i)).toBeInTheDocument();
 });
 
+// Rotating the token on a box that already follows a main is the same save
+// with one field in it, and it is the case where "empty means leave the
+// stored one alone" and "the box always starts empty" are the same field:
+// nothing but the token may go out, and nothing may be left unsaved
+// afterwards for a value the server will never report back.
+test("a token typed on its own is the only key saved, and leaves nothing unsaved", async () => {
+  const user = userEvent.setup();
+  const sent: unknown[] = [];
+  mockSettings(fullSettings({ "sync.peer_url": "https://main.lan" }));
+  server.use(
+    http.put("/api/v1/settings", async ({ request }) => {
+      sent.push(await request.json());
+      return new HttpResponse(null, { status: 204 });
+    }),
+  );
+
+  renderWithProviders(<SettingsPage />);
+  await screen.findByText("Sync");
+
+  await user.type(screen.getByLabelText("Token"), "dnsr_rotated");
+  await user.click(screen.getAllByRole("button", { name: /^save changes$/i })[0]);
+
+  await waitFor(() => expect(sent).toHaveLength(1));
+  expect(sent).toEqual([{ key: "sync.token", value: "dnsr_rotated" }]);
+
+  await waitFor(() => expect(screen.getByLabelText("Token")).toHaveValue(""));
+  expect(screen.getByLabelText("Peer URL")).toHaveValue("https://main.lan");
+  expect(screen.getByText(/all changes saved/i)).toBeInTheDocument();
+});
+
 // The Sync band shows GET /sync/status, which is not a setting and so is not
 // invalidated by the settings query — but a save is exactly what moves it.
 // At its own 30s cadence the band spent up to half a minute contradicting
