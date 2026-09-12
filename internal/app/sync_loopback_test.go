@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"strconv"
 	"strings"
 	"testing"
@@ -447,4 +448,47 @@ func TestReplicaFollowsBlockingPauses(t *testing.T) {
 	if until, _ := replica.engine.PausedUntil(0, 0); !until.IsZero() {
 		t.Fatalf("the replica is still paused until %v after the main resumed", until)
 	}
+}
+
+// TestAFollowingReplicaFetchesTheListsItWasGiven: a bundle carries a list's
+// URL, never its contents, and the replica's own refresher runs on
+// lists.refresh_hours — a day, by default. So a box that has just started
+// following a main has every list it was given and no copy of any of them,
+// and without a download kicked by the pull it serves a LAN with blocking
+// configured and nothing blocked until that ticker comes round.
+func TestAFollowingReplicaFetchesTheListsItWasGiven(t *testing.T) {
+	ctx := t.Context()
+	const blocked = "ads.example.com"
+	listSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("0.0.0.0 " + blocked + "\n"))
+	}))
+	t.Cleanup(listSrv.Close)
+
+	pub := mockDNS(t, answerA("9.9.9.9"))
+	main := newTestApp(t, withUpstreams(pub))
+	lid, err := main.Store().Filters().AddList(ctx, store.List{URL: listSrv.URL, Kind: "block", Enabled: true})
+	if err != nil {
+		t.Fatalf("AddList: %v", err)
+	}
+	// Group 1 is the default group every unknown client lands in.
+	if err := main.Store().Filters().AssignList(ctx, 1, lid); err != nil {
+		t.Fatalf("AssignList: %v", err)
+	}
+
+	replica := newTestAppWith(t, replicaConfig(t), withUpstreams(pub), withLoopbackLists(),
+		withSetting("sync.interval_seconds", "3600"))
+	mustSetMany(t, replica, map[string]string{
+		"sync.peer_url":    httpURL(t, main),
+		"sync.token":       writeAPIToken(t, main),
+		"sync.primary_dns": main.DNSAddr(),
+	})
+	// Nothing here waits on the download: the pull kicks it and returns, so
+	// what the test waits for is the replica's answer changing.
+	mustPull(t, replica)
+	if l, err := replica.Store().Filters().Lists(ctx); err != nil || len(l) != 1 || l[0].ID != lid {
+		t.Fatalf("the list did not travel: %+v (err %v)", l, err)
+	}
+	waitFor(t, "the replica to block "+blocked+" from the list it was given", func() bool {
+		return digAQuiet(replica.DNSAddr(), blocked) == "0.0.0.0"
+	})
 }

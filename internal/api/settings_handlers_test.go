@@ -252,7 +252,8 @@ func TestPausesAreNotAnEditableSetting(t *testing.T) {
 	_ = s.Settings().SetInternal(t.Context(), "sync.interval_seconds", "30")
 	// A replica's notes about its own pulls are the same kind of row: the
 	// Sync band reads them from GET /sync/status, and nothing edits them.
-	bookkeeping := []string{"sync.applied_version", "sync.applied_at", "sync.last_pull_at", "sync.last_error"}
+	bookkeeping := []string{"sync.applied_version", "sync.applied_peer", "sync.applied_at",
+		"sync.last_pull_at", "sync.last_error"}
 	for _, k := range bookkeeping {
 		_ = s.Settings().SetInternal(t.Context(), k, "1")
 	}

@@ -88,5 +88,11 @@ func Validate(b store.Bundle) error {
 			return fmt.Errorf("settings: local key %q may not be synced", key)
 		}
 	}
+	// b.SyncKey is deliberately not checked against the key table. A main
+	// that designates a key it no longer holds is a main with a broken
+	// transfer setup, not a bundle a replica should refuse: refusing it
+	// would stop every other piece of configuration — upstreams, blocking,
+	// clients — arriving over a mistake that costs one zone its AXFR, which
+	// then fails with a named error of its own. DNS continuity wins.
 	return nil
 }

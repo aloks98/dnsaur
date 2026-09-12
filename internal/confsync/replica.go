@@ -28,9 +28,16 @@ const (
 	// none of it is configuration, and a version bump per poll would make
 	// the box reconfigure itself every interval.
 	appliedVersionSetting = "sync.applied_version"
-	appliedAtSetting      = "sync.applied_at"
-	lastPullAtSetting     = "sync.last_pull_at"
-	lastErrorSetting      = "sync.last_error"
+	// appliedPeerSetting is the peer appliedVersionSetting was applied from.
+	// Version numbers are each main's own count of its own writes, so two
+	// mains sit at the same number all the time: without this, a replica
+	// re-pointed at a main that happens to be level reads that coincidence
+	// as "nothing to apply" and serves the old main's configuration for as
+	// long as the new one stays there.
+	appliedPeerSetting = "sync.applied_peer"
+	appliedAtSetting   = "sync.applied_at"
+	lastPullAtSetting  = "sync.last_pull_at"
+	lastErrorSetting   = "sync.last_error"
 
 	versionPath  = "/api/v1/sync/version"
 	bundlePath   = "/api/v1/sync/bundle"
@@ -78,6 +85,10 @@ type Reloader interface {
 	RecompileFilters(ctx context.Context) error
 	ReloadZones(ctx context.Context) error
 	ReloadSettings(ctx context.Context) error
+	// RefreshFilters downloads every enabled list and then compiles. A pull
+	// only calls it for the lists this box has never fetched — see
+	// kickFirstDownload.
+	RefreshFilters(ctx context.Context) error
 }
 
 // Replica is the pull loop: every interval it asks the main whether its
@@ -208,6 +219,14 @@ func (r *Replica) PullOnce(ctx context.Context) error {
 		r.mu.Lock()
 		r.last = api.SyncStatus{}
 		r.mu.Unlock()
+		// Clearing sync.peer_url is the promotion (§7): this box owns its
+		// configuration from here, and what it last took from a main is a
+		// number it no longer follows. Only when there is one to clear —
+		// this runs every idle cycle, on every main.
+		if v, _, err := r.st.Settings().Get(ctx, appliedVersionSetting); err == nil && v != "" {
+			r.record(ctx, appliedVersionSetting, "")
+			r.record(ctx, appliedPeerSetting, "")
+		}
 		return nil
 	}
 	all, err := r.st.Settings().All(ctx)
@@ -233,8 +252,12 @@ func (r *Replica) PullOnce(ctx context.Context) error {
 	s.AppliedVersion, _ = strconv.ParseInt(all[appliedVersionSetting], 10, 64)
 	s.AppliedAt, _ = strconv.ParseInt(all[appliedAtSetting], 10, 64)
 	// A box that has never applied anything pulls whatever the main has,
-	// even if the version happens to match the zero this one starts at.
-	_, applied := all[appliedVersionSetting]
+	// even if the version happens to match the zero this one starts at —
+	// and so does one whose applied version came from a different peer,
+	// whose numbering has nothing to do with this one's. A box upgraded
+	// from a build that recorded no peer reads as never-applied too, which
+	// costs it one bundle it already had.
+	applied := all[appliedVersionSetting] != "" && all[appliedPeerSetting] == peer
 
 	err = r.pull(ctx, peer, all, applied, &s)
 	s.LastPullAt = r.now().UnixMilli()
@@ -281,7 +304,8 @@ func (r *Replica) pull(ctx context.Context, peer string, all map[string]string, 
 		// Pointed at itself: applying its own bundle would be a no-op the
 		// operator would never see, and the registration would make this box
 		// its own replica.
-		return fmt.Errorf("%s is this instance: a replica cannot follow itself", peer)
+		return fmt.Errorf("%s reports this box's own instance.id: a replica cannot follow itself "+
+			"(a database restored from the main shares its instance.id — a replica has to be a fresh install)", peer)
 	}
 	if applied && probe.ConfigVersion == s.AppliedVersion {
 		// Nothing to apply, but the registration still goes out: it is also
@@ -307,7 +331,11 @@ func (r *Replica) pull(ctx context.Context, peer string, all map[string]string, 
 		// nothing to do.
 		slog.Info("config sync: the peer's version moved while the bundle was being fetched, retrying next cycle",
 			"peer", peer, "probed", probe.ConfigVersion, "bundle", b.ConfigVersion)
-		return nil
+		// The heartbeat still goes out, at the version this box holds: it is
+		// what the main measures staleness by and what carries the implicit
+		// transfer allow (§6), and neither has anything to do with a write
+		// that landed on the main mid-fetch.
+		return r.register(ctx, peer, token, s.AppliedVersion)
 	}
 	b.Zones = DeriveZones(b.Zones, primaryDNS(all[primaryDNSKey], peer), b.SyncKey)
 	if err := r.st.ImportBundle(ctx, b); err != nil {
@@ -321,6 +349,9 @@ func (r *Replica) pull(ctx context.Context, peer string, all map[string]string, 
 	s.AppliedVersion, s.AppliedAt = b.ConfigVersion, r.now().UnixMilli()
 	var errs []error
 	if err := r.st.Settings().SetInternal(ctx, appliedVersionSetting, strconv.FormatInt(s.AppliedVersion, 10)); err != nil {
+		errs = append(errs, err)
+	}
+	if err := r.st.Settings().SetInternal(ctx, appliedPeerSetting, peer); err != nil {
 		errs = append(errs, err)
 	}
 	if err := r.st.Settings().SetInternal(ctx, appliedAtSetting, strconv.FormatInt(s.AppliedAt, 10)); err != nil {
@@ -346,6 +377,7 @@ func (r *Replica) pull(ctx context.Context, peer string, all map[string]string, 
 			errs = append(errs, fmt.Errorf("reloading %s after the pull: %w", step.what, err))
 		}
 	}
+	r.kickFirstDownload(ctx)
 	if err := r.register(ctx, peer, token, b.ConfigVersion); err != nil {
 		// Not fatal, and it does not unwind the version: the config is
 		// applied. What it costs this box is the implicit AXFR allow on the
@@ -354,6 +386,41 @@ func (r *Replica) pull(ctx context.Context, peer string, all map[string]string, 
 		errs = append(errs, err)
 	}
 	return errors.Join(errs...)
+}
+
+// kickFirstDownload starts a background refresh when the bundle brought a
+// list this box has never fetched.
+//
+// A bundle carries a list's URL, not its contents, and Recompile builds the
+// ruleset from the copies already on disk — so a replica that has just
+// started following a main has every list it was given and no copy of any of
+// them. Left to its own refresher, it serves a LAN with blocking configured
+// and nothing blocked until lists.refresh_hours comes round, which is a day
+// by default. This is the same background download the API runs when a list
+// is created, for the same reason.
+//
+// Not awaited and not fatal: the configuration is applied either way, and a
+// list server that is slow or down must not hold up the cycle or make it
+// report a failure. It runs on the pull's own context, so a shutdown stops
+// it rather than leaving a download writing into a closing store.
+func (r *Replica) kickFirstDownload(ctx context.Context) {
+	lists, err := r.st.Filters().Lists(ctx)
+	if err != nil {
+		slog.Warn("config sync: checking which lists still need downloading failed", "err", err)
+		return
+	}
+	for _, l := range lists {
+		// LastRefreshed is 0 until a download of this box's own succeeds,
+		// which is exactly the state an imported row starts in.
+		if l.Enabled && l.LastRefreshed == 0 {
+			go func() {
+				if err := r.reload.RefreshFilters(ctx); err != nil {
+					slog.Error("config sync: downloading the lists the bundle brought failed", "err", err)
+				}
+			}()
+			return
+		}
+	}
 }
 
 // register tells the main this box is here and what it applied. It is also

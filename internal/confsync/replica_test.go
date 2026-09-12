@@ -29,12 +29,32 @@ func openStore(t *testing.T) store.Store {
 
 // countingReloader counts what a pull asked to be reloaded. Called from the
 // test's own goroutine only, so plain ints are enough.
-type countingReloader struct{ clients, filters, zones, settings int }
+type countingReloader struct {
+	clients, filters, zones, settings int
+
+	mu        sync.Mutex
+	downloads int
+}
 
 func (c *countingReloader) ReloadClients(context.Context) error    { c.clients++; return nil }
 func (c *countingReloader) RecompileFilters(context.Context) error { c.filters++; return nil }
 func (c *countingReloader) ReloadZones(context.Context) error      { c.zones++; return nil }
 func (c *countingReloader) ReloadSettings(context.Context) error   { c.settings++; return nil }
+
+// RefreshFilters is the one a pull calls off its own goroutine, so it is
+// counted under a lock rather than with the plain ints above.
+func (c *countingReloader) RefreshFilters(context.Context) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.downloads++
+	return nil
+}
+
+func (c *countingReloader) downloadCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.downloads
+}
 
 // fakeMain serves the three endpoints a pull uses, out of a real store.
 // token is what GET /sync/bundle demands; register is POST /sync/replicas.
@@ -112,6 +132,11 @@ func TestReplicaPullsAppliesAndRegisters(t *testing.T) {
 	}
 	if reloads.clients != 1 || reloads.filters != 1 || reloads.zones != 1 || reloads.settings != 1 {
 		t.Fatalf("reloads %+v", reloads)
+	}
+	// This bundle carries no lists, so nothing needs downloading: the kick
+	// is for the copies a replica does not have, not a refresh per pull.
+	if n := reloads.downloadCount(); n != 0 {
+		t.Fatalf("a bundle with no lists kicked %d downloads", n)
 	}
 	if reg := registrations(); len(reg) != 1 || reg[0].InstanceID != "replica-1" || reg[0].DNSAddr != "10.0.0.6:53" {
 		t.Fatalf("registered %+v", reg)
@@ -283,6 +308,16 @@ func TestReplicaSkipsABundleThatMovedUnderTheProbe(t *testing.T) {
 		b.ConfigVersion++
 		_ = json.NewEncoder(w).Encode(b)
 	})
+	var mu sync.Mutex
+	var registered []api.Replica
+	mux.HandleFunc("POST /api/v1/sync/replicas", func(w http.ResponseWriter, r *http.Request) {
+		var rep api.Replica
+		_ = json.NewDecoder(r.Body).Decode(&rep)
+		mu.Lock()
+		registered = append(registered, rep)
+		mu.Unlock()
+		w.WriteHeader(http.StatusNoContent)
+	})
 	ts := httptest.NewServer(mux)
 	t.Cleanup(ts.Close)
 
@@ -303,6 +338,104 @@ func TestReplicaSkipsABundleThatMovedUnderTheProbe(t *testing.T) {
 	if v, found, _ := rep.Settings().Get(ctx, "sync.applied_version"); found {
 		t.Fatalf("sync.applied_version = %q, want no version marked applied", v)
 	}
+	// The heartbeat still goes out. It is what the main measures staleness
+	// by, and what carries the implicit transfer allow (§6) — a replica that
+	// went quiet because a write landed mid-fetch would lose both over a
+	// cycle in which nothing was wrong with it.
+	mu.Lock()
+	defer mu.Unlock()
+	if len(registered) != 1 || registered[0].VersionApplied != 0 {
+		t.Fatalf("registrations %+v, want one heartbeat at the version this box had applied", registered)
+	}
+}
+
+// TestReplicaBlanksTheAppliedVersionOnPromotion: clearing sync.peer_url is
+// the promotion, and this box now owns its configuration. The version it
+// last took from a main describes a counter it no longer follows — left
+// standing, it is what the first pull after a later re-point compares
+// against.
+func TestReplicaBlanksTheAppliedVersionOnPromotion(t *testing.T) {
+	ctx := t.Context()
+	mainSt := openStore(t)
+	if _, err := mainSt.Clients().AddGroup(ctx, "kids"); err != nil {
+		t.Fatalf("AddGroup: %v", err)
+	}
+	ts := fakeMain(t, mainSt, "", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	})
+	rep := openStore(t)
+	mustSet(t, rep, "sync.peer_url", ts.URL)
+	r := NewReplica(rep, &countingReloader{}, "replica-1", "10.0.0.6:53")
+	if err := r.PullOnce(ctx); err != nil {
+		t.Fatalf("PullOnce: %v", err)
+	}
+	if v, _, _ := rep.Settings().Get(ctx, appliedVersionSetting); v == "" {
+		t.Fatal("nothing was marked applied; this test needs a version to clear")
+	}
+
+	mustSet(t, rep, "sync.peer_url", "")
+	if err := r.PullOnce(ctx); err != nil {
+		t.Fatalf("PullOnce after the promotion: %v", err)
+	}
+	if v, _, _ := rep.Settings().Get(ctx, appliedVersionSetting); v != "" {
+		t.Fatalf("sync.applied_version = %q after a promotion, want it blank", v)
+	}
+}
+
+// TestReplicaRefetchesWhenRepointedToTheSameVersion: version numbers are
+// each main's own count of its own writes, so two mains are level by
+// coincidence all the time. A replica moved from one to the other must not
+// read that coincidence as "nothing to apply" and go on serving the old
+// main's configuration forever.
+func TestReplicaRefetchesWhenRepointedToTheSameVersion(t *testing.T) {
+	ctx := t.Context()
+	first, second := openStore(t), openStore(t)
+	if _, err := first.Clients().AddGroup(ctx, "first-main"); err != nil {
+		t.Fatalf("AddGroup: %v", err)
+	}
+	if _, err := second.Clients().AddGroup(ctx, "second-main"); err != nil {
+		t.Fatalf("AddGroup: %v", err)
+	}
+	v1, _ := first.Settings().ConfigVersion(ctx)
+	v2, _ := second.Settings().ConfigVersion(ctx)
+	if v1 != v2 {
+		t.Fatalf("the two mains are at %d and %d; this test is about the version being the same", v1, v2)
+	}
+	noContent := func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) }
+	ts1 := fakeMain(t, first, "", noContent)
+	ts2 := fakeMain(t, second, "", noContent)
+
+	rep := openStore(t)
+	mustSet(t, rep, "sync.peer_url", ts1.URL)
+	r := NewReplica(rep, &countingReloader{}, "replica-1", "10.0.0.6:53")
+	if err := r.PullOnce(ctx); err != nil {
+		t.Fatalf("PullOnce: %v", err)
+	}
+	if got := groupNames(t, rep); len(got) != 1 || got[0] != "first-main" {
+		t.Fatalf("groups after the first pull = %v", got)
+	}
+
+	mustSet(t, rep, "sync.peer_url", ts2.URL)
+	if err := r.PullOnce(ctx); err != nil {
+		t.Fatalf("PullOnce after the re-point: %v", err)
+	}
+	if got := groupNames(t, rep); len(got) != 1 || got[0] != "second-main" {
+		t.Fatalf("groups after the re-point = %v, want the new main's", got)
+	}
+}
+
+// groupNames is what a bundle brought, in the only shape these tests compare.
+func groupNames(t *testing.T, st store.Store) []string {
+	t.Helper()
+	gs, err := st.Clients().Groups(t.Context())
+	if err != nil {
+		t.Fatalf("Groups: %v", err)
+	}
+	out := make([]string, 0, len(gs))
+	for _, g := range gs {
+		out = append(out, g.Name)
+	}
+	return out
 }
 
 // TestReplicaKeepsThePeerVersionWhenTheProbeFails: "behind by N" is what the
@@ -412,8 +545,12 @@ func TestReplicaRefusesToFollowItself(t *testing.T) {
 	})
 	mustSet(t, st, "sync.peer_url", ts.URL)
 	r := NewReplica(st, &countingReloader{}, "main-1", "10.0.0.5:53")
-	if err := r.PullOnce(ctx); err == nil || !strings.Contains(err.Error(), "this instance") {
-		t.Fatalf("PullOnce = %v, want a refusal to follow itself", err)
+	// Naming instance.id is the point: the way a box ends up pointed at
+	// itself in practice is a "replica" restored from the main's database,
+	// and the error has to be the thing that explains that.
+	if err := r.PullOnce(ctx); err == nil || !strings.Contains(err.Error(), "instance.id") ||
+		!strings.Contains(err.Error(), "follow itself") {
+		t.Fatalf("PullOnce = %v, want a refusal naming instance.id", err)
 	}
 }
 

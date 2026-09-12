@@ -172,8 +172,7 @@ func TestStartFiltersFromTheListCacheBeforeServing(t *testing.T) {
 // loopback included, because a list URL is admin-supplied and fetched by the
 // server itself (filter.AllowLoopbackTargets). Tests that serve a blocklist
 // locally have to opt in; production never does.
-func allowLoopbackLists(t *testing.T, a *App) {
-	t.Helper()
+func allowLoopbackLists(a *App) {
 	a.refresher = filter.NewRefresher(a.st.Filters(), a.st.Clients(), a.engine, a.cfg.DataDir,
 		filter.AllowLoopbackTargets())
 }
@@ -199,20 +198,27 @@ func answerA(ip string) dns.HandlerFunc {
 	}
 }
 
-// testAppOption seeds a setting before Start, i.e. before the first
-// applySettings reads it.
-type testAppOption func(map[string]string)
+// testAppOption adjusts a built App before Start: it seeds a setting, i.e.
+// before the first applySettings reads it, or reaches the App itself for the
+// pieces a setting cannot express.
+type testAppOption func(*App, map[string]string)
 
 // withUpstreams points the default upstreams at addrs: where every name no
 // zone claims is answered from.
 func withUpstreams(addrs ...string) testAppOption {
-	return func(s map[string]string) { s["upstreams"] = strings.Join(addrs, ",") }
+	return func(_ *App, s map[string]string) { s["upstreams"] = strings.Join(addrs, ",") }
 }
 
 // withSetting seeds any other setting, for the cases where the cache's own
 // timings are what the test is about.
 func withSetting(k, v string) testAppOption {
-	return func(s map[string]string) { s[k] = v }
+	return func(_ *App, s map[string]string) { s[k] = v }
+}
+
+// withLoopbackLists is allowLoopbackLists for an App the fixture builds, for
+// a test whose list is served from httptest.
+func withLoopbackLists() testAppOption {
+	return func(a *App, _ map[string]string) { allowLoopbackLists(a) }
 }
 
 // newTestApp builds and starts a sqlite-backed App on loopback, shut down
@@ -237,12 +243,12 @@ func newTestAppWith(t *testing.T, cfg *config.Config, opts ...testAppOption) *Ap
 	t.Helper()
 	ctx := context.Background()
 	settings := map[string]string{}
-	for _, o := range opts {
-		o(settings)
-	}
 	a, err := New(ctx, cfg, "test")
 	if err != nil {
 		t.Fatal(err)
+	}
+	for _, o := range opts {
+		o(a, settings)
 	}
 	for k, v := range settings {
 		if err := a.Store().Settings().SetInternal(ctx, k, v); err != nil {

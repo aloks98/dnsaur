@@ -106,7 +106,7 @@ func TestAPIEndToEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = a.Store().Settings().SetInternal(ctx, "upstreams", upAddr)
-	allowLoopbackLists(t, a)
+	allowLoopbackLists(a)
 	if err := a.Start(ctx); err != nil {
 		t.Fatal(err)
 	}

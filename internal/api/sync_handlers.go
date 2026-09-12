@@ -181,9 +181,12 @@ const (
 	// band reads them from GET /sync/status, which reports them in a shape
 	// the screen can use, and no PUT may write them.
 	syncAppliedVersionSetting = "sync.applied_version"
-	syncAppliedAtSetting      = "sync.applied_at"
-	syncLastPullAtSetting     = "sync.last_pull_at"
-	syncLastErrorSetting      = "sync.last_error"
+	// syncAppliedPeerSetting is the peer that version was applied from, so a
+	// re-point to a main that happens to be at the same number still pulls.
+	syncAppliedPeerSetting = "sync.applied_peer"
+	syncAppliedAtSetting   = "sync.applied_at"
+	syncLastPullAtSetting  = "sync.last_pull_at"
+	syncLastErrorSetting   = "sync.last_error"
 )
 
 func (s *Server) handleSyncBundle(w http.ResponseWriter, r *http.Request) {
@@ -275,7 +278,8 @@ func withClientHost(addr, clientIP string) string {
 func internalSetting(key string) bool {
 	switch key {
 	case store.StatsWatermarkKey, filter.PausesKey, syncReplicasSetting,
-		syncAppliedVersionSetting, syncAppliedAtSetting, syncLastPullAtSetting, syncLastErrorSetting:
+		syncAppliedVersionSetting, syncAppliedPeerSetting, syncAppliedAtSetting,
+		syncLastPullAtSetting, syncLastErrorSetting:
 		return true
 	}
 	return false
