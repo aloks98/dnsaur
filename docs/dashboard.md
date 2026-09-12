@@ -951,18 +951,21 @@ ever taking writes.
 
 #### When something is wrong
 
-Three facts appear as banners across the top of every screen, and all three
-clear on their own:
+Three facts appear as banners across the top of every screen:
 
 - **Last pull failed: <reason>** — the reason verbatim from the server. The
   previously applied configuration is still in force; DNS is unaffected.
+  Clears on its own, on the next pull that works.
 - **Peer reached over plain HTTP** — the peer URL is `http://`, so every
   pull sends the pull token and receives the whole bundle — **every TSIG
   secret on the main included** — in the clear. There is no certificate
-  subsystem here to fix that for you; put the peer behind HTTPS.
+  subsystem here to fix that for you; put the peer behind HTTPS. This one
+  **does not clear on its own**: it is a reading of the URL in the Sync
+  band, so it stays until that URL changes.
 - **Replica <id> not seen for <duration>** — on the main, about a replica
   that has missed three intervals. It has not been forgotten and its
-  transfer permission is intact; it simply is not answering.
+  transfer permission is intact; it simply is not answering. Clears on its
+  own, the next time that replica checks in.
 
 A replica that is merely *behind* is not a warning — that is what a pull
 interval looks like from the outside, and the Sync band's `applied n of m`

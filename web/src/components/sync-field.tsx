@@ -1,4 +1,5 @@
 import { useId, type ReactNode } from "react";
+import { toast } from "sonner";
 import { useController, type Control } from "react-hook-form";
 import { Button, Input, Label, NativeSelect, NativeSelectOption, cn } from "@e412/rnui-react";
 import { useTSIGKeys } from "../hooks/use-tsig-keys";
@@ -110,7 +111,15 @@ function ReplicaTable() {
                 variant="ghost"
                 aria-label={`Forget ${replica.instance_id}`}
                 disabled={forget.isPending}
-                onClick={() => forget.mutate(replica.instance_id)}
+                onClick={() =>
+                  forget.mutate(replica.instance_id, {
+                    // The row going away is the whole of the success
+                    // signal, so a refusal that said nothing would look
+                    // exactly like the moment before one that worked.
+                    onError: () =>
+                      toast.error(`Couldn't forget ${replica.instance_id} — try again`),
+                  })
+                }
               >
                 Forget
               </Button>
@@ -227,7 +236,14 @@ export function SyncField({ control }: { control: Control<Record<string, string>
             variant="outline"
             className="ml-auto"
             disabled={stopFollowing.isPending}
-            onClick={() => stopFollowing.mutate()}
+            onClick={() =>
+              // Promotion shows up as the rest of the dashboard coming back
+              // to life, which is not instant — so a refusal has to say so
+              // rather than leave the operator waiting for it.
+              stopFollowing.mutate(undefined, {
+                onError: () => toast.error("Couldn't stop following — try again"),
+              })
+            }
           >
             Stop following
           </Button>

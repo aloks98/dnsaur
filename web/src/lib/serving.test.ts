@@ -124,17 +124,23 @@ test("somethingIsWrong covers every fact the status endpoint reports", () => {
       certificate: { not_after: "2026-09-17T00:00:00Z", expiring_soon: true },
     }),
   ).toBe(true);
-  // Sync's three, through syncBanners — the poll is what clears each of
-  // them, so a fact the strip shows and the poll does not watch would sit
-  // there until the operator navigated away and back.
+  // Sync's two *watchable* facts: a failed pull, and a replica gone quiet.
+  // Both end by themselves — the next successful pull, the next check-in —
+  // so the poll is what clears them.
   expect(somethingIsWrong({ ...clean, sync: { role: "replica", last_error: "boom" } })).toBe(true);
-  expect(somethingIsWrong({ ...clean, sync: { role: "replica", plain_http: true } })).toBe(true);
   expect(
     somethingIsWrong({
       ...clean,
       sync: { role: "main", replicas: [replica({ stale: true })] },
     }),
   ).toBe(true);
+
+  // `plain_http` is not one of them. It is a fact about the peer URL the
+  // operator typed, and nothing but editing that URL will change it — so
+  // polling for it every five seconds asks a question whose answer cannot
+  // move. The banner still shows (see syncBanners below); only the poll
+  // stays off.
+  expect(somethingIsWrong({ ...clean, sync: { role: "replica", plain_http: true } })).toBe(false);
 
   // A listening protocol, a healthy certificate and a replica that checked
   // in are not "wrong", or the poll would never stop.

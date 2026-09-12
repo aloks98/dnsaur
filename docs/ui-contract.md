@@ -1829,9 +1829,9 @@ applied version, last seen) with a `Forget` action sending
 
 The warning strip (`serving-banners.tsx`, mounted in the shell) gains three
 lines, derived by `syncBanners` in `lib/serving.ts`. That same function backs
-`somethingIsWrong`, which is what keeps the status poll running while any of
-them is up — a banner the poll did not watch would sit there until the
-operator navigated away and back.
+`syncTrouble`, which `somethingIsWrong` reads — and that is what keeps the
+status poll running while a fact is up, so a banner does not sit there after
+it has cleared.
 
 | Condition | Line (verbatim) |
 |---|---|
@@ -1843,8 +1843,16 @@ operator navigated away and back.
 — how long it has been quiet, not a wall-clock stamp the reader has to
 subtract from. A replica that is merely *behind* gets no banner: that is what
 a pull interval looks like from outside, and the Sync band's `applied n of m`
-already says it on the one screen where the number is worth reading. All
-three clear on their own.
+already says it on the one screen where the number is worth reading.
+
+Two of the three clear on their own — the next successful pull empties
+`last_error`, the next check-in un-stales a replica — and those two are what
+`syncTrouble` watches, so the 5 s trouble poll is what takes them down.
+**`plain_http` is deliberately outside it**: it is a reading of the peer URL
+the operator typed, so nothing but an edit to that URL can change the
+answer, and polling for it would ask a question that cannot move. It renders
+from `syncBanners` like the other two and persists until `sync.peer_url`
+does.
 
 ---
 

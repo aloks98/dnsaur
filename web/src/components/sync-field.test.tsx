@@ -1,5 +1,6 @@
 import { http, HttpResponse } from "msw";
-import { expect, test } from "vitest";
+import { toast } from "sonner";
+import { afterEach, expect, test, vi } from "vitest";
 import { screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { useForm } from "react-hook-form";
@@ -36,6 +37,8 @@ function mockSyncStatus(status: SyncStatus) {
 function mockTSIGKeys(keys: TSIGKey[]) {
   server.use(http.get("/api/v1/tsig-keys", () => HttpResponse.json(keys)));
 }
+
+afterEach(() => vi.restoreAllMocks());
 
 // --- replica --------------------------------------------------------------
 
@@ -163,4 +166,54 @@ test("a main lists each registered replica and forgets one on request", async ()
   await userEvent.click(within(row).getByRole("button", { name: "Forget eve-2" }));
 
   await waitFor(() => expect(deleted).toBe("eve-2"));
+});
+
+// --- failures -------------------------------------------------------------
+
+// Both of these are one press with no visible result of their own: the
+// replica list is re-read from the server and the promotion shows up as the
+// screen coming back to life. A refusal that only reached the console would
+// read as "nothing happened", which is also what success looks like for a
+// second or two.
+
+test("a refused promotion says so", async () => {
+  mockSyncStatus({ role: "replica", peer_url: "https://main.lan" });
+  server.use(http.put("/api/v1/settings", () => HttpResponse.error()));
+  const errorSpy = vi.spyOn(toast, "error");
+
+  renderWithProviders(
+    <Harness values={defaultValues({ [rhfName("sync.peer_url")]: "https://main.lan" })} />,
+  );
+
+  await userEvent.click(await screen.findByRole("button", { name: "Stop following" }));
+
+  await waitFor(() => expect(errorSpy).toHaveBeenCalledWith("Couldn't stop following — try again"));
+});
+
+test("a refused forget names the replica it could not remove", async () => {
+  mockSyncStatus({
+    role: "main",
+    replicas: [
+      {
+        instance_id: "eve-2",
+        dns_addr: "10.0.0.6:53",
+        version_applied: 412,
+        last_seen: Date.now() - 60_000,
+        stale: false,
+      },
+    ],
+  });
+  server.use(
+    http.delete("/api/v1/sync/replicas/:instanceId", () =>
+      HttpResponse.json({ error: "boom" }, { status: 500 }),
+    ),
+  );
+  const errorSpy = vi.spyOn(toast, "error");
+
+  renderWithProviders(<Harness values={defaultValues()} />);
+
+  const row = await screen.findByRole("row", { name: /eve-2/ });
+  await userEvent.click(within(row).getByRole("button", { name: "Forget eve-2" }));
+
+  await waitFor(() => expect(errorSpy).toHaveBeenCalledWith("Couldn't forget eve-2 — try again"));
 });

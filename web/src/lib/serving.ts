@@ -44,18 +44,41 @@ export function somethingIsWrong(status: ResolverStatus | undefined): boolean {
     servingState(status.serving.dot) === "failed" ||
     servingState(status.serving.doh) === "failed" ||
     (status.certificate?.expiring_soon ?? false) ||
-    syncBanners(status.sync).length > 0
+    syncTrouble(status.sync)
   );
 }
 
 /**
- * Sync's three facts, as the lines the shell shows (spec §8) — one function
- * so "we show a banner for this" and "we keep asking about this" cannot
- * drift, which is exactly the drift `somethingIsWrong` exists to prevent.
+ * The sync facts a poll can actually clear: a pull that failed, and a
+ * replica that has gone quiet. Both end without anyone doing anything — the
+ * next successful pull, the next check-in — which is exactly what makes
+ * asking again worth the request.
  *
- * All three clear on their own: the next pull that succeeds empties
- * `last_error`, an `https://` peer clears `plain_http`, and a replica that
- * checks in stops being stale.
+ * `plain_http` is deliberately **not** here even though the strip shows it.
+ * It is a reading of the peer URL the operator typed, so nothing but an
+ * edit to that URL can change the answer, and polling every five seconds
+ * for as long as it stays `http://` would ask a question whose answer
+ * cannot move. The banner persists on its own; the poll does not have to.
+ */
+function syncTrouble(sync: SyncStatus | undefined): boolean {
+  if (!sync) return false;
+  return Boolean(sync.last_error) || (sync.replicas ?? []).some((r) => r.stale);
+}
+
+/**
+ * Sync's three facts, as the lines the shell shows (spec §8) — the one
+ * definition of what is on screen, so a caller cannot invent a fourth line
+ * or spell one of these differently.
+ *
+ * What is *shown* and what is *polled for* are deliberately not the same
+ * set here, which is why this is not the predicate `somethingIsWrong`
+ * reads: see `syncTrouble` above for the one fact that is worth a banner
+ * and not worth a request.
+ *
+ * Two of the three clear on their own — the next pull that succeeds empties
+ * `last_error`, and a replica that checks in stops being stale — which is
+ * why `syncTrouble` below watches those two and not `plain_http`, whose
+ * only cure is editing the peer URL.
  *
  * Every line states the fact and stops. A replica that is merely *behind*
  * gets no line at all: that is what a pull interval looks like from the

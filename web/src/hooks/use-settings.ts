@@ -2,6 +2,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "../api/client";
 import type { BackupResult, ResolverStatus, Settings } from "../api/types";
 import { somethingIsWrong } from "../lib/serving";
+import { syncKeys } from "./use-sync";
 
 // Canonical settings-domain hooks — GET /settings (Settings page, Task 12)
 // and PUT /settings (both the setup wizard's starter-upstreams write and
@@ -103,6 +104,14 @@ export function useUpdateSetting() {
       }
       // A saved `upstreams` may have just ended (or begun) a downgrade.
       void qc.invalidateQueries({ queryKey: settingsKeys.resolverStatus });
+      // A saved `sync.*` key moves what GET /sync/status answers, and that
+      // is not a setting, so the invalidation above does not reach it. The
+      // Sync band renders it directly beside the boxes that were just
+      // saved, and at its own 30s cadence it spent up to half a minute
+      // contradicting them. Unconditional rather than keyed on a `sync.`
+      // prefix: one cheap read after any save beats a prefix test that has
+      // to be remembered when a key moves.
+      void qc.invalidateQueries({ queryKey: syncKeys.status });
     },
   });
 }

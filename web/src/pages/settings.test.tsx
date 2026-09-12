@@ -941,3 +941,76 @@ test("a main leaves every band editable and shows no notice", async () => {
   expect(await screen.findByLabelText("Blocked response TTL (seconds)")).toBeEnabled();
   expect(screen.queryByText(/^Managed by/)).not.toBeInTheDocument();
 });
+
+// --- the write-only token ---------------------------------------------------
+
+// `sync.token` is the one editable key GET /settings never returns, so the
+// box starts empty on every load and "empty" has to keep meaning "leave the
+// stored one alone". That only works because the refetch after a save
+// notices the server still reports nothing for the key and puts the field —
+// and the baseline it is measured against — back to empty together. Get
+// that pairing wrong in either direction and the page either offers to
+// re-save a credential it no longer holds, or sits on a permanent unsaved
+// change nobody can clear.
+test("a saved sync token is sent, then leaves the box empty and nothing unsaved", async () => {
+  const user = userEvent.setup();
+  const sent: unknown[] = [];
+  mockSettings(fullSettings());
+  server.use(
+    http.put("/api/v1/settings", async ({ request }) => {
+      sent.push(await request.json());
+      return new HttpResponse(null, { status: 204 });
+    }),
+  );
+
+  renderWithProviders(<SettingsPage />);
+  await screen.findByText("Sync");
+
+  await user.type(screen.getByLabelText("Peer URL"), "https://main.lan");
+  await user.type(screen.getByLabelText("Token"), "dnsr_abc123");
+  await user.click(screen.getAllByRole("button", { name: /^save changes$/i })[0]);
+
+  // The credential goes out with the value that was typed — and before the
+  // peer it is judged against (SAVE_PHASES), which is why both are asserted
+  // as an ordered pair rather than as a set.
+  await waitFor(() => expect(sent).toHaveLength(2));
+  expect(sent).toEqual([
+    { key: "sync.token", value: "dnsr_abc123" },
+    { key: "sync.peer_url", value: "https://main.lan" },
+  ]);
+
+  // And then the box is empty again, with nothing left to save: the peer
+  // URL came back from the server, the token did not, and the form took
+  // both answers.
+  await waitFor(() => expect(screen.getByLabelText("Token")).toHaveValue(""));
+  expect(screen.getByLabelText("Peer URL")).toHaveValue("https://main.lan");
+  expect(screen.getByText(/all changes saved/i)).toBeInTheDocument();
+});
+
+// The Sync band shows GET /sync/status, which is not a setting and so is not
+// invalidated by the settings query — but a save is exactly what moves it.
+// At its own 30s cadence the band spent up to half a minute contradicting
+// the value sitting in the box above it.
+test("saving a setting re-reads the sync status the band renders", async () => {
+  const user = userEvent.setup();
+  let statusReads = 0;
+  mockSettings(fullSettings());
+  server.use(
+    http.get("/api/v1/sync/status", () => {
+      statusReads += 1;
+      return HttpResponse.json({ role: "main" });
+    }),
+    http.put("/api/v1/settings", () => new HttpResponse(null, { status: 204 })),
+  );
+
+  renderWithProviders(<SettingsPage />);
+  await screen.findByText("Sync");
+  await waitFor(() => expect(statusReads).toBe(1));
+
+  const ttl = screen.getByLabelText(/^blocked response ttl/i);
+  await user.clear(ttl);
+  await user.type(ttl, "60");
+  await user.click(screen.getAllByRole("button", { name: /^save changes$/i })[0]);
+
+  await waitFor(() => expect(statusReads).toBe(2));
+});

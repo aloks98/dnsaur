@@ -353,6 +353,17 @@ const SETTING_DEFAULTS: Record<string, string> = {
   "sync.tsig_key_id": "0",
 };
 
+/**
+ * Editable keys `GET /settings` deliberately never answers with — one
+ * today, and it is a credential (docs/api.md's Settings entry: a read must
+ * not be a way to copy the pull token out).
+ *
+ * The consequence is local to the save: a write-only key that saved has no
+ * server value to move the baseline *to*, because what the server now holds
+ * is unreadable from here. See onSubmit.
+ */
+const WRITE_ONLY_KEYS = new Set(["sync.token"]);
+
 // Exhaustiveness: this must list exactly the 23 keys in
 // internal/api/settings_handlers.go's editableSettings — no fewer (an
 // editable setting the admin can't reach) and no more (a PUT the server
@@ -592,7 +603,7 @@ const SETTING_GROUPS: SettingGroup[] = [
       {
         key: "sync.token",
         kind: "opaque",
-        label: "Pull token",
+        label: "Token",
         schema: tokenSchema,
       },
       {
@@ -1111,7 +1122,14 @@ function SettingsForm({ settings }: { settings: Settings }) {
     settled.forEach((result, i) => {
       const { apiKey, name, value } = changed[i];
       if (result.status === "fulfilled") {
-        nextBaseline[name] = value;
+        // A write-only key goes back to empty rather than to what was
+        // typed: the box is how the operator supplies a *new* value, and
+        // empty is how they say "leave the stored one alone". Keeping the
+        // typed value as the baseline would leave the page displaying a
+        // credential it can no longer prove is current, and would make the
+        // natural next gesture — clearing the box — a save the server
+        // refuses.
+        nextBaseline[name] = WRITE_ONLY_KEYS.has(apiKey) ? "" : value;
       } else {
         failedKeys.push(apiKey);
       }
@@ -1124,6 +1142,18 @@ function SettingsForm({ settings }: { settings: Settings }) {
     // stale certificate error from a previous attempt — the setError calls
     // just below then repopulate only what is still actually failing.
     form.reset(nextBaseline, { keepValues: true });
+
+    // `keepValues` is the exception a write-only key needs undone: its
+    // baseline just went to empty, so leaving the typed value in the box
+    // would report a permanent unsaved change nobody can clear. This is
+    // the one place that can put both halves back together, because the
+    // background refetch below cannot — the server answers nothing for
+    // this key either way, so it has no change of its own to notice.
+    settled.forEach((result, i) => {
+      const { apiKey, name } = changed[i];
+      if (result.status !== "fulfilled" || !WRITE_ONLY_KEYS.has(apiKey)) return;
+      form.resetField(name, { defaultValue: "" });
+    });
 
     // serve.tls.cert/serve.tls.key's rejection needs to survive past the
     // toast below: protocols-field.tsx's certificate line is what answers

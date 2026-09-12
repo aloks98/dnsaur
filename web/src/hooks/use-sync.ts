@@ -83,9 +83,9 @@ export function useForgetReplica() {
  * valid as one all-or-nothing request — which is also what makes the guard
  * lift exactly once instead of leaving a window where half of it has.
  *
- * Everything this instance reads is about to be its own, so the whole cache
- * goes: settings, the two statuses, and every synced resource whose screen
- * was rendered read-only a moment ago.
+ * Invalidates the settings and both statuses — the three reads that decide
+ * what this page shows and whether every other screen's write controls are
+ * live.
  */
 export function useStopFollowing() {
   const qc = useQueryClient();
