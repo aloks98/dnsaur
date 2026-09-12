@@ -387,29 +387,50 @@ func (a *App) getSetting(ctx context.Context, key string) string {
 // stored is still a pause, and refusing to start over one would take DNS
 // down for the whole network.
 func (a *App) restorePauses(ctx context.Context) {
-	if v, ok, err := a.st.Settings().Get(ctx, filter.PausesKey); err != nil {
-		slog.Error("reading the stored blocking pauses failed", "err", err)
-	} else if ok {
-		var p filter.Pauses
-		if err := json.Unmarshal([]byte(v), &p); err != nil {
-			slog.Error("the stored blocking pauses could not be read", "err", err, "value", v)
-		} else {
-			a.engine.Restore(p)
-		}
-	}
+	a.loadPauses(ctx)
 	a.engine.OnPauseChange(func(p filter.Pauses) {
 		b, err := json.Marshal(p)
 		if err != nil {
 			slog.Error("encoding the blocking pauses failed", "err", err)
 			return
 		}
-		// SetInternal: nothing edits this row by hand, and bumping
-		// config_version would make every settings watcher reconcile the
-		// whole configuration over a pause.
-		if err := a.st.Settings().SetInternal(ctx, filter.PausesKey, string(b)); err != nil {
+		// Set, not SetInternal: a pause is configuration the whole
+		// installation serves (spec §4.3), so it has to move
+		// config_version — a replica polls that counter, and a pause
+		// stored without a bump is one the rest of the boxes never hear
+		// about. The cost is one reconcile per pause, which is a few a
+		// day; the settings watcher skips the ones where nothing moved.
+		if err := a.st.Settings().Set(ctx, filter.PausesKey, string(b)); err != nil {
 			slog.Error("storing the blocking pauses failed", "err", err)
 		}
 	})
+}
+
+// loadPauses installs the stored pause state in the engine. It runs at
+// startup and again on every settings reload, which is how a pause the main
+// set reaches a replica: the bundle carries the row, and this is what turns
+// it back into a pause the query path honours.
+//
+// Restore never calls back into OnPauseChange, so the row this reads cannot
+// be rewritten by reading it. A key that is not there means nothing is
+// paused, and installing that is how a resume on the main clears one here.
+func (a *App) loadPauses(ctx context.Context) {
+	var p filter.Pauses
+	v, ok, err := a.st.Settings().Get(ctx, filter.PausesKey)
+	if err != nil {
+		// The row could not be read, which is not the same as "nothing is
+		// paused": installing the empty state on a failed read would resume
+		// blocking on a box someone deliberately paused.
+		slog.Error("reading the stored blocking pauses failed", "err", err)
+		return
+	}
+	if ok {
+		if err := json.Unmarshal([]byte(v), &p); err != nil {
+			slog.Error("the stored blocking pauses could not be read", "err", err, "value", v)
+			return
+		}
+	}
+	a.engine.Restore(p)
 }
 
 // settingValue is getSetting for the keys where "the store could not answer"
@@ -1057,10 +1078,18 @@ func (a *App) NextFilterRefresh() int64 { return a.refresher.NextRefresh() }
 // config-sync pull: it imports a whole bundle in one transaction, and
 // nothing in the API layer ever hears about it.
 //
+// The pauses go with it. They are a settings row like the rest (§4.3), and
+// the only one applySettings does not own — it is the engine that holds them,
+// and loadPauses is what puts an imported row back into it.
+//
 // It returns an error to satisfy the interface, and never does: applySettings
 // degrades in place (it keeps the previous forwarder, logs what it could not
 // use) precisely so that a bad settings value cannot take DNS down.
-func (a *App) ReloadSettings(ctx context.Context) error { a.applySettings(ctx); return nil }
+func (a *App) ReloadSettings(ctx context.Context) error {
+	a.applySettings(ctx)
+	a.loadPauses(ctx)
+	return nil
+}
 
 // PeerURL, Status, Register and Forget are App's api.Syncer half (§8).
 // Which object answers is decided by sync.peer_url, read live: it is what

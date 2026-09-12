@@ -106,13 +106,24 @@ func (e *Engine) OnPauseChange(f func(Pauses)) {
 }
 
 // Restore installs a persisted pause state, dropping anything that ran out
-// while the process was down. It replaces whatever is there, so it belongs
-// at startup and nowhere else.
+// since it was written. It replaces whatever is there, so the caller must be
+// one that holds the whole state: the startup read of the stored row, and
+// the settings reload that follows a config-sync pull — a pause is synced
+// configuration, and on a replica this is the only thing that sets one.
+//
+// A state that matches what is already in force is left alone rather than
+// stored again, so a reload that changed nothing leaves the pointer every
+// query reads exactly where it was. It never calls the OnPauseChange sink:
+// installing what was read is not a change to write back.
 func (e *Engine) Restore(p Pauses) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	next := p.clone()
 	next.prune(e.now())
+	cur := e.paused.Load()
+	if cur.Global == next.Global && maps.Equal(cur.Groups, next.Groups) && maps.Equal(cur.Clients, next.Clients) {
+		return
+	}
 	e.paused.Store(&next)
 }
 

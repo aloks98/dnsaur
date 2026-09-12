@@ -14,6 +14,7 @@ import (
 	"github.com/aloks98/dnsaur/internal/api"
 	"github.com/aloks98/dnsaur/internal/auth"
 	"github.com/aloks98/dnsaur/internal/config"
+	"github.com/aloks98/dnsaur/internal/filter"
 	"github.com/aloks98/dnsaur/internal/store"
 )
 
@@ -408,4 +409,42 @@ func apiPost(t *testing.T, url, token, body string) (int, string) {
 		t.Fatal(err)
 	}
 	return resp.StatusCode, string(b)
+}
+
+// TestReplicaFollowsBlockingPauses is §4.3's `blocking.pauses`: a pause is
+// configuration like any other, so the box that holds the config decides it
+// and every replica serves it. Both halves have to work for that — the pause
+// has to move config_version, or the replica's next probe finds nothing to
+// pull, and the reload has to put the row back into the engine, or the
+// replica imports a pause it never applies.
+func TestReplicaFollowsBlockingPauses(t *testing.T) {
+	pub := mockDNS(t, answerA("9.9.9.9"))
+	main := newTestApp(t, withUpstreams(pub))
+	replica := newTestAppWith(t, replicaConfig(t), withUpstreams(pub),
+		withSetting("sync.interval_seconds", "3600"))
+	mustSetMany(t, replica, map[string]string{
+		"sync.peer_url":    httpURL(t, main),
+		"sync.token":       writeAPIToken(t, main),
+		"sync.primary_dns": main.DNSAddr(),
+	})
+	mustPull(t, replica)
+
+	// Paused on the main, the way POST /blocking/pause pauses it.
+	main.engine.Pause(filter.PauseGlobal, 0, 30*time.Minute)
+	mustPull(t, replica)
+	until, kind := replica.engine.PausedUntil(0, 0)
+	if until.IsZero() || kind != filter.PauseGlobal {
+		t.Fatalf("the replica reports pause {until:%v scope:%q}, want the main's global pause", until, kind)
+	}
+	if want, _ := main.engine.PausedUntil(0, 0); !until.Equal(want) {
+		t.Fatalf("the replica's pause ends at %v, want the main's %v", until, want)
+	}
+
+	// And resumed: a pause that cannot be cleared is worse than one that
+	// never arrived.
+	main.engine.Pause(filter.PauseGlobal, 0, 0)
+	mustPull(t, replica)
+	if until, _ := replica.engine.PausedUntil(0, 0); !until.IsZero() {
+		t.Fatalf("the replica is still paused until %v after the main resumed", until)
+	}
 }
