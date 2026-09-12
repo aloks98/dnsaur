@@ -24,7 +24,9 @@ info:
     setting, since a pause is a decision about the network and clients reach
     either box) -- is refused with 409 {"error": "managed by <peer_url>"}
     before the handler runs, as is PUT /settings for any key outside the
-    instance-local set. The two refresh operations
+    instance-local set. A replica also refuses GET /sync/bundle and POST
+    /sync/replicas: it serves nobody a bundle and keeps no registry, so both
+    answer 409 naming the main to point at instead. The two refresh operations
     (/filters/lists/{id}/refresh, /zones/{id}/refresh) stay available because
     they are operational rather than configuration, and so do this box's own
     account, sessions, tokens and backups. Clearing sync.peer_url lifts the
@@ -4212,6 +4214,8 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
+        "409":
+          $ref: "#/components/responses/ManagedByMain"
         "503":
           description: storage unavailable
           content:
@@ -4301,6 +4305,8 @@ paths:
               schema: { $ref: "#/components/schemas/Error" }
         "403":
           $ref: "#/components/responses/ReadOnlyToken"
+        "409":
+          $ref: "#/components/responses/ManagedByMain"
         "503":
           description: >
             no sync subsystem is running on this instance, or storage is

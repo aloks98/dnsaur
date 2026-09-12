@@ -808,7 +808,10 @@ Full parameter/response detail lives in `internal/api/openapi.yaml`
   everywhere else and this is a `GET`, but the body carries every TSIG
   secret on the box — the same credentials a read token stopped being
   handed through `GET /tsig-keys` — so a read-scoped token is `403
-  {"error": "write scope required"}`.
+  {"error": "write scope required"}`. On a replica it is `409 managed by
+  <peer_url>`: the bundle a replica could answer with is the main's, one
+  pull stale, and a box that followed it would be following a copy of a
+  copy.
   `POST /sync/replicas` (`{instance_id, dns_addr, version_applied}` → 204)
   is what a replica calls after applying a bundle. Registration is what
   turns on the implicit transfer allow — an AXFR for a primary zone is
@@ -823,7 +826,10 @@ Full parameter/response detail lives in `internal/api/openapi.yaml`
   anything that still names no host is `400`. `last_seen` is stamped by the
   main rather than sent, so a replica's clock cannot decide whether it
   looks stale. Write scope, for the same reason: an unauthenticated peer
-  must not be able to register itself into a transfer allow.
+  must not be able to register itself into a transfer allow. A replica
+  keeps no registry, so it answers this one `409 managed by <peer_url>`
+  too; `DELETE` stays available, since removing an entry a box does not
+  hold is already the state the caller asked for.
   `DELETE /sync/replicas/{instance_id}` removes one — the operator's
   action, since a replica that stopped pulling is shown as stale and never
   removed automatically. Both are idempotent.

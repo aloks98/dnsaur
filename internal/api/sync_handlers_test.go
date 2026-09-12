@@ -314,8 +314,9 @@ var syncUnguardedWrites = map[string]string{
 	"POST /api/v1/filters/lists/{id}/refresh": "operational, not config (§7): one list's Refresh now.",
 	"POST /api/v1/zones/{id}/refresh":         "operational, not config (§7): one zone's transfer.",
 
-	"POST /api/v1/sync/replicas":                 "the main's registry; a replica is not one.",
-	"DELETE /api/v1/sync/replicas/{instance_id}": "same.",
+	"DELETE /api/v1/sync/replicas/{instance_id}": "removing an entry from a registry a replica " +
+		"does not keep is already the state the caller asked for, and it is how an operator clears " +
+		"one left behind by a box that was a main.",
 }
 
 // operationalWrites are the two of the above that the spec calls out by
@@ -412,6 +413,19 @@ func TestReplicaRefusesSyncedWrites(t *testing.T) {
 	}
 	if got, _, _ := s.Settings().Get(t.Context(), "serve.dot.listen"); got == ":8854" {
 		t.Error("the local half of a refused map was written anyway")
+	}
+
+	// GET /sync/bundle is the one read in this list. A replica's bundle is
+	// not its own configuration to hand out — it is the main's, one pull
+	// stale and stripped of nothing — so a box pointed at a replica would
+	// follow a copy of a copy, and its registration would be recorded by a
+	// box that has no replicas. Both say which main to point at instead.
+	w = doReq(t, h, "GET", "/api/v1/sync/bundle", "", cookie)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("GET /sync/bundle on a replica = %d %s, want 409", w.Code, strings.TrimSpace(w.Body.String()))
+	}
+	if got, want := errorOf(t, w), "managed by https://main.lan"; got != want {
+		t.Errorf("bundle error = %q, want %q", got, want)
 	}
 }
 

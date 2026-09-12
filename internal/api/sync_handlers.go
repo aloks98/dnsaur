@@ -75,9 +75,14 @@ type SyncStatus struct {
 
 func (s *Server) syncRoutes() {
 	s.route("GET /api/v1/sync/version", s.requireAuth(s.handleSyncVersion))
-	s.route("GET /api/v1/sync/bundle", s.requireAuth(s.requireWriteScope(s.handleSyncBundle)))
+	// managed on both: a replica serves nobody a bundle and keeps no
+	// registry. The bundle it could answer with is the main's, one pull
+	// stale, and a box that registered here would be recorded where nothing
+	// notifies it or lets its transfers through (§6). The 409 names the main
+	// to point at instead, which is the whole answer to both mistakes.
+	s.route("GET /api/v1/sync/bundle", s.requireAuth(s.managed(s.requireWriteScope(s.handleSyncBundle))))
 	s.route("GET /api/v1/sync/status", s.requireAuth(s.handleSyncStatus))
-	s.route("POST /api/v1/sync/replicas", s.requireAuth(s.handleReplicaRegister))
+	s.route("POST /api/v1/sync/replicas", s.requireAuth(s.managed(s.handleReplicaRegister)))
 	s.route("DELETE /api/v1/sync/replicas/{instance_id}", s.requireAuth(s.handleReplicaForget))
 }
 
