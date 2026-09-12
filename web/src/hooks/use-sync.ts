@@ -1,7 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "../api/client";
 import type { SyncStatus } from "../api/types";
-import { settingsKeys, useResolverStatus } from "./use-settings";
+import { settingsKeys, syncKeys, useResolverStatus } from "./use-settings";
 
 // Config sync (spec §7, §8) — two dnsaur instances serving one network, one
 // of which takes its configuration from the other. See docs/api.md's Sync
@@ -11,10 +11,6 @@ import { settingsKeys, useResolverStatus } from "./use-settings";
  * checks its peer every `sync.interval_seconds` (30 by default), so asking
  * more often than that would only re-read the same numbers. */
 const POLL_MS = 30_000;
-
-export const syncKeys = {
-  status: ["sync", "status"] as const,
-};
 
 /**
  * GET /sync/status — the only place the main half (the sync key, the

@@ -2,7 +2,6 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "../api/client";
 import type { BackupResult, ResolverStatus, Settings } from "../api/types";
 import { somethingIsWrong } from "../lib/serving";
-import { syncKeys } from "./use-sync";
 
 // Canonical settings-domain hooks — GET /settings (Settings page, Task 12)
 // and PUT /settings (both the setup wizard's starter-upstreams write and
@@ -19,6 +18,15 @@ export const settingsKeys = {
    * and a prefix match would sweep an entry that has no queryFn to refetch
    * with. */
   serveSettleUntil: ["serve-settle-until"] as const,
+};
+
+/** GET /sync/status' key, declared here rather than in use-sync.ts beside
+ * the hooks that read it: useUpdateSetting below has to invalidate it, and
+ * use-sync.ts already needs `settingsKeys` and `useResolverStatus` from
+ * here — so keeping it there made the two modules import each other. The
+ * dependency runs one way, use-sync → use-settings. */
+export const syncKeys = {
+  status: ["sync", "status"] as const,
 };
 
 /** How long after a `serve.*` write the status is polled regardless of what
