@@ -732,8 +732,12 @@ Full parameter/response detail lives in `internal/api/openapi.yaml`
   signed transfer refused with nothing to say why. Everything else stays
   editable on a referenced key — rotating the secret is most of what `PUT`
   is for — and a key referenced only by a zone's `tsig_key_id` renames
-  freely, since that reference is by id. `name` takes the same labels a
-  zone name does. A TSIG key (RFC
+  freely, since that reference is by id. `DELETE` also refuses the key
+  `sync.tsig_key_id` designates, with the same `409 resource in use`: every
+  replica's derived secondaries sign with it, so deleting it would leave a
+  whole installation's transfers unable to authenticate. Point
+  `sync.tsig_key_id` at another key (or `0`) first. `name` takes the same
+  labels a zone name does. A TSIG key (RFC
   8945) authenticates a zone transfer between dnsaur and a peer. Changes take
   effect on the next signed message: the DNS server reads keys from the store
   per message, so a create, edit or delete needs no restart. `name` is

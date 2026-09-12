@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"strconv"
 )
 
 // TSIGKey authenticates a zone transfer (RFC 8945). Unlike AuthToken, whose
@@ -195,6 +196,11 @@ func notifyKeyRef(dialect string) string {
 // it is a narrower race on sqlite and a likely one on postgres, not a
 // postgres-only bug.
 //
+// The fourth reference is the designated sync key. It is spelled in the
+// settings table rather than in zones, but it is the same kind of claim: every
+// replica's derived secondaries sign with it (§4.1), so deleting it would
+// leave a whole installation's transfers unable to authenticate.
+//
 // It is not fixable from here, and not cheaply fixable anywhere. Putting
 // the check and the insert in one transaction does not help by itself: at
 // READ COMMITTED the check takes no lock, so the two still interleave.
@@ -216,7 +222,9 @@ func (t *tsigKeyStore) Delete(ctx context.Context, id int64) error {
 		`DELETE FROM tsig_keys WHERE id = ?
 		   AND NOT EXISTS (SELECT 1 FROM zones WHERE zones.tsig_key_id = tsig_keys.id)
 		   AND NOT EXISTS (`+aclKeyRef(t.s.dialect)+`)
-		   AND NOT EXISTS (`+notifyKeyRef(t.s.dialect)+`)`, id)
+		   AND NOT EXISTS (`+notifyKeyRef(t.s.dialect)+`)
+		   AND NOT EXISTS (SELECT 1 FROM settings WHERE key = ? AND value = ?)`,
+		id, syncKeySetting, strconv.FormatInt(id, 10))
 	if err != nil {
 		return err
 	}

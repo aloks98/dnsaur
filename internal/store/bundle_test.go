@@ -653,3 +653,66 @@ func TestLocalSettingKey(t *testing.T) {
 		}
 	}
 }
+
+// TestImportBundleDropsRecordsAZoneNoLongerHolds: a bundle carries zone
+// definitions and never records, so an import has nothing to overwrite a
+// replica's records with. That is right while the zone still holds records —
+// they are the AXFR's to keep (§5) — and wrong the moment the main turns the
+// zone into a forwarder or a stub, which hold none: the rows a previous
+// transfer left behind would go on being served under a zone that is now
+// supposed to hand every query somewhere else.
+func TestImportBundleDropsRecordsAZoneNoLongerHolds(t *testing.T) {
+	forEachDriverPair(t, func(t *testing.T, main, replica Store) {
+		ctx := t.Context()
+		f := newFixture()
+
+		zid, err := main.Zones().AddZone(ctx, Zone{
+			Name: f.zone, Type: "primary", Enabled: true,
+			SOANS: "ns1." + f.zone, SOAMbox: "hostmaster." + f.zone, SOASerial: 1,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		b, err := main.ExportBundle(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := replica.ImportBundle(ctx, b); err != nil {
+			t.Fatal(err)
+		}
+		// What the replica's own AXFR put there, which is the only way
+		// records ever reach it.
+		if _, err := replica.Zones().AddRecord(ctx, ZoneRecord{
+			ZoneID: zid, Name: "www", Type: "A", TTL: 300, RData: "10.0.0.1", Enabled: true,
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		z, err := main.Zones().Zone(ctx, zid)
+		if err != nil {
+			t.Fatal(err)
+		}
+		z.Type, z.ForwardTo = "forwarder", "10.0.0.53:53"
+		if err := main.Zones().UpdateZone(ctx, z); err != nil {
+			t.Fatal(err)
+		}
+		b, err = main.ExportBundle(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := replica.ImportBundle(ctx, b); err != nil {
+			t.Fatal(err)
+		}
+
+		if got, err := replica.Zones().Zone(ctx, zid); err != nil || got.Type != "forwarder" {
+			t.Fatalf("the replica's zone is %+v (err %v), want a forwarder", got, err)
+		}
+		recs, err := replica.Zones().Records(ctx, zid)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(recs) != 0 {
+			t.Fatalf("the forwarder zone still holds %d records: %+v", len(recs), recs)
+		}
+	})
+}

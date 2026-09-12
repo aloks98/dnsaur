@@ -3908,7 +3908,9 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
         "409":
-          description: a zone still references this key ("resource in use")
+          description: >
+            a zone still references this key, or sync.tsig_key_id designates
+            it ("resource in use")
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }

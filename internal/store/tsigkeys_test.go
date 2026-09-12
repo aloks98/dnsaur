@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"errors"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -211,6 +212,48 @@ func TestDeleteTSIGKeyNotifyToMatchesWholeNamesOnly(t *testing.T) {
 		// still be deletable.
 		if err := s.TSIGKeys().Delete(ctx, shortID); err != nil {
 			t.Fatalf("Delete(ns2.) = %v, want nil", err)
+		}
+	})
+}
+
+// TestDeleteRefusesTheDesignatedSyncKey: sync.tsig_key_id names the key every
+// replica's transfers are signed with (§4.1). It is a reference like a zone's
+// tsig_key_id or an ACL entry, spelled in the settings table instead of the
+// zones one, and deleting it would leave every derived secondary on every
+// replica unable to sign — a whole installation's zone transfers, taken out
+// by a delete the UI showed no reason to refuse.
+func TestDeleteRefusesTheDesignatedSyncKey(t *testing.T) {
+	forEachDriver(t, func(t *testing.T, st Store) {
+		ctx := context.Background()
+		id, err := st.TSIGKeys().Create(ctx, TSIGKey{
+			Name: testGroupName("sync") + ".", Algorithm: "hmac-sha256.", Secret: "c2VjcmV0",
+		})
+		if err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+		other, err := st.TSIGKeys().Create(ctx, TSIGKey{
+			Name: testGroupName("spare") + ".", Algorithm: "hmac-sha256.", Secret: "c2VjcmV0",
+		})
+		if err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+		if err := st.Settings().Set(ctx, "sync.tsig_key_id", strconv.FormatInt(id, 10)); err != nil {
+			t.Fatalf("designating the sync key: %v", err)
+		}
+		// postgres here is one database shared by this package's whole run,
+		// so the designation must not outlive the subtest that made it.
+		t.Cleanup(func() { _ = st.Settings().Set(context.Background(), "sync.tsig_key_id", "0") })
+
+		if err := st.TSIGKeys().Delete(ctx, id); !errors.Is(err, ErrInUse) {
+			t.Fatalf("Delete = %v, want ErrInUse: the designated sync key must not vanish", err)
+		}
+		if _, ok, _ := st.TSIGKeys().Get(ctx, id); !ok {
+			t.Fatal("the sync key is gone after a refused delete")
+		}
+		// Only that one key: the guard is a reference check, not a freeze on
+		// the table while sync is configured.
+		if err := st.TSIGKeys().Delete(ctx, other); err != nil {
+			t.Fatalf("Delete of a key nothing names = %v, want nil", err)
 		}
 	})
 }

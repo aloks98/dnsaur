@@ -366,6 +366,22 @@ func (s *sqlStore) ImportBundle(ctx context.Context, b Bundle) error {
 			z.AllowTransfer, z.NotifyTo, z.ForwardTo, z.CreatedAt, z.ModifiedAt); err != nil {
 			return err
 		}
+		// A bundle carries no records, so there is nothing here to overwrite
+		// the ones a transfer left — which is right for a zone that still
+		// holds records (§5 leaves the AXFR's own state alone) and wrong the
+		// moment the main turns one into a forwarder or a stub. Those answer
+		// from somewhere else entirely, and the rows left behind would go on
+		// being served under a zone that no longer has any.
+		//
+		// `internal` is in neither list: it holds records (the built-ins do)
+		// and never travels in a bundle, so it never reaches this loop.
+		switch strings.ToLower(z.Type) {
+		case "primary", "secondary":
+		default:
+			if err := s.execTx(ctx, tx, `DELETE FROM zone_records WHERE zone_id = ?`, z.ID); err != nil {
+				return err
+			}
+		}
 	}
 	for _, l := range b.Lists {
 		for _, groupID := range l.Groups {
