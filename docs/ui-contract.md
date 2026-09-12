@@ -77,8 +77,11 @@ every write to configuration its main owns is refused with **409**
 `internal/api/sync_handlers.go`): groups, clients, filter lists, rules, TSIG
 keys, zones and zone records, **both `/blocking/pause` writes** (the pause
 state lives in the synced `blocking.pauses` setting — a pause is a decision
-about the network, and clients reach either box), and `PUT /settings` for any
-key outside the instance-local set. The peer URL in the string is verbatim
+about the network, and clients reach either box), `PUT /settings` for any
+key outside the instance-local set, and the two sync endpoints a replica is
+on the wrong end of — `GET /sync/bundle` (the bundle it could answer with is
+the main's, one pull stale) and `POST /sync/replicas` (it keeps no
+registry). The peer URL in the string is verbatim
 what `sync.peer_url` holds, so the screen can print it as-is. Two writes stay
 available because they are operational rather than configuration —
 `POST /filters/lists/{id}/refresh` and `POST /zones/{id}/refresh` — and so do
@@ -292,8 +295,9 @@ plain 401.
 A flat object; **every value is a string**, including numbers. Keys prefixed
 `instance.` are stripped, as are the bookkeeping rows by name —
 `stats.watermark`, `blocking.pauses`, `sync.replicas`, and a replica's
-`sync.applied_version`, `sync.applied_at`, `sync.last_pull_at` and
-`sync.last_error` — and `sync.token`, which is a credential. `PUT` refuses
+`sync.applied_version`, `sync.applied_peer`, `sync.applied_at`,
+`sync.last_pull_at` and `sync.last_error` — and `sync.token`, which is a
+credential. `PUT` refuses
 all of them but the token. `stats.retention_days` and
 `sync.interval_seconds` share those prefixes, are ordinary settings, and are
 returned.
@@ -465,12 +469,15 @@ change nothing visible. `GET ?client_id=` reads the client list to find its
 group, which is where its **503** comes from; an id naming no client reports
 only the global pause.
 
-**Pause state survives a restart.** Every change writes the internal
-settings row `blocking.pauses` (unix ms per scope, expired entries pruned),
-which `App.Start` installs before the listeners bind. Entries that ran out
-while the process was down are dropped rather than reinstated. Like
-`stats.watermark`, the row is stripped from `GET /settings` and refused by
-`PUT`.
+**Pause state survives a restart, and reaches a replica.** Every change
+writes the settings row `blocking.pauses` (unix ms per scope, expired
+entries pruned), which `App.Start` installs before the listeners bind and
+every settings reload installs again — that is how a pause set on the main
+arrives with the next bundle. Entries that ran out while the process was
+down are dropped rather than reinstated. The row is stripped from
+`GET /settings` and refused by `PUT`, like `stats.watermark`, but unlike it
+the row is configuration: it advances `config_version` and travels in a
+bundle.
 
 ---
 
@@ -1076,9 +1083,9 @@ main*); clearing `sync.peer_url` is the promotion.
 | Endpoint | Scope | Success | Notes |
 |---|---|---|---|
 | `GET /sync/version` | any | 200 `{config_version, instance_id}` | the cheap probe; the bundle is only fetched when the version moved |
-| `GET /sync/bundle` | **write** | 200 the bundle | **403** `write scope required` for a `read` token |
+| `GET /sync/bundle` | **write** | 200 the bundle | **403** `write scope required` for a `read` token; **409** `managed by <peer_url>` on a replica |
 | `GET /sync/status` | any | 200 the status object | answers on both roles |
-| `POST /sync/replicas` | write | 204 | `{instance_id, dns_addr, version_applied}`; idempotent |
+| `POST /sync/replicas` | write | 204 | `{instance_id, dns_addr, version_applied}`; idempotent; **409** `managed by <peer_url>` on a replica |
 | `DELETE /sync/replicas/{instance_id}` | write | 204 | idempotent — an id that is not registered is already in the state asked for |
 
 `GET /sync/bundle` is the one `GET` in this API that scope refuses rather

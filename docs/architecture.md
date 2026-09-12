@@ -838,7 +838,8 @@ Two rules keep a half-applied configuration off the replica:
 
 - **The version decides.** A bundle is fetched only when the probe's
   `config_version` differs from the one the replica last applied — a box
-  that has never applied one fetches whatever the main has — and applied
+  that has never applied one, or that last applied one from a *different*
+  peer, fetches whatever the main has — and applied
   only when the bundle's own version still matches the probe's. A
   write landing between the two requests is caught by the next cycle rather
   than applied half a version late.
@@ -851,8 +852,11 @@ Two rules keep a half-applied configuration off the replica:
 After the transaction the replica runs what an API write handler runs after
 its own write, in that order: `ReloadClients`, `RecompileFilters`,
 `ReloadZones`, `ReloadSettings`. Recompile, not refresh — a bundle cannot
-change what a list URL serves, and a list this box has never downloaded is
-fetched by the refresher's own ticker, exactly as a newly created one is.
+change what a list URL serves. A list this box has never downloaded is the
+exception: the pull kicks the same background download a list creation does,
+because a bundle carries a URL and not its contents, and waiting for
+`lists.refresh_hours` would leave a newly following replica serving a LAN
+with blocking configured and nothing blocked.
 
 The registration closes every cycle, whether or not anything was applied: it
 is also the heartbeat the main measures staleness by, and configuration
@@ -1029,8 +1033,9 @@ that waits on the internet.
   records what each attempt produced (`ok`/`stale`/`failed`/`empty` — see
   [`ui-contract.md`](ui-contract.md#refresh-outcome-last_status)) and then
   compiles. It runs on the `lists.refresh_hours` ticker, on
-  `POST /filters/refresh`, when a list is created or re-enabled, and once in
-  the background at startup.
+  `POST /filters/refresh`, when a list is created or re-enabled, once in
+  the background at startup, and after a config-sync pull that brought a
+  list this box has no copy of.
 
 `App.Start` compiles synchronously **before** it binds any listener. The
 first download can take as long as the slowest subscribed URL — with the WAN

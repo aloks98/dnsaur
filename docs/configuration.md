@@ -187,7 +187,7 @@ it — none of them travels in a config bundle.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `instance.id` | random UUID, generated per install | Stable identifier for this instance (used by future HA sync) |
+| `instance.id` | random, generated per install | Stable identifier for this instance. It is what `GET /api/v1/sync/version` reports, so a replica pointed at itself — a box whose database was copied from its main — is refused instead of quietly becoming its own replica, and it is the id a replica registers under and the main's Sync band lists it by |
 | `upstreams` | `1.1.1.1:53,1.0.0.1:53,9.9.9.9:53` | Comma-separated upstream resolvers. Each entry is plain (`host:port`; bare IPv6 and missing ports are normalized) or, with a scheme, DNS-over-TLS (`tls://`) or DNS-over-HTTPS (`https://`) — see Encrypted upstreams below for the grammar. These are the **default** route — where a name no zone claims is sent. A suffix claimed by a `forwarder` or `stub` zone goes to that zone's upstreams instead, and never falls back to these; see Conditional forwarding below |
 | `upstream.strategy` | `race` | Upstream selection strategy: `race` (query all healthy upstreams in parallel, first good answer wins), `failover` (try them in configured order, fall through on error/SERVFAIL), or `fastest` (try them ordered by measured EWMA latency, fastest first). One setting for the whole server: it applies to a conditional route's upstreams exactly as it applies to the defaults, and there is no per-zone strategy |
 | `blocking.mode` | `null-ip` | How blocked queries are answered: `null-ip` (`0.0.0.0`) or `nxdomain` |
@@ -225,8 +225,11 @@ This is a documented Phase 1 limitation, expected to be revisited in a
 later phase.
 
 Bookkeeping rows are not configuration: the `instance.*` prefix, the
-rollup watermark `stats.watermark`, the pause state `blocking.pauses`, and
-the five sync rows listed under Config sync below. None of them is editable
+rollup watermark `stats.watermark`, and the six sync rows listed under
+Config sync below. The pause state `blocking.pauses` is in that list too —
+nothing edits it by hand and `GET /settings` omits it — but it *is*
+configuration: a pause is a decision about the network, so it advances
+`config_version` and travels in a bundle like any other setting. None of them is editable
 through `PUT /api/v1/settings`, and `GET /api/v1/settings` omits them all.
 `sync.token` is excluded from that read too, and is the only *editable* key
 that is: a read must not be a way to copy the credential out.
@@ -243,14 +246,15 @@ in [`docs/architecture.md`](architecture.md#config-sync-main-and-replica),
 the endpoints are in [`docs/api.md`](api.md), and the screens in
 [`docs/dashboard.md`](dashboard.md#sync).
 
-Five more `sync.*` rows exist in the `settings` table and are **not**
+Six more `sync.*` rows exist in the `settings` table and are **not**
 settings: the server writes them about itself, `PUT /settings` refuses them
 (`setting not editable`), and `GET /settings` omits them. They are reported
 by `GET /api/v1/sync/status` instead, in a shape the dashboard can use.
 
 | Key | On | Meaning |
 |---|---|---|
-| `sync.applied_version` | replica | `config_version` of the last bundle it applied |
+| `sync.applied_version` | replica | `config_version` of the last bundle it applied. Blanked when the box is promoted: a counter it no longer follows is not a number to compare the next main against |
+| `sync.applied_peer` | replica | the peer that version was applied from. Version numbers are each main's own count of its own writes, so a replica re-pointed at a main that happens to sit at the same number still fetches the bundle |
 | `sync.applied_at` | replica | when it applied that bundle (unix ms) |
 | `sync.last_pull_at` | replica | when the last pull cycle finished, successful or not (unix ms) |
 | `sync.last_error` | replica | why the last cycle failed; cleared by the next one that succeeds |
@@ -259,7 +263,11 @@ by `GET /api/v1/sync/status` instead, in a shape the dashboard can use.
 ### Setting up a pair
 
 Two boxes, `main.example` and `replica.example`, both already set up and
-running. Nothing here is done twice: every step is on one box or the other.
+running. The replica has to be a **fresh install**, not a restore of the
+main's database: the two would share one `instance.id`, and a box that
+answers the version probe with the id of the box asking is refused as
+following itself. Nothing here is done twice: every step is on one box or
+the other.
 
 **On the main:**
 
@@ -296,7 +304,10 @@ running. Nothing here is done twice: every step is on one box or the other.
 Within one interval, expect:
 
 - the replica's groups, clients, lists, rules, TSIG keys and settings to
-  match the main's, under the main's ids;
+  match the main's, under the main's ids — and the lists it was given to be
+  downloaded shortly after the first pull rather than at the next
+  `lists.refresh_hours`, since a bundle carries a list's URL and not its
+  contents;
 - every `primary` zone on the main to exist on the replica as a
   **secondary** transferring from `sync.primary_dns` under the sync key —
   with no `allow_transfer` or `notify_to` edit on either box, since
