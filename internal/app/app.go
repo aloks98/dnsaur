@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"net"
 	"net/http"
 	"net/netip"
@@ -194,6 +195,11 @@ type App struct {
 	// atomic.Pointer, and nil for "no downgrade", so the query path and the
 	// API handler never contend with a settings write.
 	downgrade atomic.Pointer[downgradeState]
+	// settingsPasses counts the reconcile passes the configuration watcher
+	// has finished, the ones it decided to skip included. Nothing in the
+	// server reads it: it is what lets a test wait for a pass to have
+	// happened before asserting that the pass changed nothing.
+	settingsPasses atomic.Uint64
 	// handler is the same pipeline every listener serves through — plain
 	// :53, and (Task 8) DoT and DoH. Built once in Start, before the first
 	// applySettings call, so a restart with either encrypted protocol
@@ -977,6 +983,14 @@ func (a *App) Start(ctx context.Context) error {
 		a.runServingRetry,
 		func(c context.Context) { a.refresher.Run(c, refreshEvery) },
 		func(c context.Context) {
+			// The settings as this loop last applied them. A write to a
+			// synced table — a client, a rule, a zone — moves
+			// config_version and wakes this loop without touching a single
+			// setting, and the handler behind that write has already
+			// reloaded what it did change (§5). Reconciling anyway rebuilt
+			// the forwarder, reloaded the registry and recompiled every
+			// ruleset to arrive at exactly what was already serving.
+			var applied map[string]string
 			for {
 				select {
 				case <-c.Done():
@@ -991,6 +1005,20 @@ func (a *App) Start(ctx context.Context) error {
 					for len(changes) > 0 {
 						<-changes
 					}
+					switch cur, err := a.st.Settings().All(c); {
+					case err != nil:
+						// "Nothing changed" could not be established, so it
+						// is not claimed: a needless reconcile costs a
+						// rebuild, and a skipped one leaves the server
+						// answering from a configuration nobody chose.
+						slog.Warn("comparing the settings with the last applied set failed", "err", err)
+						applied = nil
+					case applied != nil && maps.Equal(applied, cur):
+						a.settingsPasses.Add(1)
+						continue
+					default:
+						applied = cur
+					}
 					a.applySettings(c)
 					// Compile, do not download. A settings write can
 					// change which rules and lists a group enforces, so
@@ -1002,6 +1030,7 @@ func (a *App) Start(ctx context.Context) error {
 					if err := a.refresher.Recompile(c); err != nil {
 						slog.Error("recompiling filters after a settings change failed", "err", err)
 					}
+					a.settingsPasses.Add(1)
 				}
 			}
 		},

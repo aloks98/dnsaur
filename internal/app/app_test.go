@@ -1914,3 +1914,36 @@ func mustSetting(t *testing.T, a *App, key, value string) {
 		t.Fatalf("SetInternal(%s): %v", key, err)
 	}
 }
+
+// TestASyncedTableWriteDoesNotReconcileTheSettings: every configuration
+// write publishes on the same hub, so the watcher wakes for a client, rule,
+// list or zone write too — and used to rebuild the forwarder, reload the
+// registry and recompile every ruleset for each one, none of which the write
+// could possibly have changed. The handler behind the write has already
+// reloaded what it did change (§5).
+func TestASyncedTableWriteDoesNotReconcileTheSettings(t *testing.T) {
+	ctx := context.Background()
+	a := newTestApp(t, withUpstreams(mockDNS(t, answerA("9.9.9.9"))))
+
+	// A settings write first: it is what a reconcile is for, and it leaves
+	// the watcher holding a snapshot to compare the next wake against.
+	first := a.fwd.forwarder()
+	if err := a.Store().Settings().Set(ctx, "upstreams", "10.9.9.9:53"); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	waitFor(t, "the forwarder to be rebuilt for a settings write", func() bool {
+		return a.fwd.forwarder() != first
+	})
+
+	before := a.fwd.forwarder()
+	passes := a.settingsPasses.Load()
+	if _, err := a.Store().Clients().AddGroup(ctx, "kids"); err != nil {
+		t.Fatalf("AddGroup: %v", err)
+	}
+	waitFor(t, "the settings watcher to finish the pass a group add woke it for", func() bool {
+		return a.settingsPasses.Load() > passes
+	})
+	if a.fwd.forwarder() != before {
+		t.Fatal("a group add rebuilt the forwarder; nothing it wrote is a setting")
+	}
+}
