@@ -816,7 +816,11 @@ Full parameter/response detail lives in `internal/api/openapi.yaml`
   came from a registered replica's `dns_addr` — and adds that address as a
   NOTIFY target for every primary zone, so neither needs an ACL edit and
   `allow_transfer` still says exactly what the operator wrote. `dns_addr`
-  must be `host:port` with the host present; `last_seen` is stamped by the
+  is stored as `host:port` with the host present — a value with no host
+  (`:53`, what a replica listening on every interface has to send) is
+  completed with the address the request arrived from, which is the
+  forwarded one only when the request came through a trusted proxy;
+  anything that still names no host is `400`. `last_seen` is stamped by the
   main rather than sent, so a replica's clock cannot decide whether it
   looks stale. Write scope, for the same reason: an unauthenticated peer
   must not be able to register itself into a transfer allow.

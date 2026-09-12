@@ -9,9 +9,10 @@ background jobs, and a REST API + auth server on top of the same storage
 layer (see [`docs/api.md`](api.md)). The web dashboard (`web/`, a React
 SPA) is built separately but embedded into that same binary via
 `//go:embed` and served by the same HTTP server as the API — there is no
-separate frontend process or listener. Planned services — DHCP, HA config
-sync — are additional listeners that feed the same internal packages
-rather than separate processes.
+separate frontend process or listener. A second instance following this one
+(see Config sync below) is another copy of the same binary, not a component
+of this one; the DHCP server planned for a later phase is an additional
+listener feeding the same internal packages rather than a separate process.
 
 ## The middleware pipeline
 
@@ -787,6 +788,168 @@ zone's master; it is spelled `pullsFromAMaster` in `internal/api` and again
 in `internal/zones`, deliberately not shared, since one answers about a type
 an HTTP client just typed and the other about a stored row.
 
+## Config sync (main and replica)
+
+Two dnsaur boxes serve one network so that either can answer when the other
+is down — DHCP hands out both addresses, and the failover is the client's.
+Zone transfers already make authoritative data identical on the pair; config
+sync is what makes the rest of it identical, so the two boxes behave the
+same.
+
+One instance is the **main**: it takes writes, and it learns nothing it did
+not already know except that a replica exists. Any instance with
+`sync.peer_url` set is a **replica**: it pulls the main's configuration on a
+timer, applies it, and refuses local writes to anything that configuration
+covers with `409 managed by <peer>`. Which of the two a box is comes from
+that one setting — there is no third mode, no election, and no split-brain
+to recover from, because only one box ever accepted writes.
+`internal/confsync` holds both halves: `Replica`, the pull loop (it runs on
+every box, and a box with no peer never dials), and `Registry`, the main's
+record of who is following it. The design rationale is in
+[`docs/superpowers/specs/2026-09-11-config-sync-design.md`](superpowers/specs/2026-09-11-config-sync-design.md);
+the endpoints are in [`docs/api.md`](api.md), the settings and a two-box
+walkthrough in [`docs/configuration.md`](configuration.md#config-sync), and
+the screens in [`docs/dashboard.md`](dashboard.md#sync).
+
+### The pull cycle
+
+```
+ replica                                   main
+   │ every sync.interval_seconds (default 30 s)
+   ├─ GET /api/v1/sync/version ───────────►│  {config_version, instance_id}
+   │◄──────────────────────────────────────┤
+   │ unchanged → register, done            │
+   │ changed:                              │
+   ├─ GET /api/v1/sync/bundle ────────────►│  the bundle, Bearer sync.token
+   │◄──────────────────────────────────────┤
+   │ derive zones, import in one tx        │
+   │ reload clients, filters, zones, settings
+   ├─ POST /api/v1/sync/replicas ─────────►│  {instance_id, dns_addr, version_applied}
+   │◄──────────────────────────────────────┤  204; the main records the replica
+```
+
+Polling, not push. The version probe is a few hundred bytes, and at 30 s the
+worst-case lag is one interval — the same order as the TTLs the network
+already lives with. A pull that fails leaves the last applied configuration
+in force and records why in `sync.last_error`; DNS is unaffected, which is
+the behaviour a store that is down already has everywhere else.
+
+Two rules keep a half-applied configuration off the replica:
+
+- **The version decides.** A bundle is fetched only when the probe's
+  `config_version` differs from the one the replica last applied — a box
+  that has never applied one fetches whatever the main has — and applied
+  only when the bundle's own version still matches the probe's. A
+  write landing between the two requests is caught by the next cycle rather
+  than applied half a version late.
+- **One transaction.** `store.ImportBundle` diffs every synced table against
+  the bundle by id — insert, update, delete — writes the settings it
+  carries, removes the synced settings it does not, and bumps
+  `config_version` once. Either the box matches the bundle or it matches
+  what it had before.
+
+After the transaction the replica runs what an API write handler runs after
+its own write, in that order: `ReloadClients`, `RecompileFilters`,
+`ReloadZones`, `ReloadSettings`. Recompile, not refresh — a bundle cannot
+change what a list URL serves, and a list this box has never downloaded is
+fetched by the refresher's own ticker, exactly as a newly created one is.
+
+The registration closes every cycle, whether or not anything was applied: it
+is also the heartbeat the main measures staleness by, and configuration
+changes far less often than three intervals.
+
+### What travels, and what stays on the box
+
+| Data | In the bundle? |
+|---|---|
+| Groups, clients, lists and their group assignments, rules, TSIG keys | Yes — with the main's ids |
+| Zone *definitions* | Yes, rewritten for the replica (below) |
+| Zone records, a zone's transfer state, a list's refresh state | No — the replica's own transfers and downloads produce them |
+| Every setting outside the local set: `upstreams`, `upstream.strategy`, `blocking.*`, `cache.*`, `lists.refresh_hours`, `qlog.*`, `stats.retention_days` | Yes — including `blocking.pauses`, since a pause is a decision about the network and clients reach either box |
+| `instance.id`, every `serve.*` key, every `sync.*` key, `stats.watermark` | No — they describe the box, not the service |
+| The bootstrap YAML (`dns_listen`, `http_listen`, `data_dir`, `storage.*`, `log_*`, `trusted_proxies`) | No — it is not in the `settings` table at all |
+| Users, sessions, API tokens, the query log and the stats behind it | No — an admin account per box; the replica's token to the main is the only credential that crosses |
+
+`store.LocalSettingKey` is the single answer to "does this key stay here?":
+the main asks it to decide what leaves in a bundle, and the replica asks it
+both to decide what a bundle may overwrite and to keep its own keys from
+being pruned as absent from one.
+
+Ids are the main's, and the import keeps them, so a `group_id`, a
+`tsig_key_id` or a query log row's `rule_id` names the same row on both
+boxes. A replica never creates a synced row of its own, so its id space is
+free for the main's to occupy; on Postgres the import advances each synced
+table's sequence past the ids it wrote, so the first row created after a
+promotion does not collide with one the main already used.
+
+**The config version** is what the probe compares. Every write to a synced
+table advances it, inside that write's own transaction — a group, a client,
+a list or an assignment, a rule, a TSIG key, a zone definition, a setting.
+Zone records, serial bumps, transfer bookkeeping and a list's refresh state
+do not, and neither does a registration arriving from a replica: bumping the
+version on each of those would have every replica pull a bundle it already
+has, forever.
+
+### Zones on the replica
+
+The bundle carries definitions; the records arrive by AXFR.
+`confsync.DeriveZones` rewrites each zone before the import:
+
+| The main's type | The replica gets |
+|---|---|
+| `primary` | a `secondary` of the same name, transferring from `sync.primary_dns` (empty: the peer URL's host on port 53) under the main's sync key, with `allow_transfer` and `notify_to` copied verbatim so the replica serves its own downstreams the same way the main does |
+| `secondary` | the same definition — both boxes become equal secondaries of the same external primary, and the replica does not transfer from the main |
+| `stub`, `forwarder` | the same definition |
+| `internal` | nothing; each box seeds its own RFC 6303 built-ins, and no bundle carries them |
+
+A derived secondary that already exists keeps its transfer state —
+`soa_serial`, `refreshed_at`, `expires_at` and the records themselves. Only
+the definition columns are written, so a config pull never makes a serving
+secondary forget what it transferred. A newly derived one is due for a
+refresh immediately, so its first transfer starts on the scheduler's next
+pass.
+
+### The implicit allow and notify
+
+Nothing rewrites an ACL to let the pair transfer. The main designates one
+TSIG key as `sync.tsig_key_id` — creating that key and picking it is the one
+manual step setting up a pair — and registration adds one clause beside each
+existing gate:
+
+- **Transfer.** An AXFR for a `primary` zone that verified under the sync key
+  and arrived from a registered replica's `dns_addr` is served even though no
+  `allow_transfer` entry matches it (the `REFUSED` row of Zone transfers
+  above). The clause is asked only after `allow_transfer` has already
+  refused, so it widens who may transfer and never narrows it. A stale
+  replica still matches: stale is exactly the state of a box coming back from
+  an outage, which is the one that needs the data. A `dns_addr` naming a
+  hostname never matches — resolving one would put a DNS lookup inside the
+  gate of the server that answers DNS — so such a replica's transfers are
+  decided by `allow_transfer` as they were before it registered.
+- **NOTIFY.** Every registered replica that is *not* stale is appended to
+  each `primary` zone's targets, signed with the sync key, and reconciled
+  into `zone_notifies` like any other. Staleness is acted on here and not at
+  the transfer gate because the two cost different things: notifying a box
+  that has been silent buys a round of retries per zone per serial bump and
+  nothing else, since its own refresh timer collects the zone when it
+  returns. A replica an operator also wrote into `notify_to` by hand is told
+  once, under the entry they wrote. A secondary zone gets no replica targets:
+  the replica follows that zone from its own primary.
+
+A replica is **stale** when nothing has been heard from it for three times
+`sync.interval_seconds`. It is never deleted automatically — a box down for
+an afternoon is not a box whose transfer permission should quietly disappear
+— so the operator removes a retired one themselves, with **Forget** on the
+Sync band or `DELETE /api/v1/sync/replicas/{instance_id}`.
+
+### Promotion
+
+Clearing `sync.peer_url` and `sync.token` lifts the guard; **Stop following**
+sends both in one write. The box keeps whatever configuration it last applied
+and takes writes again. Nothing is repointed: the zones it derived are still
+secondaries, of a main that may be gone, and turning one into a primary is a
+per-zone decision on that zone's own page.
+
 ## Package map
 
 | Package | Responsibility |
@@ -801,14 +964,14 @@ an HTTP client just typed and the other about a stored row.
 | `internal/cache` | In-memory DNS response cache (TTL clamps, negative caching, serve-stale) |
 | `internal/upstream` | Upstream forwarders and selection strategy; also the conditional routing table (`SetConditional`) that sends a suffix a `forwarder` or `stub` zone claims to that zone's own upstreams — see Conditional routing above |
 | `internal/qlog` | Async query logging and retention pruning |
+| `internal/confsync` | Config sync between two instances (see Config sync above): `Replica`, the pull loop that probes a main's config version, fetches and validates a bundle, derives the replica's own zones from it and applies it; and `Registry`, the main's record of which replicas have registered, which is what the implicit transfer allow and NOTIFY targets are read from |
 | `internal/stats` | Hourly stats rollups from the query log |
 | `internal/store` | Storage interfaces plus SQLite/Postgres implementations, migrations, settings |
 | `internal/api` | HTTP REST API server + handlers (`/api/v1`: setup, settings, blocking, groups, clients, filters, zones, queries, stats, tokens), embedded OpenAPI 3.1 doc; also mounts the web dashboard's static files (`internal/api.StaticHandler`) on every non-`/api` path when `Deps.Static` is set. The static mount — and only the static mount, so SSE on `/api/v1/queries/tail` stays unbuffered — gzips responses and sets `Content-Security-Policy` (`frame-ancestors 'none'`), `X-Content-Type-Options: nosniff`, `Referrer-Policy: same-origin`, and `X-Frame-Options: DENY` |
 | `internal/auth` | Auth service: argon2id password hashing (bounded concurrency), session + scoped (read/write) API tokens with a 90-day session ceiling, optional TOTP 2FA with single-use codes |
 | `web` | The dashboard's Go-side glue: `//go:embed all:dist` over the React SPA's Vite build output, exposed as `web.Dist() fs.FS` for `internal/app` to hand to `internal/api.Deps.Static`. The actual frontend source (React 19 + TypeScript + Tailwind + TanStack Query, see `web/README.md`) lives under `web/src`, built independently (`pnpm build`) before the Go build embeds its output |
 
-Planned, not yet present: `internal/dhcp` (Phase 2), `internal/sync`
-(Phase 1.5 HA config sync).
+Planned, not yet present: `internal/dhcp` (Phase 2).
 
 ## Storage model
 

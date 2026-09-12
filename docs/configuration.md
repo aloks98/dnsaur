@@ -224,11 +224,104 @@ filters and zones through a reload the write handler triggers directly.
 This is a documented Phase 1 limitation, expected to be revisited in a
 later phase.
 
-Two internal key prefixes (`instance.*` and future `stats.*` bookkeeping)
-are not meant to be user-edited and are excluded from the settings API
-(`GET /api/v1/settings`). `sync.token` is excluded from that read too, and
-is the only *editable* key that is: a read must not be a way to copy the
-credential out.
+Bookkeeping rows are not configuration: the `instance.*` prefix, the
+rollup watermark `stats.watermark`, the pause state `blocking.pauses`, and
+the five sync rows listed under Config sync below. None of them is editable
+through `PUT /api/v1/settings`, and `GET /api/v1/settings` omits them all.
+`sync.token` is excluded from that read too, and is the only *editable* key
+that is: a read must not be a way to copy the credential out.
+
+## Config sync
+
+Two instances, one configuration. The **main** is the instance that takes
+writes; any instance with `sync.peer_url` set is a **replica**, which pulls
+the main's configuration every `sync.interval_seconds`, applies it in one
+transaction, and refuses local writes to anything it covers with `409
+managed by <peer>`. The five `sync.*` keys in the table above are all there
+is to configure. What travels in a bundle and what stays on each box is
+in [`docs/architecture.md`](architecture.md#config-sync-main-and-replica),
+the endpoints are in [`docs/api.md`](api.md), and the screens in
+[`docs/dashboard.md`](dashboard.md#sync).
+
+Five more `sync.*` rows exist in the `settings` table and are **not**
+settings: the server writes them about itself, `PUT /settings` refuses them
+(`setting not editable`), and `GET /settings` omits them. They are reported
+by `GET /api/v1/sync/status` instead, in a shape the dashboard can use.
+
+| Key | On | Meaning |
+|---|---|---|
+| `sync.applied_version` | replica | `config_version` of the last bundle it applied |
+| `sync.applied_at` | replica | when it applied that bundle (unix ms) |
+| `sync.last_pull_at` | replica | when the last pull cycle finished, successful or not (unix ms) |
+| `sync.last_error` | replica | why the last cycle failed; cleared by the next one that succeeds |
+| `sync.replicas` | main | the registered replicas, as JSON keyed by instance id |
+
+### Setting up a pair
+
+Two boxes, `main.example` and `replica.example`, both already set up and
+running. Nothing here is done twice: every step is on one box or the other.
+
+**On the main:**
+
+1. Create a TSIG key — **TSIG keys** in the dashboard, or
+   `POST /api/v1/tsig-keys` — and set `sync.tsig_key_id` to its id. That is
+   the key replicas sign their zone transfers with, and designating it is
+   the one manual step the main needs. While it is `0`, no replica can
+   transfer a zone.
+2. Mint a **write-scope** API token (**Account & security → API tokens**, or
+   `POST /api/v1/tokens` with `{"name": "replica", "scope": "write"}`). The
+   plaintext is shown once. Write scope, not read: the bundle carries every
+   TSIG secret on the box, which a read token is not entitled to.
+
+**On the replica:**
+
+3. Save the sync settings. Send the token in the same request as the peer
+   URL (or before it): a peer with no credential is a replica that pulls a
+   `401` forever, so the write is refused from either direction.
+
+   ```
+   PUT /api/v1/settings
+   {
+     "sync.token": "<the token from step 2>",
+     "sync.peer_url": "https://main.example",
+     "sync.primary_dns": "10.0.0.5:53"
+   }
+   ```
+
+   `sync.peer_url` is scheme and host only — no path, query or credentials.
+   `sync.primary_dns` is where the main answers DNS and may be left empty,
+   which means the peer URL's host on port 53. `sync.interval_seconds`
+   defaults to 30 and has a floor of 5.
+
+Within one interval, expect:
+
+- the replica's groups, clients, lists, rules, TSIG keys and settings to
+  match the main's, under the main's ids;
+- every `primary` zone on the main to exist on the replica as a
+  **secondary** transferring from `sync.primary_dns` under the sync key —
+  with no `allow_transfer` or `notify_to` edit on either box, since
+  registering is what admits the transfer and adds the NOTIFY target;
+- the replica to appear on the main's Sync band with its DNS address,
+  applied version and last-seen stamp (it registers on every cycle; missing
+  three of them shows it as stale, and nothing removes it but the operator);
+- writes to synced configuration on the replica to answer `409 {"error":
+  "managed by https://main.example"}`, while its own Protocols, Sync and
+  Backup bands, its account, sessions and tokens, and both **Refresh now**
+  actions keep working.
+
+Use HTTPS. There is no certificate subsystem here — a reverse proxy in front
+of the main, or a LAN you trust, is your call — and over plain `http://` the
+pull token and the whole bundle, every TSIG secret on the main included,
+cross the network in the clear on every pull. A replica following an
+`http://` peer says so on a banner across every screen until it does not.
+`sync.token` is never returned by `GET /settings` on either box, and leaves
+the replica only as the `Authorization: Bearer` header on a pull.
+
+To promote the replica, clear both keys in one write —
+`PUT /api/v1/settings {"sync.peer_url": "", "sync.token": ""}`, which is what
+the Sync band's **Stop following** sends. It keeps the configuration it last
+applied and takes writes again; the zones it derived stay secondaries until
+you change each one's type on its own page.
 
 ## Encrypted upstreams
 
