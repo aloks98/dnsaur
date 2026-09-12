@@ -226,13 +226,17 @@ later phase.
 
 Bookkeeping rows are not configuration: the `instance.*` prefix, the
 rollup watermark `stats.watermark`, and the six sync rows listed under
-Config sync below. The pause state `blocking.pauses` is in that list too —
-nothing edits it by hand and `GET /settings` omits it — but it *is*
-configuration: a pause is a decision about the network, so it advances
-`config_version` and travels in a bundle like any other setting. None of them is editable
-through `PUT /api/v1/settings`, and `GET /api/v1/settings` omits them all.
+Config sync below. None of them is editable through
+`PUT /api/v1/settings`, and `GET /api/v1/settings` omits them all.
 `sync.token` is excluded from that read too, and is the only *editable* key
 that is: a read must not be a way to copy the credential out.
+
+The pause state `blocking.pauses` is hidden and refused by `PUT` in the same
+way, and is **not** one of those rows: a pause is a decision about the
+network and clients reach either box, so it is configuration. It advances
+`config_version`, a bundle carries it, and a pause set on the main is in
+force on every replica within one interval — see
+[Blocking pause](ui-contract.md#blocking-pause) for the state itself.
 
 ## Config sync
 

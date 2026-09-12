@@ -681,10 +681,14 @@ func TestImportBundleDropsRecordsAZoneNoLongerHolds(t *testing.T) {
 			t.Fatal(err)
 		}
 		// What the replica's own AXFR put there, which is the only way
-		// records ever reach it.
+		// records ever reach it — the records, and the transfer state that
+		// says when the next one is due.
 		if _, err := replica.Zones().AddRecord(ctx, ZoneRecord{
 			ZoneID: zid, Name: "www", Type: "A", TTL: 300, RData: "10.0.0.1", Enabled: true,
 		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := replica.Zones().NoteRefreshed(ctx, zid, 1757580000000, 1757590000000); err != nil {
 			t.Fatal(err)
 		}
 
@@ -713,6 +717,19 @@ func TestImportBundleDropsRecordsAZoneNoLongerHolds(t *testing.T) {
 		}
 		if len(recs) != 0 {
 			t.Fatalf("the forwarder zone still holds %d records: %+v", len(recs), recs)
+		}
+		// And the transfer state goes with them. If the main turns the zone
+		// back into a primary, the replica has to transfer it again — with a
+		// serial left standing, the comparison says it is already level and
+		// the AXFR never runs; with a refreshed_at left standing, it is not
+		// even due.
+		z, err = replica.Zones().Zone(ctx, zid)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if z.SOASerial != 0 || z.RefreshedAt != 0 {
+			t.Fatalf("the forwarder zone kept its transfer state: soa_serial=%d refreshed_at=%d",
+				z.SOASerial, z.RefreshedAt)
 		}
 	})
 }

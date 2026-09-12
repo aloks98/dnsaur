@@ -17,9 +17,13 @@ type blockingCfg struct {
 	ttl  uint32
 }
 
-// PausesKey names the settings row the pause state is stored under. It is
-// bookkeeping rather than configuration — nothing edits it by hand, and
-// GET /settings strips it, the same treatment stats.watermark gets.
+// PausesKey names the settings row the pause state is stored under.
+//
+// Nothing edits it by hand and GET /settings strips it, which is where the
+// resemblance to stats.watermark ends: a pause is a decision about the
+// network and clients reach either box, so the row is configuration. Writing
+// it advances config_version, a bundle carries it, and a replica installs it
+// through Restore on the settings reload that follows a pull.
 const PausesKey = "blocking.pauses"
 
 // PauseKind says what one pause covers.

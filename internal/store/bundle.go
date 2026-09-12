@@ -381,6 +381,15 @@ func (s *sqlStore) ImportBundle(ctx context.Context, b Bundle) error {
 			if err := s.execTx(ctx, tx, `DELETE FROM zone_records WHERE zone_id = ?`, z.ID); err != nil {
 				return err
 			}
+			// The transfer state goes with them. A zone flipped back to
+			// primary or secondary later has to be transferred again, and a
+			// serial left standing says it is already level with the
+			// primary — the AXFR is skipped and the zone serves nothing —
+			// while a refreshed_at left standing says it is not even due.
+			if err := s.execTx(ctx, tx,
+				`UPDATE zones SET soa_serial = 0, refreshed_at = 0 WHERE id = ?`, z.ID); err != nil {
+				return err
+			}
 		}
 	}
 	for _, l := range b.Lists {
