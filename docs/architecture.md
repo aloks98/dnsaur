@@ -884,7 +884,11 @@ Ids are the main's, and the import keeps them, so a `group_id`, a
 boxes. A replica never creates a synced row of its own, so its id space is
 free for the main's to occupy; on Postgres the import advances each synced
 table's sequence past the ids it wrote, so the first row created after a
-promotion does not collide with one the main already used.
+promotion does not collide with one the main already used. The one id
+space a replica does fill on its own is the built-in zones, seeded at
+whatever ids its sequence had reached; when a bundle zone lands on one of
+those, the built-in gives way and is seeded again by name at a fresh id,
+records included.
 
 **The config version** is what the probe compares. Every write to a synced
 table advances it, inside that write's own transaction — a group, a client,

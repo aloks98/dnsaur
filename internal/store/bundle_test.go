@@ -319,7 +319,12 @@ func TestImportBundleRefusesUnknownFormat(t *testing.T) {
 // row would then be stuck on this box for good. Refused rather than silently
 // skipped: two boxes disagreeing with nothing to say so is worse than a pull
 // that fails and says why.
-func TestImportBundleRefusesToOverwriteABuiltinZone(t *testing.T) {
+// TestImportBundleReseatsABuiltinZoneTheBundleCollidesWith is the case an
+// older main meets a newer replica: the main's user zones sit at ids its
+// built-ins were seeded after, while a fresh replica seeded its built-ins
+// first, at exactly those ids. The bundle's zone must take its id (§4.1),
+// and the built-in must survive by name — with its records — at another.
+func TestImportBundleReseatsABuiltinZoneTheBundleCollidesWith(t *testing.T) {
 	forEachDriver(t, func(t *testing.T, s Store) {
 		ctx := t.Context()
 		f := newFixture()
@@ -327,18 +332,13 @@ func TestImportBundleRefusesToOverwriteABuiltinZone(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		zs, err := s.Zones().Zones(ctx)
+		builtin := builtinZoneID(t, s, BuiltinZones[0])
+		before, err := s.Zones().Records(ctx, builtin)
 		if err != nil {
 			t.Fatal(err)
 		}
-		var builtin int64
-		for _, z := range zs {
-			if z.Name == BuiltinZones[0] {
-				builtin = z.ID
-			}
-		}
-		if builtin == 0 {
-			t.Fatalf("no built-in zone %q to collide with", BuiltinZones[0])
+		if len(before) == 0 {
+			t.Fatalf("built-in zone %q has no records to carry over", BuiltinZones[0])
 		}
 
 		b, err := s.ExportBundle(ctx)
@@ -350,18 +350,68 @@ func TestImportBundleRefusesToOverwriteABuiltinZone(t *testing.T) {
 				b.Zones[i].ID = builtin
 			}
 		}
-		if err := s.ImportBundle(ctx, b); err == nil || !strings.Contains(err.Error(), BuiltinZones[0]) {
-			t.Fatalf("import colliding with a built-in zone = %v, want a refusal naming it", err)
+		if err := s.ImportBundle(ctx, b); err != nil {
+			t.Fatalf("import colliding with a built-in zone: %v", err)
 		}
-		if z, err := s.Zones().Zone(ctx, builtin); err != nil || z.Name != BuiltinZones[0] || z.Type != "internal" {
-			t.Errorf("built-in zone %d after the refused import = %+v (err %v)", builtin, z, err)
+
+		// The bundle's zone holds the id now.
+		if z, err := s.Zones().Zone(ctx, builtin); err != nil || z.Name != f.zone || z.Type != "primary" {
+			t.Errorf("zone %d after the import = %+v (err %v), want the bundle's %q", builtin, z, err, f.zone)
 		}
-		// The refusal is a rollback like any other: the prune that ran
-		// before it must not have taken the zone the bundle no longer named.
-		if _, err := s.Zones().Zone(ctx, zid); err != nil {
-			t.Errorf("zone %d after the refused import: %v", zid, err)
+		// The built-in moved rather than died: same name, same type, same
+		// records, a different id.
+		moved := builtinZoneID(t, s, BuiltinZones[0])
+		if moved == builtin {
+			t.Fatalf("built-in zone %q still at id %d after the import", BuiltinZones[0], builtin)
+		}
+		after, err := s.Zones().Records(ctx, moved)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(after) != len(before) {
+			t.Errorf("built-in zone %q has %d records after re-seating, had %d", BuiltinZones[0], len(after), len(before))
+		}
+		// Every built-in is still there, once.
+		zs, err := s.Zones().Zones(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		internal := 0
+		for _, z := range zs {
+			if z.Type == "internal" {
+				internal++
+			}
+		}
+		if internal != len(BuiltinZones) {
+			t.Errorf("%d internal zones after the import, want %d", internal, len(BuiltinZones))
+		}
+		// The prune took the zone's old row, so the name exists exactly once,
+		// at the bundle's id. (The freed id itself may be reused by the
+		// re-seeded built-in — the sequence is past everything the bundle
+		// wrote, and that is all §4.1 needs.)
+		for _, z := range zs {
+			if z.Name == f.zone && z.ID != builtin {
+				t.Errorf("zone %q also at id %d after the import, want only id %d", f.zone, z.ID, builtin)
+			}
 		}
 	})
+}
+
+// builtinZoneID finds the built-in zone of the given name, whatever id this
+// box seeded it at.
+func builtinZoneID(t *testing.T, s Store, name string) int64 {
+	t.Helper()
+	zs, err := s.Zones().Zones(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, z := range zs {
+		if z.Name == name && z.Type == "internal" {
+			return z.ID
+		}
+	}
+	t.Fatalf("no built-in zone %q", name)
+	return 0
 }
 
 // TestImportBundleLeavesLocalSettingsAlone is §4.3 enforced on the receiving

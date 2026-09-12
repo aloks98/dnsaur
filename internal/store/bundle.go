@@ -5,7 +5,6 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
-	"errors"
 	"fmt"
 	"maps"
 	"slices"
@@ -311,9 +310,14 @@ func (s *sqlStore) ImportBundle(ctx context.Context, b Bundle) error {
 
 	// The prune exempts built-in zones, so the upsert has to as well: an id
 	// in the bundle that lands on one would quietly rewrite an RFC 6303 zone
-	// into a synced one. Skipping the row instead would leave the two boxes
-	// disagreeing with nothing to say so, so it is refused.
-	if err := s.refuseBuiltinCollision(ctx, tx, zoneIDs); err != nil {
+	// into a synced one. The collision is ordinary, not a fault — each box
+	// seeds its built-ins with whatever ids its sequence had reached, so a
+	// main older than the built-ins carries user zones at ids a fresh
+	// replica gave to "localhost". The built-in gives way: it is deleted
+	// here and seeded again by name, at a fresh id, once the bundle's rows
+	// are in (below, after the sequence advance).
+	evicted, err := s.evictBuiltinCollisions(ctx, tx, zoneIDs)
+	if err != nil {
 		return err
 	}
 
@@ -416,6 +420,16 @@ func (s *sqlStore) ImportBundle(ctx context.Context, b Bundle) error {
 		}
 	}
 
+	// Built-ins evicted above come back by name with their records, at ids
+	// the sequence hands out past everything the bundle wrote. The same
+	// seeding the migration runs, so the zone is indistinguishable from
+	// one that was never in the way.
+	if evicted > 0 {
+		if err := seedBuiltinZones(ctx, tx, s.dialect); err != nil {
+			return fmt.Errorf("reseeding built-in zones: %w", err)
+		}
+	}
+
 	// One bump for the whole apply, through the helper every other version
 	// move shares.
 	v, err := bumpVersionTx(ctx, tx)
@@ -478,22 +492,29 @@ func staleSettings(ctx context.Context, tx *sql.Tx, keep map[string]string) ([]s
 	return out, rows.Err()
 }
 
-// refuseBuiltinCollision fails the import when a bundle zone id names one of
-// this box's built-in zones. See the call site.
-func (s *sqlStore) refuseBuiltinCollision(ctx context.Context, tx *sql.Tx, zoneIDs []int64) error {
+// evictBuiltinCollisions deletes every built-in zone whose id a bundle zone
+// is about to take, records first (no cascade on the foreign key), and
+// reports how many went. Only type "internal" rows qualify: a user's own
+// zone at a colliding id is the bundle's to overwrite. See the call site
+// for why this is a re-seat rather than a refusal.
+func (s *sqlStore) evictBuiltinCollisions(ctx context.Context, tx *sql.Tx, zoneIDs []int64) (int64, error) {
 	if len(zoneIDs) == 0 {
-		return nil
+		return 0, nil
 	}
+	in := placeholders(len(zoneIDs))
 	args := append([]any{zoneTypeInternal}, anyIDs(zoneIDs)...)
-	var name string
-	err := tx.QueryRowContext(ctx, s.q(`SELECT name FROM zones WHERE type = ? AND id IN (`+placeholders(len(zoneIDs))+`)`), args...).Scan(&name)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil
+	if _, err := tx.ExecContext(ctx, s.q(`DELETE FROM zone_records WHERE zone_id IN (SELECT id FROM zones WHERE type = ? AND id IN (`+in+`))`), args...); err != nil {
+		return 0, fmt.Errorf("evicting built-in zone records: %w", err)
 	}
+	res, err := tx.ExecContext(ctx, s.q(`DELETE FROM zones WHERE type = ? AND id IN (`+in+`)`), args...)
 	if err != nil {
-		return err
+		return 0, fmt.Errorf("evicting built-in zones: %w", err)
 	}
-	return fmt.Errorf("bundle zone id collides with the built-in zone %q", name)
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	return n, nil
 }
 
 // pruneMissing deletes every row of table whose id the bundle does not carry.
