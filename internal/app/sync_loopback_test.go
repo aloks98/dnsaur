@@ -56,7 +56,10 @@ func TestReplicaFollowsMainAndTransfersItsZones(t *testing.T) {
 	// replica inherits it with the bundle.
 	pub := mockDNS(t, answerA("9.9.9.9"))
 	main := newTestApp(t, withUpstreams(pub))
-	replica := newTestAppWith(t, replicaConfig(t), withUpstreams(pub))
+	// An hour between the replica's own polls, so its background loop can
+	// overlap the pulls this test drives at most once.
+	replica := newTestAppWith(t, replicaConfig(t), withUpstreams(pub),
+		withSetting("sync.interval_seconds", "3600"))
 
 	// --- the main: a sync key, a primary zone, and the token the replica pulls with.
 	keyID := mustTSIGKey(t, main, syncKeyName)
@@ -198,15 +201,27 @@ func TestReplicaFollowsMainAndTransfersItsZones(t *testing.T) {
 // port taken between the reservation and the bind cannot pass unnoticed:
 // the registration assertion compares what the main recorded with the
 // address the App is actually listening on.
+//
+// Both transports are probed, because dnssrv binds UDP and TCP on the port
+// it is given and retries neither: a port free for one and taken for the
+// other is a start that fails rather than a test that adapts.
 func replicaConfig(t *testing.T) *config.Config {
 	t.Helper()
 	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("finding a free port: %v", err)
 	}
 	addr := pc.LocalAddr().String()
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		_ = pc.Close()
+		t.Fatalf("the free udp port %s is taken on tcp: %v", addr, err)
+	}
 	if err := pc.Close(); err != nil {
-		t.Fatal(err)
+		t.Fatalf("closing the probe socket: %v", err)
+	}
+	if err := ln.Close(); err != nil {
+		t.Fatalf("closing the probe listener: %v", err)
 	}
 	cfg := testConfigOn(t, "sqlite")
 	cfg.DNSListen = []string{addr}
