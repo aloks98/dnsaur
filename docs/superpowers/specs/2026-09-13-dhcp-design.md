@@ -109,7 +109,7 @@ A refused config leaves Kea on its previous one. dnsaur records the message (`dh
 ```
 Dhcp4:
   interfaces-config.interfaces: serve.dhcp_interfaces or ["*"]; dhcp-socket-type raw
-  control-socket: the bootstrap path (Kea insists it stays where it was started with; dnsaur echoes it)
+  control-socket (below 2.7.2) / control-sockets: [ unix ] (2.7.2+): the bootstrap path echoed back; never an http entry (§6)
   lease-database: {type: memfile, persist: true}                # Kea's default file path
   valid-lifetime: dhcp.lease_seconds; renew-timer/rebind-timer: 50% / 87.5% of it
   hooks-libraries:
@@ -130,10 +130,9 @@ Automatic unless the scope overrides. Each box's own DNS address is the host par
 
 ## 6. Failover: Kea hot-standby, rendered from the pairing
 
-The HA hook needs each Kea to reach the other over HTTP. dnsaur renders the peer list; the transport is the operator's one-time setup, documented per version:
+The HA hook needs each Kea to reach the other over HTTP, and it brings its own transport: with multi-threading on (the default on 2.6 and 3.0) the hook opens a dedicated HTTP listener at the address and port of this server's own peer entry and answers `ha-heartbeat` and lease updates there. Verified on 2026-09-13 on both versions with nothing but a unix control socket configured. So dnsaur renders no HTTP control socket at all, and no `kea-ctrl-agent` is needed; `dhcp.ha_port` is simply the port in the peer URLs. (An HTTP `control-sockets` entry on the same port collides with the hook's listener, and a config carrying both `control-socket` and `control-sockets` is refused by 3.0 — both verified.)
 
-- Kea ≥ 2.7.2 (Alpine 3.0): `kea-dhcp4` has its own HTTP control socket; dnsaur renders `control-sockets` with an `http` entry on `dhcp.ha_port`. The renderer learns the engine's version once at start (`version-get`) and emits this key only when the version allows it; older Kea rejects unknown keys.
-- Kea 2.6 (Debian trixie): the HTTP side is `kea-ctrl-agent`, configured once by the operator to listen on `dhcp.ha_port` and forward to the dhcp4 socket. `docs/configuration.md` gives the four-line agent config.
+The only version-dependent rendering is the spelling of the unix control socket: `control-socket` (singular) below 2.7.2, `control-sockets: [ { unix } ]` from 2.7.2 on. The renderer learns the version once at start (`version-get`).
 
 Peer rendering: the main chooses its standby as the non-stale registered replica with the lexicographically smallest `instance.id` (deterministic, no timestamps involved) and writes that id to the synced setting `dhcp.ha_standby` before rendering, so the choice travels in the next bundle. On the main, `this-server-name` is its `instance.id`, role `primary`; the standby peer is `http://<replica dns_addr host>:<ha_port>/`. A replica whose `instance.id` equals `dhcp.ha_standby` renders the same two peers with the roles unchanged and `this-server-name` its own id; the main's url is `http://<peer host>:<ha_port>/`. Both boxes render the same pair, which is the HA hook's requirement. Any other replica renders no HA section and serves DNS only; its DHCP page says `DHCP: not in the HA pair`.
 
@@ -227,7 +226,7 @@ Copy stays plain, per the project rule; the reasoning lives in `docs/dashboard.m
 
 ## 12. Compatibility notes
 
-- Kea versions: 2.6 (Debian trixie) and 3.0 (Alpine edge) are the tested range; the renderer emits only keys present in both. The only version-dependent piece is the HA transport (§6).
+- Kea versions: 2.6 (Debian trixie) and 3.0 (Alpine edge) are the tested range; the renderer emits only keys present in both, except the control-socket spelling (§6).
 - Debian's build restricts paths: sockets under `/run/kea`, logs under `/var/log/kea`, lease files under `/var/lib/kea`; the docs' unit files respect that.
 - Containers: host networking for both processes; one image variant ships Kea beside dnsaur with a supervisor, the plain image assumes Kea on the host.
 
