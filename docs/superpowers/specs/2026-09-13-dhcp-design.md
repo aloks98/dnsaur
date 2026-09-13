@@ -83,6 +83,13 @@ Local (`serve.` prefix, never in a bundle):
 | `domain` | suffix, or empty = `dhcp.domain` |
 | `lease_seconds` | ≥ 300, or 0 = `dhcp.lease_seconds` |
 | `enabled` | disabled scopes are not rendered |
+| `domain_search` | comma-separated suffixes, or empty (option 119) |
+| `ntp_servers` | comma-separated IPv4 addresses, or empty (option 42) |
+| `static_routes` | list of `{destination CIDR, router inside cidr}`, or empty (option 121) |
+| `next_server`, `server_hostname`, `boot_file` | PXE: an IPv4 address, a hostname, a file name; each optional (siaddr, sname/66, file/67) |
+| `options` | list of `{code 1–254 not already rendered by name, hex value}`; the generic escape hatch (WINS 44, CAPWAP 138, TFTP 150, vendor info 43 without class matching) |
+| `match_client_id` | default true; false makes Kea key leases on the MAC and ignore option 61 (cloned VMs) |
+| `reservations_only` | default false; true renders the subnet with no pool, so only reserved devices get addresses |
 
 ### 4.4 Reservations (`dhcp_reservations`, synced)
 
@@ -118,7 +125,11 @@ Dhcp4:
   subnet4: one per enabled scope:
     id: scope id, subnet: cidr, pools: [start - end]
     valid-lifetime: scope override when set
-    option-data: routers (gateway, if set); domain-name-servers (§5.3); domain-name (scope suffix, if any)
+    option-data: routers (gateway, if set); domain-name-servers (§5.3); domain-name (scope suffix, if any);
+                 domain-search (119); ntp-servers (42); classless-static-route (121, "dest - router, …");
+                 every generic option as {code, csv-format: false, data: hex}
+    next-server, server-hostname, boot-file-name when set; match-client-id: false when the scope says so
+    pools omitted when reservations_only
     reservations: [{hw-address, ip-address, hostname?}]
 ```
 
@@ -220,7 +231,7 @@ Copy stays plain, per the project rule; the reasoning lives in `docs/dashboard.m
 
 - Managing the Kea process (start, stop, upgrade): it is the operator's service unit. dnsaur documents the unit and the container image variant.
 - DHCPv6 and router advertisements: Kea 6 exists; nothing in this milestone needs it.
-- Custom options, client classes, PXE/boot options, option 82 policies: Kea has them; a later milestone adds a per-scope raw options list.
+- Client classes, vendor-class matching, option 82 policies, ping check (the `ping_check` hook is not in Debian's 2.6 package), exclusions (multiple pools per scope): later. Generic options and the PXE trio are in (§4.3), after a 2026-09-14 comparison with Technitium's scope form.
 - More than one standby: Kea HA supports it in load-balancing mode; not needed for a main and a backup.
 - Reservations outside a scope's CIDR, multiple pools per scope.
 
