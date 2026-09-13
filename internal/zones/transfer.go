@@ -303,10 +303,14 @@ func (t *Transferrer) markChecked(ctx context.Context, z store.Zone, ap netip.Ad
 	// The same arithmetic install uses, from the same field, so "checked" and
 	// "transferred" cannot drift into two different expiries.
 	current.ExpiresAt = nowMs + int64(current.SOAExpire)*1000
-	// modified_at is deliberately untouched: nothing about the zone's contents
-	// changed, and moving it would make every secondary look edited on every
-	// refresh — the same rule install applies through contentChanged.
-	if err := t.zs.UpdateZone(ctx, current); err != nil {
+	// NoteRefreshed, not UpdateZone: only these two stamps changed, and
+	// UpdateZone is a configuration write — it moves config_version, which
+	// the config-sync design makes every replica poll. modified_at is
+	// deliberately untouched for the same kind of reason: nothing about the
+	// zone's contents changed, and moving it would make every secondary look
+	// edited on every refresh — the rule install applies through
+	// contentChanged.
+	if err := t.zs.NoteRefreshed(ctx, current.ID, current.RefreshedAt, current.ExpiresAt); err != nil {
 		return TransferResult{}, fmt.Errorf("stamping zone %q after its SOA probe: %w", current.Name, err)
 	}
 	// The stamps are what let the zone answer (Zone.Serving), and the

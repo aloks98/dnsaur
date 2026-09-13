@@ -191,6 +191,18 @@ type ZoneStore interface {
 	// ReplaceRecords through it) never binds last_xfr_at/last_xfr_peer/
 	// last_xfr_error, and this statement never binds anything else.
 	NoteTransferRequest(ctx context.Context, zoneID, at int64, peer, errText string) error
+	// NoteRefreshed stamps a secondary that was checked and found current:
+	// its SOA probe matched the serial it already holds, so nothing was
+	// transferred and only the two clocks that decide whether it may keep
+	// answering move.
+	//
+	// A third narrow write, for the two reasons the ones above are — its
+	// column set is disjoint from every other writer of this row — and for
+	// one more: UpdateZone advances config_version, because a zone
+	// definition travels in a config bundle. A secondary stamped through
+	// UpdateZone would therefore make its own box reconfigure, and every
+	// replica pull an identical bundle, once per SOA refresh per zone.
+	NoteRefreshed(ctx context.Context, zoneID, refreshedAt, expiresAt int64) error
 }
 
 type zoneStore struct{ s *sqlStore }
@@ -235,7 +247,7 @@ func (z *zoneStore) Zone(ctx context.Context, id int64) (Zone, error) {
 func (z *zoneStore) AddZone(ctx context.Context, zn Zone) (int64, error) {
 	// The three last_xfr_* columns are deliberately absent here — they
 	// default, and are written only by NoteTransferRequest.
-	return z.s.insert(ctx, `INSERT INTO zones (name, type, enabled, soa_ns, soa_mbox, soa_serial, soa_refresh, soa_retry, soa_expire, soa_minimum, soa_ttl, primaries, tsig_key_id, expires_at, refreshed_at, allow_transfer, notify_to, forward_to, created_at, modified_at)
+	return z.s.configInsert(ctx, `INSERT INTO zones (name, type, enabled, soa_ns, soa_mbox, soa_serial, soa_refresh, soa_retry, soa_expire, soa_minimum, soa_ttl, primaries, tsig_key_id, expires_at, refreshed_at, allow_transfer, notify_to, forward_to, created_at, modified_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		zn.Name, zn.Type, zn.Enabled, zn.SOANS, zn.SOAMbox, zn.SOASerial, zn.SOARefresh, zn.SOARetry, zn.SOAExpire, zn.SOAMinimum, zn.SOATTL, zn.Primaries, zn.TSIGKeyID, zn.ExpiresAt, zn.RefreshedAt, zn.AllowTransfer, zn.NotifyTo, zn.ForwardTo, zn.CreatedAt, zn.ModifiedAt)
 }
@@ -269,7 +281,7 @@ func updateRecordArgs(r ZoneRecord) []any {
 }
 
 func (z *zoneStore) UpdateZone(ctx context.Context, zn Zone) error {
-	return z.s.execOne(ctx, updateZoneSQL, updateZoneArgs(zn)...)
+	return z.s.configExecOne(ctx, updateZoneSQL, updateZoneArgs(zn)...)
 }
 
 // updateZoneIfUnchangedSQL is updateZoneSQL with the optimistic predicate
@@ -279,11 +291,7 @@ func (z *zoneStore) UpdateZone(ctx context.Context, zn Zone) error {
 const updateZoneIfUnchangedSQL = updateZoneSQL + ` AND modified_at = ?`
 
 func (z *zoneStore) UpdateZoneIfUnchanged(ctx context.Context, zn Zone, prevModifiedAt int64) error {
-	res, err := z.s.db.ExecContext(ctx, z.s.q(updateZoneIfUnchangedSQL), append(updateZoneArgs(zn), prevModifiedAt)...)
-	if err != nil {
-		return wrapDBErr(err)
-	}
-	n, err := res.RowsAffected()
+	n, err := z.s.configExecN(ctx, updateZoneIfUnchangedSQL, append(updateZoneArgs(zn), prevModifiedAt)...)
 	if err != nil {
 		return err
 	}
@@ -313,6 +321,18 @@ func (z *zoneStore) NoteTransferAttempt(ctx context.Context, zoneID int64, at in
 // noteTransferAttemptSQL — see ZoneStore.NoteTransferRequest.
 const noteTransferRequestSQL = `UPDATE zones SET last_xfr_at = ?, last_xfr_peer = ?, last_xfr_error = ? WHERE id = ?`
 
+// noteRefreshedSQL names the only two columns a "checked, still current"
+// outcome may write. Disjoint from updateZoneSQL for the reason the two
+// statements above are, and with a second reason of its own: UpdateZone is a
+// configuration write and moves config_version, so stamping a secondary
+// through it would have every SOA probe look, to this box's own settings
+// watcher and to every replica, like the operator had edited the zone.
+const noteRefreshedSQL = `UPDATE zones SET refreshed_at = ?, expires_at = ? WHERE id = ?`
+
+func (z *zoneStore) NoteRefreshed(ctx context.Context, zoneID, refreshedAt, expiresAt int64) error {
+	return z.s.execOne(ctx, noteRefreshedSQL, refreshedAt, expiresAt, zoneID)
+}
+
 func (z *zoneStore) NoteTransferRequest(ctx context.Context, zoneID, at int64, peer, errText string) error {
 	return z.s.execOne(ctx, noteTransferRequestSQL, at, peer, errText, zoneID)
 }
@@ -320,7 +340,7 @@ func (z *zoneStore) NoteTransferRequest(ctx context.Context, zoneID, at int64, p
 func (z *zoneStore) DeleteZone(ctx context.Context, id int64) error {
 	// zone_records rows for this zone go with it — ON DELETE CASCADE in the
 	// 0004 migration, not application logic here.
-	return z.s.execOne(ctx, `DELETE FROM zones WHERE id = ?`, id)
+	return z.s.configExecOne(ctx, `DELETE FROM zones WHERE id = ?`, id)
 }
 
 // bumpSerialSQL advances a zone's serial by one *in the uint32 space*.

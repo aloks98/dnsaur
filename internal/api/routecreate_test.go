@@ -43,6 +43,14 @@ var noLocationRoutes = map[string]string{
 	"POST /api/v1/zones/{id}/refresh": "transfers into the zone the URL already names; 200.",
 	"POST /api/v1/zones/{id}/file": "replaces the records of the zone the URL already names; 200 " +
 		"with a summary of what it imported.",
+	"POST /api/v1/sync/pairing-code": "mints the code the operator carries to the replica. It is " +
+		"shown once and stored only as a hash, so there is nothing to address and nothing to " +
+		"fetch back.",
+	"POST /api/v1/sync/pair": "records a replica in the main's own settings, under an id the " +
+		"caller minted itself; there is no row and no URL that serves one. DELETE " +
+		"/sync/replicas/{instance_id} is the only address a replica has.",
+	"POST /api/v1/sync/follow": "stores this box's peer and its secret; 204, and the state it " +
+		"leaves is read from GET /sync/status.",
 }
 
 // createProbe is one POST that must answer 201 + Location: the URL to send

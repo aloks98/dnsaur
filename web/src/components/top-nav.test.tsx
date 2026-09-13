@@ -5,7 +5,7 @@ import { afterEach, expect, test, vi } from "vitest";
 import { fireEvent, screen, waitFor, within } from "@testing-library/react";
 import { useLocation, useNavigationType } from "react-router";
 import { server } from "../test/msw-server";
-import { blockingHandler } from "../test/msw-handlers";
+import { blockingHandler, replicaHandlers } from "../test/msw-handlers";
 import { renderWithProviders } from "../test/render";
 import {
   resetLiveTailReport,
@@ -383,6 +383,29 @@ test("an unreachable resolver says so rather than staying green", async () => {
   renderTopNav();
   await waitFor(() => expect(screen.getByRole("status")).toHaveTextContent(/dns down/i));
   expect(screen.getByRole("status")).not.toHaveTextContent(/dns ok/i);
+});
+
+// Being a replica is a state, not a warning (spec §8): it reads as a chip
+// beside the health readouts, and the page-wide strip is left for the two
+// facts that actually need fixing.
+test("a replica names the main it follows, and the chip opens the Sync band", async () => {
+  server.use(...replicaHandlers("https://adam.dns"));
+
+  renderTopNav();
+
+  const chip = await screen.findByRole("link", { name: "Replica · adam.dns" });
+  expect(chip).toHaveAttribute("href", "/settings#sync");
+  // Beside the resolver readout, in the same flat mono vocabulary.
+  const row1 = screen.getByRole("navigation", { name: "Primary" }).parentElement;
+  expect(row1).toContainElement(chip);
+});
+
+test("a main carries no chip", async () => {
+  const { queryClient } = renderTopNav();
+
+  await waitFor(() => expect(screen.getByRole("status")).toHaveTextContent(/dns ok/i));
+  await waitFor(() => expect(queryClient.getQueryData(["resolver", "status"])).toBeDefined());
+  expect(screen.queryByRole("link", { name: /^Replica ·/ })).not.toBeInTheDocument();
 });
 
 // Stage 2 parked resolver health in row 2's filled cell for want of a

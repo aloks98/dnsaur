@@ -56,6 +56,9 @@ Hovering it shows the version of the build that answered, which is the
 number to quote when something looks wrong; it is not in the label, because
 the readout is skimmed for one word.
 
+A box that follows another one carries a second cell beside it — **Replica ·
+<host>** — linking to the band that says why. See [Sync](#sync).
+
 ---
 
 ## Query log
@@ -813,6 +816,7 @@ moment you save.
 | **Query log** | How much per-query detail is recorded, how long the rows are kept, and how long the hourly totals behind the dashboard outlive them |
 | **Lists** | How often subscriptions refresh |
 | **Protocols** | Whether clients can reach dnsaur over DNS-over-TLS / DNS-over-HTTPS, and the certificate both present |
+| **Sync** | Who follows this instance's configuration, or whose it takes (see Sync below) |
 | **Backup** | Not a setting — a button that copies the database now (see Backup below) |
 
 **Upstream strategy** is one of:
@@ -865,6 +869,163 @@ The three states that mean something is wrong — a failed bind, an expiring
 certificate, and the upstream-encryption downgrade — also appear as banners
 across the top of every screen, not just this one.
 
+### Sync
+
+Two dnsaur boxes on one network answer for each other when one is down, and
+sync is how the second one stays configured like the first. One instance is
+the **main** — it takes writes — and any instance with a peer URL set is a
+**replica**: it pulls the main's configuration on a timer, applies it, and
+stops accepting local writes to anything that configuration covers. There is
+no election and no third mode. Which one this box is comes straight from
+whether `sync.peer_url` is empty.
+
+#### Pairing the two boxes
+
+Pairing is the only part an operator does by hand, and it is two presses on
+two screens.
+
+On the **main**, **Add replica** shows a one-time **pairing code**: eight
+characters with no ambiguous glyph in them, grouped `XXXX-XXXX`. It is shown
+once and cannot be read back — only its hash is kept — so the panel states
+what it is and stops:
+
+> **Expires in 10 minutes** · Enter it on the replica under Settings › Sync.
+
+Pressing **Add replica** again mints a new code and voids the old one; the ×
+dismisses the panel, and so does leaving the page. Either way the code is
+gone from this screen for good. Five wrong guesses on the other box void it
+too.
+
+On the box that is to become a replica, type the main's URL into **Peer URL**
+— scheme and host, nothing else (`https://adam.dns.e412.in`) — put the code
+in **Pairing code**, and press **Follow**. That one request spends the code
+against the main, stores the peer and the pull secret the main answers with,
+and pulls once, so the configuration is on screen without waiting out an
+interval. Case and the grouping dash do not matter. A code the main would not
+spend — mistyped, expired, already used — is reported under the boxes,
+verbatim, and nothing is written:
+
+> the main refused the pairing code
+
+Nothing else is set up. The main creates the TSIG key its replicas transfer
+under on the first pairing and records it itself; there is no key to pick and
+no token to mint. Pairing is also what lets that replica's transfers through
+and adds it as a NOTIFY target, so no ACL is edited either — **Zones**'
+`allow_transfer` still says exactly what you wrote.
+
+#### What the band shows afterwards
+
+**On a main**, one row per paired replica: its instance id, where it answers
+DNS, the configuration version it has applied, and when it was last heard
+from. A replica that has missed three intervals is marked by that last
+column alone, greyed — it has not been forgotten and its transfer permission
+is intact, it simply is not answering. **Forget** removes a row, revokes that
+box's secret and takes its address back out of the transfer allow. Nothing
+removes one automatically — a box that is down for an afternoon is not a box
+whose permission should quietly disappear — so a replica you have actually
+retired is yours to forget here.
+
+**On a replica**, the peer it follows and how it is getting on:
+
+> ● Following https://adam.dns.e412.in
+> applied 412 of 412 · last pull 20 s ago
+
+The square is green while the last pull worked and red when it did not, and
+a failure states the server's own reason beneath — **Last pull failed: …**.
+The configuration that was already applied stays in force either way; DNS is
+unaffected. **Peer reached over plain HTTP** appears here when the peer URL
+is `http://`: every pull then sends the pull secret and receives the whole
+bundle — **every TSIG secret on the main included** — in the clear. There is
+no certificate subsystem here to fix that for you; put the peer behind
+HTTPS. It is stated beside the URL it is about, because editing that URL is
+the only thing that changes it.
+
+**Advanced**, on both roles, holds what is still a setting:
+
+| Field | Where | What it is |
+|---|---|---|
+| **Pull interval (seconds)** | both | How often the replica asks the main whether its configuration moved. Five or more |
+| **Primary DNS address (override)** | replica only | Where the main answers DNS, as `host:port` — the address the derived secondary zones transfer from. Empty uses the address the main advertises. A main has no peer to derive an address from, so it is not shown there |
+
+Both save with the rest of the page, and **Advanced** opens itself if a save
+is refused for either of them, so the reason is never hidden. The peer URL and the pull secret are
+not on the form at all: pairing writes them together and **Stop following**
+clears them together, and neither is valid without the other.
+
+#### Being a replica, elsewhere in the app
+
+The top bar carries a chip beside **DNS OK**:
+
+> ◻ Replica · adam.dns
+
+It links to this band, and it is the only place the main is named. Every
+screen whose configuration belongs to the main — Filtering, Zones, TSIG keys
+and the synced Settings bands — puts one muted line beside the action it has
+had to switch off:
+
+> Managed by the main
+
+That is the whole of it. Being a replica is a state, not a fault, so it gets
+no warning banner; the strip across the top is kept for the two things that
+are actually wrong (below).
+
+#### What a replica can still change
+
+Everything that describes *this box* rather than the service both boxes
+provide: the **Protocols** band (its own listen addresses and certificate),
+the **Sync** band itself, **Backup**, and its own account, sessions and API
+tokens. Those bands stay editable and save normally.
+
+Everything else is the main's. The **Upstreams**, **Blocking**, **Cache**,
+**Query log** and **Lists** bands render with their values and no controls,
+and so do Filtering, Zones and TSIG keys.
+
+Reading is never restricted. Filters, search, a revealed TSIG secret, a zone
+file export and both **Refresh now** actions all still work — refreshing a
+list or pulling a zone acts on this box's own copy and is not a change to
+the configuration the main owns. Pausing blocking is: the pause is stored as
+a setting and reaches both boxes, so it is set on the main.
+
+#### Promotion
+
+**Stop following** clears the peer URL and the pull secret together, in one
+write. The moment it lands, the guard lifts and this box takes writes again
+— it is a main with whatever configuration it last applied, and the chip and
+the managed lines go with it.
+
+What it does not do is repoint any zone. The zones a replica derived from the
+main are still **secondaries**, and their primary may now be a box that is
+gone; each one stays a copy until you change its type on its own zone page.
+That is deliberately a per-zone decision: turning them all into primaries
+would be this screen guessing which ones you actually want this box to own.
+
+There is no split-brain to recover from either way, because only one box was
+ever taking writes.
+
+#### When something is wrong
+
+These facts appear as banners across the top of every screen, all of them
+failures — the first and the last end on their own:
+
+- **Last pull failed: <reason>** — on a replica, the reason verbatim from
+  the server. The previously applied configuration is still in force; DNS is
+  unaffected. Clears on its own, on the next pull that works.
+- **Sync: <reason>** — on the main, and the same field read the other way:
+  the list of replicas could not be read. Until it can, no replica is
+  admitted to a transfer and none is notified, however many the band shows.
+  This one does not clear on its own — the row stays unreadable until
+  somebody repairs it, and the line goes when they have.
+- **Replica <id> not seen for <duration>** — on the main, about a replica
+  that has missed three intervals. It has not been forgotten and its
+  transfer permission is intact; it simply is not answering. Clears on its
+  own, the next time that replica checks in.
+
+A replica that is merely *behind* is not a warning — that is what a pull
+interval looks like from the outside, and the Sync band's `applied n of m`
+is where that number belongs. Nor is being a replica, or reaching a peer
+over plain HTTP: those are states, and they are stated where they belong —
+the top bar's chip, and the Sync band's own line.
+
 ### Backup
 
 **Back up now** writes a copy of the database into
@@ -902,6 +1063,10 @@ that saved stops being counted as unsaved; one that was rejected keeps the
 value that was typed, stays marked unsaved and can be retried, and the toast
 names which. **Discard** after a partial save puts back what the server now
 holds, not what it held before the save.
+
+The one exception is **Stop following** on the Sync band, which writes the
+peer URL and the token in a single all-or-nothing request — half of that
+promotion is not a state to be left in.
 
 The page also re-reads the settings in the background, so a key saved from
 another tab arrives here on its own. A field you are editing is never taken

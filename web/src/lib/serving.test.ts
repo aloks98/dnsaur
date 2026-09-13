@@ -1,11 +1,12 @@
 import { expect, test } from "vitest";
-import type { ProtocolStatus, ResolverStatus } from "../api/types";
+import type { ProtocolStatus, ResolverStatus, SyncReplica } from "../api/types";
 import {
   daysUntil,
   expiringSoonDetail,
   formatCertDate,
   servingState,
   somethingIsWrong,
+  syncBanners,
 } from "./serving";
 
 test("servingState reads off intent and reality, not just one bool", () => {
@@ -123,13 +124,90 @@ test("somethingIsWrong covers every fact the status endpoint reports", () => {
       certificate: { not_after: "2026-09-17T00:00:00Z", expiring_soon: true },
     }),
   ).toBe(true);
-  // A listening protocol and a healthy certificate are not "wrong", or the
-  // poll would never stop.
+  // Sync's two *watchable* facts: a failed pull, and a replica gone quiet.
+  // Both end by themselves — the next successful pull, the next check-in —
+  // so the poll is what clears them.
+  expect(somethingIsWrong({ ...clean, sync: { role: "replica", last_error: "boom" } })).toBe(true);
+  expect(
+    somethingIsWrong({
+      ...clean,
+      sync: { role: "main", replicas: [replica({ stale: true })] },
+    }),
+  ).toBe(true);
+
+  // `plain_http` is not one of them. It is a fact about the peer URL the
+  // operator typed, and nothing but editing that URL will change it — so
+  // polling for it every five seconds asks a question whose answer cannot
+  // move. The banner still shows (see syncBanners below); only the poll
+  // stays off.
+  expect(somethingIsWrong({ ...clean, sync: { role: "replica", plain_http: true } })).toBe(false);
+
+  // A listening protocol, a healthy certificate and a replica that checked
+  // in are not "wrong", or the poll would never stop.
   expect(
     somethingIsWrong({
       ...clean,
       serving: { ...clean.serving, dot: { enabled: true, listening: true, addr: ":853" } },
       certificate: { not_after: "2027-09-17T00:00:00Z", expiring_soon: false },
+      sync: { role: "main", replicas: [replica()] },
     }),
   ).toBe(false);
+});
+
+function replica(overrides: Partial<SyncReplica> = {}): SyncReplica {
+  return {
+    instance_id: "eve-2",
+    dns_addr: "10.0.0.6:53",
+    version_applied: 412,
+    last_seen: Date.now() - 60_000,
+    stale: false,
+    ...overrides,
+  };
+}
+
+// The exact lines the shell renders, pinned here rather than only through
+// the shell, because the durations are arithmetic and a banner test that
+// matched loosely would not have caught "56 years".
+test("syncBanners states each fact once, and says how long a stale replica has been quiet", () => {
+  const now = Date.UTC(2026, 8, 12, 12, 0, 0);
+  expect(syncBanners(undefined, now)).toEqual([]);
+  expect(syncBanners({ role: "main" }, now)).toEqual([]);
+  expect(
+    syncBanners(
+      {
+        role: "replica",
+        peer_url: "http://main.lan",
+        last_error: "dial tcp: connection refused",
+        plain_http: true,
+      },
+      now,
+    ),
+  ).toEqual(["Last pull failed: dial tcp: connection refused"]);
+  // A main's `last_error` is not a pull: it is `sync.replicas`, the one row
+  // its whole registry lives in, unreadable — so the line may not say the
+  // box failed to pull from a main it does not have.
+  expect(
+    syncBanners(
+      { role: "main", last_error: "sync.replicas is not the JSON this build wrote" },
+      now,
+    ),
+  ).toEqual(["Sync: sync.replicas is not the JSON this build wrote"]);
+  // A plaintext peer is a reading of the URL in the Sync band, so it is
+  // stated there and nowhere else — the strip is for the two facts that
+  // clear on their own.
+  expect(
+    syncBanners({ role: "replica", peer_url: "http://main.lan", plain_http: true }, now),
+  ).toEqual([]);
+  expect(
+    syncBanners(
+      {
+        role: "main",
+        replicas: [
+          replica({ instance_id: "eve-2", stale: true, last_seen: now - 95 * 60_000 }),
+          replica({ instance_id: "eve-3", stale: false, last_seen: now - 30_000 }),
+        ],
+      },
+      now,
+    ),
+  ).toEqual(["Replica eve-2 not seen for 1h 35m"]);
 });

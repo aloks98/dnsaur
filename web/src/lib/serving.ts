@@ -1,4 +1,5 @@
-import type { CertificateStatus, ProtocolStatus, ResolverStatus } from "../api/types";
+import type { CertificateStatus, ProtocolStatus, ResolverStatus, SyncStatus } from "../api/types";
+import { formatDuration } from "./format";
 
 /**
  * A protocol's reality, reduced to the three states spec §8 and the
@@ -42,8 +43,70 @@ export function somethingIsWrong(status: ResolverStatus | undefined): boolean {
     status.encryption_downgraded ||
     servingState(status.serving.dot) === "failed" ||
     servingState(status.serving.doh) === "failed" ||
-    (status.certificate?.expiring_soon ?? false)
+    (status.certificate?.expiring_soon ?? false) ||
+    syncTrouble(status.sync)
   );
+}
+
+/**
+ * The sync facts worth asking again about: a `last_error`, and a replica
+ * that has gone quiet. A replica's two end without anyone doing anything —
+ * the next successful pull, the next check-in — which is what makes asking
+ * again worth the request. A main's `last_error` is an unreadable
+ * `sync.replicas` and waits on the operator, but it is watched all the same:
+ * the poll is what takes the line down once the row is repaired.
+ *
+ * `plain_http` is neither watched here nor shown as a banner: it is a
+ * reading of the peer URL the operator typed, so nothing but an edit to
+ * that URL can change the answer. It is stated once, in the Sync band
+ * beside the peer it describes (see components/sync-field.tsx).
+ */
+function syncTrouble(sync: SyncStatus | undefined): boolean {
+  if (!sync) return false;
+  return Boolean(sync.last_error) || (sync.replicas ?? []).some((r) => r.stale);
+}
+
+/**
+ * Sync's failures, as the lines the shell shows (spec §8) — the one
+ * definition of what is on screen, so a caller cannot invent another line
+ * or spell one of these differently.
+ *
+ * Only failures. Being a replica is a *state*, and it reads as the top
+ * bar's role chip and one muted line per synced screen; a plaintext peer is
+ * a standing property of the peer URL and reads in the Sync band beside it.
+ * A page-wide strip that carried those too would warn about the normal
+ * case, which is how an operator learns to skip the strip.
+ *
+ * Two of the three clear on their own — the next pull that succeeds empties
+ * a replica's `last_error`, and a replica that checks in stops being stale —
+ * which is exactly what makes `syncTrouble` worth polling for. A main's
+ * `last_error` is the exception: `sync.replicas` is unreadable until
+ * somebody repairs the row, so that line stands until they do.
+ *
+ * Every line states the fact and stops. A replica that is merely *behind*
+ * gets no line at all: that is what a pull interval looks like from the
+ * outside, and the Sync band's "applied n of m" already says it on the one
+ * screen where the number is worth reading.
+ */
+export function syncBanners(sync: SyncStatus | undefined, now: number = Date.now()): string[] {
+  if (!sync) return [];
+  const lines: string[] = [];
+  // The same field, two failures. On a replica it is the last pull; on a
+  // main it is the registry row that could not be read, and there is no
+  // pull to have failed.
+  if (sync.last_error)
+    lines.push(
+      sync.role === "replica" ? `Last pull failed: ${sync.last_error}` : `Sync: ${sync.last_error}`,
+    );
+  for (const replica of sync.replicas ?? []) {
+    if (!replica.stale) continue;
+    // How long it has been quiet, not when it was last heard: an operator
+    // should not have to subtract a wall-clock stamp from now.
+    lines.push(
+      `Replica ${replica.instance_id} not seen for ${formatDuration(now - replica.last_seen)}`,
+    );
+  }
+  return lines;
 }
 
 const MONTHS = [

@@ -91,11 +91,11 @@ func (s *sqlStore) insert(ctx context.Context, q string, args ...any) (int64, er
 type clientStore struct{ s *sqlStore }
 
 func (c *clientStore) AddGroup(ctx context.Context, name string) (int64, error) {
-	return c.s.insert(ctx, `INSERT INTO groups (name) VALUES (?)`, name)
+	return c.s.configInsert(ctx, `INSERT INTO groups (name) VALUES (?)`, name)
 }
 
 func (c *clientStore) AddClient(ctx context.Context, cl Client) (int64, error) {
-	return c.s.insert(ctx, `INSERT INTO clients (name, matcher, group_id) VALUES (?, ?, ?)`, cl.Name, cl.Matcher, cl.GroupID)
+	return c.s.configInsert(ctx, `INSERT INTO clients (name, matcher, group_id) VALUES (?, ?, ?)`, cl.Name, cl.Matcher, cl.GroupID)
 }
 
 func (c *clientStore) Groups(ctx context.Context) ([]Group, error) {
@@ -146,14 +146,14 @@ type filterStore struct{ s *sqlStore }
 // written before the name column did, so deriving here too would be a second
 // copy of the same rule that no test could tell apart from the first.
 func (f *filterStore) AddList(ctx context.Context, l List) (int64, error) {
-	return f.s.insert(ctx, `INSERT INTO lists (url, name, kind, enabled) VALUES (?, ?, ?, ?)`,
+	return f.s.configInsert(ctx, `INSERT INTO lists (url, name, kind, enabled) VALUES (?, ?, ?, ?)`,
 		l.URL, strings.TrimSpace(l.Name), l.Kind, l.Enabled)
 }
 
 // RenameList sets the display name. Blank means "go back to the derived
 // default", which is what storing blank already means — see AddList.
 func (f *filterStore) RenameList(ctx context.Context, id int64, name string) error {
-	return f.s.execOne(ctx, `UPDATE lists SET name = ? WHERE id = ?`, strings.TrimSpace(name), id)
+	return f.s.configExecOne(ctx, `UPDATE lists SET name = ? WHERE id = ?`, strings.TrimSpace(name), id)
 }
 
 // AssignList adds one list to one group. Both columns are foreign keys and
@@ -162,8 +162,10 @@ func (f *filterStore) RenameList(ctx context.Context, id int64, name string) err
 // every other write, so they reach the API as ErrReference and ErrDuplicate
 // rather than as "storage unavailable".
 func (f *filterStore) AssignList(ctx context.Context, groupID, listID int64) error {
-	_, err := f.s.db.ExecContext(ctx, f.s.q(`INSERT INTO group_lists (group_id, list_id) VALUES (?, ?)`), groupID, listID)
-	return wrapDBErr(err)
+	return f.s.configWrite(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, f.s.q(`INSERT INTO group_lists (group_id, list_id) VALUES (?, ?)`), groupID, listID)
+		return wrapDBErr(err)
+	})
 }
 
 // ReplaceGroupLists sets a group's filter lists to exactly listIDs, in one
@@ -183,14 +185,14 @@ func (f *filterStore) AssignList(ctx context.Context, groupID, listID int64) err
 // is ErrNotFound, because that one is the request's path rather than its
 // body.
 func (f *filterStore) ReplaceGroupLists(ctx context.Context, groupID int64, listIDs []int64) error {
-	tx, err := f.s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	// Undoes every statement below unless Commit ran — same shape as
-	// clientStore.DeleteGroup (crud.go).
-	defer tx.Rollback()
+	// configWrite owns the transaction, its rollback and the version bump —
+	// same shape as clientStore.DeleteGroup (crud.go).
+	return f.s.configWrite(ctx, func(tx *sql.Tx) error {
+		return f.replaceGroupLists(ctx, tx, groupID, listIDs)
+	})
+}
 
+func (f *filterStore) replaceGroupLists(ctx context.Context, tx *sql.Tx, groupID int64, listIDs []int64) error {
 	// The group is checked here rather than left to the foreign key: a
 	// missing group and a missing list are different answers, and the
 	// driver's violation says only that some reference failed.
@@ -220,11 +222,11 @@ func (f *filterStore) ReplaceGroupLists(ctx context.Context, groupID int64, list
 			return wrapDBErr(err)
 		}
 	}
-	return tx.Commit()
+	return nil
 }
 
 func (f *filterStore) AddRule(ctx context.Context, r Rule) (int64, error) {
-	return f.s.insert(ctx, `INSERT INTO rules (group_id, action, pattern, is_regex) VALUES (?, ?, ?, ?)`, r.GroupID, r.Action, r.Pattern, r.IsRegex)
+	return f.s.configInsert(ctx, `INSERT INTO rules (group_id, action, pattern, is_regex) VALUES (?, ?, ?, ?)`, r.GroupID, r.Action, r.Pattern, r.IsRegex)
 }
 
 // TouchList records a successful refresh. Clearing last_error here (rather

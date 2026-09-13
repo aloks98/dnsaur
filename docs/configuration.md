@@ -178,9 +178,16 @@ against a fresh database. Changing them via `PUT /api/v1/settings` updates
 the DB, bumps a config version, and live components reload automatically —
 **except** the entries marked "restart required" below.
 
+The config version counts configuration changes, not settings writes: every
+write to a group, client, filter list or its assignments, rule, TSIG key or
+zone *definition* advances it too. It is what a replica polls
+(`GET /api/v1/sync/version`) to decide whether the main's configuration
+moved. Zone records, serial bumps and transfer bookkeeping do not advance
+it — none of them travels in a config bundle.
+
 | Key | Default | Meaning |
 |---|---|---|
-| `instance.id` | random UUID, generated per install | Stable identifier for this instance (used by future HA sync) |
+| `instance.id` | random, generated per install | Stable identifier for this instance. It is what `GET /api/v1/sync/version` reports, so a replica pointed at itself — a box whose database was copied from its main — is refused instead of quietly becoming its own replica, and it is the id a replica pairs under and the main's Sync band lists it by |
 | `upstreams` | `1.1.1.1:53,1.0.0.1:53,9.9.9.9:53` | Comma-separated upstream resolvers. Each entry is plain (`host:port`; bare IPv6 and missing ports are normalized) or, with a scheme, DNS-over-TLS (`tls://`) or DNS-over-HTTPS (`https://`) — see Encrypted upstreams below for the grammar. These are the **default** route — where a name no zone claims is sent. A suffix claimed by a `forwarder` or `stub` zone goes to that zone's upstreams instead, and never falls back to these; see Conditional forwarding below |
 | `upstream.strategy` | `race` | Upstream selection strategy: `race` (query all healthy upstreams in parallel, first good answer wins), `failover` (try them in configured order, fall through on error/SERVFAIL), or `fastest` (try them ordered by measured EWMA latency, fastest first). One setting for the whole server: it applies to a conditional route's upstreams exactly as it applies to the defaults, and there is no per-zone strategy |
 | `blocking.mode` | `null-ip` | How blocked queries are answered: `null-ip` (`0.0.0.0`) or `nxdomain` |
@@ -199,6 +206,10 @@ the DB, bumps a config version, and live components reload automatically —
 | `serve.doh.listen` | `:443` | Address the DoH listener binds — same `host:port` grammar as `serve.dot.listen` |
 | `serve.tls.cert` | *(empty)* | Absolute path to the PEM certificate DoT and DoH both present. Empty means neither protocol can be enabled yet |
 | `serve.tls.key` | *(empty)* | Absolute path to the PEM private key matching `serve.tls.cert` |
+| `sync.peer_url` | *(empty)* | The main instance this one follows, as an absolute `http`/`https` URL, scheme and host only. Empty means this instance is a main and accepts writes; non-empty makes it a replica, which pulls the main's configuration and refuses local writes to anything that configuration covers. Pairing writes it; clearing it is the promotion. Writing it by hand requires `sync.token` in the same request or already stored |
+| `sync.token` | *(empty)* | The secret this replica pulls with: 32 random bytes the main minted for this box alone when the two paired, good for the two sync reads and nothing else. Pairing writes it — it is never shown and never typed, and the only time an operator writes it by hand is clearing it to stop following. **Never returned by `GET /api/v1/settings`** — it is a credential, and the settings screen shows only whether one is set |
+| `sync.interval_seconds` | `30` | How often a replica probes the main's config version. The main reads its own copy too: a replica it has not heard from for three intervals is shown as stale. **Minimum 5** — below that the probe costs the main more than the drift it removes |
+| `sync.primary_dns` | *(empty)* | An **override** for where the main answers DNS — the address a replica's derived secondary zones transfer from. The host is required when it is set. Empty, which is the ordinary case, means the peer URL's host on the port the main advertises in its version probe (53 when it advertises none) |
 
 **†** — Restart-required exception. `cache.*` sizing/TTL settings and
 `lists.refresh_hours` are read once at startup (the cache and the
@@ -212,9 +223,154 @@ filters and zones through a reload the write handler triggers directly.
 This is a documented Phase 1 limitation, expected to be revisited in a
 later phase.
 
-Two internal key prefixes (`instance.*` and future `stats.*` bookkeeping)
-are not meant to be user-edited and are excluded from the settings API
-(`GET /api/v1/settings`).
+Bookkeeping rows are not configuration: the `instance.*` prefix, the
+rollup watermark `stats.watermark`, and the eight sync rows listed under
+Config sync below. None of them is editable through
+`PUT /api/v1/settings`, and `GET /api/v1/settings` omits them all.
+`sync.token` is excluded from that read too, and is the only *editable* key
+that is: a read must not be a way to copy the credential out.
+
+The pause state `blocking.pauses` is hidden and refused by `PUT` in the same
+way, and is **not** one of those rows: a pause is a decision about the
+network and clients reach either box, so it is configuration. It advances
+`config_version`, a bundle carries it, and a pause set on the main is in
+force on every replica within one interval — see
+[Blocking pause](ui-contract.md#blocking-pause) for the state itself.
+
+## Config sync
+
+Two instances, one configuration. The **main** is the instance that takes
+writes; any instance with `sync.peer_url` set is a **replica**, which pulls
+the main's configuration every `sync.interval_seconds`, applies it in one
+transaction, and refuses local writes to anything it covers with `409
+managed by <peer>`. The four `sync.*` keys in the table above are all there
+is to configure, and pairing writes two of them. What travels in a bundle
+and what stays on each box is in
+[`docs/architecture.md`](architecture.md#config-sync-main-and-replica),
+the endpoints are in [`docs/api.md`](api.md), and the screens in
+[`docs/dashboard.md`](dashboard.md#sync).
+
+Eight more `sync.*` rows exist in the `settings` table and are **not**
+settings: the server writes them about itself, `PUT /settings` refuses them
+(`setting not editable`), and `GET /settings` omits them. They are reported
+by `GET /api/v1/sync/status` instead, in a shape the dashboard can use —
+`sync.pairing` excepted, since a live code is shown once when it is minted
+and never read back.
+
+| Key | On | Meaning |
+|---|---|---|
+| `sync.applied_version` | replica | `config_version` of the last bundle it applied. Blanked when the box is promoted: a counter it no longer follows is not a number to compare the next main against |
+| `sync.applied_peer` | replica | the peer that version was applied from. Version numbers are each main's own count of its own writes, so a replica re-pointed at a main that happens to sit at the same number still fetches the bundle |
+| `sync.applied_at` | replica | when it applied that bundle (unix ms) |
+| `sync.last_pull_at` | replica | when the last pull cycle finished, successful or not (unix ms) |
+| `sync.last_error` | replica | why the last cycle failed; cleared by the next one that succeeds |
+| `sync.replicas` | main | the registered replicas, as JSON keyed by instance id, each with the hash of the secret that box pulls with |
+| `sync.pairing` | main | the live pairing code — its hash, when it expires, and how many wrong attempts have been made against it. Never the code itself: 40 bits would not survive being ground offline in the ten minutes it is alive |
+| `sync.tsig_key_id` | main | the TSIG key replicas transfer under, created and recorded by the first pairing. Nobody picks it, and `GET /api/v1/sync/status` reports its name |
+
+### Setting up a pair
+
+Two boxes, `main.example` and `replica.example`, both already set up and
+running. The replica has to be a **fresh install**, not a restore of the
+main's database: the two would share one `instance.id`, and both ends refuse
+that — a main will not pair with its own id, and a replica whose peer answers
+the version probe with the replica's own id will not follow it.
+
+The two are introduced by a **pairing code**, and that code is the only thing
+that crosses by hand. Three steps, each on one box:
+
+1. **On the main**, press **Add replica** in the Sync band, or
+   `POST /api/v1/sync/pairing-code`. It answers a code of eight characters in
+   two groups — `KTRW-9PJM` — shown once and good for ten minutes. One code
+   is live at a time: minting a second voids the first.
+
+2. **On the replica**, enter the main's URL and that code and press
+   **Follow**, or:
+
+   ```
+   POST /api/v1/sync/follow
+   {"peer_url": "https://main.example", "code": "KTRW-9PJM"}
+   ```
+
+   The URL is scheme and host only — no path, query or credentials. The
+   replica spends the code on the main, gets back a secret of its own, writes
+   it and the peer URL in one settings write, and pulls once immediately
+   rather than waiting out an interval. `204` means the pairing landed. The
+   code's case and its grouping dash are yours to get wrong; five wrong codes
+   void the live one and the main has to mint another.
+
+3. **Wait for the first pull.** Following kicks one off at once; after that
+   the replica probes every `sync.interval_seconds`, 30 by default.
+
+Nothing else is configured. The main creates the TSIG key its replicas
+transfer under on the first pairing — named `sync-<six characters>.`,
+HMAC-SHA256, listed on the **TSIG keys** page like any other key and not
+deletable while it is designated — and pairing is what admits that replica's
+transfers and adds it as a NOTIFY target. The operator never picks a key and
+never handles the secret a replica pulls with.
+
+`sync.interval_seconds` and the `sync.primary_dns` override are the only sync
+settings left to touch, both optional, both under **Advanced** in the band.
+
+Within one interval, expect:
+
+- the replica's groups, clients, lists, rules, TSIG keys and settings to
+  match the main's, under the main's ids — and the lists it was given to be
+  downloaded shortly after the first pull rather than at the next
+  `lists.refresh_hours`, since a bundle carries a list's URL and not its
+  contents;
+- every `primary` zone on the main to exist on the replica as a
+  **secondary** transferring from the main's DNS address under the sync key —
+  with no `allow_transfer` or `notify_to` edit on either box, since pairing
+  is what admits the transfer and adds the NOTIFY target;
+- the replica to appear on the main's Sync band with its DNS address,
+  applied version and last-seen stamp. It appeared there the moment it
+  paired; every version probe carries the version it has applied, and that
+  probe is the only heartbeat there is. Missing three of them shows it as
+  stale, and nothing removes it but the operator — **Forget** in the band, or
+  `DELETE /api/v1/sync/replicas/{instance_id}`, which revokes that box's
+  secret with the entry;
+- writes to synced configuration on the replica to answer `409 {"error":
+  "managed by https://main.example"}`, while its own Protocols, Sync and
+  Backup bands, its account, sessions and tokens, and both **Refresh now**
+  actions keep working.
+
+Use HTTPS. There is no certificate subsystem here — a reverse proxy in front
+of the main, or a LAN you trust, is your call — and over plain `http://` the
+pairing code, the replica's secret and the whole bundle, every TSIG secret on
+the main included, cross the network in the clear. A replica following an
+`http://` peer says so in its Sync band for as long as it is true.
+
+The code is short-lived rather than strong: eight characters from a 32-glyph
+alphabet with no ambiguous pair in it is 40 bits, so what protects it is that
+it expires after ten minutes, dies on the fifth wrong attempt, and is spent
+by the first box that gets it right. Only its hash, its expiry and the count
+of wrong attempts are stored. `POST /api/v1/sync/pair` is the one
+unauthenticated write in the API — a box that has not paired yet holds no
+credential to present — and it is throttled per source address on the login
+endpoint's budget. Wrong, expired, spent and voided are one answer,
+`403 pairing code refused`, so a guesser cannot learn whether a code is live.
+Show a code to exactly one box. Anyone on the LAN who finds the window open
+can spoil the live code with five wrong guesses — they learn nothing by it,
+but the main has to mint another — and, since that budget is login's, they
+lock their own address out of the login form doing it. A replica answers the
+two unauthenticated sync routes with `409 managed by <main url>`, so which
+box is the main is readable from the LAN; the addresses of both are in the
+DHCP leases the pair hands out anyway.
+
+What the code buys is that replica's own secret: 32 random bytes, good for
+`GET /sync/version` and `GET /sync/bundle` on this main and nothing else. It
+is not an API token, never appears on the tokens page, and the main keeps
+only its hash. It is never returned by `GET /settings` on either box, and
+leaves the replica only as the `Authorization: Bearer` header on a pull. A
+session cookie and an API token are `401` on both of those reads at any
+scope. Pairing the same box again replaces its entry and its secret.
+
+To promote the replica, clear both keys in one write —
+`PUT /api/v1/settings {"sync.peer_url": "", "sync.token": ""}`, which is what
+the Sync band's **Stop following** sends. It keeps the configuration it last
+applied and takes writes again; the zones it derived stay secondaries until
+you change each one's type on its own page.
 
 ## Encrypted upstreams
 

@@ -5,6 +5,7 @@ import { act, fireEvent, screen, waitFor, within } from "@testing-library/react"
 import userEvent from "@testing-library/user-event";
 import { Link, Route, Routes } from "react-router";
 import { server } from "../test/msw-server";
+import { replicaHandlers } from "../test/msw-handlers";
 import { renderWithProviders } from "../test/render";
 import type { Settings } from "../api/types";
 import { SettingsPage } from "./settings";
@@ -33,6 +34,11 @@ function fullSettings(overrides: Partial<Settings> = {}): Settings {
     "serve.doh.listen": ":443",
     "serve.tls.cert": "",
     "serve.tls.key": "",
+    // sync.token and sync.tsig_key_id are deliberately absent: the first is
+    // write-only, the second internal, and GET /settings returns neither.
+    "sync.peer_url": "",
+    "sync.interval_seconds": "30",
+    "sync.primary_dns": "",
     ...overrides,
   };
 }
@@ -228,7 +234,10 @@ test("every section says whether it applies on save or waits for a restart", asy
   // Protocols included: reconcileServing (internal/app/serve.go) applies
   // every serve.* write live, on the same write that changed it.
   const restartSections = ["Cache", "Lists"];
-  const instantSections = ["Upstreams", "Blocking", "Query log", "Protocols"];
+  // Sync is instant for the same reason: the pull loop re-reads its peer,
+  // interval and primary address on every pass
+  // (internal/confsync/replica.go).
+  const instantSections = ["Upstreams", "Blocking", "Query log", "Protocols", "Sync"];
 
   for (const title of restartSections) {
     const section = screen.getByRole("heading", { name: title }).closest("section")!;
@@ -899,4 +908,133 @@ test("a postgres install is shown the server's own pg_dump answer", async () => 
   expect(
     await screen.findByText("backups are a sqlite feature; use pg_dump for postgres"),
   ).toBeInTheDocument();
+});
+
+// --- replica mode ---------------------------------------------------------
+
+// Spec §4.3/§7: the instance keys stay this box's to write, everything else
+// belongs to the main and answers 409. The screen has to draw that line
+// where the server draws it — a band left live whose every save is refused
+// is worse than one that says so up front.
+test("a replica keeps the local bands editable and shows the synced ones read-only", async () => {
+  mockSettings(fullSettings());
+  server.use(...replicaHandlers("https://main.lan"));
+
+  renderWithProviders(<SettingsPage />);
+
+  expect(await screen.findByText("Managed by the main")).toBeInTheDocument();
+
+  // Synced: the main's to change.
+  expect(screen.getByLabelText("Blocked response TTL (seconds)")).toBeDisabled();
+  expect(screen.getByLabelText("Retention (days)")).toBeDisabled();
+
+  // Local: still this box's own. The Sync band is the one a replica has to
+  // keep, since promotion is the way out of being one.
+  expect(screen.getByLabelText("DNS-over-TLS listen address")).toBeEnabled();
+  expect(screen.getByRole("button", { name: "Stop following" })).toBeEnabled();
+});
+
+test("a main leaves every band editable and shows no notice", async () => {
+  mockSettings(fullSettings());
+
+  renderWithProviders(<SettingsPage />);
+
+  expect(await screen.findByLabelText("Blocked response TTL (seconds)")).toBeEnabled();
+  expect(screen.queryByText(/^Managed by/)).not.toBeInTheDocument();
+});
+
+// The pull secret is minted by pairing (POST /sync/follow writes both keys),
+// so the band has no box for it and this page has no way to type one. What
+// is left of the Sync band on the form are the two keys that describe how
+// this box pulls, and both live under Advanced.
+test("the Sync band offers no key select, and keeps interval and override under Advanced", async () => {
+  const user = userEvent.setup();
+  mockSettings(fullSettings());
+  server.use(...replicaHandlers("https://main.lan"));
+
+  renderWithProviders(<SettingsPage />);
+  await screen.findByText("Sync");
+
+  expect(screen.queryByLabelText("Sync key")).not.toBeInTheDocument();
+  expect(screen.queryByLabelText("Token")).not.toBeInTheDocument();
+
+  await user.click(screen.getByRole("button", { name: /advanced/i }));
+  expect(screen.getByLabelText("Pull interval (seconds)")).toBeEnabled();
+  expect(screen.getByLabelText("Primary DNS address (override)")).toBeEnabled();
+
+  // The top bar's replica chip links to /settings#sync, so the band has to
+  // be an anchor the browser can actually land on.
+  expect(document.getElementById("sync")).toContainElement(screen.getByText("Sync"));
+});
+
+// An anchor the page never scrolls to is a link that appears to do nothing:
+// this page is its own scroll container, so the browser's own fragment
+// handling — which runs on the document before any of these bands exist —
+// cannot do it.
+test("arriving at /settings#sync scrolls the band into view", async () => {
+  const scrollIntoView = vi.spyOn(Element.prototype, "scrollIntoView");
+  mockSettings(fullSettings());
+
+  renderWithProviders(<SettingsPage />, { route: "/settings#sync" });
+  await screen.findByText("Sync");
+
+  await waitFor(() =>
+    expect(scrollIntoView.mock.contexts).toContain(document.getElementById("sync")),
+  );
+});
+
+// A message under a control nobody can see is a save that fails for no
+// stated reason: the disclosure has to give way to its own field's error.
+test("an interval the server would refuse opens Advanced and says why", async () => {
+  const user = userEvent.setup();
+  mockSettings(fullSettings({ "sync.interval_seconds": "3" }));
+
+  renderWithProviders(<SettingsPage />);
+  await screen.findByText("Sync");
+
+  // Closed on load, and the stored value is only judged on save — so an
+  // unrelated edit is what gets the form validated, exactly as the
+  // pre-existing blocking.mode case above does.
+  expect(screen.getByRole("button", { name: /advanced/i })).toHaveAttribute(
+    "aria-expanded",
+    "false",
+  );
+  const ttl = screen.getByLabelText(/^blocked response ttl/i);
+  await user.clear(ttl);
+  await user.type(ttl, "60");
+  await user.click(screen.getAllByRole("button", { name: /^save changes$/i })[0]);
+
+  expect(await screen.findByText("Must be 5 or more.")).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: /advanced/i })).toHaveAttribute(
+    "aria-expanded",
+    "true",
+  );
+});
+
+// The Sync band shows GET /sync/status, which is not a setting and so is not
+// invalidated by the settings query — but a save is exactly what moves it.
+// At its own 30s cadence the band spent up to half a minute contradicting
+// the value sitting in the box above it.
+test("saving a setting re-reads the sync status the band renders", async () => {
+  const user = userEvent.setup();
+  let statusReads = 0;
+  mockSettings(fullSettings());
+  server.use(
+    http.get("/api/v1/sync/status", () => {
+      statusReads += 1;
+      return HttpResponse.json({ role: "main" });
+    }),
+    http.put("/api/v1/settings", () => new HttpResponse(null, { status: 204 })),
+  );
+
+  renderWithProviders(<SettingsPage />);
+  await screen.findByText("Sync");
+  await waitFor(() => expect(statusReads).toBe(1));
+
+  const ttl = screen.getByLabelText(/^blocked response ttl/i);
+  await user.clear(ttl);
+  await user.type(ttl, "60");
+  await user.click(screen.getAllByRole("button", { name: /^save changes$/i })[0]);
+
+  await waitFor(() => expect(statusReads).toBe(2));
 });

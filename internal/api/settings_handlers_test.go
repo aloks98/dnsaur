@@ -246,6 +246,17 @@ func TestPausesAreNotAnEditableSetting(t *testing.T) {
 	h := srv.Handler()
 	_ = s.Settings().SetInternal(t.Context(), "blocking.mode", "null-ip")
 	_ = s.Settings().SetInternal(t.Context(), filter.PausesKey, `{"global":4711}`)
+	// The main's registry of replicas is the same kind of row, and
+	// sync.interval_seconds shares its prefix the way blocking.mode does.
+	_ = s.Settings().SetInternal(t.Context(), "sync.replicas", `{"r1":{"instance_id":"r1"}}`)
+	_ = s.Settings().SetInternal(t.Context(), "sync.interval_seconds", "30")
+	// A replica's notes about its own pulls are the same kind of row: the
+	// Sync band reads them from GET /sync/status, and nothing edits them.
+	bookkeeping := []string{"sync.applied_version", "sync.applied_peer", "sync.applied_at",
+		"sync.last_pull_at", "sync.last_error"}
+	for _, k := range bookkeeping {
+		_ = s.Settings().SetInternal(t.Context(), k, "1")
+	}
 
 	w := doReq(t, h, "GET", "/api/v1/settings", "", cookie)
 	var m map[string]string
@@ -256,8 +267,26 @@ func TestPausesAreNotAnEditableSetting(t *testing.T) {
 	if _, leaked := m[filter.PausesKey]; leaked {
 		t.Fatalf("the pause state leaked into GET /settings: %v", m)
 	}
+	if _, leaked := m["sync.replicas"]; leaked {
+		t.Fatalf("the replica registry leaked into GET /settings: %v", m)
+	}
+	for _, k := range bookkeeping {
+		if _, leaked := m[k]; leaked {
+			t.Fatalf("%s leaked into GET /settings: %v", k, m)
+		}
+		body := `{"key":"` + k + `","value":"2"}`
+		if w := doReq(t, h, "PUT", "/api/v1/settings", body, cookie); w.Code != 400 {
+			t.Fatalf("%s accepted as editable: %d", k, w.Code)
+		}
+	}
+	if m["sync.interval_seconds"] == "" {
+		t.Fatalf("sync.interval_seconds not returned: %v", m)
+	}
 	if w := doReq(t, h, "PUT", "/api/v1/settings", `{"key":"`+filter.PausesKey+`","value":"{}"}`, cookie); w.Code != 400 {
 		t.Fatalf("the pause state accepted as editable: %d", w.Code)
+	}
+	if w := doReq(t, h, "PUT", "/api/v1/settings", `{"key":"sync.replicas","value":"{}"}`, cookie); w.Code != 400 {
+		t.Fatalf("the replica registry accepted as editable: %d", w.Code)
 	}
 }
 

@@ -19,6 +19,7 @@ import {
   useResumeBlocking,
   type BlockingStatus,
 } from "../hooks/use-blocking";
+import { useManagedBy } from "../hooks/use-sync";
 import { formatCountdown } from "../lib/format";
 
 const PAUSE_OPTIONS = [
@@ -73,6 +74,12 @@ export function PauseControl({ groupId = 0, clientId = 0, variant = "button" }: 
   const status = useBlockingStatus({ groupId, clientId });
   const pauseBlocking = usePauseBlocking();
   const resumeBlocking = useResumeBlocking();
+  // A pause is persisted to the synced `blocking.pauses` setting, so on a
+  // replica it is a write the main owns and the server answers 409 — see
+  // docs/api.md's replica note. The cell still reads: an operator on the
+  // replica has to be able to see that blocking is paused, even though
+  // pausing it is the main's to do.
+  const managedBy = useManagedBy();
 
   const pausedUntil = status.data?.paused_until ?? 0;
 
@@ -148,7 +155,7 @@ export function PauseControl({ groupId = 0, clientId = 0, variant = "button" }: 
   return (
     <DropdownMenu>
       <DropdownMenuTrigger
-        disabled={busy}
+        disabled={busy || managedBy !== ""}
         className={variant === "chrome" ? cn(CHROME_CELL, chromeTone) : undefined}
         render={
           variant === "chrome" ? undefined : (

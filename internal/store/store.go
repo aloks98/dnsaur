@@ -98,6 +98,14 @@ type Store interface {
 	// wrote and how big it is. sqlite only — ErrNoBackup comes back on
 	// postgres, which has pg_dump and needs no help from this process.
 	Backup(ctx context.Context, dir string) (path string, size int64, err error)
+	// ExportBundle reads this instance's synced configuration — the config
+	// sync design's §4 document, every table a replica has to match and
+	// nothing that describes this box.
+	ExportBundle(ctx context.Context) (Bundle, error)
+	// ImportBundle replaces every synced table with the bundle's rows,
+	// keeping the bundle's ids, in one transaction, and bumps
+	// config_version once. See the method for what it leaves alone.
+	ImportBundle(ctx context.Context, b Bundle) error
 	Clients() ClientStore
 	Filters() FilterStore
 	Settings() SettingsStore

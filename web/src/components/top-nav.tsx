@@ -1,5 +1,5 @@
 import { LogOut } from "lucide-react";
-import { NavLink, useLocation, useSearchParams } from "react-router";
+import { Link, NavLink, useLocation, useSearchParams } from "react-router";
 import { toast } from "sonner";
 import {
   Avatar,
@@ -27,6 +27,7 @@ import {
   type NavGroup,
 } from "../lib/nav";
 import { useLists } from "../hooks/use-filters";
+import { useManagedBy } from "../hooks/use-sync";
 import { useLiveTailStatus } from "../lib/live-tail";
 import { paletteShortcut } from "../lib/platform";
 import { parseWindow, WINDOW_PARAM, WINDOWS } from "../lib/stats-window";
@@ -154,6 +155,7 @@ export function TopNav({ onOpenCommandPalette }: TopNavProps) {
               status that is green nearly all the time, and filling both
               would make the bar shout twice. */}
           <ResolverStatusCell />
+          <RoleChip />
         </div>
       </div>
 
@@ -206,6 +208,50 @@ export function TopNav({ onOpenCommandPalette }: TopNavProps) {
       )}
     </header>
   );
+}
+
+/**
+ * Row 1's third readout, and the only one that is not about health: this
+ * box takes its configuration from another one.
+ *
+ * A chip beside the two health cells rather than a page-wide banner, because
+ * being a replica is a *state* and not a fault — the strip above the page is
+ * kept for the two sync facts that are actually wrong (lib/serving.ts's
+ * syncBanners). Its square is hollow — an outline, no fill — which is the
+ * bar's quietest possible marker: present, and lit up about nothing.
+ *
+ * The host, not the whole URL: this is an identity, and at this type size a
+ * scheme and a port would push the nav strip's four groups off screen.
+ * Reads the peer the shell already holds (useManagedBy), so it costs no
+ * request, and links to the one screen that can change it.
+ */
+function RoleChip() {
+  const peer = useManagedBy();
+  if (peer === "") return null;
+
+  return (
+    <Link
+      to="/settings#sync"
+      title="Open Settings › Sync"
+      // Not uppercased like the rest of the bar: this cell carries a
+      // hostname, and a hostname shouted is a hostname misread.
+      className={cn(CELL, "gap-2 border-l border-l-border tracking-wider normal-case", CELL_QUIET)}
+    >
+      <span aria-hidden className="size-[7px] shrink-0 border border-muted-foreground" />
+      Replica · <span className="text-foreground">{peerHost(peer)}</span>
+    </Link>
+  );
+}
+
+/** The peer URL's hostname, or the URL verbatim when it will not parse —
+ * the value came from a settings box, and a chip is no place to discover
+ * that it is malformed. */
+function peerHost(peer: string): string {
+  try {
+    return new URL(peer).hostname;
+  } catch {
+    return peer;
+  }
 }
 
 /**

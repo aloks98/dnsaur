@@ -2,17 +2,26 @@ package app
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
+	"net/http"
+	"net/http/httptest"
+	"net/netip"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/aloks98/dnsaur/internal/api"
 	"github.com/aloks98/dnsaur/internal/config"
 	"github.com/aloks98/dnsaur/internal/dnssrv"
 	"github.com/aloks98/dnsaur/internal/filter"
@@ -168,8 +177,7 @@ func TestStartFiltersFromTheListCacheBeforeServing(t *testing.T) {
 // loopback included, because a list URL is admin-supplied and fetched by the
 // server itself (filter.AllowLoopbackTargets). Tests that serve a blocklist
 // locally have to opt in; production never does.
-func allowLoopbackLists(t *testing.T, a *App) {
-	t.Helper()
+func allowLoopbackLists(a *App) {
 	a.refresher = filter.NewRefresher(a.st.Filters(), a.st.Clients(), a.engine, a.cfg.DataDir,
 		filter.AllowLoopbackTargets())
 }
@@ -195,20 +203,27 @@ func answerA(ip string) dns.HandlerFunc {
 	}
 }
 
-// testAppOption seeds a setting before Start, i.e. before the first
-// applySettings reads it.
-type testAppOption func(map[string]string)
+// testAppOption adjusts a built App before Start: it seeds a setting, i.e.
+// before the first applySettings reads it, or reaches the App itself for the
+// pieces a setting cannot express.
+type testAppOption func(*App, map[string]string)
 
 // withUpstreams points the default upstreams at addrs: where every name no
 // zone claims is answered from.
 func withUpstreams(addrs ...string) testAppOption {
-	return func(s map[string]string) { s["upstreams"] = strings.Join(addrs, ",") }
+	return func(_ *App, s map[string]string) { s["upstreams"] = strings.Join(addrs, ",") }
 }
 
 // withSetting seeds any other setting, for the cases where the cache's own
 // timings are what the test is about.
 func withSetting(k, v string) testAppOption {
-	return func(s map[string]string) { s[k] = v }
+	return func(_ *App, s map[string]string) { s[k] = v }
+}
+
+// withLoopbackLists is allowLoopbackLists for an App the fixture builds, for
+// a test whose list is served from httptest.
+func withLoopbackLists() testAppOption {
+	return func(a *App, _ map[string]string) { allowLoopbackLists(a) }
 }
 
 // newTestApp builds and starts a sqlite-backed App on loopback, shut down
@@ -223,14 +238,22 @@ func newTestApp(t *testing.T, opts ...testAppOption) *App {
 // shut down when the test ends.
 func newTestAppOn(t *testing.T, driver string, opts ...testAppOption) *App {
 	t.Helper()
+	return newTestAppWith(t, testConfigOn(t, driver), opts...)
+}
+
+// newTestAppWith is newTestAppOn with the config handed in rather than
+// derived, for a test that needs a listen address the driver's default
+// config does not name.
+func newTestAppWith(t *testing.T, cfg *config.Config, opts ...testAppOption) *App {
+	t.Helper()
 	ctx := context.Background()
 	settings := map[string]string{}
-	for _, o := range opts {
-		o(settings)
-	}
-	a, err := New(ctx, testConfigOn(t, driver), "test")
+	a, err := New(ctx, cfg, "test")
 	if err != nil {
 		t.Fatal(err)
+	}
+	for _, o := range opts {
+		o(a, settings)
 	}
 	for k, v := range settings {
 		if err := a.Store().Settings().SetInternal(ctx, k, v); err != nil {
@@ -302,10 +325,17 @@ func digAQuiet(addr, name string) string {
 // gets that guarantee instead of sleeping and hoping.
 func waitFor(t *testing.T, what string, cond func() bool) {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
+	waitUntil(t, 5*time.Second, what, cond)
+}
+
+// waitUntil is waitFor with the deadline named by the caller, for the cases
+// where the thing waited on has a bound of its own that is longer.
+func waitUntil(t *testing.T, within time.Duration, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(within)
 	for !cond() {
 		if time.Now().After(deadline) {
-			t.Fatalf("timed out waiting for %s", what)
+			t.Fatalf("timed out after %s waiting for %s", within, what)
 		}
 		time.Sleep(time.Millisecond)
 	}
@@ -1707,5 +1737,450 @@ func TestPausesSurviveRestart(t *testing.T) {
 	}
 	if strings.Contains(v, `"2"`) {
 		t.Fatalf("the expired group pause is still being written: %s", v)
+	}
+}
+
+// TestAppIsTheSyncer pins the delegation api.Deps.Sync depends on: which
+// half of the sync subsystem answers is decided by sync.peer_url alone, and
+// it decides it live — the API's write guard reads PeerURL on every write,
+// so a box that starts following must stop accepting writes at once rather
+// than at its next poll.
+func TestAppIsTheSyncer(t *testing.T) {
+	ctx := context.Background()
+	a := newTestApp(t)
+
+	if peer := a.PeerURL(); peer != "" {
+		t.Fatalf("PeerURL = %q on a main", peer)
+	}
+	if st := a.Status(); st.Role != "main" || len(st.Replicas) != 0 {
+		t.Fatalf("status %+v", st)
+	}
+
+	// The main's half: a code, the pairing that spends it, and the version
+	// probe that stamps what the replica has applied — all of it the
+	// registry's, reached through these delegations.
+	code, _, err := a.NewPairingCode(ctx)
+	if err != nil {
+		t.Fatalf("NewPairingCode: %v", err)
+	}
+	if _, err := a.Pair(ctx, api.PairRequest{
+		Code: code, InstanceID: "r1", DNSAddr: "10.0.0.6:53",
+	}); err != nil {
+		t.Fatalf("Pair: %v", err)
+	}
+	if err := a.Heartbeat(ctx, "r1", 7); err != nil {
+		t.Fatalf("Heartbeat: %v", err)
+	}
+	// A probe from a box this main was told to forget is the API's 401, not
+	// a store failure, so the sentinel has to survive the delegation.
+	if err := a.Heartbeat(ctx, "nobody", 1); !errors.Is(err, api.ErrNotRegistered) {
+		t.Fatalf("Heartbeat for an unknown id = %v, want api.ErrNotRegistered", err)
+	}
+	st := a.Status()
+	if len(st.Replicas) != 1 || st.Replicas[0].InstanceID != "r1" || st.Replicas[0].VersionApplied != 7 {
+		t.Fatalf("replicas %+v", st.Replicas)
+	}
+	if st.Replicas[0].LastSeen == 0 {
+		t.Fatalf("the pairing is not dated: %+v", st.Replicas[0])
+	}
+
+	// The replica's half, the moment the setting lands.
+	if err := a.Store().Settings().Set(ctx, "sync.peer_url", "http://main.example"); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	if peer := a.PeerURL(); peer != "http://main.example" {
+		t.Fatalf("PeerURL = %q", peer)
+	}
+	if st := a.Status(); st.Role != "replica" || st.PeerURL != "http://main.example" || !st.PlainHTTP {
+		t.Fatalf("status %+v", st)
+	}
+
+	if err := a.Forget(ctx, "r1"); err != nil {
+		t.Fatalf("Forget: %v", err)
+	}
+	if err := a.Forget(ctx, "nobody"); err != nil {
+		t.Fatalf("Forget of an unknown id: %v", err)
+	}
+	if err := a.Store().Settings().Set(ctx, "sync.peer_url", ""); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	if st := a.Status(); st.Role != "main" || len(st.Replicas) != 0 {
+		t.Fatalf("after the promotion: %+v", st)
+	}
+}
+
+// TestReloadSettingsRebuildsTheForwarder: a pull applies a bundle straight
+// into the store, so nothing in the API layer has told the app about it.
+// ReloadSettings is what makes the new upstreams the ones queries go to.
+func TestReloadSettingsRebuildsTheForwarder(t *testing.T) {
+	ctx := context.Background()
+	a := newTestApp(t)
+	before := a.fwd.forwarder()
+	if err := a.Store().Settings().SetInternal(ctx, "upstreams", "10.9.9.9:53"); err != nil {
+		t.Fatalf("SetInternal: %v", err)
+	}
+	if err := a.ReloadSettings(ctx); err != nil {
+		t.Fatalf("ReloadSettings: %v", err)
+	}
+	if a.fwd.forwarder() == before {
+		t.Fatal("ReloadSettings left the previous forwarder serving")
+	}
+}
+
+// TestAppAnswersTheReplicaHooks pins the two hooks the zones layer asks §6's
+// questions through: who may transfer a primary zone without an
+// allow_transfer entry, and who every primary zone notifies.
+//
+// The registry is the real one, read through the settings row it writes, so
+// what these assert is the whole path from a registration to a transfer's
+// gate.
+func TestAppAnswersTheReplicaHooks(t *testing.T) {
+	ctx := context.Background()
+	a := newTestApp(t)
+	// The first entry is a real pairing, which is also where the key these
+	// hooks ask about comes from: nobody designates one by hand (§6).
+	mustAppPair(t, a, "r-ip", "10.0.0.6:53")
+	syncKey := a.Status().SyncKey
+	if syncKey == "" {
+		t.Fatal("pairing designated no sync key; there is nothing for these hooks to match on")
+	}
+
+	// Two more registrations, written as the registry stores them, because
+	// Pair dates an entry itself — on purpose, so that a clock skew cannot
+	// decide whether a box looks stale — and one of these has to be older
+	// than the cutoff of three intervals. The hostname one is the case the
+	// transfer gate deliberately cannot answer: localhost is 127.0.0.1 to
+	// everything that resolves, and the gate does not resolve.
+	now := time.Now().UnixMilli()
+	registerReplicas(t, a, map[string]api.Replica{
+		"r-host":  {DNSAddr: "localhost:53", LastSeen: now},
+		"r-stale": {DNSAddr: "10.0.0.9:53", LastSeen: now - int64(10*time.Minute/time.Millisecond)},
+	})
+
+	ip := netip.MustParseAddr("10.0.0.6")
+	if !a.replicaMayTransfer(syncKey, ip) {
+		t.Error("a registered replica signing with the sync key was not admitted")
+	}
+	// Stale is not a reason to refuse data: a box catching up after an
+	// outage is exactly the one that looks stale.
+	if !a.replicaMayTransfer(syncKey, netip.MustParseAddr("10.0.0.9")) {
+		t.Error("a stale replica was refused its transfer")
+	}
+	if a.replicaMayTransfer(syncKey, netip.MustParseAddr("127.0.0.1")) {
+		t.Error("a replica registered by hostname matched an address: the gate resolved a name")
+	}
+	if a.replicaMayTransfer(dns.CanonicalName("other.example"), ip) {
+		t.Error("a key the main has not designated was admitted")
+	}
+	if a.replicaMayTransfer("", ip) {
+		t.Error("an unsigned request's empty key name was admitted")
+	}
+
+	targets, err := a.replicaNotifyTargets(ctx)
+	if err != nil {
+		t.Fatalf("replicaNotifyTargets: %v", err)
+	}
+	got := map[string]string{}
+	for _, tgt := range targets {
+		got[tgt.Addr()] = tgt.Key
+	}
+	// The hostname is a usable notify target — it is resolved at send time,
+	// where a lookup is allowed — and the stale one is not: notifying a box
+	// that has been silent for three intervals only buys retries.
+	if len(got) != 2 || got["10.0.0.6:53"] != syncKey || got["localhost:53"] != syncKey {
+		t.Fatalf("notify targets = %v, want 10.0.0.6:53 and localhost:53 under %s", got, syncKey)
+	}
+
+	// With no key designated there is nothing to sign with, and nothing on
+	// the replica side that follows this main's zones.
+	mustSetting(t, a, "sync.tsig_key_id", "0")
+	if a.replicaMayTransfer(syncKey, ip) {
+		t.Error("a transfer was admitted with no sync key designated")
+	}
+	targets, err = a.replicaNotifyTargets(ctx)
+	if err != nil {
+		t.Fatalf("replicaNotifyTargets: %v", err)
+	}
+	if len(targets) != 0 {
+		t.Errorf("notify targets = %v with no sync key designated, want none", targets)
+	}
+}
+
+// registerReplicas adds entries to the registry's settings row directly,
+// which is how a replica's last_seen can be put in the past: Pair dates it
+// itself, on purpose, so that a clock skew cannot decide whether a box looks
+// stale. Entries already in the row are left alone, secret hash included, so
+// a box that paired for real is still one.
+func registerReplicas(t *testing.T, a *App, reps map[string]api.Replica) {
+	t.Helper()
+	all := map[string]json.RawMessage{}
+	row, _, err := a.Store().Settings().Get(context.Background(), "sync.replicas")
+	if err != nil {
+		t.Fatalf("Get(sync.replicas): %v", err)
+	}
+	if row != "" {
+		if err := json.Unmarshal([]byte(row), &all); err != nil {
+			t.Fatalf("sync.replicas is %q: %v", row, err)
+		}
+	}
+	for id, r := range reps {
+		r.InstanceID = id
+		raw, err := json.Marshal(r)
+		if err != nil {
+			t.Fatalf("Marshal: %v", err)
+		}
+		all[id] = raw
+	}
+	raw, err := json.Marshal(all)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	mustSetting(t, a, "sync.replicas", string(raw))
+}
+
+func mustSetting(t *testing.T, a *App, key, value string) {
+	t.Helper()
+	if err := a.Store().Settings().SetInternal(context.Background(), key, value); err != nil {
+		t.Fatalf("SetInternal(%s): %v", key, err)
+	}
+}
+
+// mustAppPair spends a fresh code on one replica through the two methods the
+// pairing endpoints call. What it answers the far box is the secret and the
+// DNS port, neither of which any caller here has a use for; what a pairing
+// leaves behind on this main is what these tests read.
+func mustAppPair(t *testing.T, a *App, instanceID, dnsAddr string) {
+	t.Helper()
+	ctx := t.Context()
+	code, _, err := a.NewPairingCode(ctx)
+	if err != nil {
+		t.Fatalf("NewPairingCode: %v", err)
+	}
+	if _, err := a.Pair(ctx, api.PairRequest{Code: code, InstanceID: instanceID, DNSAddr: dnsAddr}); err != nil {
+		t.Fatalf("Pair(%s): %v", instanceID, err)
+	}
+}
+
+// syncKeyNamePattern is the shape §6 gives the key a main designates for
+// its replicas: nobody picks the name, so it is the only thing that says
+// where the key came from.
+var syncKeyNamePattern = regexp.MustCompile(`^sync-[a-z2-7]{6}\.$`)
+
+// TestPairCreatesTheSyncKeyOnce is §6's "the operator never picks or creates
+// it": the first pairing makes the key, every pairing after reuses it, and
+// an id naming a key that is no longer there is replaced rather than handed
+// out as a transfer nothing can sign.
+//
+// Once matters more than made. A second key would leave every replica that
+// paired before it signing under one this main no longer designates, and
+// nothing on either box would say so — the transfer would simply stop being
+// admitted.
+func TestPairCreatesTheSyncKeyOnce(t *testing.T) {
+	ctx := t.Context()
+	a := newTestApp(t)
+	if got := mustGetSetting(t, a, "sync.tsig_key_id"); got != "0" {
+		t.Fatalf("a fresh box designates sync.tsig_key_id %q, want 0: this test cannot tell a created key from a seeded one", got)
+	}
+
+	mustAppPair(t, a, "r-one", "10.0.0.6:53")
+	first := syncKeyID(t, a)
+	if first == 0 {
+		t.Fatal("pairing designated no sync key; the replica would transfer nothing")
+	}
+	k, found, err := a.Store().TSIGKeys().Get(ctx, first)
+	if err != nil || !found {
+		t.Fatalf("the designated key %d: found=%v err=%v", first, found, err)
+	}
+	if !syncKeyNamePattern.MatchString(k.Name) {
+		t.Errorf("the sync key is named %q, want sync-<six lowercase base32 chars>.", k.Name)
+	}
+	if k.Algorithm != dns.HmacSHA256 {
+		t.Errorf("the sync key signs with %q, want %q", k.Algorithm, dns.HmacSHA256)
+	}
+	if raw, err := base64.StdEncoding.DecodeString(k.Secret); err != nil || len(raw) != 32 {
+		t.Errorf("the sync key's secret is %d base64 bytes (err %v), want 32", len(raw), err)
+	}
+	if s := a.Status(); s.SyncKey != k.Name {
+		t.Errorf("GET /sync/status reports sync_key %q, want %q", s.SyncKey, k.Name)
+	}
+
+	mustAppPair(t, a, "r-two", "10.0.0.7:53")
+	if second := syncKeyID(t, a); second != first {
+		t.Errorf("the second pairing designated key %d, want the first's %d", second, first)
+	}
+	keys, err := a.Store().TSIGKeys().List(ctx)
+	if err != nil {
+		t.Fatalf("TSIGKeys().List: %v", err)
+	}
+	if len(keys) != 1 {
+		t.Errorf("the main holds %d TSIG keys after two pairings, want the one it made", len(keys))
+	}
+
+	// An id that names nothing is the one case a second key is right: the
+	// row was removed under the setting, and the replicas signing with it
+	// have nothing to sign with either way.
+	mustSetting(t, a, "sync.tsig_key_id", "424242")
+	mustAppPair(t, a, "r-three", "10.0.0.8:53")
+	third := syncKeyID(t, a)
+	if third == 0 || third == 424242 {
+		t.Fatalf("pairing with sync.tsig_key_id naming no key left key %d designated, want a new one", third)
+	}
+	if _, found, err := a.Store().TSIGKeys().Get(ctx, third); err != nil || !found {
+		t.Errorf("the replacement key %d: found=%v err=%v", third, found, err)
+	}
+}
+
+// syncKeyID is the key sync.tsig_key_id designates. The pairing no longer
+// answers the id — the bundle the replica pulls carries it — so this is
+// where a test reads which key a pairing left designated.
+func syncKeyID(t *testing.T, a *App) int64 {
+	t.Helper()
+	raw := mustGetSetting(t, a, "sync.tsig_key_id")
+	id, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		t.Fatalf("sync.tsig_key_id is %q: %v", raw, err)
+	}
+	return id
+}
+
+// TestPairMovesTheConfigVersion: designating the key the first pairing makes
+// is a configuration change as much as creating it is. A replica that pulled
+// between the two holds a bundle whose sync_key is still 0, and only a
+// version move brings it back for the corrected one.
+func TestPairMovesTheConfigVersion(t *testing.T) {
+	ctx := t.Context()
+	a := newTestApp(t)
+	before, err := a.Store().Settings().ConfigVersion(ctx)
+	if err != nil {
+		t.Fatalf("ConfigVersion: %v", err)
+	}
+	mustAppPair(t, a, "r-one", "10.0.0.6:53")
+	after, err := a.Store().Settings().ConfigVersion(ctx)
+	if err != nil {
+		t.Fatalf("ConfigVersion: %v", err)
+	}
+	if after-before != 2 {
+		t.Fatalf("config_version moved by %d over the first pairing, want 2: the key created and the key designated", after-before)
+	}
+}
+
+// TestDNSPortFollowsTheListener pins §8's fallback source: a replica with no
+// sync.primary_dns override joins its peer URL's host to the port the main
+// advertises, so that port has to be the one this box is actually answering
+// on rather than the protocol's default.
+func TestDNSPortFollowsTheListener(t *testing.T) {
+	// A reserved port rather than a literal, for replicaConfig's reason: a
+	// fixed DNS port is one another process on the machine can be holding.
+	a := newTestAppWith(t, replicaConfig(t))
+	_, port, err := net.SplitHostPort(a.DNSAddr())
+	if err != nil {
+		t.Fatalf("DNSAddr %q: %v", a.DNSAddr(), err)
+	}
+	want, err := strconv.Atoi(port)
+	if err != nil {
+		t.Fatalf("port %q: %v", port, err)
+	}
+	if got := a.DNSPort(); got != want {
+		t.Errorf("DNSPort() = %d, want the %d it is listening on", got, want)
+	}
+
+	// A listen address with no port it can read is the protocol's default: a
+	// box that is answering at all is answering somewhere, and 0 would send
+	// every replica's derived secondary at a port nothing serves.
+	for _, listen := range [][]string{nil, {"[::]"}, {"127.0.0.1:domain"}} {
+		if got := (&App{cfg: &config.Config{DNSListen: listen}}).DNSPort(); got != 53 {
+			t.Errorf("DNSPort() = %d with dns_listen %q, want 53", got, listen)
+		}
+	}
+}
+
+// TestASyncedTableWriteDoesNotReconcileTheSettings: every configuration
+// write publishes on the same hub, so the watcher wakes for a client, rule,
+// list or zone write too — and used to rebuild the forwarder, reload the
+// registry and recompile every ruleset for each one, none of which the write
+// could possibly have changed. The handler behind the write has already
+// reloaded what it did change (§5).
+func TestASyncedTableWriteDoesNotReconcileTheSettings(t *testing.T) {
+	ctx := context.Background()
+	a := newTestApp(t, withUpstreams(mockDNS(t, answerA("9.9.9.9"))))
+
+	// A settings write first: it is what a reconcile is for, and it leaves
+	// the watcher holding a snapshot to compare the next wake against.
+	first := a.fwd.forwarder()
+	if err := a.Store().Settings().Set(ctx, "upstreams", "10.9.9.9:53"); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	waitFor(t, "the forwarder to be rebuilt for a settings write", func() bool {
+		return a.fwd.forwarder() != first
+	})
+
+	before := a.fwd.forwarder()
+	passes := a.settingsPasses.Load()
+	if _, err := a.Store().Clients().AddGroup(ctx, "kids"); err != nil {
+		t.Fatalf("AddGroup: %v", err)
+	}
+	waitFor(t, "the settings watcher to finish the pass a group add woke it for", func() bool {
+		return a.settingsPasses.Load() > passes
+	})
+	if a.fwd.forwarder() != before {
+		t.Fatal("a group add rebuilt the forwarder; nothing it wrote is a setting")
+	}
+}
+
+// TestAGroupWriteRecompilesTheRulesets: a group's ruleset is built by the
+// filter refresher and by nothing else, so the handler that creates, renames
+// or disables a group has to ask for a recompile the way the list and rule
+// handlers do. Without it a group created with lists has no ruleset at all —
+// its clients resolve unfiltered — and a group disabled goes on filtering,
+// both until something unrelated happens to move a setting.
+func TestAGroupWriteRecompilesTheRulesets(t *testing.T) {
+	ctx := context.Background()
+	const blocked = "ads.example.com"
+	listSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("0.0.0.0 " + blocked + "\n"))
+	}))
+	t.Cleanup(listSrv.Close)
+
+	a := newTestApp(t, withUpstreams(mockDNS(t, answerA("9.9.9.9"))), withLoopbackLists())
+	lid, err := a.Store().Filters().AddList(ctx, store.List{URL: listSrv.URL, Kind: "block", Enabled: true})
+	if err != nil {
+		t.Fatalf("AddList: %v", err)
+	}
+	// Downloaded before the group exists, so what the assertions below turn
+	// on is the ruleset being rebuilt and not the copy being fetched.
+	if err := a.RefreshFilters(ctx); err != nil {
+		t.Fatalf("RefreshFilters: %v", err)
+	}
+
+	token := writeAPIToken(t, a)
+	base := httpURL(t, a) + "/api/v1"
+	code, body := apiPost(t, base+"/groups", token,
+		`{"name":"kids","list_ids":[`+strconv.FormatInt(lid, 10)+`]}`)
+	if code != http.StatusCreated {
+		t.Fatalf("POST /groups = %d %s", code, body)
+	}
+	var created struct {
+		ID int64 `json:"id"`
+	}
+	if err := json.Unmarshal([]byte(body), &created); err != nil || created.ID == 0 {
+		t.Fatalf("POST /groups body %q: %v", body, err)
+	}
+	code, body = apiPost(t, base+"/clients", token,
+		`{"name":"laptop","matcher":"127.0.0.1","group_id":`+strconv.FormatInt(created.ID, 10)+`}`)
+	if code != http.StatusCreated {
+		t.Fatalf("POST /clients = %d %s", code, body)
+	}
+
+	if got := digA(t, a.DNSAddr(), blocked); got != "0.0.0.0" {
+		t.Fatalf("%s answers %s for a client in a group subscribed to a list that blocks it, want 0.0.0.0", blocked, got)
+	}
+
+	code, body = apiSend(t, http.MethodPatch, base+"/groups/"+strconv.FormatInt(created.ID, 10),
+		token, `{"enabled":false}`)
+	if code != http.StatusNoContent {
+		t.Fatalf("PATCH /groups = %d %s", code, body)
+	}
+	if got := digA(t, a.DNSAddr(), blocked); got != "9.9.9.9" {
+		t.Fatalf("%s answers %s after its group was disabled, want the upstream's 9.9.9.9", blocked, got)
 	}
 }

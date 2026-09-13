@@ -15,15 +15,15 @@ import (
 
 func (s *Server) filtersRoutes() {
 	s.route("GET /api/v1/filters/lists", s.requireAuth(s.handleListsGet))
-	s.route("POST /api/v1/filters/lists", s.requireAuth(s.handleListCreate))
-	s.route("PATCH /api/v1/filters/lists/{id}", s.requireAuth(s.handleListPatch))
-	s.route("DELETE /api/v1/filters/lists/{id}", s.requireAuth(s.handleListDelete))
+	s.route("POST /api/v1/filters/lists", s.requireAuth(s.managed(s.handleListCreate)))
+	s.route("PATCH /api/v1/filters/lists/{id}", s.requireAuth(s.managed(s.handleListPatch)))
+	s.route("DELETE /api/v1/filters/lists/{id}", s.requireAuth(s.managed(s.handleListDelete)))
 	s.route("POST /api/v1/filters/lists/{id}/refresh", s.requireAuth(s.handleListRefresh))
 	s.route("GET /api/v1/groups/{id}/lists", s.requireAuth(s.handleGroupListsGet))
-	s.route("PUT /api/v1/groups/{id}/lists", s.requireAuth(s.handleGroupListsPut))
+	s.route("PUT /api/v1/groups/{id}/lists", s.requireAuth(s.managed(s.handleGroupListsPut)))
 	s.route("GET /api/v1/groups/{id}/rules", s.requireAuth(s.handleRulesGet))
-	s.route("POST /api/v1/groups/{id}/rules", s.requireAuth(s.handleRuleCreate))
-	s.route("DELETE /api/v1/filters/rules/{id}", s.requireAuth(s.handleRuleDelete))
+	s.route("POST /api/v1/groups/{id}/rules", s.requireAuth(s.managed(s.handleRuleCreate)))
+	s.route("DELETE /api/v1/filters/rules/{id}", s.requireAuth(s.managed(s.handleRuleDelete)))
 	s.route("POST /api/v1/filters/refresh", s.requireAuth(s.handleRefresh))
 }
 

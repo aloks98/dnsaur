@@ -3,14 +3,18 @@ package app
 import (
 	"context"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -21,6 +25,7 @@ import (
 	"github.com/aloks98/dnsaur/internal/cache"
 	"github.com/aloks98/dnsaur/internal/clients"
 	"github.com/aloks98/dnsaur/internal/config"
+	"github.com/aloks98/dnsaur/internal/confsync"
 	"github.com/aloks98/dnsaur/internal/dnssrv"
 	"github.com/aloks98/dnsaur/internal/filter"
 	"github.com/aloks98/dnsaur/internal/qlog"
@@ -52,6 +57,11 @@ func defaultSettings() map[string]string {
 		"serve.doh.listen":      ":443",
 		"serve.tls.cert":        "",
 		"serve.tls.key":         "",
+		"sync.peer_url":         "",
+		"sync.token":            "",
+		"sync.interval_seconds": "30",
+		"sync.primary_dns":      "",
+		"sync.tsig_key_id":      "0",
 	}
 }
 
@@ -137,6 +147,14 @@ type App struct {
 	notifier *zones.Notifier
 	notifyIn *zones.NotifyServer
 	logger   *qlog.Logger
+	// replica is the config-sync pull loop and replicas is the registry of
+	// the boxes that pull from this one. Both exist on every instance,
+	// because which kind this is is a setting and not a startup decision:
+	// the loop dials nobody while sync.peer_url is empty, and the registry
+	// stays empty while nothing registers. App is the api.Syncer in front
+	// of the pair — see PeerURL.
+	replica  *confsync.Replica
+	replicas *confsync.Registry
 	fwd      *swappable
 	// dnsCache is the pipeline's cache, held here rather than left local to
 	// Start because a routing change has to be able to invalidate it: an
@@ -179,6 +197,11 @@ type App struct {
 	// atomic.Pointer, and nil for "no downgrade", so the query path and the
 	// API handler never contend with a settings write.
 	downgrade atomic.Pointer[downgradeState]
+	// settingsPasses counts the reconcile passes the configuration watcher
+	// has finished, the ones it decided to skip included. Nothing in the
+	// server reads it: it is what lets a test wait for a pass to have
+	// happened before asserting that the pass changed nothing.
+	settingsPasses atomic.Uint64
 	// handler is the same pipeline every listener serves through — plain
 	// :53, and (Task 8) DoT and DoH. Built once in Start, before the first
 	// applySettings call, so a restart with either encrypted protocol
@@ -234,6 +257,17 @@ func New(ctx context.Context, cfg *config.Config, version string) (*App, error) 
 		ready:    make(chan struct{}),
 	}
 	a.refresher = filter.NewRefresher(st.Filters(), st.Clients(), a.engine, cfg.DataDir)
+	a.replicas = confsync.NewRegistry(st)
+	// The address this box registers with its main is the first dns_listen
+	// entry verbatim. A wildcard host (":53", the default) is therefore what
+	// the main would record, and it can neither allow a transfer from it nor
+	// notify it — a two-box deployment names a real address here. There is
+	// no sync.replica_dns to override it in this version.
+	var dnsAddr string
+	if len(cfg.DNSListen) > 0 {
+		dnsAddr = cfg.DNSListen[0]
+	}
+	a.replica = confsync.NewReplica(st, a, a.getSetting(ctx, "instance.id"), dnsAddr)
 	// The resolver every hostname in a zone's configuration is looked up
 	// through: a secondary's primaries, a NOTIFY target, a stub's
 	// out-of-zone nameserver. Four constructors default it independently,
@@ -246,7 +280,8 @@ func New(ctx context.Context, cfg *config.Config, version string) (*App, error) 
 	zoneRes := a.zoneLookup()
 	// Built before the Transferrer, which takes its Wake for the cascade.
 	a.notifier = zones.NewNotifier(st.Zones(), st.Notifies(), st.TSIGKeys(),
-		zones.WithNotifyResolver(zoneRes))
+		zones.WithNotifyResolver(zoneRes),
+		zones.WithReplicaTargets(a.replicaNotifyTargets))
 	// The transfer republishes the served snapshot itself: a zone installed
 	// into the store that nothing reloaded is answering from the copy it just
 	// replaced. The key store is passed live, not a snapshot, for the same
@@ -292,7 +327,8 @@ func New(ctx context.Context, cfg *config.Config, version string) (*App, error) 
 	// us. It reads a.resolver's live snapshot, so a zone this server
 	// authors is transferred as of its last reload, the same data an
 	// ordinary query would get.
-	a.xfrOut = zones.NewTransferServer(a.resolver, st.Zones())
+	a.xfrOut = zones.NewTransferServer(a.resolver, st.Zones(),
+		zones.WithReplicaAllow(a.replicaMayTransfer))
 	// The inbound half. It shares the Refresher the scheduler drives, so a
 	// notify-triggered transfer takes the same per-zone lock a scheduled one
 	// does rather than racing it.
@@ -359,29 +395,50 @@ func (a *App) getSetting(ctx context.Context, key string) string {
 // stored is still a pause, and refusing to start over one would take DNS
 // down for the whole network.
 func (a *App) restorePauses(ctx context.Context) {
-	if v, ok, err := a.st.Settings().Get(ctx, filter.PausesKey); err != nil {
-		slog.Error("reading the stored blocking pauses failed", "err", err)
-	} else if ok {
-		var p filter.Pauses
-		if err := json.Unmarshal([]byte(v), &p); err != nil {
-			slog.Error("the stored blocking pauses could not be read", "err", err, "value", v)
-		} else {
-			a.engine.Restore(p)
-		}
-	}
+	a.loadPauses(ctx)
 	a.engine.OnPauseChange(func(p filter.Pauses) {
 		b, err := json.Marshal(p)
 		if err != nil {
 			slog.Error("encoding the blocking pauses failed", "err", err)
 			return
 		}
-		// SetInternal: nothing edits this row by hand, and bumping
-		// config_version would make every settings watcher reconcile the
-		// whole configuration over a pause.
-		if err := a.st.Settings().SetInternal(ctx, filter.PausesKey, string(b)); err != nil {
+		// Set, not SetInternal: a pause is configuration the whole
+		// installation serves (spec §4.3), so it has to move
+		// config_version — a replica polls that counter, and a pause
+		// stored without a bump is one the rest of the boxes never hear
+		// about. The cost is one reconcile per pause, which is a few a
+		// day; the settings watcher skips the ones where nothing moved.
+		if err := a.st.Settings().Set(ctx, filter.PausesKey, string(b)); err != nil {
 			slog.Error("storing the blocking pauses failed", "err", err)
 		}
 	})
+}
+
+// loadPauses installs the stored pause state in the engine. It runs at
+// startup and again on every settings reload, which is how a pause the main
+// set reaches a replica: the bundle carries the row, and this is what turns
+// it back into a pause the query path honours.
+//
+// Restore never calls back into OnPauseChange, so the row this reads cannot
+// be rewritten by reading it. A key that is not there means nothing is
+// paused, and installing that is how a resume on the main clears one here.
+func (a *App) loadPauses(ctx context.Context) {
+	var p filter.Pauses
+	v, ok, err := a.st.Settings().Get(ctx, filter.PausesKey)
+	if err != nil {
+		// The row could not be read, which is not the same as "nothing is
+		// paused": installing the empty state on a failed read would resume
+		// blocking on a box someone deliberately paused.
+		slog.Error("reading the stored blocking pauses failed", "err", err)
+		return
+	}
+	if ok {
+		if err := json.Unmarshal([]byte(v), &p); err != nil {
+			slog.Error("the stored blocking pauses could not be read", "err", err, "value", v)
+			return
+		}
+	}
+	a.engine.Restore(p)
 }
 
 // settingValue is getSetting for the keys where "the store could not answer"
@@ -847,7 +904,10 @@ func (a *App) Start(ctx context.Context) error {
 		ZoneRefresher: a.zoneRefresh,
 		// a, again: App is what knows the ladder fell to plaintext defaults.
 		ResolverStatus: a,
-		Version:        a.version, Static: web.Dist(),
+		// And again: App is the one object that can say which half of the
+		// sync subsystem answers.
+		Sync:    a,
+		Version: a.version, Static: web.Dist(),
 		TrustedProxies: a.cfg.TrustedProxies,
 		DataDir:        a.cfg.DataDir,
 	})
@@ -913,6 +973,11 @@ func (a *App) Start(ctx context.Context) error {
 		// for it before closing the store rather than pulling the store out
 		// from under a transfer.
 		a.notifyIn.Run,
+		// The config-sync pull loop. It pulls once before its first wait, so
+		// a restart applies whatever the main changed while this box was
+		// down, and it costs a box that follows nobody one settings read
+		// every five seconds.
+		a.replica.Run,
 		// Re-attempts DoT/DoH while either is enabled and not listening, so
 		// a bind failure whose cause the operator has since cleared stops
 		// needing an unrelated settings write to notice — see
@@ -920,11 +985,42 @@ func (a *App) Start(ctx context.Context) error {
 		a.runServingRetry,
 		func(c context.Context) { a.refresher.Run(c, refreshEvery) },
 		func(c context.Context) {
+			// The settings as this loop last applied them. A write to a
+			// synced table — a client, a rule, a zone — moves
+			// config_version and wakes this loop without touching a single
+			// setting, and the handler behind that write has already
+			// reloaded what it did change (§5). Reconciling anyway rebuilt
+			// the forwarder, reloaded the registry and recompiled every
+			// ruleset to arrive at exactly what was already serving.
+			var applied map[string]string
 			for {
 				select {
 				case <-c.Done():
 					return
 				case <-changes:
+					// Coalesce a burst into one pass. Every configuration
+					// write publishes here now, not only a settings write
+					// — adding twenty clients would otherwise rebuild the
+					// forwarder and recompile the whole ruleset twenty
+					// times, and the last pass is the only one whose result
+					// differs from the one before it.
+					for len(changes) > 0 {
+						<-changes
+					}
+					switch cur, err := a.st.Settings().All(c); {
+					case err != nil:
+						// "Nothing changed" could not be established, so it
+						// is not claimed: a needless reconcile costs a
+						// rebuild, and a skipped one leaves the server
+						// answering from a configuration nobody chose.
+						slog.Warn("comparing the settings with the last applied set failed", "err", err)
+						applied = nil
+					case applied != nil && maps.Equal(applied, cur):
+						a.settingsPasses.Add(1)
+						continue
+					default:
+						applied = cur
+					}
 					a.applySettings(c)
 					// Compile, do not download. A settings write can
 					// change which rules and lists a group enforces, so
@@ -936,6 +1032,7 @@ func (a *App) Start(ctx context.Context) error {
 					if err := a.refresher.Recompile(c); err != nil {
 						slog.Error("recompiling filters after a settings change failed", "err", err)
 					}
+					a.settingsPasses.Add(1)
 				}
 			}
 		},
@@ -1005,6 +1102,299 @@ func (a *App) RefreshList(ctx context.Context, id int64) error {
 	return a.refresher.RefreshOne(ctx, id)
 }
 func (a *App) NextFilterRefresh() int64 { return a.refresher.NextRefresh() }
+
+// ReloadSettings rebuilds everything applySettings owns — the forwarder, the
+// blocking mode, the encrypted listeners — for a caller that wrote settings
+// straight into the store rather than through the API. That caller is the
+// config-sync pull: it imports a whole bundle in one transaction, and
+// nothing in the API layer ever hears about it.
+//
+// The pauses go with it. They are a settings row like the rest (§4.3), and
+// the only one applySettings does not own — it is the engine that holds them,
+// and loadPauses is what puts an imported row back into it.
+//
+// It returns an error to satisfy the interface, and never does: applySettings
+// degrades in place (it keeps the previous forwarder, logs what it could not
+// use) precisely so that a bad settings value cannot take DNS down.
+func (a *App) ReloadSettings(ctx context.Context) error {
+	a.applySettings(ctx)
+	a.loadPauses(ctx)
+	return nil
+}
+
+// The methods from here to DNSPort are App's api.Syncer half (§8). Which
+// object answers is decided by sync.peer_url, read live: it is what the
+// write guard asks on every write, and the two roles are the two sides of
+// that one setting — the registry answers for a main, the pull loop for a
+// replica.
+func (a *App) PeerURL() string { return a.replica.PeerURL() }
+
+func (a *App) Status() api.SyncStatus {
+	if a.replica.PeerURL() != "" {
+		return a.replica.Status()
+	}
+	// Status takes no context — it answers a status endpoint and a
+	// background warning strip alike — so the deadline is made here rather
+	// than inherited. Five seconds, as Replica.PeerURL bounds its own read:
+	// the work behind it is two settings rows, and a handler may not hang
+	// on a store that has stopped answering.
+	ctx, cancel := context.WithTimeout(context.Background(), syncStatusTimeout)
+	defer cancel()
+	return a.replicas.Status(ctx)
+}
+
+// syncStatusTimeout bounds the store reads behind GET /sync/status on a main.
+const syncStatusTimeout = 5 * time.Second
+
+func (a *App) Forget(ctx context.Context, instanceID string) error {
+	return a.replicas.Forget(ctx, instanceID)
+}
+
+func (a *App) NewPairingCode(ctx context.Context) (string, int64, error) {
+	return a.replicas.NewPairingCode(ctx)
+}
+
+// Pair spends a code on one replica and answers what that box needs to
+// follow this one: its secret and the port to transfer from. The key to sign
+// with rides in the bundle the replica's first pull brings.
+//
+// confsync.ErrPairingRefused is reported as api.ErrPairingRefused, which is
+// the sentinel the handler that answers 403 can name: internal/confsync
+// imports internal/api, so the dependency cannot run the other way.
+func (a *App) Pair(ctx context.Context, req api.PairRequest) (api.PairResult, error) {
+	secret, err := a.replicas.Pair(ctx, req.Code, req.InstanceID, req.DNSAddr)
+	if errors.Is(err, confsync.ErrPairingRefused) {
+		return api.PairResult{}, api.ErrPairingRefused
+	}
+	if err != nil {
+		return api.PairResult{}, err
+	}
+	// After the code is spent, not before: Registry.Pair refuses a bad code
+	// without a side effect, and a key minted ahead of it would be one more
+	// key on the TSIG page for every guess somebody made.
+	//
+	// Not swallowed either: a replica whose main designated no key would
+	// pair successfully and then transfer nothing. The error costs the
+	// operator this code — the registry has already spent it — and the
+	// answer is to mint another.
+	if _, err := a.ensureSyncKey(ctx); err != nil {
+		return api.PairResult{}, err
+	}
+	return api.PairResult{Secret: secret, DNSPort: a.DNSPort()}, nil
+}
+
+// ensureSyncKey is the key a main's replicas transfer under, made on the
+// first pairing because the operator never picks one (§6). It answers the
+// designated key's id, creating one when nothing is designated or the
+// designated id names no key — a row deleted out from under the setting.
+//
+// Idempotent, and it only ever adds. Whatever sync.tsig_key_id resolves to
+// is the key, whoever made it and whatever it is called: the replicas that
+// have already paired are signing with it, and a second key would leave
+// every one of them signing under a name this main no longer designates,
+// with nothing on either box to say why the transfers stopped.
+//
+// The create is an ordinary synced write, so the key reaches every replica
+// in the next bundle, alongside the derived secondaries that name it.
+func (a *App) ensureSyncKey(ctx context.Context) (int64, error) {
+	id, err := a.st.Settings().GetInt(ctx, "sync.tsig_key_id")
+	if err != nil {
+		return 0, err
+	}
+	if id != 0 {
+		switch _, found, err := a.st.TSIGKeys().Get(ctx, id); {
+		case err != nil:
+			return 0, err
+		case found:
+			return id, nil
+		}
+	}
+	secret := make([]byte, 32)
+	if _, err := rand.Read(secret); err != nil {
+		return 0, err
+	}
+	// rand.Text draws from RFC 4648's base32 alphabet, which lowercased is
+	// the one §6 names; six of its characters are the whole of the name's
+	// variable half, and a TSIG owner name is matched case-insensitively.
+	id, err = a.st.TSIGKeys().Create(ctx, store.TSIGKey{
+		Name:      "sync-" + strings.ToLower(rand.Text()[:6]) + ".",
+		Algorithm: "hmac-sha256.",
+		Secret:    base64.StdEncoding.EncodeToString(secret),
+		CreatedAt: time.Now().UnixMilli(),
+	})
+	if err != nil {
+		return 0, err
+	}
+	// Recorded before the pairing answers. A key created and not designated
+	// is one the next pairing would make again, leaving the first orphaned
+	// on the TSIG page and the replica that got it signing with nothing.
+	//
+	// A bumping write, where the rest of sync.* is bookkeeping: the bundle
+	// carries this id, so a replica that pulled between the create above
+	// and this line holds one that designates no key, and only a moved
+	// version brings it back for the corrected one. The row still never
+	// travels — sync.* is local (§4.3).
+	if err := a.st.Settings().Set(ctx, "sync.tsig_key_id", strconv.FormatInt(id, 10)); err != nil {
+		return 0, err
+	}
+	return id, nil
+}
+
+func (a *App) Authenticate(ctx context.Context, secret string) (string, bool, error) {
+	return a.replicas.Authenticate(ctx, secret)
+}
+
+// Heartbeat maps the registry's "forgotten while probing" onto the API's,
+// for Pair's reason: the endpoint that turns it into a 401 is over there.
+func (a *App) Heartbeat(ctx context.Context, instanceID string, applied int64) error {
+	err := a.replicas.Heartbeat(ctx, instanceID, applied)
+	if errors.Is(err, confsync.ErrNotRegistered) {
+		return api.ErrNotRegistered
+	}
+	return err
+}
+
+// Follow is the replica half of the same handshake, with confsync's refusal
+// mapped onto the API's for Pair's reason. The peer's own words about the
+// refusal are logged rather than returned: the answer that endpoint gives
+// is fixed, because what a main is willing to say about which way a code
+// was wrong is not much (§9).
+func (a *App) Follow(ctx context.Context, peerURL, code string) error {
+	err := a.replica.Follow(ctx, peerURL, code)
+	if errors.Is(err, confsync.ErrFollowRefused) {
+		slog.Warn("pairing with the main was refused", "peer", peerURL, "err", err)
+		return api.ErrFollowRefused
+	}
+	return err
+}
+
+// DNSPort is the port this box answers DNS on, which a replica joins its
+// peer URL's host to when sync.primary_dns names no override (§8). The
+// first dns_listen entry decides it, the same entry the address this box
+// pairs with comes from; a value that names no port is the default, since
+// a box that is answering at all is answering somewhere.
+func (a *App) DNSPort() int {
+	if len(a.cfg.DNSListen) > 0 {
+		if _, port, err := net.SplitHostPort(a.cfg.DNSListen[0]); err == nil {
+			if n, err := strconv.Atoi(port); err == nil {
+				return n
+			}
+		}
+	}
+	return 53
+}
+
+// replicaHookTimeout bounds the store reads behind the two hooks below. Both
+// run on a DNS path — a transfer's gate, a notify pass — so a store that has
+// stopped answering costs that path two seconds rather than holding it.
+//
+// It bounds the reads, not the wait for the registry's own lock: Register and
+// Forget hold that across a settings read and write, so a registration
+// arriving at the same moment can hold this hook up for as long as the store
+// takes to serve it (SQLite's busy timeout is five seconds). A TryLock fast
+// path would trade that for refusing a transfer that should have been
+// allowed, which is the worse of the two.
+const replicaHookTimeout = 2 * time.Second
+
+// replicaMayTransfer is zones.ReplicaAllow (§6): the request signed with the
+// key sync.tsig_key_id designates, from a box registered as a replica.
+//
+// A stale replica still matches. Stale means nothing has been heard from it
+// for three intervals, which is exactly the state a box coming back from an
+// outage is in — refusing it the data it is behind on would be the wrong way
+// round. NOTIFY is where staleness is acted on, below.
+func (a *App) replicaMayTransfer(keyName string, peer netip.Addr) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), replicaHookTimeout)
+	defer cancel()
+	syncKey := a.replicas.SyncKeyName(ctx)
+	if syncKey == "" || !strings.EqualFold(keyName, syncKey) {
+		return false
+	}
+	reps, err := a.replicas.List(ctx)
+	if err != nil {
+		slog.Warn("reading the registered replicas failed; the transfer is left to allow_transfer",
+			"peer", peer, "err", err)
+		return false
+	}
+	for _, r := range reps {
+		if ip, ok := replicaIP(r.DNSAddr); ok && ip == peer {
+			return true
+		}
+	}
+	return false
+}
+
+// replicaNotifyTargets is zones.ReplicaTargets (§6): every registered
+// replica that is not stale, signed with the sync key.
+//
+// Staleness is acted on here and not in the transfer gate because the two
+// cost different things. Notifying a box that has been silent for three
+// intervals buys a round of retries per zone per serial bump for as long as
+// it stays away, and buys nothing: its own refresh timer collects the zone
+// when it returns.
+func (a *App) replicaNotifyTargets(ctx context.Context) ([]zones.NotifyTarget, error) {
+	ctx, cancel := context.WithTimeout(ctx, replicaHookTimeout)
+	defer cancel()
+	// The registry first, and its error returned rather than logged: the
+	// targets are reconciled into zone_notifies, so a read that failed must
+	// not reach the notifier as "this main has no replicas" (see
+	// zones.ReplicaTargets). It is also the read that answers whether the
+	// key lookup below is worth making at all.
+	reps, err := a.replicas.List(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if len(reps) == 0 {
+		return nil, nil
+	}
+	// No designated key means no replica is following this main's zones at
+	// all: a replica's derived secondaries transfer under the sync key, so
+	// there is nothing an unsigned NOTIFY would usefully invite.
+	syncKey := a.replicas.SyncKeyName(ctx)
+	if syncKey == "" {
+		return nil, nil
+	}
+	var out []zones.NotifyTarget
+	for _, r := range reps {
+		if r.Stale {
+			continue
+		}
+		// dns_addr is exactly the `host:port` half of one notify_to entry, so
+		// it is read by that format's own parser rather than assembled here:
+		// an address the format cannot express is dropped with a line saying
+		// so, instead of becoming a target nothing can ever send to.
+		ts, err := zones.ParseNotifyTo(r.DNSAddr + " key:" + syncKey)
+		if err != nil {
+			slog.Warn("a registered replica's dns_addr is not a usable notify target",
+				"instance_id", r.InstanceID, "dns_addr", r.DNSAddr, "err", err)
+			continue
+		}
+		out = append(out, ts...)
+	}
+	return out, nil
+}
+
+// replicaIP is the address a registered replica's dns_addr names.
+//
+// dns_addr is validated as host:port, which permits a hostname, and a
+// hostname here never matches: resolving one would put a DNS lookup inside
+// the gate of the server that answers DNS — the same rule that keeps
+// allow_transfer's parser pure (see zones/notifyto.go). Such a replica is
+// simply not covered by the implicit allow, and its transfers are decided by
+// allow_transfer as they were before it registered.
+func replicaIP(dnsAddr string) (netip.Addr, bool) {
+	host, _, err := net.SplitHostPort(dnsAddr)
+	if err != nil {
+		return netip.Addr{}, false
+	}
+	ip, err := netip.ParseAddr(host)
+	if err != nil {
+		return netip.Addr{}, false
+	}
+	// Unmapped, because the peer a transfer arrives from is (see peerAddr):
+	// ::ffff:10.0.0.6 and 10.0.0.6 are one address, and must compare equal.
+	return ip.Unmap(), true
+}
 
 func (a *App) Shutdown(ctx context.Context) error {
 	if a.apiCancel != nil {

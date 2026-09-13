@@ -48,6 +48,75 @@ export interface CertificateStatus {
 }
 
 /**
+ * One replica registered with this main (Go: api.Replica). `last_seen` is
+ * stamped by the main on registration, never sent by the replica, so a
+ * replica's clock cannot decide whether it looks stale. `stale` is the
+ * main's own verdict — nothing heard for three pull intervals — and is
+ * never a reason to remove the row: an operator forgets a replica
+ * deliberately.
+ */
+export interface SyncReplica {
+  instance_id: string;
+  /** Where this replica answers DNS (host:port) — the address an AXFR
+   * arrives from and a NOTIFY goes to. */
+  dns_addr: string;
+  version_applied: number;
+  /** Unix ms. */
+  last_seen: number;
+  stale: boolean;
+}
+
+/**
+ * GET /sync/status, and the same object GET /resolver/status carries as
+ * `sync` (Go: api.SyncStatus). Both halves are optional because an
+ * instance is only ever one of the two: a **replica** follows `peer_url`
+ * and reports what it has applied, a **main** reports the key replicas
+ * sign with and who is registered. An instance with no sync configured
+ * reads as a main with no replicas.
+ *
+ * `sync.token` is deliberately absent — it is write-only (see
+ * docs/api.md's Settings entry), and pairing is what writes it, so no
+ * screen has a reason to read it back.
+ */
+export interface SyncStatus {
+  role: "main" | "replica";
+  /** Replica half. Omitted (`undefined`) rather than falsy when this is a
+   * main — the same `omitempty` shape as ProtocolStatus.error. */
+  peer_url?: string;
+  peer_version?: number;
+  applied_version?: number;
+  applied_at?: number;
+  last_pull_at?: number;
+  /** Both halves. On a replica it is why the last pull failed; on a main it
+   * is `sync.replicas` unreadable, which is a main that admits no transfer
+   * and notifies nobody however many replicas the band lists. */
+  last_error?: string;
+  /** The peer is reached over plain `http://`, so the bundle — every TSIG
+   * secret on the box included — travels in the clear. */
+  plain_http?: boolean;
+  /** Main half: the name of the TSIG key replicas sign their transfers
+   * with. The main creates it on the first pairing and nobody picks it. */
+  sync_key?: string;
+  replicas?: SyncReplica[];
+}
+
+/**
+ * POST /sync/pairing-code (Go: api's pairingCode) — the one-time code
+ * the operator carries to the box that is to become a replica.
+ *
+ * Answered once and never readable again: only its hash is stored, and
+ * minting a second code voids the first. The screen that asked for it is
+ * the only place it exists.
+ */
+export interface PairingCode {
+  /** Eight glyphs from an unambiguous alphabet, grouped `XXXX-XXXX` by the
+   * server — shown exactly as it arrives. */
+  code: string;
+  /** Unix ms. */
+  expires_at: number;
+}
+
+/**
  * GET /resolver/status — state of the running resolver that is not a
  * setting, and so deliberately not part of the flat GET /settings map.
  *
@@ -70,6 +139,11 @@ export interface ResolverStatus {
   reason: string;
   serving: ServingStatus;
   certificate?: CertificateStatus;
+  /** The sync subsystem's whole visible state, carried here so every screen
+   * can ask "am I a replica" without a second round trip. Optional: a
+   * dnsaur older than config sync answers without it, and so does every
+   * fixture written before it existed. Absent reads as a main. */
+  sync?: SyncStatus;
 }
 
 export interface Group {

@@ -4,6 +4,7 @@ import { afterEach, expect, test, vi } from "vitest";
 import { fireEvent, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { server } from "../../test/msw-server";
+import { replicaHandlers } from "../../test/msw-handlers";
 import { renderWithProviders } from "../../test/render";
 import type { Client, Group, List } from "../../api/types";
 import { GroupsClientsTab } from "./groups-clients";
@@ -741,4 +742,30 @@ test("a client row showing its group's pause says so and can't resume it", async
   fireEvent.click(within(menu).getByText(/^resume blocking$/i));
   await new Promise((resolve) => setTimeout(resolve, 30));
   expect(deleted).toBe(false);
+});
+
+// --- replica mode ---------------------------------------------------------
+
+// Spec §7: with a peer configured, every write to a synced resource is a 409
+// before the store is touched. Groups and clients are synced, so the screen
+// states whose configuration this is and stops offering to change it —
+// rather than letting an operator fill in a form the server will refuse.
+test("a replica says who manages it and won't offer to add a group", async () => {
+  mockAll();
+  server.use(...replicaHandlers("https://main.lan"));
+
+  renderWithProviders(<GroupsClientsTab />);
+
+  // One muted line in the section header, beside the control it explains —
+  // not a page-wide warning strip. Being a replica is a state; the strip is
+  // reserved for the two sync facts that are actually wrong.
+  const notice = await screen.findByText("Managed by the main");
+  const addGroup = screen.getByRole("button", { name: "Add group" });
+  expect(addGroup).toBeDisabled();
+  expect(notice.parentElement).toContainElement(addGroup);
+  expect(notice.className).toContain("text-muted-foreground");
+  expect(notice.className).not.toContain("bg-warning");
+
+  expect(screen.getByRole("button", { name: "Add client" })).toBeDisabled();
+  expect(screen.getAllByText("Managed by the main")).toHaveLength(1);
 });

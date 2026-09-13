@@ -28,6 +28,7 @@ import (
 type fakeReloader struct {
 	mu                                              sync.Mutex
 	clients, records, filters, recompiles, notifies int
+	settings                                        int
 	// refreshed is the ids passed to RefreshList, in order, so a test can
 	// tell a per-list download from the all-lists one. nextRefreshAt is
 	// what NextFilterRefresh reports; set it before the request, since
@@ -72,6 +73,13 @@ func (f *fakeReloader) NextFilterRefresh() int64 {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.nextRefreshAt
+}
+
+func (f *fakeReloader) ReloadSettings(ctx context.Context) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.settings++
+	return nil
 }
 
 func (f *fakeReloader) RecompileFilters(ctx context.Context) error {

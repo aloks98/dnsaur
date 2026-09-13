@@ -20,6 +20,15 @@ export const settingsKeys = {
   serveSettleUntil: ["serve-settle-until"] as const,
 };
 
+/** GET /sync/status' key, declared here rather than in use-sync.ts beside
+ * the hooks that read it: useUpdateSetting below has to invalidate it, and
+ * use-sync.ts already needs `settingsKeys` and `useResolverStatus` from
+ * here — so keeping it there made the two modules import each other. The
+ * dependency runs one way, use-sync → use-settings. */
+export const syncKeys = {
+  status: ["sync", "status"] as const,
+};
+
 /** How long after a `serve.*` write the status is polled regardless of what
  * it currently says, and how often during that window.
  *
@@ -103,6 +112,14 @@ export function useUpdateSetting() {
       }
       // A saved `upstreams` may have just ended (or begun) a downgrade.
       void qc.invalidateQueries({ queryKey: settingsKeys.resolverStatus });
+      // A saved `sync.*` key moves what GET /sync/status answers, and that
+      // is not a setting, so the invalidation above does not reach it. The
+      // Sync band renders it directly beside the boxes that were just
+      // saved, and at its own 30s cadence it spent up to half a minute
+      // contradicting them. Unconditional rather than keyed on a `sync.`
+      // prefix: one cheap read after any save beats a prefix test that has
+      // to be remembered when a key moves.
+      void qc.invalidateQueries({ queryKey: syncKeys.status });
     },
   });
 }

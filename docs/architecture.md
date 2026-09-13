@@ -9,9 +9,10 @@ background jobs, and a REST API + auth server on top of the same storage
 layer (see [`docs/api.md`](api.md)). The web dashboard (`web/`, a React
 SPA) is built separately but embedded into that same binary via
 `//go:embed` and served by the same HTTP server as the API — there is no
-separate frontend process or listener. Planned services — DHCP, HA config
-sync — are additional listeners that feed the same internal packages
-rather than separate processes.
+separate frontend process or listener. A second instance following this one
+(see Config sync below) is another copy of the same binary, not a component
+of this one; the DHCP server planned for a later phase is an additional
+listener feeding the same internal packages rather than a separate process.
 
 ## The middleware pipeline
 
@@ -256,7 +257,7 @@ read:
 | Rcode | Means |
 |---|---|
 | `NOTAUTH` | dnsaur doesn't hold that zone — wrong or disabled apex, or a type (`internal`/`stub`/`forwarder`) that holds no data to send — or the request's TSIG didn't verify |
-| `REFUSED` | dnsaur holds the zone, but the peer's address or key isn't in its `allow_transfer` |
+| `REFUSED` | dnsaur holds the zone, but the peer's address or key isn't in its `allow_transfer` — unless the zone is a `primary` and the peer is a registered replica signed with the sync key, which config sync admits beside the ACL rather than by rewriting it (`docs/superpowers/specs/2026-09-11-config-sync-design.md` §6) |
 | `SERVFAIL` | the zone is a `secondary` dnsaur can't currently vouch for (nothing transferred yet, or past `expires_at`), or the server is already at its concurrent-transfer limit |
 | `NOTIMP` | the AXFR arrived over UDP, which RFC 5936 §4.2 leaves undefined. Checked *after* every row above, so a peer outside the ACL is still told `REFUSED` rather than told about the transport |
 | `FORMERR` | the query isn't a well-formed transfer request — in practice, a class other than IN. The other half of that rule, a question count other than one, is answered `FORMERR` by miekg's own accept function before dnsaur sees the message at all |
@@ -787,6 +788,254 @@ zone's master; it is spelled `pullsFromAMaster` in `internal/api` and again
 in `internal/zones`, deliberately not shared, since one answers about a type
 an HTTP client just typed and the other about a stored row.
 
+## Config sync (main and replica)
+
+Two dnsaur boxes serve one network so that either can answer when the other
+is down — DHCP hands out both addresses, and the failover is the client's.
+Zone transfers already make authoritative data identical on the pair; config
+sync is what makes the rest of it identical, so the two boxes behave the
+same.
+
+One instance is the **main**: it takes writes, and it learns nothing it did
+not already know except that a replica exists. Any instance with
+`sync.peer_url` set is a **replica**: it pulls the main's configuration on a
+timer, applies it, and refuses local writes to anything that configuration
+covers with `409 managed by <peer>`. Which of the two a box is comes from
+that one setting — there is no third mode, no election, and no split-brain
+to recover from, because only one box ever accepted writes.
+`internal/confsync` holds both halves: `Replica`, the pull loop (it runs on
+every box, and a box with no peer never dials), and `Registry`, the main's
+record of who is following it. The design rationale is in
+[`docs/superpowers/specs/2026-09-11-config-sync-design.md`](superpowers/specs/2026-09-11-config-sync-design.md);
+the endpoints are in [`docs/api.md`](api.md), the settings and a two-box
+walkthrough in [`docs/configuration.md`](configuration.md#config-sync), and
+the screens in [`docs/dashboard.md`](dashboard.md#sync).
+
+### The pull cycle
+
+```
+ replica                                   main
+   │ once, with a code the operator carried from the main's screen
+   ├─ POST /api/v1/sync/pair ─────────────►│  {code, instance_id, dns_addr}, no credential
+   │◄──────────────────────────────────────┤  {secret, dns_port}; the main records the box
+   │
+   │ then every sync.interval_seconds (default 30 s)
+   ├─ GET /api/v1/sync/version?applied=N ─►│  Bearer <secret>; the main stamps last_seen and N
+   │◄──────────────────────────────────────┤  {config_version, instance_id, dns_port}
+   │ unchanged → done                      │
+   │ changed:                              │
+   ├─ GET /api/v1/sync/bundle ────────────►│  the bundle, same bearer
+   │◄──────────────────────────────────────┤
+   │ derive zones, import in one tx        │
+   │ reload clients, filters, zones, settings
+```
+
+Polling, not push. The version probe is a few hundred bytes, and at 30 s the
+worst-case lag is one interval — the same order as the TTLs the network
+already lives with. A pull that fails leaves the last applied configuration
+in force and records why in `sync.last_error`; DNS is unaffected, which is
+the behaviour a store that is down already has everywhere else.
+
+**The probe is the heartbeat.** There is no registration call: a replica
+exists on the main from the moment it paired, and each probe carries in
+`?applied=` the version that box has actually installed, which is what the
+main stamps the entry with alongside a `last_seen` of its own clock — a
+replica reporting when it thinks it called would let a clock skew decide
+whether it looks stale. It reports a version only while that number is this
+peer's own count of its own writes; one applied from a different main
+describes nothing this one can read. An id the main no longer knows gets the
+`401` a wrong secret gets, because the answer is the same: pair again.
+
+Two rules keep a half-applied configuration off the replica:
+
+- **The version decides.** A bundle is fetched only when the probe's
+  `config_version` differs from the one the replica last applied — a box
+  that has never applied one, or that last applied one from a *different*
+  peer, fetches whatever the main has — and applied
+  only when the bundle's own version still matches the probe's. A
+  write landing between the two requests is caught by the next cycle rather
+  than applied half a version late.
+- **One transaction.** `store.ImportBundle` diffs every synced table against
+  the bundle by id — insert, update, delete — writes the settings it
+  carries, removes the synced settings it does not, and bumps
+  `config_version` once. Either the box matches the bundle or it matches
+  what it had before.
+
+After the transaction the replica runs what an API write handler runs after
+its own write, in that order: `ReloadClients`, `RecompileFilters`,
+`ReloadZones`, `ReloadSettings`. Recompile, not refresh — a bundle cannot
+change what a list URL serves. A list this box has never downloaded is the
+exception: the pull kicks the same background download a list creation does,
+because a bundle carries a URL and not its contents, and waiting for
+`lists.refresh_hours` would leave a newly following replica serving a LAN
+with blocking configured and nothing blocked.
+
+The registration closes every cycle, whether or not anything was applied: it
+is also the heartbeat the main measures staleness by, and configuration
+changes far less often than three intervals.
+
+### What travels, and what stays on the box
+
+| Data | In the bundle? |
+|---|---|
+| Groups, clients, lists and their group assignments, rules, TSIG keys | Yes — with the main's ids |
+| Zone *definitions* | Yes, rewritten for the replica (below) |
+| Zone records, a zone's transfer state, a list's refresh state | No — the replica's own transfers and downloads produce them |
+| Every setting outside the local set: `upstreams`, `upstream.strategy`, `blocking.*`, `cache.*`, `lists.refresh_hours`, `qlog.*`, `stats.retention_days` | Yes — including `blocking.pauses`, since a pause is a decision about the network and clients reach either box |
+| `instance.id`, every `serve.*` key, every `sync.*` key, `stats.watermark` | No — they describe the box, not the service |
+| The bootstrap YAML (`dns_listen`, `http_listen`, `data_dir`, `storage.*`, `log_*`, `trusted_proxies`) | No — it is not in the `settings` table at all |
+| Users, sessions, API tokens, the query log and the stats behind it | No — an admin account per box; the replica's token to the main is the only credential that crosses |
+
+`store.LocalSettingKey` is the single answer to "does this key stay here?":
+the main asks it to decide what leaves in a bundle, and the replica asks it
+both to decide what a bundle may overwrite and to keep its own keys from
+being pruned as absent from one.
+
+Ids are the main's, and the import keeps them, so a `group_id`, a
+`tsig_key_id` or a query log row's `rule_id` names the same row on both
+boxes. A replica never creates a synced row of its own, so its id space is
+free for the main's to occupy; on Postgres the import advances each synced
+table's sequence past the ids it wrote, so the first row created after a
+promotion does not collide with one the main already used. The one id
+space a replica does fill on its own is the built-in zones, seeded at
+whatever ids its sequence had reached; when a bundle zone lands on one of
+those, the built-in gives way and is seeded again by name at a fresh id,
+records included.
+
+**The config version** is what the probe compares. Every write to a synced
+table advances it, inside that write's own transaction — a group, a client,
+a list or an assignment, a rule, a TSIG key, a zone definition, a setting.
+Zone records, serial bumps, transfer bookkeeping and a list's refresh state
+do not, and neither does the stamp a replica's heartbeat leaves on the
+registry: bumping the version on each of those would have every replica pull
+a bundle it already has, forever.
+
+### Pairing
+
+The two boxes are introduced once, by a code the operator carries from the
+main's screen to the replica's. `Registry.NewPairingCode` mints eight
+characters of a 32-glyph alphabet with no ambiguous pair in it, hands it back
+once, and stores in `sync.pairing` only what is needed to recognise it again:
+its hash, when it expires (ten minutes), and how many wrong guesses have been
+made against it. Minting replaces whatever was live — one door open at a
+time.
+
+`POST /sync/pair` is the one unauthenticated write in this API, because a box
+that has not paired holds no credential to present: the code is the proof,
+and it is spent by being used. What stands in for a credential is the login
+endpoint's own throttle, per source address, in front of a code that is 40
+bits, lives ten minutes and dies on the fifth wrong attempt. A correct code
+is spent *before* the entry is written — a store that fails after that costs
+the operator a fresh code, where the other order would leave a used code live
+for a second box. Wrong, expired, spent and voided are one `403`: a guesser
+told which it was would learn whether a code is live at all.
+
+What the code buys is that one replica's secret, 32 random bytes that exist
+in plain text on the main for the length of one response. The registry keeps
+its hash beside the entry in `sync.replicas`, keyed by instance id, and
+`Registry.Authenticate` finds a caller by scanning them — a scan, because
+only hashes are stored and the entries are a handful the operator paired by
+hand. **Forget** deletes the entry and the hash with it, so the secret dies
+with the registration; pairing the same instance id again replaces both.
+
+The replica's half is `Replica.Follow`. It posts the code, then writes
+`sync.peer_url` and the secret in one settings write, because a peer stored
+without its secret is a replica that pulls a `401` forever. Then it kicks a
+pull — on the poll loop's context, not the request's, so a shutdown still
+stops it — and answers as soon as the pairing is stored, which is the part
+that cannot be retried: the code is spent on the main either way, and a first
+pull that fails is reported where every other failed pull is.
+
+`App.ensureSyncKey` runs after the code is spent, and is where the sync TSIG
+key comes from: the main creates its own the first time anyone pairs —
+`sync-<six base32 characters>.`, HMAC-SHA256, a 32-byte secret — records it
+as `sync.tsig_key_id` before answering the replica, and designates the same
+key on every later pairing. That record is a version-moving write where the
+rest of `sync.*` is bookkeeping: the bundle carries the key id, so a replica
+that pulled between the key being created and it being designated is holding
+one that names no key, and only a moved version fetches the corrected one.
+The row itself still never leaves the box — `sync.*` is local.
+
+It only ever adds, and whatever that setting resolves to is the key, whoever
+made it: a second one would leave every replica that has already paired
+signing under a name this main no longer designates, with nothing on either
+box to say why the transfers stopped. The key is listed on
+the TSIG keys page like any other, and the store refuses to delete it while
+the setting names it. The operator never picks it.
+
+**The two reads take a replica's secret and nothing else.** `requireReplica`
+accepts the bearer token one pairing minted, and answers `401` to a session
+cookie or an API token at any scope — the bundle carries every TSIG secret on
+the box, and the probe behind it is a heartbeat for the box it names, so both
+belong to the replicas this main paired with. One answer for every way the
+credential can fail, so a caller learns whether its own works and nothing
+else. Those two reads and both pairing calls are `409 managed by <peer>` on a
+replica: the bundle a replica could answer with is the main's, one pull
+stale, and a box that stopped being a main must stop stamping the replicas it
+used to have. `POST /sync/follow` is the replica's own call and is not
+refused that way — a box already following one is told which.
+
+### Zones on the replica
+
+The bundle carries definitions; the records arrive by AXFR.
+`confsync.DeriveZones` rewrites each zone before the import:
+
+| The main's type | The replica gets |
+|---|---|
+| `primary` | a `secondary` of the same name, transferring from `sync.primary_dns` when that override is set and otherwise from the peer URL's host on the port the main advertises in its probe (53 when it advertised none), under the main's sync key, with `allow_transfer` and `notify_to` copied verbatim so the replica serves its own downstreams the same way the main does |
+| `secondary` | the same definition — both boxes become equal secondaries of the same external primary, and the replica does not transfer from the main |
+| `stub`, `forwarder` | the same definition |
+| `internal` | nothing; each box seeds its own RFC 6303 built-ins, and no bundle carries them |
+
+A derived secondary that already exists keeps its transfer state —
+`soa_serial`, `refreshed_at`, `expires_at` and the records themselves. Only
+the definition columns are written, so a config pull never makes a serving
+secondary forget what it transferred. A newly derived one is due for a
+refresh immediately, so its first transfer starts on the scheduler's next
+pass.
+
+### The implicit allow and notify
+
+Nothing rewrites an ACL to let the pair transfer. The main designates one
+TSIG key as `sync.tsig_key_id` — it creates that key itself on the first
+pairing, and nobody picks it — and pairing adds one clause beside each
+existing gate:
+
+- **Transfer.** An AXFR for a `primary` zone that verified under the sync key
+  and arrived from a registered replica's `dns_addr` is served even though no
+  `allow_transfer` entry matches it (the `REFUSED` row of Zone transfers
+  above). The clause is asked only after `allow_transfer` has already
+  refused, so it widens who may transfer and never narrows it. A stale
+  replica still matches: stale is exactly the state of a box coming back from
+  an outage, which is the one that needs the data. A `dns_addr` naming a
+  hostname never matches — resolving one would put a DNS lookup inside the
+  gate of the server that answers DNS — so such a replica's transfers are
+  decided by `allow_transfer` as they were before it paired.
+- **NOTIFY.** Every registered replica that is *not* stale is appended to
+  each `primary` zone's targets, signed with the sync key, and reconciled
+  into `zone_notifies` like any other. Staleness is acted on here and not at
+  the transfer gate because the two cost different things: notifying a box
+  that has been silent buys a round of retries per zone per serial bump and
+  nothing else, since its own refresh timer collects the zone when it
+  returns. A replica an operator also wrote into `notify_to` by hand is told
+  once, under the entry they wrote. A secondary zone gets no replica targets:
+  the replica follows that zone from its own primary.
+
+A replica is **stale** when nothing has been heard from it for three times
+`sync.interval_seconds`. It is never deleted automatically — a box down for
+an afternoon is not a box whose transfer permission should quietly disappear
+— so the operator removes a retired one themselves, with **Forget** on the
+Sync band or `DELETE /api/v1/sync/replicas/{instance_id}`, which revokes that
+box's secret along with the entry.
+
+### Promotion
+
+Clearing `sync.peer_url` and `sync.token` lifts the guard; **Stop following**
+sends both in one write. The box keeps whatever configuration it last applied
+and takes writes again. Nothing is repointed: the zones it derived are still
+secondaries, of a main that may be gone, and turning one into a primary is a
+per-zone decision on that zone's own page.
+
 ## Package map
 
 | Package | Responsibility |
@@ -801,14 +1050,14 @@ an HTTP client just typed and the other about a stored row.
 | `internal/cache` | In-memory DNS response cache (TTL clamps, negative caching, serve-stale) |
 | `internal/upstream` | Upstream forwarders and selection strategy; also the conditional routing table (`SetConditional`) that sends a suffix a `forwarder` or `stub` zone claims to that zone's own upstreams — see Conditional routing above |
 | `internal/qlog` | Async query logging and retention pruning |
+| `internal/confsync` | Config sync between two instances (see Config sync above): `Replica`, the pull loop that probes a main's config version, fetches and validates a bundle, derives the replica's own zones from it and applies it; and `Registry`, the main's record of which replicas have paired — the pairing codes, each replica's secret hash, and what the implicit transfer allow and NOTIFY targets are read from |
 | `internal/stats` | Hourly stats rollups from the query log |
 | `internal/store` | Storage interfaces plus SQLite/Postgres implementations, migrations, settings |
 | `internal/api` | HTTP REST API server + handlers (`/api/v1`: setup, settings, blocking, groups, clients, filters, zones, queries, stats, tokens), embedded OpenAPI 3.1 doc; also mounts the web dashboard's static files (`internal/api.StaticHandler`) on every non-`/api` path when `Deps.Static` is set. The static mount — and only the static mount, so SSE on `/api/v1/queries/tail` stays unbuffered — gzips responses and sets `Content-Security-Policy` (`frame-ancestors 'none'`), `X-Content-Type-Options: nosniff`, `Referrer-Policy: same-origin`, and `X-Frame-Options: DENY` |
 | `internal/auth` | Auth service: argon2id password hashing (bounded concurrency), session + scoped (read/write) API tokens with a 90-day session ceiling, optional TOTP 2FA with single-use codes |
 | `web` | The dashboard's Go-side glue: `//go:embed all:dist` over the React SPA's Vite build output, exposed as `web.Dist() fs.FS` for `internal/app` to hand to `internal/api.Deps.Static`. The actual frontend source (React 19 + TypeScript + Tailwind + TanStack Query, see `web/README.md`) lives under `web/src`, built independently (`pnpm build`) before the Go build embeds its output |
 
-Planned, not yet present: `internal/dhcp` (Phase 2), `internal/sync`
-(Phase 1.5 HA config sync).
+Planned, not yet present: `internal/dhcp` (Phase 2).
 
 ## Storage model
 
@@ -866,8 +1115,9 @@ that waits on the internet.
   records what each attempt produced (`ok`/`stale`/`failed`/`empty` — see
   [`ui-contract.md`](ui-contract.md#refresh-outcome-last_status)) and then
   compiles. It runs on the `lists.refresh_hours` ticker, on
-  `POST /filters/refresh`, when a list is created or re-enabled, and once in
-  the background at startup.
+  `POST /filters/refresh`, when a list is created or re-enabled, once in
+  the background at startup, and after a config-sync pull that brought a
+  list this box has no copy of.
 
 `App.Start` compiles synchronously **before** it binds any listener. The
 first download can take as long as the slowest subscribed URL — with the WAN

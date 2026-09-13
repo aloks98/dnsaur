@@ -67,10 +67,30 @@ var unauthenticatedRoutes = map[string]string{
 		"creates the first one. Self-guarding rather than unprotected: once an admin exists it " +
 		"refuses with 409 (auth.ErrSetupDone), so it is only usable on a virgin install.",
 
+	"POST /api/v1/sync/pair": "the pairing handshake. A box that has not paired yet holds no " +
+		"credential to present — the code the operator carried from the main's screen is the " +
+		"proof (spec §3). It is 40 bits, lives ten minutes, dies after five wrong guesses or one " +
+		"right one, and the endpoint is throttled per source address on login's own budget (§9).",
+
 	"/api/": "not an endpoint. The method-less catch-all that turns any unmatched /api/... request " +
 		"into a JSON 404 instead of letting it fall through to the SPA mount. It reaches no data " +
 		"and answers 404 to everything, authenticated or not. openapi_test.go excludes it from the " +
 		"spec comparison for the same reason.",
+}
+
+// replicaSecretRoutes are the registered routes whose credential is a
+// replica's pairing secret rather than a session or an API token
+// (Server.requireReplica). They still answer 401 without credentials, so
+// they are not exemptions from auth; what they are exempt from is the
+// write-token probe below, which for these routes has to assert the
+// opposite — that an API token is refused.
+//
+// Exact whole patterns, for unauthenticatedRoutes' reason.
+var replicaSecretRoutes = map[string]string{
+	"GET /api/v1/sync/version": "the pull loop's probe, and the main's heartbeat for the replica " +
+		"it names: it stamps that replica's registry entry, so it is that replica's call to make.",
+	"GET /api/v1/sync/bundle": "carries every TSIG secret on the box (§9). It goes to the replicas " +
+		"this main paired with and to nobody else — an API token is not one of them.",
 }
 
 // knownRouteParams are the path-parameter names the probe URL builder knows
@@ -81,6 +101,10 @@ var unauthenticatedRoutes = map[string]string{
 var knownRouteParams = map[string]bool{
 	"id":  true,
 	"rid": true,
+	// A replica registers under its own instance.id, which is an opaque
+	// string rather than a row id — so any value routes, and "1" (what the
+	// probes substitute) is as good as any other.
+	"instance_id": true,
 }
 
 // catchAllProbePath is the concrete URL used to exercise the method-less
@@ -209,6 +233,12 @@ func TestEveryRouteEnforcesAuth(t *testing.T) {
 				"If the route was renamed, move the exemption; if it was removed, delete it.", pattern)
 		}
 	}
+	for pattern := range replicaSecretRoutes {
+		if !registered[pattern] {
+			t.Errorf("replicaSecretRoutes names %q, but no route registers that pattern. "+
+				"If the route was renamed, move the entry; if it was removed, delete it.", pattern)
+		}
+	}
 
 	_ = login(t, srv, s) // creates admin user id 1
 	_, readTok, err := srv.deps.Auth.CreateAPIToken(context.Background(), 1, "route-auth-read", "read", 0)
@@ -246,6 +276,17 @@ func TestEveryRouteEnforcesAuth(t *testing.T) {
 			}
 
 			if method == http.MethodGet || method == http.MethodHead {
+				if reason, replicaOnly := replicaSecretRoutes[rt.pattern]; replicaOnly {
+					// The write-token probe cannot apply: this route's
+					// credential is a replica secret, and an API token is
+					// meant to be refused. Assert that instead, so a route
+					// that quietly went back to requireAuth fails here.
+					if w := bearerReq(h, method, url, writeTok); w.Code != http.StatusUnauthorized {
+						t.Fatalf("%s is listed in replicaSecretRoutes but answers %d to a write-scope "+
+							"API token, want 401.\nRecorded reason: %s", rt.pattern, w.Code, reason)
+					}
+					return
+				}
 				// Read-only method: no 403 to assert. Instead prove the 401
 				// above is conditional on the credential rather than
 				// unconditional. Safe to actually execute — GET handlers do

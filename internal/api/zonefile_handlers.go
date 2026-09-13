@@ -27,7 +27,7 @@ const zoneFileMaxBytes = 1 << 20
 
 func (s *Server) zoneFileRoutes() {
 	s.route("GET /api/v1/zones/{id}/file", s.requireAuth(s.handleZoneFileExport))
-	s.route("POST /api/v1/zones/{id}/file", s.requireAuth(s.handleZoneFileImport))
+	s.route("POST /api/v1/zones/{id}/file", s.requireAuth(s.managed(s.handleZoneFileImport)))
 }
 
 // handleZoneFileExport renders a zone as a standard BIND master file

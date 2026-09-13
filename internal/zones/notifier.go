@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/aloks98/dnsaur/internal/store"
@@ -75,6 +76,12 @@ type Notifier struct {
 	now    func() time.Time
 	sender Sender
 
+	// replicaTargets is the config-sync clause beside notify_to: §6 of
+	// docs/superpowers/specs/2026-09-11-config-sync-design.md has every
+	// primary zone tell every registered replica, so registering one does
+	// not mean editing every zone. nil means notify_to is the whole list.
+	replicaTargets ReplicaTargets
+
 	// wake is buffered to exactly one, which is what makes Wake both
 	// non-blocking and coalescing: a pending wake already in the channel
 	// absorbs every further Wake until Run drains it.
@@ -105,6 +112,26 @@ func WithNotifyResolver(res Lookup) NotifyOption {
 // test can observe what would have gone on the wire without a socket.
 func WithNotifySender(s Sender) NotifyOption {
 	return func(n *Notifier) { n.sender = s }
+}
+
+// ReplicaTargets returns the NOTIFY targets to add to every primary zone.
+// internal/app answers it from the replica registry: one target per
+// registered, non-stale replica, signed with the designated sync key.
+//
+// It is asked once per pass rather than once per zone — the answer is the
+// same for every zone, and a pass is the unit the rest of this file already
+// takes its snapshots in.
+//
+// An error fails the whole pass. It must never be reported as an empty list:
+// the targets are reconciled into zone_notifies, so a registry that will not
+// answer would delete every replica's row and its delivery history with it —
+// the one failure mode a durable queue exists to avoid.
+type ReplicaTargets func(ctx context.Context) ([]NotifyTarget, error)
+
+// WithReplicaTargets installs that clause. Production passes it on a main;
+// without it a zone tells exactly what its notify_to names.
+func WithReplicaTargets(f ReplicaTargets) NotifyOption {
+	return func(n *Notifier) { n.replicaTargets = f }
 }
 
 // NewNotifier returns a Notifier that reads zones from zs, tracks delivery
@@ -204,8 +231,9 @@ func (n *Notifier) Wake() {
 // is a zone being deleted, which takes them with it (ON DELETE CASCADE), and
 // a zone that no longer exists is not in `all` either.
 //
-// The error reported is a failure to *read* — the zone list, or the queue
-// itself. A zone whose notify_to will not parse, or whose reconcile failed,
+// The error reported is a failure to *read* — the zone list, the queue
+// itself, or the replica registry every primary zone's targets are widened
+// from. A zone whose notify_to will not parse, or whose reconcile failed,
 // is recorded against that zone and does not fail the pass, because one bad
 // zone must not stop the others being told.
 func (n *Notifier) Pass(ctx context.Context) error {
@@ -214,6 +242,18 @@ func (n *Notifier) Pass(ctx context.Context) error {
 		return err
 	}
 	nowMs := n.now().UnixMilli()
+	// Once for the pass: the registered replicas are the same set for every
+	// zone, and asking per zone would read the registry sixteen times to get
+	// sixteen identical answers.
+	var replicas []NotifyTarget
+	if n.replicaTargets != nil {
+		var err error
+		if replicas, err = n.replicaTargets(ctx); err != nil {
+			// Before the queue is read and long before anything is written:
+			// see ReplicaTargets for why this may not become an empty list.
+			return fmt.Errorf("reading the registered replicas: %w", err)
+		}
+	}
 
 	// One query, before anything is written: what every zone's rows are now.
 	rowsByZone, err := n.rowsByZone(ctx)
@@ -259,6 +299,10 @@ func (n *Notifier) Pass(ctx context.Context) error {
 				"zone", z.Name, "err", err)
 			continue
 		}
+		// Before rowsMatch and reconcile, so a replica's target gets a
+		// zone_notifies row like any other — tracked, backed off, and pruned
+		// on the pass after the operator forgets the replica.
+		targets = withReplicaTargets(targets, z, replicas)
 		if rowsMatch(rowsByZone[z.ID], targets) {
 			// Nothing to insert and nothing to delete: the overwhelmingly
 			// common case, and the one that must not cost a transaction.
@@ -331,6 +375,23 @@ func (n *Notifier) Pass(ctx context.Context) error {
 	// is what keeps Pass meaning "the pass is over" for Wake and for Run.
 	_ = g.Wait()
 	return nil
+}
+
+// withReplicaTargets appends the registered replicas to a primary zone's own
+// targets (§6). A secondary gets none: it holds another server's zone on
+// loan, and the replica follows that zone from its own primary.
+//
+// Nothing is deduped here, deliberately. Addr is the row identity, and a
+// repeated address is already one row (the store's Reconcile), one
+// comparison (rowsMatch) and one packet (Pass's seen map) — the handling a
+// notify_to naming an address twice has always had. A replica an operator
+// also wrote into notify_to by hand is therefore told once, under the entry
+// they wrote, because that one comes first.
+func withReplicaTargets(targets []NotifyTarget, z store.Zone, replicas []NotifyTarget) []NotifyTarget {
+	if !strings.EqualFold(z.Type, "primary") {
+		return targets
+	}
+	return append(targets, replicas...)
 }
 
 // rowsMatch reports whether the rows a zone already has are exactly the ones

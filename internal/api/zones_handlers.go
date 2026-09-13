@@ -16,12 +16,12 @@ import (
 
 func (s *Server) zonesRoutes() {
 	s.route("GET /api/v1/zones", s.requireAuth(s.handleZonesList))
-	s.route("POST /api/v1/zones", s.requireAuth(s.handleZoneCreate))
+	s.route("POST /api/v1/zones", s.requireAuth(s.managed(s.handleZoneCreate)))
 	s.route("GET /api/v1/zones/{id}", s.requireAuth(s.handleZoneGet))
-	s.route("PATCH /api/v1/zones/{id}", s.requireAuth(s.handleZonePatch))
-	s.route("DELETE /api/v1/zones/{id}", s.requireAuth(s.handleZoneDelete))
+	s.route("PATCH /api/v1/zones/{id}", s.requireAuth(s.managed(s.handleZonePatch)))
+	s.route("DELETE /api/v1/zones/{id}", s.requireAuth(s.managed(s.handleZoneDelete)))
 	s.route("POST /api/v1/zones/{id}/refresh", s.requireAuth(s.handleZoneRefresh))
-	s.route("POST /api/v1/zones/{id}/clone", s.requireAuth(s.handleZoneClone))
+	s.route("POST /api/v1/zones/{id}/clone", s.requireAuth(s.managed(s.handleZoneClone)))
 }
 
 // reloadZones is called after successful zone mutations; failures are

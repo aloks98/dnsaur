@@ -11,6 +11,7 @@ import type {
   SetupState,
   Settings,
   StatsOverview,
+  SyncStatus,
   TimelineBucket,
   TopEntry,
   TSIGKey,
@@ -176,6 +177,31 @@ function defaultTSIGKeys(): TSIGKey[] {
   ];
 }
 
+/**
+ * GET /resolver/status and GET /sync/status as a **replica** following
+ * `peer` — the pair every synced screen reads before it decides whether its
+ * write controls are live (see hooks/use-sync.ts's useManagedBy). Spread
+ * into `server.use(...)`:
+ *
+ *     server.use(...replicaHandlers("https://main.lan"));
+ */
+export function replicaHandlers(peer: string) {
+  const sync: SyncStatus = { role: "replica", peer_url: peer };
+  const status: ResolverStatus = {
+    encryption_downgraded: false,
+    reason: "",
+    serving: {
+      dot: { enabled: false, listening: false, addr: "" },
+      doh: { enabled: false, listening: false, addr: "" },
+    },
+    sync,
+  };
+  return [
+    http.get("/api/v1/resolver/status", () => HttpResponse.json(status)),
+    http.get("/api/v1/sync/status", () => HttpResponse.json(sync)),
+  ];
+}
+
 export const handlers = [
   http.get("/api/v1/auth/me", () => {
     const me: MeResponse = { id: 1, username: "admin", totp_enabled: false };
@@ -205,9 +231,25 @@ export const handlers = [
         dot: { enabled: false, listening: false, addr: "" },
         doh: { enabled: false, listening: false, addr: "" },
       },
+      // A main with no replicas — what an instance with no sync configured
+      // reads as (docs/api.md, Sync). Every screen asks this endpoint who
+      // it belongs to before disabling its write controls, so the default
+      // has to be the role that changes nothing.
+      sync: { role: "main" },
     };
     return HttpResponse.json(status);
   }),
+
+  // GET /sync/status carries the same object. Only the Settings page's Sync
+  // band reads it (see components/sync-field.tsx); the DELETE below is
+  // registered as a default rather than per-test because that page mounts
+  // the band on every render, replicas or not.
+  http.get("/api/v1/sync/status", () => {
+    const status: SyncStatus = { role: "main" };
+    return HttpResponse.json(status);
+  }),
+
+  http.delete("/api/v1/sync/replicas/:instanceId", () => new HttpResponse(null, { status: 204 })),
 
   http.get("/api/v1/health", () => {
     const health: HealthStatus = { status: "ok", version: "dev" };

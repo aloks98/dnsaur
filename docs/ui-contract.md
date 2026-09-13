@@ -63,11 +63,34 @@ Nothing warns first — treat 401 as "log in again", which the SPA already does.
 
 **Scopes** — a `read` token is rejected on any method other than GET/HEAD with
 **403** `read-only token` (`Server.requireAuth`, same function). Enforcement is
-method-based with one exception on the read side: `GET /tsig-keys` and
+method-based with two exceptions on the read side: `GET /tsig-keys` and
 `GET /tsig-keys/{id}` blank a `read` token's `secret` and set
-`secret_redacted: true` (§2.10). Session cookies are always minted `write`, so
-a browser session is never 403'd for scope — the SPA has no 403 handling and
-doesn't need any.
+`secret_redacted: true` (§2.10), and `GET /sync/bundle` and
+`GET /sync/version` take a replica's pairing secret only — a session or an
+API token at any scope is **401** `unauthorized` (§2.11). Session cookies are
+always minted `write`, so a browser session is never 403'd for scope — the SPA
+has no 403 handling and doesn't need any.
+
+**Managed by a main** — an instance with `sync.peer_url` set is a replica, and
+every write to configuration its main owns is refused with **409**
+`managed by <peer_url>` before the handler runs (`Server.managed`,
+`internal/api/sync_handlers.go`): groups, clients, filter lists, rules, TSIG
+keys, zones and zone records, **both `/blocking/pause` writes** (the pause
+state lives in the synced `blocking.pauses` setting — a pause is a decision
+about the network, and clients reach either box), `PUT /settings` for any
+key outside the instance-local set, and the four sync endpoints a replica is
+on the wrong end of — `GET /sync/bundle` (the bundle it could answer with is
+the main's, one pull stale), `GET /sync/version` (a box that stopped being a
+main stops stamping the replicas it had), and the two pairing calls,
+`POST /sync/pairing-code` and `POST /sync/pair` (it keeps no
+registry). `POST /sync/follow` is the replica's own and is not refused this
+way; it answers 409 `already following <peer_url>` instead, because the
+answer is to stop following first. The peer URL in the string is verbatim
+what `sync.peer_url` holds, so the screen can print it as-is. Two writes stay
+available because they are operational rather than configuration —
+`POST /filters/lists/{id}/refresh` and `POST /zones/{id}/refresh` — and so do
+this box's own account, sessions, tokens and backups. On a main (the default,
+no `sync.peer_url`) none of this is reachable. See §2.11.
 
 **CSRF** — a cookie-authenticated non-GET/HEAD request whose `Sec-Fetch-Site`
 header is `cross-site` is refused with **403** `cross-site request`
@@ -274,8 +297,18 @@ plain 401.
 
 #### `GET /api/v1/settings`
 A flat object; **every value is a string**, including numbers. Keys prefixed
-`instance.` are stripped, as is `stats.watermark` by name — the rollup's own
-bookkeeping. `stats.retention_days` is an ordinary setting and is returned.
+`instance.` are stripped, as are the bookkeeping rows by name —
+`stats.watermark`, `blocking.pauses`, `sync.replicas`, `sync.pairing`,
+`sync.tsig_key_id`, and a replica's
+`sync.applied_version`, `sync.applied_peer`, `sync.applied_at`,
+`sync.last_pull_at` and `sync.last_error` — and `sync.token`, which is a
+credential. `PUT` refuses
+all of them but the token. `sync.pairing` holds the SHA-256 of the live
+pairing code, which is 40 bits: a reader who had it could grind it offline
+inside the ten minutes it is alive. `sync.tsig_key_id` is written by the
+first pairing and chosen by nobody. `stats.retention_days` and
+`sync.interval_seconds` share those prefixes, are ordinary settings, and are
+returned.
 
 ```json
 {
@@ -360,7 +393,8 @@ above.
     "dot": { "enabled": true, "listening": true, "addr": "[::]:853" },
     "doh": { "enabled": true, "listening": true, "addr": "[::]:443" }
   },
-  "certificate": { "not_after": "2026-11-14T00:00:00Z", "expiring_soon": false }
+  "certificate": { "not_after": "2026-11-14T00:00:00Z", "expiring_soon": false },
+  "sync": { "role": "main" }
 }
 ```
 
@@ -377,6 +411,13 @@ unless they disagree. A failed bind is retried server-side every 30s.
 use: absent when neither protocol is enabled, when no paths are set, and
 when none has ever loaded. That is a different fact from "not expiring
 soon", and conflating them would put an expiry warning on a fresh install.
+
+`sync` is **always present** and is the same object `GET /sync/status`
+answers on its own (§2.11 and §3.13). It rides here so the warning strip can
+show "behind by N", a failed pull, a peer reached over plain HTTP or a stale
+replica without a second round trip. An instance with no sync configured
+reads as `{"role": "main"}` and nothing else — the `omitempty` on every other
+field means a main with no replicas is exactly that one key.
 
 **Polling.** The dashboard polls this while `somethingIsWrong`
 (`web/src/lib/serving.ts`) — a downgrade, either protocol enabled and not
@@ -418,8 +459,8 @@ mismatched pair stores with a 204.
 | Endpoint | Params | Success |
 |---|---|---|
 | `GET /blocking` | `group_id` **or** `client_id` int, optional, **default 0** | **200** `{"paused_until": <unix ms>, "scope": "global"\|"group"\|"client"}`, `paused_until` `0` and no `scope` when not paused |
-| `POST /blocking/pause` | body `{["group_id"\|"client_id": int,] "minutes": int}` | **204** |
-| `DELETE /blocking/pause` | `group_id` **or** `client_id` query, optional, default 0 | **204**, unconditionally |
+| `POST /blocking/pause` | body `{["group_id"\|"client_id": int,] "minutes": int}` | **204**; **409** `managed by <peer>` on a replica (§1) |
+| `DELETE /blocking/pause` | `group_id` **or** `client_id` query, optional, default 0 | **204**, unconditionally; **409** on a replica |
 
 `minutes` must be **1–1440**, else 400 `minutes must be 1-1440`. Ids are
 **not validated** — an id naming nothing is accepted, and a non-numeric one
@@ -436,12 +477,15 @@ change nothing visible. `GET ?client_id=` reads the client list to find its
 group, which is where its **503** comes from; an id naming no client reports
 only the global pause.
 
-**Pause state survives a restart.** Every change writes the internal
-settings row `blocking.pauses` (unix ms per scope, expired entries pruned),
-which `App.Start` installs before the listeners bind. Entries that ran out
-while the process was down are dropped rather than reinstated. Like
-`stats.watermark`, the row is stripped from `GET /settings` and refused by
-`PUT`.
+**Pause state survives a restart, and reaches a replica.** Every change
+writes the settings row `blocking.pauses` (unix ms per scope, expired
+entries pruned), which `App.Start` installs before the listeners bind and
+every settings reload installs again — that is how a pause set on the main
+arrives with the next bundle. Entries that ran out while the process was
+down are dropped rather than reinstated. The row is stripped from
+`GET /settings` and refused by `PUT`, like `stats.watermark`, but unlike it
+the row is configuration: it advances `config_version` and travels in a
+bundle.
 
 ---
 
@@ -1016,7 +1060,10 @@ three.
 > `DELETE /tsig-keys/{id}` answers **409 `resource in use`** when any zone
 > names the key — by `tsig_key_id`, or by `key:` in either list — enforced
 > in the `DELETE` statement itself (`tsigKeyStore.Delete`) because
-> `zones.tsig_key_id` carries no foreign key.
+> `zones.tsig_key_id` carries no foreign key. The same statement refuses the
+> key `sync.tsig_key_id` designates, the one the first pairing created for a
+> main's replicas to transfer under (§2.11): no zone names it, and every
+> replica signs with it.
 >
 > **`PUT /tsig-keys/{id}` applies the name half of the same guard.** A write
 > that *changes the name* while `allow_transfer` or `notify_to` names the key
@@ -1033,6 +1080,103 @@ three.
 > column to match, counting the zones that name the key; it is computed
 > client-side from `GET /zones` rather than served as a field, so if that
 > request fails every row reads `—` and the 409 is what reports the truth.
+
+---
+
+### 2.11 Sync
+
+Two dnsaur instances serving one network keep the same configuration: the
+**main** is the one that accepts writes, a **replica** is any instance with
+`sync.peer_url` set, and there is no third mode. A replica pulls, applies,
+and refuses local writes to anything the bundle carries (§1, *Managed by a
+main*); clearing `sync.peer_url` is the promotion.
+
+| Endpoint | Credential | Success | Notes |
+|---|---|---|---|
+| `POST /sync/pairing-code` | session or **write** token | 200 `{code, expires_at}` | mints the code, on the main; **409** `managed by <peer_url>` on a replica; **503** `sync unavailable` |
+| `POST /sync/pair` | **none** | 200 `{secret, dns_port}` | what a replica calls; the code is the proof. **403** `pairing code refused`, **429** with `Retry-After`, **400**, **409** on a replica |
+| `POST /sync/follow` | session or **write** token | 204 | `{peer_url, code}`, on the box that is to become a replica; **400**, **409** `already following <peer_url>`, **502** `the main refused the pairing code` |
+| `GET /sync/version` | **replica secret only** | 200 `{config_version, instance_id, dns_port}` | `?applied=N` is the heartbeat; the bundle is only fetched when the version moved |
+| `GET /sync/bundle` | **replica secret only** | 200 the bundle | **401** for a session or an API token at any scope; **409** `managed by <peer_url>` on a replica |
+| `GET /sync/status` | any | 200 the status object | answers on both roles |
+| `DELETE /sync/replicas/{instance_id}` | write | 204 | **Forget**: removes the entry and revokes that box's secret. Idempotent — an id that is not registered is already in the state asked for |
+
+**Pairing** is how the two boxes are introduced, and the only step the
+operator does by hand. `POST /sync/pairing-code` answers a code of eight
+characters from an alphabet with no ambiguous glyph in it, grouped
+`XXXX-XXXX`, shown once, live for ten minutes; one code is live at a time and
+minting a second voids the first. Only its hash, its expiry and its attempt
+count are stored (`sync.pairing`, §2.3). `POST /sync/follow` is the other
+end: the box posts the code to the main's `POST /sync/pair`, writes
+`sync.peer_url` and the secret it got back into `sync.token` in one settings
+write, and pulls once so the configuration is visible without waiting out an
+interval. `204` means the peer and the secret are stored. The case and the
+grouping dash of a typed code do not matter. Errors on `follow`: 400
+`invalid json`, 400 `peer_url must be an absolute http or https URL, scheme
+and host only`, 400 `code required`, 409 `already following <peer_url>`,
+502 `the main refused the pairing code`, 503 `sync unavailable`. A 502 that
+is not the fixed refusal carries the reason verbatim, and the three the far
+box gives on purpose read `that box has no pairing endpoint`, `the main is
+refusing attempts for now — wait a minute and try again`, and `that box is a
+replica of <main url>` — none of them a code to retype.
+
+`POST /sync/pair` is the one **unauthenticated** write in this API: a box
+that has not paired yet holds no credential to present. It is throttled per
+source address on the same budget as `POST /auth/login` (**429** with
+`Retry-After`), and a code that is wrong, expired, already spent or voided by
+five wrong guesses is one answer for all four — **403** `pairing code
+refused` — because a guesser told which it was learns whether a code is live.
+Errors: 400 `invalid json`, 400 `instance_id required`, 400 `instance_id must
+not contain a slash`, 400 `a main cannot pair with itself` (the replica is a
+restore of the main's database and shares its `instance.id`), 400 `dns_addr
+must be a host:port address: ...` / `dns_addr must name a host, not just a
+port` / `dns_addr port must be numeric, 1-65535`, 503 `sync unavailable`.
+
+Pairing is not bookkeeping. It is what turns on the implicit transfer allow —
+an AXFR for a `primary` zone is accepted when it verified under the main's
+`sync.tsig_key_id` **and** came from a registered replica's `dns_addr` — and
+adds that address as a NOTIFY target for every primary zone. Neither edits an
+ACL, so `allow_transfer` still says exactly what the operator wrote. A
+`dns_addr` with no host (`:53` — what a replica listening on every interface
+has to send) is completed with the address the request arrived from, which is
+where this main can reach that box. Pairing again with the same `instance_id`
+replaces the entry and its secret.
+
+The sync key is the main's own: it creates one on the first pairing —
+`sync-<six characters>.`, HMAC-SHA256 — and records it in the internal
+`sync.tsig_key_id`. It appears on the TSIG keys page (§2.10) like any other
+key, and `DELETE` refuses it with `409 resource in use` while it is
+designated. There is no select and nothing to choose.
+
+`GET /sync/version` is also the **heartbeat**: there is no registration call.
+The main stamps the calling replica's `last_seen` from the request and its
+`version_applied` from `?applied=N` — absent, unparseable or negative is `0`,
+which is what a box that has only just paired truthfully reports. `dns_port`
+is what a replica joins its peer URL's host to when `sync.primary_dns` names
+no override. A box forgotten between presenting its secret and being stamped
+gets the same `401` a wrong secret gets: the answer it needs is to pair
+again.
+
+`GET /sync/bundle` is the one `GET` in this API a credential refuses rather
+than redacts, and the reason is the body: settings (everything except the
+instance-local `instance.*`, `serve.*`, `sync.*` and `stats.watermark`),
+groups, clients, lists with their group assignments, rules, **TSIG keys with
+their secrets**, and zone *definitions*. Zone records are deliberately
+absent — a replica gets those by AXFR. Ids in it are the main's and the
+replica keeps them, so a `group_id`, or a query log row's `rule_id`, names
+the same row on both boxes.
+
+Both reads take a replica's pairing secret as `Authorization: Bearer` and
+nothing else — the one `POST /sync/pair` answered with. A session cookie and
+an API token are **401** `unauthorized` at any scope, and so is every other
+way the credential can fail, so a caller learns whether its own works and
+nothing else.
+
+`last_seen` is stamped by the main, never sent by the replica — a clock skew
+on the replica must not decide whether it looks stale. A replica not seen for
+three intervals is shown as stale and **never removed automatically**; the
+operator removes one, because a box that is down for an afternoon is not a
+box whose transfer allow should quietly disappear.
 
 ---
 
@@ -1405,6 +1549,10 @@ Full editable allowlist. Values are always strings on the wire.
 | `qlog.retention_days` | `90` | int ≥ 0 | **hot, delayed** — re-read per prune run, so it lands on the next 24h tick |
 | `qlog.privacy` | `full` | `full` \| `anon` \| `none` | **hot**, read per query |
 | `stats.retention_days` | `365` | int ≥ 1 | **hot, delayed** — same prune run as `qlog.retention_days` |
+| `sync.peer_url` | *(empty)* | empty, or an absolute `http`/`https` URL | **hot** — it is what makes this instance a replica, and clearing it is the promotion |
+| `sync.token` | *(empty)* | any string — **write-only, never in `GET /settings`** | **hot** |
+| `sync.interval_seconds` | `30` | int ≥ 5 | **hot** |
+| `sync.primary_dns` | *(empty)* | empty, or `host:port` with the **host present** | **hot** |
 
 No upper bound on any integer key. Two have a lower bound above zero, and
 both are rejected with `must be a whole number, one or more`:
@@ -1412,10 +1560,34 @@ both are rejected with `must be a whole number, one or more`:
 `stats.retention_days`, where `0` would delete every hourly bucket on the
 next prune. `blocking.mode` treats **anything ≠ `nxdomain`** as null-ip.
 
+`sync.peer_url` is a **scheme and a host and nothing else** — the pull loop
+joins `/api/v1/sync/...` onto it, so a path, a query, a fragment or
+credentials are refused with `invalid value for sync.peer_url: must be a
+scheme and host only, with no path, query or credentials`. A lone trailing
+slash is accepted and stripped before the value is stored, so
+`https://main.lan/` reads back as `https://main.lan`.
+
+The peer and the token are checked **in both directions**. Setting
+`sync.peer_url` non-empty requires `sync.token` — already stored, or sent in
+the same map (`invalid value for sync.peer_url: set sync.token first`), and
+clearing `sync.token` while a peer is configured is refused the same way
+(`invalid value for sync.token: clear sync.peer_url first`); either state
+would be a replica that pulls a 401 forever. The handler judges `sync.token`
+before `sync.peer_url` so the Sync band can save both in one request, and
+judges a peer *being cleared* before either, so "stop following" can send
+`{"sync.peer_url": "", "sync.token": ""}` in one request too. Both are
+written for you by `POST /sync/follow`; the pair is typed by hand only to
+stop following.
+
 Non-editable keys that exist but are stripped from `GET /settings`:
 `instance.id`, `stats.watermark`, `blocking.pauses` (the stored pause state,
 see [Blocking pause](#blocking-pause) — the other `blocking.*` keys above are
-ordinary settings and stay visible).
+ordinary settings and stay visible), and the two the pairing handshake owns,
+`sync.pairing` and `sync.tsig_key_id`. `sync.token` is stripped too and is the
+only *editable* key that is: it is the credential this instance pulls its
+config with, so a read must not be a way to copy it out. The band shows
+**set** / **not set** from whether the key is absent, and writes it like any
+other setting.
 
 ### 3.10 Tokens
 
@@ -1448,6 +1620,33 @@ Computed and discarded, so the UI cannot have them: the matched
 rule/list pattern, the parser's skipped-line count, and the query-log dropped
 count. Also note **there is no join returning a client or group *name* alongside
 a query row** — the UI must resolve `client_id` itself against `GET /clients`.
+
+### 3.13 Sync status
+
+One shape for both roles; read `role` first, since every other field is
+`omitempty` and a main with no replicas is `{"role": "main"}` and nothing
+else. From `GET /sync/status` and from `GET /resolver/status`'s `sync`.
+
+```json
+{"role":"replica","peer_url":"https://main.lan","peer_version":412,
+ "applied_version":411,"applied_at":1757580000000,"last_pull_at":1757580030000,
+ "last_error":"","plain_http":false}
+{"role":"main","sync_key":"sync-k3n9wq.",
+ "replicas":[{"instance_id":"V1StGXR8Z5jdHi6BmyT","dns_addr":"10.0.0.6:53",
+              "version_applied":412,"last_seen":1757580030000,"stale":false}]}
+```
+
+| Field | Role | Meaning |
+|---|---|---|
+| `role` | both | `main` or `replica`. Derived from `sync.peer_url`, not stored as a mode |
+| `peer_url` | replica | verbatim what `sync.peer_url` holds; the same string the 409 quotes |
+| `peer_version` | replica | the main's `config_version` at the last probe — `peer_version - applied_version` is "behind by N" |
+| `applied_version`, `applied_at` | replica | the last bundle actually applied, and unix ms of when |
+| `last_pull_at` | replica | unix ms of the last attempt, successful or not |
+| `last_error` | both | on a replica, why the last pull failed, `""` when it did not — a failed pull leaves the previous config in force, DNS unaffected. On a main it is `sync.replicas` unreadable, which is a main that admits no transfer and notifies nobody |
+| `plain_http` | replica | the peer is `http://`, so the bundle (TSIG secrets included) crosses in the clear on every pull. Persistent while it is true; there is no certificate subsystem and this warning is the whole mitigation |
+| `sync_key` | main | the **name** of the TSIG key replicas transfer under — the main creates it on the first pairing and nobody picks it — or `""` when no replica has paired yet, or when `sync.tsig_key_id` names a key that is gone |
+| `replicas[]` | main | `instance_id`, `dns_addr`, `version_applied`, `last_seen` (unix ms, stamped by the main), `stale`. An entry appears the moment that box pairs and is refreshed by every version probe; `stale` is three `sync.interval_seconds` without one. Never the replica's secret, in any form |
 
 ---
 
@@ -1629,6 +1828,172 @@ or not, so a rejected row blocks Save through the field's own schema (the same
 form holding the last valid one — an edit that looked applied, was silently
 discarded on save, and lost its row error on the resync.
 
+### 6.1 Replica mode: which controls are live
+
+Every screen reads `GET /resolver/status`'s `sync` block (§3.13) — already
+held by the shell for its banners, so this costs no request — and treats
+`role === "replica"` as "the write controls here are not this box's". The
+server refuses the write regardless (**409** `managed by <peer_url>`, §1);
+this is the screen agreeing with it up front instead of offering a form that
+can only fail.
+
+Being a replica reads as a **state**, in two places and no others.
+
+The top bar carries one chip, after the `DNS OK` readout, in the same mono
+cell vocabulary. Its marker is a **hollow** 7px square — an outline, no fill
+— which is the quietest marker the bar has. Verbatim:
+
+> `Replica · <host>`
+
+`<host>` is `sync.peer_url`'s hostname (the URL verbatim if it will not
+parse). The chip is a link to `/settings#sync`, which is the Sync band's
+anchor, and it is the only place in the app that names the main.
+
+Each synced screen carries one muted line in its section header, immediately
+left of the disabled action it qualifies, verbatim:
+
+> `Managed by the main`
+
+and nothing else. Not a banner, not a warning tint: following a main is the
+configuration working. No explanation either — that is
+[`docs/dashboard.md`](dashboard.md)'s job. **Navigation is never hidden and
+no read is disabled**: filters, search, sorting, a group selection, a
+revealed TSIG secret, an export and both "Refresh now" actions all stay live.
+
+| Screen | Disabled while managed | Still live |
+|---|---|---|
+| Filtering → Groups & clients | Add group, Add client, the group enabled switch, Rename, Delete, the per-group Lists assignment | group selection, counts, client matching help |
+| Filtering → Lists | Add list, the enabled switch, Rename, Delete | Refresh all, per-list Refresh, search and both filters |
+| Filtering → Rules | Add rule, Delete rule | group select, search, action filter |
+| Zones → list | New zone, Clone, Enable/Disable, Delete zone | the pull action (`Transfer now` / `Fetch now`), built-ins disclosure |
+| Zones → detail | Add record, record Edit/Delete, Set TTL, Save SOA, the transfer-ACL / primaries / notify-targets Edit pencils, Import, Enable/Disable zone, Delete zone | Export, Refresh now, the record filter, every band's readout |
+| TSIG keys | New key, Edit, Delete | Show/Hide a secret, Copy, the Used-by column |
+| Settings | every band whose keys are outside the instance-local set — Upstreams, Blocking, Cache, Query log, Lists | Protocols, Sync, Backup, and the Save bar for those |
+| Blocking pause (shell, group rows, client rows) | the whole control | the state it reads — `Blocking active` / `Paused · m:ss` |
+
+The line sits once per screen: on Groups & clients it is in the **Groups**
+header, not repeated over Clients. On Settings it sits in the Save bar,
+beside Discard, because there the disabled thing is whole bands rather than
+one button.
+
+The Settings bands are gated by key, not by band: a band is read-only when
+any key in it is outside `instance.*` / `serve.*` / `sync.*`, which is the
+TypeScript mirror of `store.LocalSettingKey`. The band body is wrapped in a
+disabled `<fieldset>`, so a control added to one later is covered without
+anyone remembering to gate it.
+
+### 6.2 The Sync band
+
+Settings gains a **Sync** band, rendered wholesale (like Protocols) because
+almost nothing in it is a setting. Its `<section>` carries `id="sync"` —
+every band does, slugged from its title — which is what the role chip links
+to. The left column's line names the role, verbatim:
+
+> `Replicas that pull this instance's configuration.` — a main
+> `Configuration is pulled from the main.` — a replica
+
+**On a main** the band holds the registry and the pairing:
+
+- A header row: `Replicas`, the mono note `sync.role = main`, and an outline
+  **`Add replica`** at the right.
+- **`Add replica`** posts `POST /sync/pairing-code` and reveals an inline
+  panel between that row and the table — card surface, 3px `--primary` left
+  rule — holding `PAIRING CODE · ONE-TIME`, the code at 28px mono, and the
+  two muted phrases `Expires in 10 minutes` and
+  `· Enter it on the replica under Settings › Sync.`, with a ghost `×`
+  (`Dismiss`). The code is **never re-read**: there is no endpoint that
+  answers one back, so the panel's whole lifetime is the mutation's — the ×
+  clears it, a second `Add replica` replaces it, and leaving the page ends
+  it.
+- One row per replica in a bordered 5-column table — `INSTANCE`,
+  `DNS ADDRESS`, `APPLIED` (as `v<version_applied>`), `LAST SEEN`, and a ghost **`Forget`**
+  per row
+  sending `DELETE /sync/replicas/{instance_id}`. A `stale: true` entry is
+  marked by its last-seen cell alone, in `--muted-foreground`: no badge, no
+  row tint. With none registered the band says `No replicas registered.`
+
+A main is also any box that has not paired yet, so the band adds, below the
+registry: **`Peer URL`** (key `sync.peer_url`, placeholder
+`https://adam.dns.e412.in`), **`Pairing code`** (mono, placeholder
+`XXXX-XXXX`), a primary **`Follow`**, and the muted line
+`The code is shown once on the main, under Settings › Sync › Add replica.`
+`Follow` sends `POST /sync/follow {peer_url, code}`; a refusal is rendered
+under the boxes, verbatim from the server (`the main refused the pairing
+code`, `already following <peer_url>`, a 400's reason). Neither box is a form
+field — the request writes both keys itself, so there is nothing for the
+Save bar to carry.
+
+**On a replica** the band states the relationship instead:
+
+> `Following <peer_url>` — with a 7px square, `--success`, or `--destructive` when `last_error` is set
+> `applied <applied_version> of <peer_version> · last pull <relative time>`
+> `Last pull failed: <last_error>` — only when set, in `--destructive-foreground`
+> `Peer reached over plain HTTP` — only when `plain_http`, muted
+
+and an outline **`Stop following`** at the right. That button is the one
+place this page sends a settings *map* rather than one key per request:
+`PUT /settings {"sync.peer_url": "", "sync.token": ""}` — the pair is only
+valid together (§2.3), and all-or-nothing is exactly the shape promotion
+wants.
+
+Below a rule, a mono `ADVANCED` disclosure (rnui's Accordion, one item),
+closed on load, holds what is still a setting: `sync.interval_seconds` as
+**`Pull interval (seconds)`** on both roles, and on a replica
+**`Primary DNS address (override)`** (`sync.primary_dns`) with the note
+`Leave empty to use the address the main advertises.` The rows are laid out
+as the rest of the page's settings rows are — label and mono key on one
+baseline line, the unsaved dot at the right of it, the input below at the
+column's full width — and the disclosure **opens on its own, and cannot be
+closed, while either field carries a validation message**: a rejected value
+under a closed disclosure is a save that failed for no stated reason.
+
+A refused **Follow** is `role="alert"` and is named by both boxes'
+`aria-describedby`: nothing else on screen moves when that press fails.
+
+There is **no sync-key select and no token box**. `sync.tsig_key_id` is
+internal — the main creates the key on the first pairing — and `sync.token`
+is written by `POST /sync/follow` and cleared by `Stop following`; neither is
+returned by `GET /settings` and neither has a control.
+
+### 6.3 Sync's shell banners
+
+The warning strip (`serving-banners.tsx`, mounted in the shell) gains the
+lines below, derived by `syncBanners` in `lib/serving.ts`. That same function
+backs `syncTrouble`, which `somethingIsWrong` reads — and that is what keeps
+the status poll running while a fact is up, so a banner does not sit there
+after it has cleared.
+
+| Condition | Line (verbatim) |
+|---|---|
+| `last_error` non-empty, `role: "replica"` | `Last pull failed: <last_error>` |
+| `last_error` non-empty, `role: "main"` | `Sync: <last_error>` |
+| a `replicas[]` entry with `stale: true` (one line each) | `Replica <instance_id> not seen for <duration>` |
+
+The field is one, the failure is not: on a replica it is the last pull, and
+on a main it is `sync.replicas` — the row the whole registry lives in —
+unreadable, which is a main that admits no transfer and notifies nobody
+while the band reads "no replicas". A main has no pull to have failed, so it
+does not get the replica's line.
+
+`<duration>` is `formatDuration(now - last_seen)` — `42m`, `1h 35m`, `2d 6h`
+— how long it has been quiet, not a wall-clock stamp the reader has to
+subtract from. A replica that is merely *behind* gets no banner: that is what
+a pull interval looks like from outside, and the Sync band's `applied n of m`
+already says it on the one screen where the number is worth reading.
+
+A replica's two clear on their own — the next successful pull empties
+`last_error`, the next check-in un-stales a replica — which is exactly what
+`syncTrouble` watches, so the 5 s trouble poll is what takes them down. A
+main's `Sync:` line does not: `sync.replicas` stays unreadable until somebody
+repairs the row, and the poll only takes the line down once they have.
+
+**`plain_http` is deliberately not a banner**, and neither is being a replica
+at all. A plaintext peer is a reading of the peer URL the operator typed, so
+nothing but an edit to that URL can change the answer; it is stated once, in
+the Sync band beside the peer it describes. The strip is for the two facts
+that are wrong and can stop being wrong — a strip that also warned about the
+normal case is a strip an operator learns to skip.
+
 ---
 
 ## 7. Loading / empty / error states
@@ -1781,7 +2146,7 @@ an inline script because the served CSP is `script-src 'self'` with no
 | **Filtering → Groups & Clients** | CRUD works, but the per-group "Lists (n)" menu has **no error state**: it's disabled only while `isPending`, not on `isError`, and its toggle rebuilds the assignment set from `groupLists.data ?? []`. If that read failed, clicking one list PUTs `[thatOne]` and **silently drops every other assignment**. |
 | **Filtering → Lists** | The table leads with the list's `name`; the URL is a muted second line and stays in the row's `title`. Actions (toggle, rename, delete) are labelled by name. The **Status** column replaces the old "Last refreshed" one and carries the badge plus a plain-language line per `last_status`. |
 | **Dashboard health** | Reduced to the shell's two row-1 readouts (blocking state, and `DNS OK`/`DNS down` from `GET /health`, whose `version` is the readout's `title`). Filter-list freshness moved off the dashboard with the redesign and now lives only on Filtering → Lists. The spec's "upstreams healthy" signal **has no code at all** — there is no upstream-health endpoint. |
-| **Settings** | 12 keys work. The spec's "storage (read-only info)" section is absent, with a code comment noting no endpoint exists to source it. |
+| **Settings** | All 23 editable keys work, across seven bands (the last two — Protocols and Sync — rendered wholesale rather than as label+input rows). The spec's "storage (read-only info)" section is absent, with a code comment noting no endpoint exists to source it. |
 | **Account** | TOTP, tokens and password are complete: the Password section holds a current/new/confirm form and a **Log out everywhere** action (`POST /auth/password`, `DELETE /auth/sessions`, §2.2). |
 | **Command palette** | Navigates to the 9 leaf pages only, grouped by nav section. The spec's "quick actions (pause, block a domain)" don't exist. |
 

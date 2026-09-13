@@ -43,6 +43,12 @@ type Reloader interface {
 	// server-wide interval, not of any one list — there are no per-list
 	// schedules — so every row reports the same value.
 	NextFilterRefresh() int64
+	// ReloadSettings re-runs everything a settings write reconfigures — the
+	// forwarder, the blocking mode, the encrypted listeners. The API's own
+	// settings handler does not call it (the store's change channel already
+	// wakes that path); the config-sync pull does, because it writes a whole
+	// bundle straight into the store and nothing here ever hears about it.
+	ReloadSettings(ctx context.Context) error
 	// NotifyZones wakes the outbound NOTIFY pass. See zones.Notifier.Wake:
 	// it is promptness, never correctness, so a handler that forgets this
 	// call only delays delivery by one tick rather than losing it.
@@ -142,7 +148,11 @@ type Deps struct {
 	// behind it. The handler then answers "nothing wrong", which is the
 	// truthful answer for a server that has no forwarder to have downgraded.
 	ResolverStatus ResolverStatus
-	Version        string
+	// Sync may be nil, and is in every test server with no App behind it.
+	// A nil Syncer is a main that follows nobody: the write guard lifts and
+	// the status endpoint answers role "main" with no replicas. See Syncer.
+	Sync    Syncer
+	Version string
 	// Static serves the embedded web dashboard on non-/api paths. Nil
 	// disables it (e.g. tests that don't care about the SPA).
 	Static fs.FS
@@ -201,10 +211,14 @@ type Server struct {
 	// (handleQueriesTail). A field rather than the constant itself so a test
 	// can shorten it instead of waiting out the real interval.
 	tailHeartbeat time.Duration
+	// followTimeout bounds POST /sync/follow, which is one pairing request
+	// (handleFollow). A field for tailHeartbeat's reason.
+	followTimeout time.Duration
 }
 
 func New(d Deps) *Server {
-	s := &Server{deps: d, attempts: newAttemptLimiter(), tailHeartbeat: sseHeartbeat}
+	s := &Server{deps: d, attempts: newAttemptLimiter(), tailHeartbeat: sseHeartbeat,
+		followTimeout: syncFollowTimeout}
 	s.registerRoutes()
 	return s
 }
@@ -244,6 +258,7 @@ func (s *Server) registerRoutes() {
 	s.zoneFileRoutes()
 	s.tsigKeysRoutes()
 	s.notifiesRoutes()
+	s.syncRoutes()
 	// Later tasks append their routes here.
 	//
 	// This catch-all is registered through route() like everything else —
@@ -526,6 +541,11 @@ const (
 	// credential from another (a read-scoped token asking for a secret)
 	// cannot get that from the user.
 	tokenKey
+	// replicaKey carries the instance id of the replica whose pairing
+	// secret authenticated the request (Server.requireReplica). Only the
+	// two sync reads are behind that, and the version probe is the
+	// heartbeat for the box this names.
+	replicaKey
 )
 
 // bearerPrefix is the Authorization scheme, with its separating space.

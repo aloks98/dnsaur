@@ -219,6 +219,7 @@ func (a apiReloader) ReloadZones(ctx context.Context) error {
 }
 func (a apiReloader) RefreshFilters(context.Context) error     { return nil }
 func (a apiReloader) RecompileFilters(context.Context) error   { return nil }
+func (a apiReloader) ReloadSettings(context.Context) error     { return nil }
 func (a apiReloader) RefreshList(context.Context, int64) error { return nil }
 func (a apiReloader) NextFilterRefresh() int64                 { return 0 }
 func (a apiReloader) NotifyZones()                             {}
