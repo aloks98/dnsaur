@@ -102,7 +102,7 @@ Both tables are in the config bundle, bump `config_version` on write, and are re
 
 At start, after every write to `dhcp_scopes`, `dhcp_reservations`, or a `dhcp.*`/`serve.dhcp_interfaces` setting (the settings watcher already wakes on every synced write), and after a bundle is applied on a replica. The renderer builds the whole `Dhcp4` object and sends one `config-set`. Kea answers `result: 0` with a hash, or `result: 1` with its message.
 
-A refused config leaves Kea on its previous one. dnsaur records the message (`dhcp.last_error` internal setting, cleared by the next accepted render) and shows it (§8). It does not retry on a timer; the next change, or "Apply again" on the DHCP page, re-renders.
+A refused config leaves Kea on its previous one. dnsaur keeps the message in memory (it is per box, and a restart renders again anyway; `dhcp.` is a synced prefix, so a setting would travel), cleared by the next accepted render, and shows it (§8). It does not retry on a timer; the next change, or "Apply again" on the DHCP page, re-renders.
 
 ### 5.2 What
 
