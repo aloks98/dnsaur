@@ -117,7 +117,7 @@ A refused config leaves Kea on its previous one. dnsaur keeps the message in mem
 ```
 Dhcp4:
   interfaces-config.interfaces: serve.dhcp_interfaces or ["*"]; dhcp-socket-type raw
-  control-socket (below 2.7.2) / control-sockets: [ unix ] (2.7.2+): the bootstrap path echoed back; never an http entry (§6)
+  control-socket (below 2.7.2) / control-sockets: [ unix ] (2.7.2+): the socket-name the engine's own config-get reports, falling back to the bootstrap path (the same socket, but across a bind mount a different path, and Kea refuses to move it); never an http entry (§6)
   lease-database: {type: memfile, persist: true}                # Kea's default file path
   valid-lifetime: dhcp.lease_seconds; renew-timer/rebind-timer: 50% / 87.5% of it
   hooks-libraries:
