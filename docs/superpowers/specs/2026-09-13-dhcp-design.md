@@ -64,6 +64,7 @@ Synced (spec §4.3 of config sync: every key not under a local prefix):
 | `dhcp.lease_poll_seconds` | `10` | `positiveInt`, minimum 2 |
 | `dhcp.ha_port` | `8000` | port each box's Kea HA listener answers on |
 | `dhcp.ha_standby` (internal) | `""` | written by the main's renderer: the `instance.id` of the replica it chose as standby; replicas read it to know whether they are in the pair |
+| `dhcp.ha_primary` (internal) | `""` | written by the main's renderer: its own `instance.id`, so the standby can render the main's peer entry under the same name (`instance.` is local and never travels otherwise) |
 
 Local (`serve.` prefix, never in a bundle):
 
