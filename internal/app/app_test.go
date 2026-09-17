@@ -1768,12 +1768,12 @@ func TestAppIsTheSyncer(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("Pair: %v", err)
 	}
-	if err := a.Heartbeat(ctx, "r1", 7); err != nil {
+	if err := a.Heartbeat(ctx, "r1", 7, true); err != nil {
 		t.Fatalf("Heartbeat: %v", err)
 	}
 	// A probe from a box this main was told to forget is the API's 401, not
 	// a store failure, so the sentinel has to survive the delegation.
-	if err := a.Heartbeat(ctx, "nobody", 1); !errors.Is(err, api.ErrNotRegistered) {
+	if err := a.Heartbeat(ctx, "nobody", 1, false); !errors.Is(err, api.ErrNotRegistered) {
 		t.Fatalf("Heartbeat for an unknown id = %v, want api.ErrNotRegistered", err)
 	}
 	st := a.Status()

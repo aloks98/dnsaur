@@ -20,7 +20,8 @@ info:
     An instance with the "sync.peer_url" setting is a replica: it follows
     another instance's configuration, and every write to a resource that
     configuration covers -- groups, clients, filter lists, rules, TSIG keys,
-    zones, zone records, and a blocking pause (the pause state is a synced
+    zones, zone records, DHCP scopes and reservations, and a blocking pause
+    (the pause state is a synced
     setting, since a pause is a decision about the network and clients reach
     either box) -- is refused with 409 {"error": "managed by <peer_url>"}
     before the handler runs, as is PUT /settings for any key outside the
@@ -30,7 +31,9 @@ info:
     nobody's heartbeat and keeps no registry, so all four answer 409 naming
     the main to point at instead. The two refresh operations
     (/filters/lists/{id}/refresh, /zones/{id}/refresh) stay available because
-    they are operational rather than configuration, and so do this box's own
+    they are operational rather than configuration, as does DELETE
+    /dhcp/leases/{ip} -- a lease belongs to the engine rather than to the
+    configuration -- and so do this box's own
     account, sessions, tokens and backups. Clearing sync.peer_url lifts the
     refusal; see the Sync tag.
     There is no separate "upstreams" resource: upstream DNS servers are
@@ -60,6 +63,7 @@ tags:
   - name: Tokens
   - name: TSIG Keys
   - name: Sync
+  - name: DHCP
 components:
   securitySchemes:
     cookieAuth:
@@ -92,6 +96,203 @@ components:
         error:
           type: string
           description: the bind failure, present only when enabled && !listening
+    DHCPScope:
+      type: object
+      description: >
+        One DHCP subnet, rendered as one Kea subnet4. Synced configuration:
+        the ids travel in the bundle, so a scope means the same row on the
+        main and on its replica.
+      properties:
+        id: { type: integer, format: int64 }
+        name: { type: string, description: non-empty and unique }
+        cidr:
+          type: string
+          description: >
+            an IPv4 prefix in masked form ("192.168.1.0/24"). Host bits set
+            are rejected rather than quietly masked, since "10.0.0.5/24" and
+            "10.0.0.0/24" look alike in a form and hand out different
+            subnets. No two enabled scopes may overlap.
+        pool_start: { type: string, description: first address of the dynamic range }
+        pool_end:
+          type: string
+          description: >
+            last address of the dynamic range, inclusive. Both ends must be
+            inside cidr, start <= end, and neither may be the subnet's
+            network or broadcast address. Both may be empty only when
+            reservations_only is true.
+        gateway: { type: string, description: "option 3; empty hands out no router. Must be inside cidr" }
+        dns_servers:
+          type: string
+          description: >
+            comma-separated addresses for option 6. Empty is not "no DNS": it
+            is the automatic answer -- this box's own address followed by its
+            HA partner's, the same two in the same order on both boxes.
+        domain: { type: string, description: "option 15; empty falls back to the dhcp.domain setting" }
+        lease_seconds:
+          type: integer
+          description: >
+            this scope's own lifetime, 300 or more, or 0 to use the
+            dhcp.lease_seconds setting. A scope that sets one also gets its
+            own renew and rebind timers.
+        enabled:
+          type: boolean
+          description: >
+            a disabled scope is rendered into nothing and is exempt from the
+            overlap rule in both directions, which is what makes "disable it,
+            then renumber it" a usable sequence.
+        domain_search: { type: string, description: "option 119: comma-separated suffixes, or empty" }
+        ntp_servers: { type: string, description: "option 42: comma-separated IPv4 addresses, or empty" }
+        static_routes:
+          type: array
+          description: "option 121. Each router must be inside cidr -- a router only reachable through the route it is announcing is not a route"
+          items:
+            type: object
+            properties:
+              destination: { type: string }
+              router: { type: string }
+        next_server: { type: string, description: "PXE siaddr; an IPv4 address, or empty" }
+        server_hostname: { type: string, description: "PXE sname (option 66); at most 63 bytes, the field is NUL-terminated" }
+        boot_file: { type: string, description: "PXE file (option 67); at most 127 bytes" }
+        options:
+          type: array
+          description: >
+            every option with no field of its own, as raw hex. A code the
+            renderer already emits by name (1, 3, 6, 15, 42, 51, 54, 58, 59,
+            66, 67, 119, 121) is rejected, so one option code never has two
+            answers.
+          items:
+            type: object
+            properties:
+              code: { type: integer, description: 1-254 }
+              hex: { type: string, description: "the value's bytes; colons and case are normalised away" }
+        match_client_id:
+          type: boolean
+          description: >
+            false makes the engine key a lease on the hardware address alone
+            and ignore option 61, which is what cloned VMs sharing a client
+            id need. **Absent means true** on POST -- it is the column
+            default. On PATCH, absent means unchanged.
+        reservations_only:
+          type: boolean
+          description: renders the subnet with no pool, so only reserved devices get an address
+        created_at: { type: integer, format: int64, description: unix ms }
+        modified_at: { type: integer, format: int64, description: unix ms }
+    DHCPReservation:
+      type: object
+      description: a fixed address for one MAC inside one scope, rendered as a Kea host reservation
+      properties:
+        id: { type: integer, format: int64 }
+        scope_id:
+          type: integer
+          format: int64
+          description: >
+            the scope this reservation lives in. Fixed once created: a PATCH
+            may not move it, because an address validated against one subnet
+            must not be carried into another. Delete and recreate instead.
+        mac:
+          type: string
+          description: >
+            stored canonically as lowercase "aa:bb:cc:dd:ee:ff". Anything
+            net.ParseMAC accepts is taken ("AA-BB-CC-DD-EE-FF",
+            "aabb.ccdd.eeff"); anything longer than six bytes is refused,
+            since a DHCPv4 reservation is keyed on a 6-byte address and one
+            the engine cannot match would silently never fire. Unique within
+            the scope.
+        ip:
+          type: string
+          description: >
+            inside the scope's cidr, and not its gateway. It may sit inside
+            the pool or outside it -- Kea keeps a reserved address out of
+            dynamic allocation either way. Unique within the scope.
+        hostname:
+          type: string
+          description: >
+            one RFC 1123 label (not a dotted name -- the suffix comes from
+            the scope), or empty. Unique within the scope, case-insensitively,
+            when set.
+        comment: { type: string }
+        created_at: { type: integer, format: int64, description: unix ms }
+        modified_at: { type: integer, format: int64, description: unix ms }
+    DHCPLease:
+      type: object
+      description: >
+        one row of the lease table as of the last poll. Never stored by
+        dnsaur: it is read from the engine every dhcp.lease_poll_seconds and
+        replaced whole.
+      properties:
+        scope_id: { type: integer, format: int64, description: the subnet the engine handed it out of }
+        ip: { type: string }
+        mac: { type: string, description: canonical lowercase }
+        hostname: { type: string, description: "the client's own name (option 12 or FQDN), or the reservation's when the client sent none" }
+        expires_at:
+          type: integer
+          format: int64
+          description: >
+            unix ms, and **0 for a reservation nothing has leased yet** -- the
+            operator pinned the address and no client has asked for it. That
+            is the one field that tells such a row from a live lease.
+        reserved: { type: boolean, description: a reservation pins either this MAC or this address in this scope }
+    DHCPStatus:
+      type: object
+      description: >
+        Everything this instance knows about its engine. "enabled" false --
+        the kea_socket bootstrap key is empty -- is the whole answer on a box
+        with no engine, and the only DHCP answer it gives.
+      properties:
+        enabled: { type: boolean }
+        engine:
+          type: string
+          enum: [ok, unreachable, "config rejected"]
+          description: >
+            "ok" is a config the engine took and a poll that reached it. A
+            configuration it would not take outranks an engine that is not
+            there: it is the one an operator has to act on, and it is still
+            true when the engine comes back.
+        engine_version: { type: string, description: what version-get reported, e.g. "2.6.3" }
+        message:
+          type: string
+          description: >
+            the engine's own words: its refusal of the last config-set, why
+            it could not be reached, or a command it refused on the last
+            poll. Cleared by the next render it accepts.
+        table_age_seconds:
+          type: integer
+          format: int64
+          description: >
+            how long ago the poll that built the lease table read it. An
+            engine that stops answering keeps the table it last gave -- it is
+            still the truth about the leases on the segment -- and this is
+            how stale that truth is.
+        ha:
+          type: object
+          description: absent on a single box, and on an engine too old to know status-get's HA block
+          properties:
+            mode: { type: string, description: '"hot-standby"' }
+            local_state: { type: string }
+            peer:
+              type: string
+              description: >
+                what the partner calls itself, as the engine talking to it
+                reports the name -- the "<peer>" in "Engine 2.6.3 ·
+                hot-standby with <peer> · hot-standby". Absent on an engine
+                whose status-get does not carry it.
+            remote_state: { type: string }
+            communication_interrupted:
+              type: boolean
+              description: what the "DHCP partner unreachable" strip fact reads
+            unacked_clients: { type: integer }
+        scopes:
+          type: array
+          description: >
+            one entry per scope the last render saw. "leased" may exceed
+            "pool_size" after a pool is shrunk: the engine keeps the leases it
+            has already handed out until they expire.
+          items:
+            type: object
+            properties:
+              id: { type: integer, format: int64 }
+              pool_size: { type: integer }
+              leased: { type: integer }
     List:
       type: object
       description: >
@@ -569,6 +770,11 @@ components:
           description: >
             nothing heard for three sync intervals. Never a reason to delete
             the entry; an operator removes one deliberately.
+        dhcp:
+          type: boolean
+          description: >
+            the replica runs a DHCP engine of its own, as its last version
+            probe said. Only such a replica is chosen as the DHCP standby.
     SyncStatus:
       type: object
       description: >
@@ -725,6 +931,17 @@ components:
         write whose Sec-Fetch-Site is cross-site ({"error": "cross-site
         request"}) -- CSRF defence in depth behind SameSite=Strict. Bearer
         requests are never checked for the latter.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    DHCPDisabled:
+      description: >
+        DHCP is not enabled on this instance: the kea_socket bootstrap key is
+        empty, so there is no engine, no lease table and nothing to
+        configure. {"error": "dhcp is not enabled"}. GET /dhcp/status is the
+        one DHCP route that still answers, with {"enabled": false}. Turning
+        DHCP on is a bootstrap change and a restart, which is why this is 404
+        rather than 503.
       content:
         application/json:
           schema: { $ref: "#/components/schemas/Error" }
@@ -1181,6 +1398,12 @@ paths:
         — and "error" carries the bind failure in that case.
 
 
+        "dhcp" is GET /dhcp/status's object, carried here for the same
+        reason "sync" is: the warning strip shows "DHCP engine unreachable",
+        "DHCP config rejected: <message>" and "DHCP partner unreachable" from
+        it. An instance whose kea_socket is empty reads as enabled: false.
+
+
         "sync" is this instance's relationship to a main, or its own list of
         replicas -- the same object GET /sync/status answers, carried here so
         the warning strip can show "behind by N", a failed pull, a peer
@@ -1221,6 +1444,7 @@ paths:
                         type: boolean
                         description: true when not_after falls within the 14-day warning window
                   sync: { $ref: "#/components/schemas/SyncStatus" }
+                  dhcp: { $ref: "#/components/schemas/DHCPStatus" }
                 example:
                   encryption_downgraded: true
                   reason: 'upstream "tls://1.1.1.1:853": missing "#name"'
@@ -1290,10 +1514,16 @@ paths:
         (an absolute path, or empty to unset), sync.peer_url (an absolute
         http/https URL, or empty), sync.token (any string; never returned by
         GET /settings), sync.interval_seconds (int, 5 or more),
-        sync.primary_dns ("host:port" with the host required, or empty).
-        All other keys are rejected. That includes the two internal sync
-        rows, which are written by pairing and by nothing else and are
-        stripped from GET /settings.
+        sync.primary_dns ("host:port" with the host required, or empty),
+        dhcp.domain (a domain suffix, written with no trailing dot, or
+        empty for leases that get no names), dhcp.lease_seconds (int, 300 or
+        more), dhcp.lease_poll_seconds (int, 2 or more), dhcp.ha_port
+        (numeric 1-65535) and serve.dhcp_interfaces (comma-separated
+        interface names, or empty for every interface).
+        All other keys are rejected. That includes the internal sync rows and
+        the two internal DHCP rows (dhcp.ha_primary, dhcp.ha_standby), which
+        are written by pairing and by the renderer and by nothing else, and
+        are stripped from GET /settings.
 
 
         "upstreams" is a comma-separated list of entries, each plain
@@ -2002,7 +2232,7 @@ paths:
                   properties:
                     id: { type: integer, format: int64 }
                     name: { type: string }
-                    matcher: { type: string, description: IP address or CIDR, stored canonically }
+                    matcher: { type: string, description: "IP address, CIDR or mac:<hardware address>, stored canonically" }
                     group_id: { type: integer, format: int64 }
         "400":
           description: group_id must be a positive id
@@ -2034,10 +2264,14 @@ paths:
                 matcher:
                   type: string
                   description: >
-                    IP address or CIDR, without an interface zone. Stored
-                    canonically: a CIDR is masked (10.0.0.1/24 -> 10.0.0.0/24)
-                    and IPv4-mapped IPv6 is unmapped (::ffff:192.168.1.0/120
-                    -> 192.168.1.0/24).
+                    IP address or CIDR, without an interface zone, or
+                    `mac:<hardware address>`. Stored canonically: a CIDR is
+                    masked (10.0.0.1/24 -> 10.0.0.0/24), IPv4-mapped IPv6 is
+                    unmapped (::ffff:192.168.1.0/120 -> 192.168.1.0/24) and a
+                    MAC is lowercased colon form (mac:AA-BB-CC-DD-EE-FF ->
+                    mac:aa:bb:cc:dd:ee:ff). A `mac` matcher follows the
+                    device's current DHCP lease and matches nothing while it
+                    has none.
                 group_id: { type: integer, format: int64 }
       responses:
         "201":
@@ -2059,8 +2293,8 @@ paths:
         "400":
           description: >
             invalid json; matcher must be an IP or CIDR without an interface
-            zone, and group_id set; or `group_id does not name an existing
-            group`
+            zone, or mac:<hardware address>, and group_id set; or `group_id
+            does not name an existing group`
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -2105,10 +2339,14 @@ paths:
                 matcher:
                   type: string
                   description: >
-                    IP address or CIDR, without an interface zone. Stored
-                    canonically: a CIDR is masked (10.0.0.1/24 -> 10.0.0.0/24)
-                    and IPv4-mapped IPv6 is unmapped (::ffff:192.168.1.0/120
-                    -> 192.168.1.0/24).
+                    IP address or CIDR, without an interface zone, or
+                    `mac:<hardware address>`. Stored canonically: a CIDR is
+                    masked (10.0.0.1/24 -> 10.0.0.0/24), IPv4-mapped IPv6 is
+                    unmapped (::ffff:192.168.1.0/120 -> 192.168.1.0/24) and a
+                    MAC is lowercased colon form (mac:AA-BB-CC-DD-EE-FF ->
+                    mac:aa:bb:cc:dd:ee:ff). A `mac` matcher follows the
+                    device's current DHCP lease and matches nothing while it
+                    has none.
                 group_id: { type: integer, format: int64 }
       responses:
         "204":
@@ -2116,8 +2354,8 @@ paths:
         "400":
           description: >
             bad id; invalid json; matcher must be an IP or CIDR without an
-            interface zone, and group_id set; or `group_id does not name an
-            existing group`
+            interface zone, or mac:<hardware address>, and group_id set; or
+            `group_id does not name an existing group`
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -3984,6 +4222,13 @@ paths:
                         The rule pattern or list entry that fired. Empty for
                         anything that was not blocked, and for rows logged
                         before the column existed.
+                    hostname:
+                      type: string
+                      description: >
+                        The DHCP lease table's name for client_ip, joined on
+                        as the row is read. Absent — not empty — when DHCP is
+                        off, when no lease holds that address, and on every
+                        row while qlog.privacy is anon.
         "401":
           description: authentication required
           content:
@@ -4154,6 +4399,553 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
 
+  /dhcp/scopes:
+    get:
+      tags: [DHCP]
+      summary: List DHCP scopes
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/DHCPScope" }
+        "401":
+          description: authentication required
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "404":
+          $ref: "#/components/responses/DHCPDisabled"
+        "503":
+          description: storage unavailable
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+    post:
+      tags: [DHCP]
+      summary: Create a DHCP scope
+      description: >
+        Validated before anything is written, against every other scope:
+        overlap is a claim about a set of rows, not a column constraint.
+
+
+        An omitted "match_client_id" is true, which is the column default.
+        Omitted "id", "created_at" and "modified_at" are the server's.
+
+
+        The write is stored and then rendered and sent to the engine as one
+        config-set. **The answer is 201 whatever the engine says**: a config
+        it refuses leaves the row stored and the engine on its previous
+        configuration, and the refusal is in GET /dhcp/status until a render
+        is accepted. Telling the caller its scope was not saved would be
+        false.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/DHCPScope" }
+            example:
+              name: lan
+              cidr: 192.168.1.0/24
+              pool_start: 192.168.1.100
+              pool_end: 192.168.1.200
+              gateway: 192.168.1.1
+              domain: home.lan
+              enabled: true
+      responses:
+        "201":
+          description: Created; Location names the new scope
+          headers:
+            Location: { schema: { type: string } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DHCPScope" }
+        "400":
+          description: >
+            invalid json, or the validator's own message naming the column
+            and the value -- a cidr with host bits set, a pool outside it or
+            inverted, a gateway outside it, a lease_seconds below 300, an
+            option code the renderer already emits by name, or an overlap
+            with another enabled scope ("192.168.1.0/24 overlaps an enabled
+            scope: lan (192.168.1.0/24)")
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401":
+          description: authentication required
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "403":
+          $ref: "#/components/responses/ReadOnlyToken"
+        "404":
+          $ref: "#/components/responses/DHCPDisabled"
+        "409":
+          $ref: "#/components/responses/ManagedByMain"
+        "503":
+          description: storage unavailable
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /dhcp/scopes/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: integer, format: int64 }
+    patch:
+      tags: [DHCP]
+      summary: Edit a DHCP scope
+      description: >
+        A merge: every key the body omits keeps the value it has, so the
+        row's enable toggle sends {"enabled": false} and nothing else. "id",
+        "scope-created" timestamps and anything else the server owns are
+        taken from the stored row whatever the body says.
+
+
+        "match_client_id" is the one field where absent means unchanged
+        rather than true -- a PATCH that turned client-id matching back on
+        for a scope of cloned VMs, with nothing on the screen saying so,
+        would be the opposite of a merge.
+
+
+        A change to "cidr" or "gateway" re-validates every reservation in
+        this scope against the new values, and is refused naming the first
+        one that would be stranded. The alternative is a scope whose own
+        reservations the renderer then refuses -- taking every other scope
+        down with it, behind one address nobody can find without reading the
+        engine's message.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/DHCPScope" }
+            example: { enabled: false }
+      responses:
+        "204":
+          description: No Content
+        "400":
+          description: >
+            bad id, invalid json, the validator's message, or "reservation
+            192.168.1.50 (aa:bb:cc:dd:ee:01) would be stranded: ..."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401":
+          description: authentication required
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "403":
+          $ref: "#/components/responses/ReadOnlyToken"
+        "404":
+          description: >
+            no scope with this id, or DHCP is not enabled on this instance
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "409":
+          description: >
+            this instance is a replica ({"error": "managed by <peer_url>"}),
+            or another scope already has that name
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503":
+          description: storage unavailable
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+    delete:
+      tags: [DHCP]
+      summary: Delete a DHCP scope
+      description: >
+        Removes the scope and its reservations in one transaction. The leases
+        the engine already handed out of it are not touched here -- the next
+        render drops the subnet, and the engine forgets them.
+      responses:
+        "204":
+          description: No Content
+        "400":
+          description: bad id
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401":
+          description: authentication required
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "403":
+          $ref: "#/components/responses/ReadOnlyToken"
+        "404":
+          description: no scope with this id, or DHCP is not enabled on this instance
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "409":
+          $ref: "#/components/responses/ManagedByMain"
+        "503":
+          description: storage unavailable
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /dhcp/reservations:
+    get:
+      tags: [DHCP]
+      summary: List DHCP reservations
+      description: every reservation of every scope, ordered by id -- the engine's config is rendered from all of them at once
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/DHCPReservation" }
+        "401":
+          description: authentication required
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "404":
+          $ref: "#/components/responses/DHCPDisabled"
+        "503":
+          description: storage unavailable
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+    post:
+      tags: [DHCP]
+      summary: Create a DHCP reservation
+      description: >
+        Every rule is relative to the scope "scope_id" names, so an id naming
+        no scope is 404 rather than a reservation checked against nothing.
+        Renders afterwards, and answers 201 whatever the engine says -- see
+        POST /dhcp/scopes.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/DHCPReservation" }
+            example:
+              scope_id: 1
+              mac: "aa:bb:cc:dd:ee:01"
+              ip: 192.168.1.50
+              hostname: nas
+      responses:
+        "201":
+          description: Created; Location names the new reservation
+          headers:
+            Location: { schema: { type: string } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DHCPReservation" }
+        "400":
+          description: >
+            invalid json, or the validator's message: a mac that is not a
+            6-byte hardware address, an ip outside the scope ("address is
+            outside the scope: 10.0.0.5 is not inside 192.168.1.0/24"), the
+            scope's own gateway, or a hostname that is not one RFC 1123 label
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401":
+          description: authentication required
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "403":
+          $ref: "#/components/responses/ReadOnlyToken"
+        "404":
+          description: scope_id names no scope, or DHCP is not enabled on this instance
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "409":
+          description: >
+            this instance is a replica ({"error": "managed by <peer_url>"}),
+            or the validator's own words for a collision inside this scope:
+            "mac aa:bb:cc:dd:ee:01 is reserved in this scope",
+            "192.168.1.50 is reserved in this scope", or
+            'hostname "nas" is used in this scope'
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503":
+          description: storage unavailable
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /dhcp/reservations/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: integer, format: int64 }
+    patch:
+      tags: [DHCP]
+      summary: Edit a DHCP reservation
+      description: >
+        A merge, like the scope PATCH: every key the body omits keeps the
+        value it has. "scope_id" is fixed -- a body naming a different one is
+        ignored rather than obeyed, because an address validated against one
+        subnet must not be carried into another. Delete and recreate to move
+        a reservation between scopes.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/DHCPReservation" }
+            example: { hostname: nas }
+      responses:
+        "204":
+          description: No Content
+        "400":
+          description: bad id, invalid json, or the validator's message
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401":
+          description: authentication required
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "403":
+          $ref: "#/components/responses/ReadOnlyToken"
+        "404":
+          description: no reservation with this id, or DHCP is not enabled on this instance
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "409":
+          description: >
+            this instance is a replica ({"error": "managed by <peer_url>"}),
+            or the validator's own words for a collision inside this scope --
+            see POST /dhcp/reservations
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503":
+          description: storage unavailable
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+    delete:
+      tags: [DHCP]
+      summary: Delete a DHCP reservation
+      responses:
+        "204":
+          description: No Content
+        "400":
+          description: bad id
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401":
+          description: authentication required
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "403":
+          $ref: "#/components/responses/ReadOnlyToken"
+        "404":
+          description: no reservation with this id, or DHCP is not enabled on this instance
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "409":
+          $ref: "#/components/responses/ManagedByMain"
+        "503":
+          description: storage unavailable
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /dhcp/leases:
+    get:
+      tags: [DHCP]
+      summary: The lease table
+      description: >
+        What the engine held at the last poll, ordered by address -- the only
+        order that is stable across polls, since the engine pages its lease
+        database in whatever order it holds it. Reservations nothing has
+        leased yet are in the list too, with expires_at 0: a reserved device
+        has a name and an address before its first lease.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/DHCPLease" }
+        "401":
+          description: authentication required
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "404":
+          $ref: "#/components/responses/DHCPDisabled"
+
+  /dhcp/leases/{ip}:
+    parameters:
+      - name: ip
+        in: path
+        required: true
+        schema: { type: string }
+    delete:
+      tags: [DHCP]
+      summary: Release one lease
+      description: >
+        lease4-del on this box's own engine. **Not refused on a replica**: a
+        lease belongs to the engine rather than to the configuration, and
+        Kea's HA propagates the release to the partner. It is the one DHCP
+        write whose button stays live on a replica.
+      responses:
+        "204":
+          description: No Content
+        "400":
+          description: the path does not parse as an IP address
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401":
+          description: authentication required
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "403":
+          $ref: "#/components/responses/ReadOnlyToken"
+        "404":
+          description: >
+            DHCP is not enabled on this instance, or the engine refused the
+            command -- which for lease4-del means it holds no such lease, and
+            the message is the engine's own words
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503":
+          description: the engine is unreachable
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /dhcp/leases/{ip}/reserve:
+    parameters:
+      - name: ip
+        in: path
+        required: true
+        schema: { type: string }
+    post:
+      tags: [DHCP]
+      summary: Turn a lease into a reservation
+      description: >
+        The Leases page's per-row "Reserve": it reads the scope, MAC, address
+        and hostname off the lease table entry and writes a reservation from
+        them. No body. The client's own hostname is sanitised to an RFC 1123
+        label the same way the DNS stage sanitises it, so a device that
+        called itself "Anna's iPad" does not make this button answer 400
+        about a name nobody typed.
+      responses:
+        "201":
+          description: Created; Location names the new reservation
+          headers:
+            Location: { schema: { type: string } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DHCPReservation" }
+        "400":
+          description: the path does not parse as an IP address, or the validator's message
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401":
+          description: authentication required
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "403":
+          $ref: "#/components/responses/ReadOnlyToken"
+        "404":
+          description: >
+            no lease holds that address, the lease names a scope this box no
+            longer has, or DHCP is not enabled on this instance
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "409":
+          description: >
+            this instance is a replica ({"error": "managed by <peer_url>"}),
+            or that mac or address is already reserved in this scope
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503":
+          description: storage unavailable
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /dhcp/status:
+    get:
+      tags: [DHCP]
+      summary: The engine's state
+      description: >
+        The one DHCP route that answers on a box with no engine, because "is
+        DHCP running here" is exactly what it is for: an instance whose
+        kea_socket is empty answers {"enabled": false} with an empty scope
+        list. The same object is embedded in GET /resolver/status as "dhcp".
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DHCPStatus" }
+        "401":
+          description: authentication required
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /dhcp/apply:
+    post:
+      tags: [DHCP]
+      summary: Re-render and send the configuration now
+      description: >
+        The Scopes page's "Apply again". Nothing retries a refused
+        configuration on a timer, so this is how an operator re-sends one
+        after fixing what the engine complained about -- a hook library
+        installed, a socket permission corrected.
+
+
+        It answers 200 with the status object whatever the engine said,
+        rather than 204: the message this render produced is the answer, and
+        reading it out of a second request would show the state before this
+        one landed.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DHCPStatus" }
+        "401":
+          description: authentication required
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "403":
+          $ref: "#/components/responses/ReadOnlyToken"
+        "404":
+          $ref: "#/components/responses/DHCPDisabled"
+        "409":
+          $ref: "#/components/responses/ManagedByMain"
+
   /sync/version:
     get:
       tags: [Sync]
@@ -4190,6 +4982,13 @@ paths:
             the config_version this replica has actually installed. Absent
             or unparseable is 0, which is what a box that has only just
             paired truthfully reports.
+        - name: dhcp
+          in: query
+          required: false
+          schema: { type: string, enum: ["1"] }
+          description: >
+            present as 1 when this replica runs a DHCP engine (kea_socket is
+            set). Absent is false, which is what an older replica reports.
       responses:
         "200":
           description: OK

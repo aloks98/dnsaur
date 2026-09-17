@@ -11,8 +11,8 @@ SPA) is built separately but embedded into that same binary via
 `//go:embed` and served by the same HTTP server as the API — there is no
 separate frontend process or listener. A second instance following this one
 (see Config sync below) is another copy of the same binary, not a component
-of this one; the DHCP server planned for a later phase is an additional
-listener feeding the same internal packages rather than a separate process.
+of this one; DHCP is the one part dnsaur does not serve itself — ISC Kea is
+a second process, and dnsaur is its control plane (see DHCP below).
 
 ## The middleware pipeline
 
@@ -22,8 +22,8 @@ terminal upstream forwarder. Each stage can answer the query outright
 
 ```
                  ┌─────────────────────────────────────────────────────────┐
- UDP/TCP :53 ───►│  qlog  →  recovery  →  client-id  →  filter  →  zones   │
-                 │  →  cache  →  upstream forwarder                        │
+ UDP/TCP :53 ───►│  qlog  →  recovery  →  client-id  →  filter  →  dhcp    │
+                 │  →  zones  →  cache  →  upstream forwarder              │
                  └─────────────────────────────────────────────────────────┘
 ```
 
@@ -49,7 +49,19 @@ terminal upstream forwarder. Each stage can answer the query outright
    client, whichever ends later winning; every change is written to one
    settings row and installed again at the next start, so a restart in the
    middle of a pause does not turn blocking back on.
-5. **zones** — answers authoritatively for the suffixes this server holds,
+5. **dhcp** — answers names the DHCP lease table holds, and only exists on
+   a box with an engine configured (`kea_socket`). `A` for a lease's
+   sanitised hostname under its scope's suffix, `PTR` for an address inside
+   a scope, and **NODATA for any other type of a name a lease answers to**:
+   a resolver asks for the AAAA of every A it looks up, and forwarding that
+   one would both leak an internal name and answer it with whatever the
+   internet says. A record a zone holds for the same name **wins** — the
+   stage asks the zone index before it answers, so explicit configuration
+   beats inferred state — and everything else passes through untouched,
+   including a question in a class other than `IN`. TTL is
+   `min(300, what is left of the lease)`, and an answer is tagged `dhcp` in
+   the query log. See DHCP below.
+6. **zones** — answers authoritatively for the suffixes this server holds,
    before the cache or any upstream is consulted, and tags the result
    `authoritative` in the query log. This is a zone cut, not a set of
    overrides: once a zone claims a name, that name is *never* forwarded.
@@ -67,7 +79,6 @@ terminal upstream forwarder. Each stage can answer the query outright
    private ranges (`BuiltinZones` in `internal/store/builtins.go`) —
    seeded at migration so those names never reach an upstream; every
    write to one of them is refused with `409` at the API layer instead.
-   Future DHCP-registered hostnames register into a zone at this stage.
    Two zone types are the exception that proves the rule — a `forwarder`
    and a `stub` claim a suffix without holding any data for it, so
    `Zone.Answer` returns `handled=false` and the query goes on to the next
@@ -76,12 +87,12 @@ terminal upstream forwarder. Each stage can answer the query outright
    own, and passing through the cache on the way is the whole reason the
    routing lives there rather than here. See Conditional routing below.
    See [`dashboard.md`](dashboard.md#zones) for the user-facing rules.
-6. **cache** — in-memory cache keyed on (qname, qtype), respecting upstream
+7. **cache** — in-memory cache keyed on (qname, qtype), respecting upstream
    TTLs with configurable min/max clamps, negative caching, and
    serve-stale-on-failure with background refresh. An entry records no
    route, so a change to the conditional routing table below purges the
    suffixes it changed — see Conditional routing below.
-7. **upstream forwarder** — the terminal handler; sends unresolved queries
+8. **upstream forwarder** — the terminal handler; sends unresolved queries
    to configured upstreams with a selectable strategy (`race`, `failover`
    or `fastest` — see [`configuration.md`](configuration.md)). It also holds
    the conditional routing table: a query under a suffix a `forwarder` or
@@ -1036,6 +1047,159 @@ and takes writes again. Nothing is repointed: the zones it derived are still
 secondaries, of a main that may be gone, and turning one into a primary is a
 per-zone decision on that zone's own page.
 
+## DHCP
+
+dnsaur does not implement DHCP. `kea-dhcp4` serves the protocol; dnsaur owns
+everything an operator touches — scopes, reservations, the names leases get
+in DNS, the client identity a lease gives a device, and the state of the
+whole thing — and drives the engine over its unix control socket. The
+operator-facing half is [`docs/configuration.md`](configuration.md#dhcp);
+this is the shape of it.
+
+```
+operator ──► dnsaur API ──► store (scopes, reservations, settings)   [synced config, both boxes]
+                               │
+                               ▼  on every change, and at start
+                          renderer ──► {"command":"config-set","arguments":{"Dhcp4":…}} ──► kea-dhcp4 (unix socket)
+                                                                                              │  serves :67, holds leases,
+                                                                                              │  HA-syncs with the peer Kea
+                          lease poller ◄── {"command":"lease4-get-page"} ◄────────────────────┘
+                               │ every dhcp.lease_poll_seconds (default 10)
+                               ▼
+                    in-memory lease table ──► DNS stage (A/PTR)  ──► client identity (mac matcher) ──► API (Leases page, query log names)
+```
+
+Both boxes of a pair run that whole loop against their own engine. Kea's HA
+hook keeps the two lease sets identical; **dnsaur never copies a lease
+between boxes.**
+
+### What is shared and what is this box's
+
+| | Where it lives |
+|---|---|
+| `dhcp_scopes`, `dhcp_reservations` | synced tables — in the config bundle, `config_version` bumps on write, and a write on a replica is `409 managed by <peer>`, exactly like zones and groups |
+| `dhcp.domain`, `dhcp.lease_seconds`, `dhcp.lease_poll_seconds`, `dhcp.ha_port` | synced settings, so both boxes render from the same numbers |
+| `dhcp.ha_primary`, `dhcp.ha_standby` | synced too, but written by the main's renderer rather than by anyone: the pair it chose, travelling in the next bundle so the standby can render the same two peers (see Config sync above for the internal-settings rule) |
+| `kea_socket` | bootstrap, per box. Kea keeps the socket it was started with |
+| `serve.dhcp_interfaces` | a `serve.` setting, so local by definition — each box binds its own interfaces |
+| the lease table, the engine's version, its hook directory, its status | neither: read from the local engine, held in memory, never written down |
+
+### When the engine is rendered
+
+The renderer builds the whole `Dhcp4` object and sends one `config-set`;
+there is no partial update, because a whole object is the only thing Kea
+takes. That happens at start, after every write to a scope or a
+reservation, after any `dhcp.*` or `serve.dhcp_interfaces` setting changes,
+after a bundle is applied on a replica, on `POST /api/v1/dhcp/apply`, and on
+the first poll that reaches an engine which had been unreachable.
+
+Two things keep that from being noisy. The settings watcher wakes on *every*
+synced write — a blocking pause is a settings row — so the DHCP reconcile
+hashes the render input and skips when it is unchanged, rather than having
+Kea rebuild every subnet to arrive at what it is already running. And a
+scope written on this box never reaches the watcher at all: the handler that
+stored it has already rendered.
+
+A refused configuration leaves Kea on its previous one, and the message —
+Kea's own words — is kept in memory rather than in a setting: it is a fact
+about this box, `dhcp.` is a synced prefix, and a restart renders again
+anyway. Nothing retries on a timer; the next change, or **Apply again**,
+re-sends.
+
+The engine tells the renderer three things about itself, once at start
+(`version-get`, `config-get`): its version, which decides whether the
+control socket is spelled `control-socket` or `control-sockets`; the
+directory its hook libraries sit in, which is how Debian's and Alpine's
+layouts both work with nothing to configure; and the path its own
+configuration gives the control socket, which is what the render names,
+not `kea_socket`. The two are the same socket, but across a bind mount they
+are different paths, and Kea will not move its socket: a config naming
+another path is refused, and Debian's build then closes the socket it had
+(`DHCP4_CONFIG_UNRECOVERABLE_ERROR`) until the engine is restarted.
+
+### The lease table
+
+Every `dhcp.lease_poll_seconds` the manager pages through `lease4-get-page`
+and builds a **new** table: address, hardware address, hostname, the subnet
+id mapped back to a scope, `cltt + valid-lft` as the expiry, and only Kea's
+active state — declined and expired-reclaimed rows are not addresses anyone
+holds. Reservations are folded in, so a reserved device has a name and an
+address before its first lease; those rows carry no expiry, which is what
+tells them apart.
+
+The table is immutable and swapped behind an `atomic.Pointer`, so a reader
+holding one sees a consistent set of leases for as long as it holds it, and
+no query path ever waits on the poller. Subscribers — the DNS stage's view,
+the `mac` matchers — are called on the swap.
+
+An engine that stops answering keeps the table it last gave: it is still the
+truth about the segment, and the status says how old it is. `status-get` is
+read on the same poll for the HA state.
+
+`GET /dhcp/status` reports the engine as `ok`, `unreachable` or
+`config rejected`, and **a rejected configuration outranks an unreachable
+engine**: it is the one an operator has to act on, and it is still true when
+the engine comes back. A command refused on a poll is neither — the engine
+is there, running what dnsaur gave it — so that shows as a message on an
+otherwise `ok` engine.
+
+### Names, and the `mac` matcher
+
+The `dhcp` pipeline stage (above) answers from that table and from nothing
+else. Hostnames are sanitised to RFC 1123 labels — lowercased, invalid runs
+collapsed to `-` — and a lease with nothing usable gets no name. When two
+leases in one scope sanitise to the same name the newer keeps it and the
+loser is logged, once per table rather than once per query. The reverse
+direction is the same table, keyed by address: a `PTR` inside a scope's
+range answers `<hostname>.<suffix>.`, and an address outside every scope is
+not this stage's business.
+
+Client matchers gained a third kind, `mac:aa:bb:cc:dd:ee:ff`. The registry
+resolves it through the same table and re-resolves on every swap, so a
+device keeps its group across a renewal that moved it; a MAC with no lease
+matches nothing. The query log's hostname column is the same join, done at
+read time — nothing is stored, so an old row shows whoever holds that
+address now.
+
+### The pair
+
+Two paired boxes render **one Kea hot-standby pair** between their engines.
+The main chooses the standby — the non-stale registered replica with the
+lexicographically smallest `instance.id`, a choice every render on either
+box makes identically — records it in `dhcp.ha_primary`/`dhcp.ha_standby`,
+and both boxes then render the same two peers with only `this-server-name`
+differing. Any other replica renders no HA section and runs plain Kea beside
+a pair it is not in.
+
+The HA hook brings its own transport: with multi-threading on — the default
+on both tested versions — it opens an HTTP listener on the address and port
+of this server's own peer entry. So dnsaur renders no HTTP control socket
+and needs no `kea-ctrl-agent`, and `dhcp.ha_port` is simply the port in the
+peer URLs. Both boxes also hand out the same two DNS servers in the same
+order, which is what DHCP-level failover needs from DNS.
+
+Kea owns everything after that: lease synchronisation, the standby answering
+only once the primary has left clients unacknowledged, and the
+reconciliation when they meet again.
+
+### Failure modes
+
+| What | What happens |
+|---|---|
+| `kea_socket` empty | none of this exists: no manager, no stage, no section in the dashboard, and `GET /dhcp/status` answers `{"enabled": false}` |
+| the socket is missing, or Kea is down at start | status `engine unreachable`; scopes stay editable; the poller keeps trying, and the first poll that reaches the engine re-reads its version and hooks and renders |
+| Kea refuses the rendered configuration | it stays on its previous one; the message is Kea's, shown verbatim, and **Apply again** re-sends. Nothing retries on a timer |
+| a hook library is missing | the same, and the message names the file |
+| the render cannot be built at all — a scope with no local address inside it and no `dns_servers` | the engine is never asked, so what it is running is unchanged; the message names the scope and the setting to fix |
+| Kea restarts | its leases come back from the memfile; the next poll refreshes the table, and the reconnect re-renders |
+| a 3.0 engine that comes up after dnsaur's first render | dnsaur discovered nothing, so it rendered for the older syntax — `control-socket`, which 3.0 refuses. That is one refused render, reported as one; the poll that first reaches the engine re-reads its version and renders again, and the second one is accepted |
+| a replica is forgotten while it is the standby | its pull is refused, and the render after that drops the pair — but nothing renders on that box until something changes, so promote it or stop its engine before forgetting it (`configuration.md`) |
+| the store cannot be read on a poll | the poll runs against the scopes last read — a table built from stale scopes beats no table |
+| the HA partner is unreachable | Kea's problem to solve; the strip shows `DHCP partner unreachable` for as long as it says so |
+| a replica pairs later, or is forgotten | the next lease poll on both boxes adds or drops the standby peer. Nothing else has to notice, and nothing else would: the registry is written without moving `config_version`, so no settings write and no handler is involved |
+| a pool is shrunk below its live leases | Kea keeps what it has handed out until those leases expire, and the Scopes page shows `leased` above the pool size |
+| two devices claim one hostname | the newer lease keeps the name; the other is logged with both hardware addresses |
+
 ## Package map
 
 | Package | Responsibility |
@@ -1051,13 +1215,12 @@ per-zone decision on that zone's own page.
 | `internal/upstream` | Upstream forwarders and selection strategy; also the conditional routing table (`SetConditional`) that sends a suffix a `forwarder` or `stub` zone claims to that zone's own upstreams — see Conditional routing above |
 | `internal/qlog` | Async query logging and retention pruning |
 | `internal/confsync` | Config sync between two instances (see Config sync above): `Replica`, the pull loop that probes a main's config version, fetches and validates a bundle, derives the replica's own zones from it and applies it; and `Registry`, the main's record of which replicas have paired — the pairing codes, each replica's secret hash, and what the implicit transfer allow and NOTIFY targets are read from |
+| `internal/dhcp` | dnsaur's half of the DHCP engine (see DHCP above): `Client`, the unix control-socket protocol; `Render`, the whole `Dhcp4` object built from scopes, reservations and settings; `Manager`, which applies it, polls the leases into an immutable `Table` and keeps the engine's status; and `Names`, the pipeline stage that answers `A`/`PTR` from that table |
 | `internal/stats` | Hourly stats rollups from the query log |
 | `internal/store` | Storage interfaces plus SQLite/Postgres implementations, migrations, settings |
 | `internal/api` | HTTP REST API server + handlers (`/api/v1`: setup, settings, blocking, groups, clients, filters, zones, queries, stats, tokens), embedded OpenAPI 3.1 doc; also mounts the web dashboard's static files (`internal/api.StaticHandler`) on every non-`/api` path when `Deps.Static` is set. The static mount — and only the static mount, so SSE on `/api/v1/queries/tail` stays unbuffered — gzips responses and sets `Content-Security-Policy` (`frame-ancestors 'none'`), `X-Content-Type-Options: nosniff`, `Referrer-Policy: same-origin`, and `X-Frame-Options: DENY` |
 | `internal/auth` | Auth service: argon2id password hashing (bounded concurrency), session + scoped (read/write) API tokens with a 90-day session ceiling, optional TOTP 2FA with single-use codes |
 | `web` | The dashboard's Go-side glue: `//go:embed all:dist` over the React SPA's Vite build output, exposed as `web.Dist() fs.FS` for `internal/app` to hand to `internal/api.Deps.Static`. The actual frontend source (React 19 + TypeScript + Tailwind + TanStack Query, see `web/README.md`) lives under `web/src`, built independently (`pnpm build`) before the Go build embeds its output |
-
-Planned, not yet present: `internal/dhcp` (Phase 2).
 
 ## Storage model
 

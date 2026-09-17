@@ -4,7 +4,7 @@ import { afterEach, expect, test, vi } from "vitest";
 import { fireEvent, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { server } from "../../test/msw-server";
-import { replicaHandlers } from "../../test/msw-handlers";
+import { dhcpHandlers, dhcpLease, replicaHandlers } from "../../test/msw-handlers";
 import { renderWithProviders } from "../../test/render";
 import type { Client, Group, List } from "../../api/types";
 import { GroupsClientsTab } from "./groups-clients";
@@ -564,6 +564,9 @@ const ACCEPTED_MATCHERS = [
   { name: "a plain IPv6 address", value: "2001:db8::1" },
   { name: "an IPv6 address with a zone id", value: "fe80::1%eth0" },
   { name: "a bare /0 prefix", value: "0.0.0.0/0" },
+  // The third matcher kind (spec §8.2): a hardware address, which follows
+  // the device's current DHCP lease rather than naming an address at all.
+  { name: "a mac matcher", value: "mac:aa:bb:cc:dd:ee:ff" },
 ];
 
 const REJECTED_MATCHERS = [
@@ -575,6 +578,18 @@ const REJECTED_MATCHERS = [
     error: /zone ids can't be combined/i,
   },
   { name: "a zero-padded prefix", value: "192.168.1.0/024", error: /leading zero/i },
+  // The prefix is recognised, so the message is about the address and not
+  // about a CIDR the operator never typed.
+  {
+    name: "a mac matcher that is not a hardware address",
+    value: "mac:not-a-mac",
+    error: /hardware address, e\.g\. mac:aa:bb:cc:dd:ee:ff/i,
+  },
+  {
+    name: "an eight-byte mac matcher",
+    value: "mac:aa:bb:cc:dd:ee:ff:00:11",
+    error: /hardware address/i,
+  },
 ];
 
 /** The client row is behind its own button, like the group one. */
@@ -768,4 +783,83 @@ test("a replica says who manages it and won't offer to add a group", async () =>
 
   expect(screen.getByRole("button", { name: "Add client" })).toBeDisabled();
   expect(screen.getAllByText("Managed by the main")).toHaveLength(1);
+});
+
+// --- DHCP ------------------------------------------------------------------
+
+test("a mac matcher is posted in the one spelling the server stores", async () => {
+  const user = userEvent.setup();
+  let body: unknown;
+  mockAll({ groups: [group({ id: 1, name: "default" })] });
+  server.use(
+    http.post("/api/v1/clients", async ({ request }) => {
+      body = await request.json();
+      return HttpResponse.json({ id: 5 }, { status: 201 });
+    }),
+  );
+
+  renderWithProviders(<GroupsClientsTab />);
+  await waitFor(() => expect(groupRows()).toHaveLength(1));
+  // Typed in hyphen notation and in caps, which the server accepts and then
+  // stores as the colon form — so the row would come back spelled
+  // differently from what was typed.
+  await submitMatcher(user, "mac:AA-BB-CC-DD-EE-FF");
+
+  await waitFor(() =>
+    expect(body).toEqual({ name: "", matcher: "mac:aa:bb:cc:dd:ee:ff", group_id: 1 }),
+  );
+});
+
+// Spec §8.2: the client list shows the lease hostname beside an address
+// when the lease table has one. It is the name the *device* gave itself, not
+// the one the operator typed — which is how you tell which box 10.0.0.31 is
+// without having named it.
+test("a client row carries the lease hostname beside its address", async () => {
+  mockAll({
+    clients: [
+      client({ id: 1, name: "", matcher: "192.168.150.31" }),
+      client({ id: 2, name: "", matcher: "mac:a4:83:e7:12:9f:c0" }),
+      // A CIDR pins a range rather than a device, so no lease can name it.
+      client({ id: 3, name: "", matcher: "192.168.150.64/27" }),
+    ],
+  });
+  server.use(
+    ...dhcpHandlers({
+      leases: [
+        dhcpLease({ ip: "192.168.150.31", mac: "dc:a6:32:9a:77:03", hostname: "attic-pi" }),
+        dhcpLease({ ip: "192.168.150.104", mac: "a4:83:e7:12:9f:c0", hostname: "alok-mbp" }),
+      ],
+    }),
+  );
+
+  renderWithProviders(<GroupsClientsTab />);
+  await waitFor(() => expect(clientRows()).toHaveLength(3));
+
+  expect(await within(clientRows()[0]).findByText("· attic-pi")).toBeInTheDocument();
+  expect(within(clientRows()[1]).getByText("· alok-mbp")).toBeInTheDocument();
+  expect(within(clientRows()[2]).queryByText(/·/)).not.toBeInTheDocument();
+});
+
+// Most instances have no engine, and every DHCP route but the status 404s
+// there — so the screen must not ask for a lease table that cannot exist,
+// nor for the settings it would only have wanted the poll interval out of.
+test("no lease table and no settings are fetched on a box with no engine", async () => {
+  const asked: string[] = [];
+  mockAll({ clients: [client({ id: 1, matcher: "192.168.150.31" })] });
+  server.use(
+    http.get("/api/v1/dhcp/leases", () => {
+      asked.push("leases");
+      return HttpResponse.json([]);
+    }),
+    http.get("/api/v1/settings", () => {
+      asked.push("settings");
+      return HttpResponse.json({});
+    }),
+  );
+
+  const result = renderWithProviders(<GroupsClientsTab />);
+  await waitFor(() => expect(clientRows()).toHaveLength(1));
+  await waitFor(() => expect(result.queryClient.isFetching()).toBe(0));
+
+  expect(asked).toEqual([]);
 });

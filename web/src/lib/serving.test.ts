@@ -1,7 +1,14 @@
 import { expect, test } from "vitest";
-import type { ProtocolStatus, ResolverStatus, SyncReplica } from "../api/types";
+import type {
+  DHCPHAStatus,
+  DHCPStatus,
+  ProtocolStatus,
+  ResolverStatus,
+  SyncReplica,
+} from "../api/types";
 import {
   daysUntil,
+  dhcpBanners,
   expiringSoonDetail,
   formatCertDate,
   servingState,
@@ -142,16 +149,98 @@ test("somethingIsWrong covers every fact the status endpoint reports", () => {
   // stays off.
   expect(somethingIsWrong({ ...clean, sync: { role: "replica", plain_http: true } })).toBe(false);
 
-  // A listening protocol, a healthy certificate and a replica that checked
-  // in are not "wrong", or the poll would never stop.
+  // DHCP's three, on the same terms: all of them end without anyone doing
+  // anything, so the poll is what takes their lines down.
+  expect(somethingIsWrong({ ...clean, dhcp: dhcp({ engine: "unreachable" }) })).toBe(true);
+  expect(
+    somethingIsWrong({ ...clean, dhcp: dhcp({ engine: "config rejected", message: "no" }) }),
+  ).toBe(true);
+  expect(
+    somethingIsWrong({
+      ...clean,
+      dhcp: dhcp({ ha: ha({ communication_interrupted: true }) }),
+    }),
+  ).toBe(true);
+
+  // A listening protocol, a healthy certificate, a replica that checked in
+  // and a healthy engine are not "wrong", or the poll would never stop.
   expect(
     somethingIsWrong({
       ...clean,
       serving: { ...clean.serving, dot: { enabled: true, listening: true, addr: ":853" } },
       certificate: { not_after: "2027-09-17T00:00:00Z", expiring_soon: false },
       sync: { role: "main", replicas: [replica()] },
+      dhcp: dhcp({ ha: ha() }),
     }),
   ).toBe(false);
+  // And a box with no engine is the normal case, not a fault: `enabled`
+  // false is the whole answer most instances give.
+  expect(
+    somethingIsWrong({ ...clean, dhcp: { enabled: false, table_age_seconds: 0, scopes: [] } }),
+  ).toBe(false);
+});
+
+function dhcp(overrides: Partial<DHCPStatus> = {}): DHCPStatus {
+  return {
+    enabled: true,
+    engine: "ok",
+    engine_version: "2.6.3",
+    message: "",
+    table_age_seconds: 3,
+    scopes: [],
+    ...overrides,
+  };
+}
+
+function ha(overrides: Partial<DHCPHAStatus> = {}): DHCPHAStatus {
+  return {
+    mode: "hot-standby",
+    local_state: "hot-standby",
+    peer: "backup-box",
+    remote_state: "hot-standby",
+    communication_interrupted: false,
+    unacked_clients: 0,
+    ...overrides,
+  };
+}
+
+// The three lines spec §8.4 names, verbatim. Only failures: DHCP being off
+// is what most instances are, and a healthy pair is the configuration
+// working — a strip that warned about either is a strip nobody reads.
+test("dhcpBanners states each failure once, in the engine's own words", () => {
+  expect(dhcpBanners(undefined)).toEqual([]);
+  expect(dhcpBanners({ enabled: false, table_age_seconds: 0, scopes: [] })).toEqual([]);
+  expect(dhcpBanners(dhcp())).toEqual([]);
+  expect(dhcpBanners(dhcp({ ha: ha() }))).toEqual([]);
+
+  expect(dhcpBanners(dhcp({ engine: "unreachable" }))).toEqual(["DHCP engine unreachable"]);
+  expect(
+    dhcpBanners(
+      dhcp({
+        engine: "config rejected",
+        message: "subnet4[1]: pool 192.168.150.100-192.168.150.199 is not in subnet",
+      }),
+    ),
+  ).toEqual([
+    "DHCP config rejected: subnet4[1]: pool 192.168.150.100-192.168.150.199 is not in subnet",
+  ]);
+  expect(dhcpBanners(dhcp({ ha: ha({ communication_interrupted: true }) }))).toEqual([
+    "DHCP partner unreachable",
+  ]);
+
+  // Independent facts, shown together: the engine can be gone while the
+  // partner is also unreachable, and one line would hide the other.
+  expect(
+    dhcpBanners(dhcp({ engine: "unreachable", ha: ha({ communication_interrupted: true }) })),
+  ).toEqual(["DHCP engine unreachable", "DHCP partner unreachable"]);
+
+  // Where the page shows the engine's own line, the strip does not repeat
+  // it; the partner fact is not on that line, so it stays.
+  expect(dhcpBanners(dhcp({ engine: "unreachable" }), true)).toEqual([]);
+  expect(dhcpBanners(dhcp({ engine: "config rejected", message: "no" }), true)).toEqual([]);
+  expect(
+    dhcpBanners(dhcp({ engine: "unreachable", ha: ha({ communication_interrupted: true }) }), true),
+  ).toEqual(["DHCP partner unreachable"]);
 });
 
 function replica(overrides: Partial<SyncReplica> = {}): SyncReplica {
@@ -161,6 +250,7 @@ function replica(overrides: Partial<SyncReplica> = {}): SyncReplica {
     version_applied: 412,
     last_seen: Date.now() - 60_000,
     stale: false,
+    dhcp: true,
     ...overrides,
   };
 }

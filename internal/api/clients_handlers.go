@@ -224,7 +224,7 @@ func (s *Server) handleClientsList(w http.ResponseWriter, r *http.Request) {
 // zone because that is the one rejection whose cause isn't obvious from
 // looking at the value: `fe80::1%eth0` is a perfectly good address that the
 // request side can never produce (see clients.NormalizeMatcher).
-const badMatcher = "matcher must be an IP or CIDR without an interface zone, and group_id set"
+const badMatcher = "matcher must be an IP or CIDR without an interface zone, or mac:<hardware address>, and group_id set"
 
 // missingGroupMsg is the answer to a client write whose group_id names no
 // group. clients.group_id is a foreign key, and this one is named in the

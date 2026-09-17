@@ -6,6 +6,8 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+
+	"github.com/aloks98/dnsaur/internal/dhcp"
 )
 
 // This file drives Server.routes the same way routeauth_test.go does, for a
@@ -51,6 +53,8 @@ var noLocationRoutes = map[string]string{
 		"/sync/replicas/{instance_id} is the only address a replica has.",
 	"POST /api/v1/sync/follow": "stores this box's peer and its secret; 204, and the state it " +
 		"leaves is read from GET /sync/status.",
+	"POST /api/v1/dhcp/apply": "re-sends the configuration the engine already has a copy of; " +
+		"it creates no row and answers 200 with the status object that render left behind.",
 }
 
 // createProbe is one POST that must answer 201 + Location: the URL to send
@@ -68,7 +72,11 @@ type createProbe struct {
 // the body carries the row's id (the created object, not a bare envelope —
 // so the header and the body cannot disagree about which row it is).
 func TestEveryCreateAnswersLocation(t *testing.T) {
-	srv, s, _ := testServer(t)
+	// With an engine behind it, because three of the creating POSTs are
+	// DHCP's and every /dhcp route answers 404 on a box whose kea_socket is
+	// empty — which would make this test assert about the guard rather than
+	// about Location.
+	srv, s, fake := dhcpServer(t)
 	h := srv.Handler() // also builds srv.mux, which assertResolvesTo needs
 	cookie := login(t, srv, s)
 
@@ -77,6 +85,16 @@ func TestEveryCreateAnswersLocation(t *testing.T) {
 	// this API created; groups are not seeded at all.
 	groupID := mustCreate(t, h, cookie, "/api/v1/groups", `{"name":"location-probe"}`)
 	zoneID := mustCreate(t, h, cookie, "/api/v1/zones", `{"name":"location-probe.test"}`)
+	// And a scope with a lease inside it: "Reserve" builds its row from the
+	// lease table entry, so there has to be one for it to read.
+	scopeID := mustCreate(t, h, cookie, "/api/v1/dhcp/scopes", probeScope)
+	fake.serve(dhcp.Lease{
+		IP: "192.168.1.140", MAC: "aa:bb:cc:dd:ee:09", Hostname: "probe",
+		SubnetID: scopeID, CLTT: 4_000_000_000, ValidLft: 3600,
+	})
+	if err := srv.deps.DHCP.Poll(t.Context()); err != nil {
+		t.Fatalf("polling the fake engine: %v", err)
+	}
 
 	probes := []createProbe{
 		{
@@ -125,6 +143,28 @@ func TestEveryCreateAnswersLocation(t *testing.T) {
 			// A clone creates a zone, so the URL it points at is a zone's,
 			// not a sub-resource of the one that was copied.
 			location: func(id int64) string { return fmt.Sprintf("/api/v1/zones/%d", id) },
+		},
+		{
+			pattern: "POST /api/v1/dhcp/scopes", url: "/api/v1/dhcp/scopes",
+			body:     `{"name":"location-probe-scope","cidr":"10.44.0.0/24","pool_start":"10.44.0.10","pool_end":"10.44.0.20"}`,
+			location: func(id int64) string { return fmt.Sprintf("/api/v1/dhcp/scopes/%d", id) },
+		},
+		{
+			pattern: "POST /api/v1/dhcp/reservations", url: "/api/v1/dhcp/reservations",
+			body: fmt.Sprintf(`{"scope_id":%d,"mac":"aa:bb:cc:dd:ee:08","ip":"192.168.1.60"}`, scopeID),
+			location: func(id int64) string {
+				return fmt.Sprintf("/api/v1/dhcp/reservations/%d", id)
+			},
+		},
+		{
+			pattern: "POST /api/v1/dhcp/leases/{ip}/reserve",
+			url:     "/api/v1/dhcp/leases/192.168.1.140/reserve",
+			// No body: the row is already on screen, and the reservation is
+			// built from the lease table entry.
+			body: "",
+			location: func(id int64) string {
+				return fmt.Sprintf("/api/v1/dhcp/reservations/%d", id)
+			},
 		},
 		{
 			pattern: "POST /api/v1/zones/{id}/records",

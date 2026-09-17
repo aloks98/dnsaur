@@ -1,6 +1,10 @@
 import { http, HttpResponse } from "msw";
 import type {
   Client,
+  DHCPLease,
+  DHCPReservation,
+  DHCPScope,
+  DHCPStatus,
   Group,
   HealthStatus,
   List,
@@ -202,6 +206,131 @@ export function replicaHandlers(peer: string) {
   ];
 }
 
+// --- DHCP ------------------------------------------------------------------
+
+/**
+ * One scope, with every optional field at the value the server stores for
+ * "not set" — `[]` for the two list columns (the store writes "[]" rather
+ * than null, see internal/store/dhcp.go's marshalList), `0` for a lease time
+ * that falls back to the setting, `""` for a domain that does. A fixture
+ * full of populated options would let a screen that only ever renders a
+ * populated one pass.
+ */
+export function dhcpScope(overrides: Partial<DHCPScope> = {}): DHCPScope {
+  return {
+    id: 1,
+    name: "Main LAN",
+    cidr: "192.168.150.0/24",
+    pool_start: "192.168.150.100",
+    pool_end: "192.168.150.199",
+    gateway: "192.168.150.1",
+    dns_servers: "",
+    domain: "lan.e412.in",
+    lease_seconds: 0,
+    enabled: true,
+    domain_search: "",
+    ntp_servers: "",
+    static_routes: [],
+    next_server: "",
+    server_hostname: "",
+    boot_file: "",
+    options: [],
+    match_client_id: true,
+    reservations_only: false,
+    created_at: Date.now() - 30 * 24 * 60 * 60 * 1000,
+    modified_at: Date.now() - 15 * 60 * 1000,
+    ...overrides,
+  };
+}
+
+export function dhcpReservation(overrides: Partial<DHCPReservation> = {}): DHCPReservation {
+  return {
+    id: 1,
+    scope_id: 1,
+    mac: "a4:83:e7:12:9f:c0",
+    ip: "192.168.150.10",
+    hostname: "alok-mbp",
+    comment: "",
+    created_at: Date.now() - 24 * 60 * 60 * 1000,
+    modified_at: Date.now() - 24 * 60 * 60 * 1000,
+    ...overrides,
+  };
+}
+
+export function dhcpLease(overrides: Partial<DHCPLease> = {}): DHCPLease {
+  return {
+    scope_id: 1,
+    ip: "192.168.150.104",
+    mac: "a4:83:e7:12:9f:c0",
+    hostname: "alok-mbp",
+    expires_at: Date.now() + 19 * 60 * 60 * 1000,
+    reserved: false,
+    ...overrides,
+  };
+}
+
+/** A healthy single-box engine: nothing wrong, no partner, one scope whose
+ * pool is a little over half used. */
+export function dhcpStatus(overrides: Partial<DHCPStatus> = {}): DHCPStatus {
+  return {
+    enabled: true,
+    engine: "ok",
+    engine_version: "2.6.3",
+    message: "",
+    table_age_seconds: 3,
+    scopes: [{ id: 1, pool_size: 100, leased: 61 }],
+    ...overrides,
+  };
+}
+
+/**
+ * Every DHCP route, on a box that **has** an engine — the opposite of the
+ * global default below, which answers `{enabled: false}` so that no
+ * pre-existing test grows a DHCP section it never asked for. Spread into
+ * `server.use(...)`:
+ *
+ *     server.use(...dhcpHandlers());
+ *     server.use(...dhcpHandlers({ status: dhcpStatus({ engine: "unreachable" }) }));
+ *
+ * `GET /resolver/status` is re-registered too, because that is the copy the
+ * shell's nav and warning strip read — a fixture that turned DHCP on for
+ * `/dhcp/status` alone would leave the section hidden on every screen.
+ * Writes are deliberately absent: they are registered per-test, the same way
+ * zones' and clients' are, so a test that asserts on a request body owns the
+ * handler that receives it.
+ */
+export function dhcpHandlers({
+  status = dhcpStatus(),
+  scopes = [dhcpScope()],
+  reservations = [dhcpReservation()],
+  leases = [dhcpLease()],
+  sync = { role: "main" } as SyncStatus,
+}: {
+  status?: DHCPStatus;
+  scopes?: DHCPScope[];
+  reservations?: DHCPReservation[];
+  leases?: DHCPLease[];
+  sync?: SyncStatus;
+} = {}) {
+  const resolver: ResolverStatus = {
+    encryption_downgraded: false,
+    reason: "",
+    serving: {
+      dot: { enabled: false, listening: false, addr: "" },
+      doh: { enabled: false, listening: false, addr: "" },
+    },
+    sync,
+    dhcp: status,
+  };
+  return [
+    http.get("/api/v1/resolver/status", () => HttpResponse.json(resolver)),
+    http.get("/api/v1/dhcp/status", () => HttpResponse.json(status)),
+    http.get("/api/v1/dhcp/scopes", () => HttpResponse.json(scopes)),
+    http.get("/api/v1/dhcp/reservations", () => HttpResponse.json(reservations)),
+    http.get("/api/v1/dhcp/leases", () => HttpResponse.json(leases)),
+  ];
+}
+
 export const handlers = [
   http.get("/api/v1/auth/me", () => {
     const me: MeResponse = { id: 1, username: "admin", totp_enabled: false };
@@ -375,6 +504,15 @@ export const handlers = [
   // TSIG keys (Milestone D1), GET-only like zones above: the mutation
   // endpoints are registered per-test via server.use().
   http.get("/api/v1/tsig-keys", () => HttpResponse.json(defaultTSIGKeys())),
+
+  // DHCP off by default — the `kea_socket` bootstrap key empty, which is
+  // what most instances are and the only DHCP answer such a box gives. Every
+  // other DHCP route 404s there, so registering none of them is the honest
+  // default: a test that wants the section spreads dhcpHandlers() above.
+  http.get("/api/v1/dhcp/status", () => {
+    const status: DHCPStatus = { enabled: false, table_age_seconds: 0, scopes: [] };
+    return HttpResponse.json(status);
+  }),
 
   blockingHandler(),
 ];

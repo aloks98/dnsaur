@@ -5,7 +5,14 @@ import { afterEach, expect, test, vi } from "vitest";
 import { fireEvent, screen, waitFor, within } from "@testing-library/react";
 import { useLocation, useNavigationType } from "react-router";
 import { server } from "../test/msw-server";
-import { blockingHandler, replicaHandlers } from "../test/msw-handlers";
+import {
+  blockingHandler,
+  dhcpHandlers,
+  dhcpReservation,
+  dhcpScope,
+  dhcpStatus,
+  replicaHandlers,
+} from "../test/msw-handlers";
 import { renderWithProviders } from "../test/render";
 import {
   resetLiveTailReport,
@@ -646,4 +653,84 @@ test("no other screen gets the tail cells", async () => {
 
   expect(screen.queryByRole("button", { name: /(pause|resume) tail/i })).not.toBeInTheDocument();
   expect(screen.queryByRole("status", { name: "Query log" })).not.toBeInTheDocument();
+});
+
+// --- DHCP ------------------------------------------------------------------
+//
+// The one section that is not always there: an instance whose `kea_socket`
+// is empty has no engine and every DHCP route but the status 404s, so the
+// section is dropped whole rather than offered and broken.
+
+test("the DHCP section is absent on a box with no engine", async () => {
+  renderTopNav();
+
+  // The default fixture is a box with no engine, so waiting for the group
+  // that *is* always there is what makes this a settled negative rather
+  // than a race with the status fetch.
+  await waitFor(() => expect(screen.getByRole("button", { name: "Filtering" })).toBeEnabled());
+  expect(screen.queryByRole("button", { name: "DHCP" })).not.toBeInTheDocument();
+});
+
+test("the DHCP section appears once the box has one, with its three screens", async () => {
+  server.use(...dhcpHandlers());
+  renderTopNav({ route: "/dhcp" });
+
+  expect(await screen.findByRole("button", { name: "DHCP" })).toBeInTheDocument();
+  const dhcpTabs = tabs("DHCP");
+  expect(within(dhcpTabs).getByRole("link", { name: "Scopes" })).toHaveAttribute("href", "/dhcp");
+  expect(within(dhcpTabs).getByRole("link", { name: "Leases" })).toHaveAttribute(
+    "href",
+    "/dhcp/leases",
+  );
+  expect(within(dhcpTabs).getByRole("link", { name: "Reservations" })).toHaveAttribute(
+    "href",
+    "/dhcp/reservations",
+  );
+});
+
+test("each DHCP screen gets its own readout, and no other screen pays for them", async () => {
+  server.use(
+    ...dhcpHandlers({
+      scopes: [dhcpScope(), dhcpScope({ id: 2, name: "Office" })],
+      status: dhcpStatus({
+        scopes: [
+          { id: 1, pool_size: 100, leased: 61 },
+          { id: 2, pool_size: 356, leased: 0 },
+        ],
+      }),
+    }),
+  );
+  const scopes = renderTopNav({ route: "/dhcp" });
+  expect(await screen.findByText("2 scopes · 61 leased of 456")).toBeInTheDocument();
+  scopes.unmount();
+
+  server.use(
+    ...dhcpHandlers(),
+    http.get("/api/v1/settings", () => HttpResponse.json({ "dhcp.lease_poll_seconds": "4" })),
+  );
+  const leases = renderTopNav({ route: "/dhcp/leases" });
+  // The interval is the setting's, so a box polling every four seconds says
+  // four rather than the default.
+  expect(await screen.findByText("LIVE · every 4 s")).toBeInTheDocument();
+  leases.unmount();
+
+  server.use(
+    ...dhcpHandlers({
+      reservations: [
+        dhcpReservation(),
+        dhcpReservation({ id: 2, scope_id: 2, ip: "192.168.151.20" }),
+        dhcpReservation({ id: 3, scope_id: 2, ip: "192.168.151.21" }),
+      ],
+    }),
+  );
+  const reservations = renderTopNav({ route: "/dhcp/reservations" });
+  expect(await screen.findByText("3 reservations · 2 scopes")).toBeInTheDocument();
+  reservations.unmount();
+
+  server.use(...dhcpHandlers());
+  renderTopNav({ route: "/settings" });
+  await waitFor(() => expect(screen.getByRole("button", { name: "DHCP" })).toBeEnabled());
+  expect(screen.queryByRole("status", { name: "Scopes" })).not.toBeInTheDocument();
+  expect(screen.queryByRole("status", { name: "Lease table" })).not.toBeInTheDocument();
+  expect(screen.queryByRole("status", { name: "Reservations" })).not.toBeInTheDocument();
 });

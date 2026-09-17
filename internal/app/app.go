@@ -26,6 +26,7 @@ import (
 	"github.com/aloks98/dnsaur/internal/clients"
 	"github.com/aloks98/dnsaur/internal/config"
 	"github.com/aloks98/dnsaur/internal/confsync"
+	"github.com/aloks98/dnsaur/internal/dhcp"
 	"github.com/aloks98/dnsaur/internal/dnssrv"
 	"github.com/aloks98/dnsaur/internal/filter"
 	"github.com/aloks98/dnsaur/internal/qlog"
@@ -62,6 +63,17 @@ func defaultSettings() map[string]string {
 		"sync.interval_seconds": "30",
 		"sync.primary_dns":      "",
 		"sync.tsig_key_id":      "0",
+		// DHCP (design §4.2). dhcp.* is a synced prefix and
+		// serve.dhcp_interfaces a local one, which is the difference between
+		// "both boxes hand out the same lease time" and "this box binds
+		// eth0".
+		dhcpDomainSetting:         "",
+		dhcpLeaseSetting:          "3600",
+		"dhcp.lease_poll_seconds": "10",
+		dhcpHAPortSetting:         strconv.Itoa(defaultHAPort),
+		dhcpHAPrimarySetting:      "",
+		dhcpHAStandbySetting:      "",
+		dhcpInterfacesSetting:     "",
 	}
 }
 
@@ -155,7 +167,18 @@ type App struct {
 	// of the pair — see PeerURL.
 	replica  *confsync.Replica
 	replicas *confsync.Registry
-	fwd      *swappable
+	// dhcp is the engine manager, nil when kea_socket is empty — which is
+	// every install that does not run Kea, and the state every DHCP path in
+	// this package checks for first.
+	dhcp *dhcp.Manager
+	// dhcpReady closes when the manager's first discovery, render and poll
+	// have finished. Nothing in the server waits on it — Start deliberately
+	// does not, or a DNS listener would wait on an engine that is down —
+	// and like a.ready it is what lets a test assert about that first render
+	// rather than about whether it has happened yet. Nil when there is no
+	// engine.
+	dhcpReady chan struct{}
+	fwd       *swappable
 	// dnsCache is the pipeline's cache, held here rather than left local to
 	// Start because a routing change has to be able to invalidate it: an
 	// entry is keyed on (qname, qtype) with no record of which route
@@ -267,7 +290,7 @@ func New(ctx context.Context, cfg *config.Config, version string) (*App, error) 
 	if len(cfg.DNSListen) > 0 {
 		dnsAddr = cfg.DNSListen[0]
 	}
-	a.replica = confsync.NewReplica(st, a, a.getSetting(ctx, "instance.id"), dnsAddr)
+	a.replica = confsync.NewReplica(st, a, a.getSetting(ctx, "instance.id"), dnsAddr, cfg.KeaSocket != "")
 	// The resolver every hostname in a zone's configuration is looked up
 	// through: a secondary's primaries, a NOTIFY target, a stub's
 	// out-of-zone nameserver. Four constructors default it independently,
@@ -338,6 +361,14 @@ func New(ctx context.Context, cfg *config.Config, version string) (*App, error) 
 	// admitted message — the pre-Task-7 behaviour, silently, with a log
 	// line as the only signal. A primary editing ten records would cause
 	// ten full zone transfers.
+	// The DHCP engine, when this box has one (design §4.1). Built here so
+	// the DNS pipeline and the API can both be given it in Start; nothing is
+	// dialled until Start calls Manager.Start, which is what keeps New free
+	// of side effects on a box whose Kea is not running yet.
+	if cfg.KeaSocket != "" {
+		a.dhcp = dhcp.NewManager(dhcp.NewClient(cfg.KeaSocket), a, st.Settings(), slog.Default())
+		a.dhcpReady = make(chan struct{})
+	}
 	a.notifyIn = zones.NewNotifyServer(a.resolver, st.Zones(), a.zoneRefresh,
 		zones.WithNotifyServerResolver(zoneRes),
 		// Live, not a snapshot, for the reason the DNS servers get it that
@@ -835,14 +866,26 @@ func (a *App) Start(ctx context.Context) error {
 	a.logger = qlog.New(a.st.QueryLog(), qlog.Options{
 		Privacy: a.getSetting(ctx, "qlog.privacy"), InstanceID: instanceID,
 	})
-	a.handler = dnssrv.Chain(a.fwd,
+	stages := []dnssrv.Middleware{
 		a.logger.Middleware(),
 		dnssrv.Recover(),
 		a.registry.Middleware(),
 		a.engine.Middleware(),
-		a.resolver.Middleware(),
-		a.dnsCache.Middleware(),
-	)
+	}
+	if a.dhcp != nil {
+		// Above the zones stage, so a record an operator typed beats a name
+		// inferred from a lease — which is what zoneHas is for (§8.1) —
+		// and below blocking, so a leased name is filtered like any other.
+		// Called once: it subscribes to the manager, and a second call would
+		// report every name collision twice.
+		stages = append(stages, dhcp.Names(a.dhcp, a.dhcpScopes, a.dhcpDomain, a.zoneHas))
+		// The `mac` client matcher resolves through the same table, and
+		// re-resolves on every swap, so a device keeps its group across a
+		// renewal that moved it (§8.2).
+		a.dhcp.Subscribe(func(t *dhcp.Table) { a.registry.SetLeaseLookup(leaseAddrOf(t)) })
+	}
+	stages = append(stages, a.resolver.Middleware(), a.dnsCache.Middleware())
+	a.handler = dnssrv.Chain(a.fwd, stages...)
 
 	a.applySettings(ctx)
 	// applySettings has, by this line, possibly started DoT and/or DoH from
@@ -898,7 +941,42 @@ func (a *App) Start(ctx context.Context) error {
 		a.servers = append(a.servers, s)
 	}
 
-	apiSrv := api.New(api.Deps{
+	// The engine, once the listeners are up. Manager.Start asks what it is,
+	// renders once and returns only after the first poll, and every one of
+	// those is a round trip to a socket that may not be there: on its own
+	// goroutine, because the alternative is a DNS server that does not bind
+	// until a Kea that is down has finished not answering. The cost is that
+	// the first queries of a run may be answered before the lease table has
+	// its first page, which is one poll interval at most and is what every
+	// later poll is anyway.
+	//
+	// In a.wg, so Shutdown waits for it rather than pulling the store out
+	// from under a render, and on runCtx, because the poller it leaves
+	// behind outlives Start.
+	//
+	// Nothing here is fatal (§10). An engine that is not there, and a config
+	// it refuses, are both states the dashboard shows and the next change
+	// clears — not reasons to refuse to serve DNS.
+	if a.dhcp != nil {
+		a.wg.Add(1)
+		go func() {
+			defer a.wg.Done()
+			defer close(a.dhcpReady)
+			// Start's own render records what it was built from through
+			// Rendered, so the first settings write of this run is compared
+			// against the configuration the engine is actually holding
+			// rather than against nothing — and against what that render
+			// sent rather than against a second read of the store, which a
+			// write landing in between would have made a different one.
+			if err := a.dhcp.Start(runCtx); err != nil {
+				slog.Error("starting the dhcp engine manager failed", "err", err)
+				return
+			}
+			slog.Info("dhcp engine manager started", "socket", a.cfg.KeaSocket)
+		}()
+	}
+
+	deps := api.Deps{
 		Store: a.st, Auth: auth.New(a.st.Users(), a.st.Tokens()),
 		Engine: a.engine, Reloader: a, Logger: a.logger, Refresher: a.refresher,
 		ZoneRefresher: a.zoneRefresh,
@@ -910,7 +988,15 @@ func (a *App) Start(ctx context.Context) error {
 		Version: a.version, Static: web.Dist(),
 		TrustedProxies: a.cfg.TrustedProxies,
 		DataDir:        a.cfg.DataDir,
-	})
+	}
+	if a.dhcp != nil {
+		// Both left nil on a box with no engine, which is what makes every
+		// /dhcp route but the status one a 404 and leaves every query-log row
+		// exactly as it is stored.
+		deps.DHCP = a.dhcp
+		deps.LeaseHostname = a.leaseHostname
+	}
+	apiSrv := api.New(deps)
 	ln, err := net.Listen("tcp", a.cfg.HTTPListen)
 	if err != nil {
 		stopWhatStarted()
@@ -1032,6 +1118,12 @@ func (a *App) Start(ctx context.Context) error {
 					if err := a.refresher.Recompile(c); err != nil {
 						slog.Error("recompiling filters after a settings change failed", "err", err)
 					}
+					// The engine, but only when what it would be given
+					// actually changed (§5.1): a pause is a settings row and
+					// a retention day count is a settings row, and neither
+					// is a reason to rebuild every subnet Kea holds. See
+					// reconcileDHCP.
+					a.reconcileDHCP(c)
 					a.settingsPasses.Add(1)
 				}
 			}
@@ -1119,6 +1211,12 @@ func (a *App) NextFilterRefresh() int64 { return a.refresher.NextRefresh() }
 func (a *App) ReloadSettings(ctx context.Context) error {
 	a.applySettings(ctx)
 	a.loadPauses(ctx)
+	// The engine goes with them (§5.1): a bundle carries the scopes, the
+	// reservations and the dhcp.* settings, and this is the only place a
+	// replica hears that any of them landed. Gated on the render input
+	// having changed, so a bundle that moved a client group does not
+	// re-render Kea.
+	a.reconcileDHCP(ctx)
 	return nil
 }
 
@@ -1246,8 +1344,8 @@ func (a *App) Authenticate(ctx context.Context, secret string) (string, bool, er
 
 // Heartbeat maps the registry's "forgotten while probing" onto the API's,
 // for Pair's reason: the endpoint that turns it into a 401 is over there.
-func (a *App) Heartbeat(ctx context.Context, instanceID string, applied int64) error {
-	err := a.replicas.Heartbeat(ctx, instanceID, applied)
+func (a *App) Heartbeat(ctx context.Context, instanceID string, applied int64, dhcp bool) error {
+	err := a.replicas.Heartbeat(ctx, instanceID, applied, dhcp)
 	if errors.Is(err, confsync.ErrNotRegistered) {
 		return api.ErrNotRegistered
 	}
@@ -1430,6 +1528,13 @@ func (a *App) Shutdown(ctx context.Context) error {
 		errs = append(errs, err)
 	}
 	a.wg.Wait() // qlog drains its buffer on ctx cancel before returning
+	// The lease poller is not in a.wg — Manager.Start owns it, and it
+	// outlives the goroutine that called Start. It reads this box's scopes
+	// through App.RenderInput on every tick, so closing the store without
+	// waiting for it is a shutdown that races a poll already inside a query.
+	if a.dhcp != nil {
+		a.dhcp.Wait()
+	}
 	if f := a.fwd.forwarder(); f != nil {
 		_ = f.Close()
 	}

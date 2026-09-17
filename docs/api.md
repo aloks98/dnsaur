@@ -58,14 +58,17 @@ curl or any HTTP client.
 - **On a replica, writes to synced configuration are `409
   {"error": "managed by <peer_url>"}`.** An instance with `sync.peer_url`
   set follows another instance's configuration, so groups, clients, filter
-  lists, rules, TSIG keys, zones and zone records are read-only on it, as is
+  lists, rules, TSIG keys, zones, zone records, and DHCP scopes and
+  reservations are read-only on it, as is
   `PUT /settings` for any key outside the instance-local set. A blocking
   pause is refused too: the pause state is persisted to the synced
   `blocking.pauses` setting, because a pause is a decision about the network
   and clients reach either box. The answer comes before the handler runs, so
   nothing was written. The two refresh operations
   (`POST /filters/lists/{id}/refresh`, `POST /zones/{id}/refresh`) are
-  operational rather than configuration and stay available, and so do this
+  operational rather than configuration and stay available, and so does
+  `DELETE /dhcp/leases/{ip}` — a lease belongs to the engine rather than to
+  the configuration — and so do this
   box's own account, sessions, tokens and backups. Clearing `sync.peer_url`
   is the promotion and lifts the refusal — see Sync below.
 
@@ -207,7 +210,8 @@ Full parameter/response detail lives in `internal/api/openapi.yaml`
   settings; `instance.*` keys, the bookkeeping rows — `stats.watermark`,
   `blocking.pauses`, `sync.replicas`, `sync.pairing`, `sync.tsig_key_id`,
   `sync.applied_version`, `sync.applied_peer`, `sync.applied_at`,
-  `sync.last_pull_at`, `sync.last_error` — and the
+  `sync.last_pull_at`, `sync.last_error`, `dhcp.ha_primary`,
+  `dhcp.ha_standby` — and the
   write-only `sync.token` are omitted),
   `PUT /settings` (`{key, value}` for one, or a flat
   `{"<key>": "<value>", ...}` map for several at once; editable keys:
@@ -217,7 +221,8 @@ Full parameter/response detail lives in `internal/api/openapi.yaml`
   `qlog.privacy`, `stats.retention_days`, `serve.dot.enabled`, `serve.dot.listen`,
   `serve.doh.enabled`, `serve.doh.listen`, `serve.tls.cert`,
   `serve.tls.key`, `sync.peer_url`, `sync.token`, `sync.interval_seconds`,
-  `sync.primary_dns` — see [`docs/configuration.md`](configuration.md) for
+  `sync.primary_dns`, `dhcp.domain`, `dhcp.lease_seconds`,
+  `dhcp.lease_poll_seconds`, `dhcp.ha_port`, `serve.dhcp_interfaces` — see [`docs/configuration.md`](configuration.md) for
   what each means and which require a restart to take effect). **A map is
   all-or-nothing**: every key is validated before any of them is written,
   the write lands in one transaction, and there is one config-version bump
@@ -323,10 +328,12 @@ Full parameter/response detail lives in `internal/api/openapi.yaml`
   clients; a group nobody created is an empty array, since the parameter
   narrows a listing rather than addressing a resource, and a `group_id` that
   is not a positive id is a `400`), `POST /clients`, `PUT /clients/{id}`,
-  `DELETE /clients/{id}` — each client is an IP or CIDR `matcher` bound to
-  a `group_id`. The matcher is stored canonically: CIDRs are masked,
-  IPv4-mapped IPv6 is unmapped. An interface zone (`fe80::1%eth0`) is
-  `400`, because the request side never carries one. A `group_id` naming no
+  `DELETE /clients/{id}` — each client is an IP, CIDR or
+  `mac:<hardware address>` `matcher` bound to a `group_id`. The matcher is
+  stored canonically: CIDRs are masked, IPv4-mapped IPv6 is unmapped, a MAC
+  is lowercase colon form. An interface zone (`fe80::1%eth0`) is `400`,
+  because the request side never carries one. A `mac` matcher follows the
+  device's current DHCP lease and matches nothing while it has none. A `group_id` naming no
   group is `400 group_id does not name an existing group`; the same
   reference from the *path* (`POST /groups/{id}/rules`) is a `404` instead,
   since there the missing row is the resource the URL addressed.
@@ -789,7 +796,11 @@ Full parameter/response detail lives in `internal/api/openapi.yaml`
   carries `matched`, the rule pattern or list entry that fired — `rule_id`
   and `list_id` name the rule or the list, not the line of it. It is `""`
   for anything that was not blocked, and for rows logged before the column
-  existed.
+  existed; a name answered from the DHCP lease table carries `dhcp`. Rows
+  read back on either route also carry `hostname`, the lease table's name
+  for `client_ip`, joined on as they are read — absent rather than empty
+  when DHCP is off, when no lease holds that address, and on every row while
+  `qlog.privacy` is `anon`.
 - **Stats** — `GET /stats/overview?hours=` (totals: `total`, `blocked`,
   `cached`, `forwarded`, `clients`, plus `dropped` — query log entries
   discarded since start because the write buffer was full, so a non-zero
@@ -844,6 +855,9 @@ Full parameter/response detail lives in `internal/api/openapi.yaml`
   the same `instance_id` replaces the entry and its secret. A replica keeps
   no registry, so it answers both pairing calls `409 managed by <peer_url>`.
   `GET /sync/version` answers `{config_version, instance_id, dns_port}` —
+  and takes `?dhcp=1` from a replica whose own `kea_socket` names an engine,
+  which is the only way the main learns whether that box could be the DHCP
+  hot-standby —
   the cheap probe a replica makes every `sync.interval_seconds`, so the
   bundle is only fetched when the version moved. It is also the
   **heartbeat**: there is no registration call, and the main stamps the
@@ -890,6 +904,88 @@ Full parameter/response detail lives in `internal/api/openapi.yaml`
   main the registry row it could not read — until it can, no replica is
   admitted to a transfer and none is notified. An instance with no sync
   configured reads as a main with no replicas.
+- **DHCP** — `GET/POST /dhcp/scopes`, `PATCH/DELETE /dhcp/scopes/{id}`,
+  `GET/POST /dhcp/reservations`, `PATCH/DELETE /dhcp/reservations/{id}`,
+  `GET /dhcp/leases`, `DELETE /dhcp/leases/{ip}`,
+  `POST /dhcp/leases/{ip}/reserve`, `GET /dhcp/status`, `POST /dhcp/apply`.
+  dnsaur does not implement DHCP: ISC Kea (`kea-dhcp4`) serves the protocol
+  and dnsaur owns everything an operator touches, rendering the engine's
+  whole configuration and sending it over Kea's unix control socket.
+  **The `kea_socket` bootstrap key is the switch.** Empty — the default —
+  means DHCP is off, and every route here except `GET /dhcp/status` answers
+  `404 {"error": "dhcp is not enabled"}`; the status route answers
+  `{"enabled": false}`, because "is DHCP running here" is what it is for.
+  404 rather than 503: nothing is temporarily unavailable, and turning DHCP
+  on is a bootstrap change and a restart.
+  **Scopes and reservations are synced configuration** — the ids travel in
+  the bundle, so a scope means the same row on both boxes — so every write
+  to them is `409 managed by <peer_url>` on a replica. `DELETE
+  /dhcp/leases/{ip}` is the exception and stays live there: a lease belongs
+  to the engine rather than to the configuration, and Kea's HA propagates
+  the release to the partner.
+  A **scope** is one subnet, rendered as one Kea `subnet4`: `cidr` in masked
+  form (host bits set are refused rather than quietly masked), a pool inside
+  it that is not the network or broadcast address, an optional gateway,
+  suffix, lease time, and the option fields (`domain_search`, `ntp_servers`,
+  `static_routes`, the PXE trio, and `options` for every code with no field
+  of its own, as hex). No two *enabled* scopes may overlap — a disabled one
+  is rendered into nothing and is exempt in both directions, which is what
+  makes "disable it, then renumber it" a usable sequence. `dns_servers`
+  empty is not "no DNS": it is the automatic answer of this box's address
+  followed by its HA partner's, the same two in the same order on both
+  boxes, which is what DHCP-level failover needs from DNS.
+  `match_client_id` is the one field whose column default (`true`) and Go
+  zero value (`false`) disagree: **absent means `true` on a create and
+  unchanged on a `PATCH`**, since a merge that turned client-id matching
+  back on for a scope of cloned VMs, with nothing on the screen saying so,
+  would be the opposite of a merge. Both `PATCH`es are merges — every key
+  the body omits keeps the value it has. A scope `PATCH` that changes `cidr`
+  or `gateway` re-validates every reservation in that scope and is `400`
+  naming the first that would be stranded, because the alternative is a
+  configuration the renderer refuses whole, every other scope included.
+  A **reservation** pins one MAC to one address inside one scope. The MAC is
+  stored canonically (`aa:bb:cc:dd:ee:ff`) from any notation `net.ParseMAC`
+  takes, and anything longer than six bytes is refused — a DHCPv4
+  reservation is keyed on a 6-byte address, and one the engine cannot match
+  would silently never fire. `scope_id` is fixed once created: delete and
+  recreate to move one, since an address validated against one subnet must
+  not be carried into another. A rule about the row is `400` with the
+  validator's own message; a collision with another row in the same scope is
+  `409`; a `scope_id` naming no scope is `404`.
+  **Every write renders**: the row is stored, then the whole `Dhcp4` object
+  is built and sent as one `config-set`. **The answer is the normal 200/201
+  whatever the engine says** — a config Kea refuses leaves the row stored
+  and the engine on its previous configuration, and the refusal is in `GET
+  /dhcp/status` until a render is accepted. A 5xx there would tell the
+  caller the scope was not saved, which is false, and would leave them with
+  no row to fix. Nothing retries a refused config on a timer;
+  `POST /dhcp/apply` is the "Apply again" that re-sends it, and answers
+  `200` with the status object that render left behind.
+  `GET /dhcp/leases` is the table as of the last poll — never stored, read
+  from the engine every `dhcp.lease_poll_seconds` and replaced whole —
+  ordered by address, which is the only order stable across polls.
+  Reservations nothing has leased yet are in it with `expires_at: 0`, which
+  is the one field that tells such a row from a live lease. `DELETE
+  /dhcp/leases/{ip}` is `lease4-del` on this box's own engine: `404` with
+  the engine's own words when it holds no such lease, `503` when it cannot
+  be reached. `POST /dhcp/leases/{ip}/reserve` takes no body — the row is
+  already on screen — and builds the reservation from the table entry,
+  sanitising the client's own hostname to an RFC 1123 label so a device that
+  called itself "Anna's iPad" does not make the button answer 400 about a
+  name nobody typed.
+  `GET /dhcp/status` is `{enabled, engine, engine_version, message,
+  table_age_seconds, ha, scopes[]}`, and the same object is embedded in
+  `GET /resolver/status` as `dhcp` for the warning strip. `engine` is `ok`,
+  `unreachable` or `config rejected`; a configuration the engine would not
+  take outranks an engine that is not there, because it is the one an
+  operator has to act on and it is still true when the engine comes back.
+  `table_age_seconds` is how stale the lease table is — an engine that stops
+  answering keeps the table it last gave, which is still the truth about the
+  leases on the segment. `ha` is absent on a single box; its `peer` is what
+  the partner calls itself, as the engine talking to it reports the name, and
+  is absent on an engine whose `status-get` does not carry one. In `scopes[]`,
+  `leased` may exceed `pool_size` after a pool is shrunk: the engine keeps
+  the leases it already handed out until they expire.
 - **Tokens** — `GET /tokens` (list this user's API tokens; session tokens
   and hashes are never included), `POST /tokens`
   (`{name, scope[, expires_at]}`, returns the plaintext token once

@@ -148,6 +148,66 @@ jobs:
             echo '```'
           } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
 
+  # The real engine (internal/dhcp/kea_real_test.go). Everything else in
+  # internal/dhcp runs against keatest's fake control socket, which answers
+  # whatever a test tells it to — so nothing there can say whether Kea
+  # accepts a rendered config or whether its replies decode.
+  #
+  # Kea comes from the Debian package, which is one of the two versions the
+  # renderer targets (2.6 on trixie, 3.0 on Alpine edge). The image installs
+  # it at start rather than being built here: it is one apt-get on a small
+  # base, and a Dockerfile for it would be a second place to keep the
+  # version honest.
+  test-kea:
+    runs-on: medium
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version: "1.26" }
+      # The job runs in a container of its own and the Docker daemon it
+      # talks to does not share its filesystem, so nothing is bind mounted:
+      # the engine's config and the compiled test go in with docker cp, and
+      # the test runs inside the engine's container, where the socket is.
+      # Static (CGO off), so it runs on the engine's image; no -race, which
+      # needs cgo -- the race build of this package runs in the test job.
+      - name: Build the real-engine test
+        run: CGO_ENABLED=0 go test -c -o /tmp/kea.test ./internal/dhcp/
+      # Debian's build restricts where kea-dhcp4 may put things: the control
+      # socket under /run/kea, lease files under /var/lib/kea, logs under
+      # /var/log/kea. The package's postinst creates none of them in a
+      # container, so the shell does.
+      - name: Start Kea
+        run: |
+          docker create --name kea-ci debian:trixie-slim \
+            sh -c 'set -e
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update -qq
+              apt-get install -y --no-install-recommends kea-dhcp4-server
+              mkdir -p /run/kea /var/lib/kea /var/log/kea
+              chmod 750 /run/kea
+              exec kea-dhcp4 -c /etc/kea-ci/kea-dhcp4.conf'
+          docker cp ci/kea kea-ci:/etc/kea-ci
+          docker cp /tmp/kea.test kea-ci:/kea.test
+          docker start kea-ci
+      # The apt-get is most of the wait. A socket that never appears is the
+      # engine failing to start, and its log is the only thing that says why.
+      - name: Wait for the control socket
+        run: |
+          for _ in $(seq 1 120); do
+            docker exec kea-ci test -S /run/kea/kea.sock && break
+            sleep 1
+          done
+          docker exec kea-ci test -S /run/kea/kea.sock || { docker logs kea-ci; exit 1; }
+      - name: Real-engine test
+        run: docker exec -e DNSAUR_TEST_KEA_SOCKET=/run/kea/kea.sock kea-ci /kea.test -test.run Real -test.v -test.count=1
+      # Always, and with the log: the test replaces the engine's whole
+      # configuration, so a failure is usually something Kea said about it.
+      - name: Stop Kea
+        if: always()
+        run: |
+          docker logs kea-ci || true
+          docker rm -f kea-ci || true
+
   # Playwright smoke test (web/e2e/smoke.spec.ts) against the real embedded
   # build: webServer (web/playwright.config.ts) builds the actual dnsaur
   # binary over the web-dist artifact from the `web` job and runs it, then

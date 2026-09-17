@@ -1,0 +1,89 @@
+{
+  "control-socket": {
+    "socket-name": "/run/kea/kea.sock",
+    "socket-type": "unix"
+  },
+  "hooks-libraries": [
+    {
+      "library": "/usr/lib/x86_64-linux-gnu/kea/hooks/libdhcp_lease_cmds.so"
+    }
+  ],
+  "interfaces-config": {
+    "dhcp-socket-type": "raw",
+    "interfaces": [
+      "*"
+    ]
+  },
+  "lease-database": {
+    "persist": true,
+    "type": "memfile"
+  },
+  "rebind-timer": 3150,
+  "renew-timer": 1800,
+  "subnet4": [
+    {
+      "id": 1,
+      "option-data": [
+        {
+          "data": "10.42.0.1",
+          "name": "routers"
+        },
+        {
+          "data": "1.1.1.1, 8.8.8.8",
+          "name": "domain-name-servers"
+        },
+        {
+          "data": "lab.lan",
+          "name": "domain-name"
+        }
+      ],
+      "pools": [
+        {
+          "pool": "10.42.0.100 - 10.42.0.200"
+        }
+      ],
+      "rebind-timer": 787,
+      "renew-timer": 450,
+      "reservations": [
+        {
+          "hostname": "printer",
+          "hw-address": "aa:bb:cc:dd:ee:01",
+          "ip-address": "10.42.0.50"
+        },
+        {
+          "hostname": "scanner",
+          "hw-address": "aa:bb:cc:dd:ee:04",
+          "ip-address": "10.42.0.51"
+        }
+      ],
+      "subnet": "10.42.0.0/24",
+      "valid-lifetime": 900
+    },
+    {
+      "id": 2,
+      "option-data": [
+        {
+          "data": "10.43.0.2, 10.9.9.9",
+          "name": "domain-name-servers"
+        },
+        {
+          "data": "home.lan",
+          "name": "domain-name"
+        }
+      ],
+      "pools": [
+        {
+          "pool": "10.43.0.10 - 10.43.0.250"
+        }
+      ],
+      "reservations": [
+        {
+          "hw-address": "aa:bb:cc:dd:ee:02",
+          "ip-address": "10.43.0.50"
+        }
+      ],
+      "subnet": "10.43.0.0/24"
+    }
+  ],
+  "valid-lifetime": 3600
+}

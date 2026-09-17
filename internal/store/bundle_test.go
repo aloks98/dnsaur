@@ -2,6 +2,8 @@ package store
 
 import (
 	"fmt"
+	"reflect"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -44,7 +46,7 @@ var fixtureSeq = func() *atomic.Int64 {
 	return &n
 }()
 
-type fixture struct{ group, matcher, listURL, key, zone string }
+type fixture struct{ group, matcher, listURL, key, zone, scope, subnet string }
 
 func newFixture() fixture {
 	n := fixtureSeq.Add(1)
@@ -54,8 +56,15 @@ func newFixture() fixture {
 		listURL: fmt.Sprintf("https://example.com/ads-%d.txt", n),
 		key:     fmt.Sprintf("xfer-%d.example.", n),
 		zone:    fmt.Sprintf("e%d.example", n),
+		scope:   fmt.Sprintf("lan-%d", n),
+		subnet:  fmt.Sprintf("10.%d.%d", n>>8&0xff, n&0xff),
 	}
 }
+
+// cidr and host are this fixture's own /24 and an address in it, so two
+// fixtures never write the same reservation into the same scope.
+func (f fixture) cidr() string      { return f.subnet + ".0/24" }
+func (f fixture) host(n int) string { return fmt.Sprintf("%s.%d", f.subnet, n) }
 
 // TestBundleRoundTripKeepsIDs is §4.1: the replica writes the main's rows
 // under the main's ids, so every foreign key in the bundle — and every
@@ -99,6 +108,21 @@ func TestBundleRoundTripKeepsIDs(t *testing.T) {
 		}
 		if _, err := main.Zones().AddRecord(ctx, ZoneRecord{ZoneID: zid, Name: "www", Type: "A", TTL: 300, RData: "10.0.0.1", Enabled: true}); err != nil {
 			t.Fatal(err)
+		}
+		wantScope := scopeFixture(f)
+		scopeID, err := main.DHCP().AddScope(ctx, wantScope)
+		if err != nil {
+			t.Fatal(err)
+		}
+		wantScope.ID = scopeID
+		wantRes := []Reservation{
+			{ScopeID: scopeID, MAC: "aa:bb:cc:00:00:01", IP: f.host(10), Hostname: "printer-1", CreatedAt: 1757800000000, ModifiedAt: 1757800000000},
+			{ScopeID: scopeID, MAC: "aa:bb:cc:00:00:02", IP: f.host(11), Comment: "the nas", CreatedAt: 1757800000000, ModifiedAt: 1757800000000},
+		}
+		for i := range wantRes {
+			if wantRes[i].ID, err = main.DHCP().AddReservation(ctx, wantRes[i]); err != nil {
+				t.Fatal(err)
+			}
 		}
 		if err := main.Settings().Set(ctx, "blocking.mode", "nxdomain"); err != nil {
 			t.Fatal(err)
@@ -174,6 +198,21 @@ func TestBundleRoundTripKeepsIDs(t *testing.T) {
 			t.Errorf("serve.dot.listen reached the replica (ok %v, err %v); §4.3 keeps it local", ok, err)
 		}
 
+		// DHCP §4.3/§4.4: both tables travel, under the main's ids, so a
+		// reservation names the same scope on both boxes.
+		if got, err := replica.DHCP().Scope(ctx, scopeID); err != nil || !reflect.DeepEqual(got, wantScope) {
+			t.Errorf("scope %d on the replica = %+v (err %v), want the main's %+v", scopeID, got, err, wantScope)
+		}
+		gotRes, err := replica.DHCP().Reservations(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, w := range wantRes {
+			if got := reservationByID(gotRes, w.ID); got != w {
+				t.Errorf("reservation %d on the replica = %+v, want the main's %+v", w.ID, got, w)
+			}
+		}
+
 		// Records never travel: the replica's secondary transfers them.
 		recs, err := replica.Zones().Records(ctx, zid)
 		if err != nil {
@@ -233,6 +272,30 @@ func TestImportBundleDeletesWhatTheBundleLacks(t *testing.T) {
 		if _, err := s.Filters().AddRule(ctx, Rule{GroupID: gid, Action: "block", Pattern: "ads.example"}); err != nil {
 			t.Fatal(err)
 		}
+		// Two scopes: one the bundle keeps, holding one reservation it keeps
+		// and one it drops, and one the bundle drops whole.
+		two := newFixture()
+		keptScope, err := s.DHCP().AddScope(ctx, scopeFixture(f))
+		if err != nil {
+			t.Fatal(err)
+		}
+		droppedScope, err := s.DHCP().AddScope(ctx, scopeFixture(two))
+		if err != nil {
+			t.Fatal(err)
+		}
+		keptRes, err := s.DHCP().AddReservation(ctx, Reservation{ScopeID: keptScope, MAC: "aa:bb:cc:00:01:01", IP: f.host(10)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		droppedRes, err := s.DHCP().AddReservation(ctx, Reservation{ScopeID: keptScope, MAC: "aa:bb:cc:00:01:02", IP: f.host(11)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		orphanRes, err := s.DHCP().AddReservation(ctx, Reservation{ScopeID: droppedScope, MAC: "aa:bb:cc:00:01:03", IP: two.host(10)})
+		if err != nil {
+			t.Fatal(err)
+		}
+
 		b, err := s.ExportBundle(ctx)
 		if err != nil {
 			t.Fatal(err)
@@ -242,6 +305,12 @@ func TestImportBundleDeletesWhatTheBundleLacks(t *testing.T) {
 		b.Groups = b.Groups[:len(b.Groups)-1]
 		b.Clients = nil
 		b.Rules = nil
+		// And drop one reservation on its own, plus a whole scope — whose
+		// reservation has to go before the scope can.
+		b.Scopes = slices.DeleteFunc(b.Scopes, func(sc Scope) bool { return sc.ID == droppedScope })
+		b.Reservations = slices.DeleteFunc(b.Reservations, func(r Reservation) bool {
+			return r.ID == droppedRes || r.ID == orphanRes
+		})
 		if err := s.ImportBundle(ctx, b); err != nil {
 			t.Fatal(err)
 		}
@@ -252,6 +321,29 @@ func TestImportBundleDeletesWhatTheBundleLacks(t *testing.T) {
 		for _, g := range gs {
 			if g.ID == gid {
 				t.Fatal("the group survived an import whose bundle lacked it")
+			}
+		}
+
+		scopes, err := s.DHCP().Scopes(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !hasScope(scopes, keptScope) {
+			t.Errorf("scope %d went with an import that still carried it", keptScope)
+		}
+		if hasScope(scopes, droppedScope) {
+			t.Errorf("scope %d survived an import whose bundle lacked it", droppedScope)
+		}
+		rs, err := s.DHCP().Reservations(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if reservationByID(rs, keptRes).ID != keptRes {
+			t.Errorf("reservation %d went with an import that still carried it", keptRes)
+		}
+		for _, id := range []int64{droppedRes, orphanRes} {
+			if reservationByID(rs, id).ID == id {
+				t.Errorf("reservation %d survived an import whose bundle lacked it", id)
 			}
 		}
 	})
@@ -537,6 +629,23 @@ func TestImportBundleSurvivesAUniqueKeySwap(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		s1, err := s.DHCP().AddScope(ctx, scopeFixture(one))
+		if err != nil {
+			t.Fatal(err)
+		}
+		s2, err := s.DHCP().AddScope(ctx, scopeFixture(two))
+		if err != nil {
+			t.Fatal(err)
+		}
+		const mac1, mac2 = "aa:bb:cc:00:02:01", "aa:bb:cc:00:02:02"
+		r1, err := s.DHCP().AddReservation(ctx, Reservation{ScopeID: s1, MAC: mac1, IP: one.host(10)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		r2, err := s.DHCP().AddReservation(ctx, Reservation{ScopeID: s1, MAC: mac2, IP: one.host(11)})
+		if err != nil {
+			t.Fatal(err)
+		}
 		b, err := s.ExportBundle(ctx)
 		if err != nil {
 			t.Fatal(err)
@@ -558,6 +667,25 @@ func TestImportBundleSurvivesAUniqueKeySwap(t *testing.T) {
 				b.Clients[i].Matcher = two.matcher
 			case c2:
 				b.Clients[i].Matcher = one.matcher
+			}
+		}
+		// Two scopes trading names, and two reservations in one scope trading
+		// both halves of their pair: the NICs swapped between machines and
+		// the addresses swapped with them.
+		for i := range b.Scopes {
+			switch b.Scopes[i].ID {
+			case s1:
+				b.Scopes[i].Name = two.scope
+			case s2:
+				b.Scopes[i].Name = one.scope
+			}
+		}
+		for i := range b.Reservations {
+			switch b.Reservations[i].ID {
+			case r1:
+				b.Reservations[i].MAC, b.Reservations[i].IP = mac2, one.host(11)
+			case r2:
+				b.Reservations[i].MAC, b.Reservations[i].IP = mac1, one.host(10)
 			}
 		}
 		if err := s.ImportBundle(ctx, b); err != nil {
@@ -585,6 +713,27 @@ func TestImportBundleSurvivesAUniqueKeySwap(t *testing.T) {
 		}
 		if matchers[c1] != two.matcher || matchers[c2] != one.matcher {
 			t.Errorf("client matchers after the swap = %q / %q, want %q / %q", matchers[c1], matchers[c2], two.matcher, one.matcher)
+		}
+		scopes, err := s.DHCP().Scopes(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		scopeNames := map[int64]string{}
+		for _, sc := range scopes {
+			scopeNames[sc.ID] = sc.Name
+		}
+		if scopeNames[s1] != two.scope || scopeNames[s2] != one.scope {
+			t.Errorf("scope names after the swap = %q / %q, want %q / %q", scopeNames[s1], scopeNames[s2], two.scope, one.scope)
+		}
+		rs, err := s.DHCP().Reservations(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := reservationByID(rs, r1); got.IP != one.host(11) || got.MAC != mac2 {
+			t.Errorf("reservation %d after the swap = %q at %q, want %q at %q", r1, got.MAC, got.IP, mac2, one.host(11))
+		}
+		if got := reservationByID(rs, r2); got.IP != one.host(10) || got.MAC != mac1 {
+			t.Errorf("reservation %d after the swap = %q at %q, want %q at %q", r2, got.MAC, got.IP, mac1, one.host(10))
 		}
 	})
 }

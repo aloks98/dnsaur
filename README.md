@@ -35,7 +35,7 @@ of truth — if it's not listed as shipped, it doesn't work yet.
 | Web dashboard | Shipped |
 | Encrypted upstreams (DNS-over-TLS, DNS-over-HTTPS) | Shipped |
 | HA config sync (pair a replica with the main using a code, then it pulls the main's configuration as one bundle and its zone data by AXFR; the dashboard says who manages what) | Shipped |
-| DHCP | Planned |
+| DHCP (scopes, reservations, PXE and generic options, leases that name themselves in DNS, hot-standby across a pair) | Shipped — ISC Kea serves the protocol, dnsaur renders its whole configuration and reads its leases |
 | Encrypted DNS serving (DoH/DoT for clients of dnsaur) | Shipped |
 | DNSSEC (validation and signing) | Deferred — see below |
 
@@ -86,6 +86,11 @@ docker run -d --name dnsaur \
   -p 53:5353/udp -p 53:5353/tcp -p 8080:8080 \
   dnsaur:local
 ```
+
+`Dockerfile.kea` is the same image with the DHCP engine beside dnsaur; it
+needs `--network host` and a volume for the engine's lease file
+(`-v dnsaur-kea-leases:/var/lib/kea`), and
+[`docs/configuration.md`](docs/configuration.md#dhcp) covers the rest.
 
 The image builds the dashboard and the binary itself, so nothing needs a Go
 or Node toolchain. It is configured through `DNSAUR_*` variables, or a

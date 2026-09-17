@@ -4,6 +4,7 @@ import { expect, test } from "vitest";
 import { Route, Routes } from "react-router";
 import { screen, waitFor } from "@testing-library/react";
 import { server } from "../test/msw-server";
+import { dhcpStatus } from "../test/msw-handlers";
 import { renderWithProviders } from "../test/render";
 import { settingsKeys } from "../hooks/use-settings";
 import type { ResolverStatus } from "../api/types";
@@ -289,6 +290,7 @@ test("a stale replica shows a shell banner on the main, naming it and how long i
           version_applied: 410,
           last_seen: Date.now() - 95 * 60_000,
           stale: true,
+          dhcp: true,
         },
         {
           instance_id: "eve-3",
@@ -296,6 +298,7 @@ test("a stale replica shows a shell banner on the main, naming it and how long i
           version_applied: 412,
           last_seen: Date.now() - 30_000,
           stale: false,
+          dhcp: true,
         },
       ],
     },
@@ -327,4 +330,127 @@ test("a replica that is up to date over https gets no banner", async () => {
   expect(screen.getByText("Some other page")).toBeInTheDocument();
   await settledStatus(result);
   expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+});
+
+// DHCP's three (spec §8.4). They read off the copy of the status object
+// `/resolver/status` carries, so an operator who never opens the DHCP
+// section still learns that the engine stopped answering.
+test("an unreachable engine shows a shell banner in the engine's absence", async () => {
+  mockResolverStatus({
+    serving: OFF_SERVING,
+    dhcp: { enabled: true, engine: "unreachable", table_age_seconds: 90, scopes: [] },
+  });
+
+  renderOnOtherRoute();
+
+  const alert = await screen.findByRole("alert");
+  expect(alert).toHaveTextContent("DHCP engine unreachable");
+});
+
+test("a refused configuration shows the engine's own words", async () => {
+  mockResolverStatus({
+    serving: OFF_SERVING,
+    dhcp: {
+      enabled: true,
+      engine: "config rejected",
+      message: "subnet4[1]: pool 192.168.150.100-192.168.150.199 is not in subnet",
+      table_age_seconds: 3,
+      scopes: [],
+    },
+  });
+
+  renderOnOtherRoute();
+
+  const alert = await screen.findByRole("alert");
+  expect(alert).toHaveTextContent(
+    "DHCP config rejected: subnet4[1]: pool 192.168.150.100-192.168.150.199 is not in subnet",
+  );
+});
+
+test("an HA pair that has stopped talking shows a shell banner", async () => {
+  mockResolverStatus({
+    serving: OFF_SERVING,
+    dhcp: {
+      enabled: true,
+      engine: "ok",
+      engine_version: "2.6.3",
+      table_age_seconds: 3,
+      ha: {
+        mode: "hot-standby",
+        local_state: "partner-down",
+        peer: "backup-box",
+        remote_state: "hot-standby",
+        communication_interrupted: true,
+        unacked_clients: 2,
+      },
+      scopes: [],
+    },
+  });
+
+  renderOnOtherRoute();
+
+  const alert = await screen.findByRole("alert");
+  expect(alert).toHaveTextContent("DHCP partner unreachable");
+});
+
+// Most instances have no engine at all, and a healthy one is the
+// configuration working. Neither is a fault, and a strip that warned about
+// either would be a strip nobody reads.
+test("a box with no engine, and a healthy one, get no banner", async () => {
+  mockResolverStatus({
+    serving: OFF_SERVING,
+    dhcp: { enabled: false, table_age_seconds: 0, scopes: [] },
+  });
+
+  const off = renderOnOtherRoute();
+  await settledStatus(off);
+  expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  off.unmount();
+
+  mockResolverStatus({
+    serving: OFF_SERVING,
+    dhcp: {
+      enabled: true,
+      engine: "ok",
+      engine_version: "2.6.3",
+      table_age_seconds: 3,
+      scopes: [{ id: 1, pool_size: 100, leased: 61 }],
+    },
+  });
+
+  const healthy = renderOnOtherRoute();
+  await settledStatus(healthy);
+  expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+});
+
+// The Scopes page carries the engine's own status line with Apply again
+// beside it, so the strip saying the same words above it was two warnings
+// for one fact. Everywhere else the strip is the only place the fact shows.
+test("a rejected DHCP config is one warning on the Scopes page and a strip line elsewhere", async () => {
+  mockResolverStatus({
+    serving: OFF_SERVING,
+    dhcp: dhcpStatus({
+      engine: "config rejected",
+      message: "scope lan: no local address is inside 10.0.0.0/16",
+    }),
+  });
+
+  const scopes = renderWithProviders(
+    <Routes>
+      <Route element={<AppShell />}>
+        <Route path="dhcp" element={<h1>Scopes</h1>} />
+      </Route>
+    </Routes>,
+    { route: "/dhcp" },
+  );
+  await screen.findByRole("heading", { name: "Scopes" });
+  await settledStatus(scopes);
+  expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  scopes.unmount();
+
+  renderOnOtherRoute();
+  const alert = await screen.findByRole("alert");
+  expect(alert).toHaveTextContent(
+    "DHCP config rejected: scope lan: no local address is inside 10.0.0.0/16",
+  );
 });

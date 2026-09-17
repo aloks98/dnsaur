@@ -64,6 +64,11 @@ export interface SyncReplica {
   /** Unix ms. */
   last_seen: number;
   stale: boolean;
+  /** Whether that box runs a DHCP engine of its own, as its last version
+   * probe reported. The main will not name a replica without one as the
+   * hot-standby partner: it would answer no lease on the segment while the
+   * primary waited out `max-response-delay` for it. */
+  dhcp: boolean;
 }
 
 /**
@@ -144,6 +149,11 @@ export interface ResolverStatus {
    * dnsaur older than config sync answers without it, and so does every
    * fixture written before it existed. Absent reads as a main. */
   sync?: SyncStatus;
+  /** GET /dhcp/status' object, carried here for the same reason `sync` is:
+   * the shell's warning strip and the nav both have to know what the engine
+   * is doing on every screen, not only on the DHCP ones. Absent reads as
+   * DHCP off — see DHCPStatus. */
+  dhcp?: DHCPStatus;
 }
 
 export interface Group {
@@ -396,6 +406,15 @@ export interface QueryEntry {
   duration_ms: number;
   /** The rule pattern or list entry that fired; "" unless the row was blocked. */
   matched: string;
+  /**
+   * The DHCP lease table's name for `client_ip`, joined on as the row is
+   * read — nothing is stored, so an old row carries whoever holds that
+   * address *now*.
+   *
+   * **Absent, not empty**, when DHCP is off, when no lease holds the
+   * address, and on every row while `qlog.privacy` is `anon`.
+   */
+  hostname?: string;
 }
 
 export interface StatsOverview {
@@ -471,4 +490,152 @@ export type Settings = Record<string, string>;
 export interface BackupResult {
   path: string;
   bytes: number;
+}
+
+/**
+ * DHCP (spec §8.3, docs/api.md's DHCP entry). dnsaur does not serve the
+ * protocol — ISC Kea does — but it owns everything an operator touches, so
+ * a scope and a reservation are rows here like any other synced
+ * configuration, and a lease is not a row at all.
+ */
+
+/** One entry of option 121. Both halves are required; the router must be
+ * inside the scope's cidr, which the server checks. */
+export interface DHCPStaticRoute {
+  destination: string;
+  router: string;
+}
+
+/** An option with no field of its own, as raw hex. The server refuses a
+ * code it already emits by name, so one code never has two answers. */
+export interface DHCPGenericOption {
+  code: number;
+  hex: string;
+}
+
+/**
+ * One DHCP subnet, rendered as one Kea `subnet4`.
+ *
+ * `dns_servers` empty is **not** "no DNS": it is the automatic answer of
+ * this box's address followed by its HA partner's. `lease_seconds` 0 falls
+ * back to the `dhcp.lease_seconds` setting, and `domain` empty to
+ * `dhcp.domain` — both are "use the instance default", not "none".
+ *
+ * `match_client_id` is the one field whose create default (`true`) is not
+ * its zero value, so the form always sends it explicitly.
+ */
+export interface DHCPScope {
+  id: number;
+  name: string;
+  /** An IPv4 prefix in masked form. Host bits set are refused rather than
+   * quietly masked — "10.0.0.5/24" and "10.0.0.0/24" look alike in a form
+   * and hand out different subnets. */
+  cidr: string;
+  pool_start: string;
+  pool_end: string;
+  gateway: string;
+  dns_servers: string;
+  domain: string;
+  lease_seconds: number;
+  enabled: boolean;
+  domain_search: string;
+  ntp_servers: string;
+  static_routes: DHCPStaticRoute[];
+  next_server: string;
+  server_hostname: string;
+  boot_file: string;
+  options: DHCPGenericOption[];
+  match_client_id: boolean;
+  reservations_only: boolean;
+  created_at: number;
+  modified_at: number;
+}
+
+/**
+ * A fixed address for one MAC inside one scope.
+ *
+ * `scope_id` is fixed once created — an address validated against one
+ * subnet must not be carried into another — so the edit form offers no
+ * scope select and the API refuses a PATCH that moves one.
+ */
+export interface DHCPReservation {
+  id: number;
+  scope_id: number;
+  /** Canonical lowercase `aa:bb:cc:dd:ee:ff`; the server takes any
+   * notation `net.ParseMAC` accepts and stores it in this one. */
+  mac: string;
+  ip: string;
+  /** One RFC 1123 label — the suffix comes from the scope — or empty. */
+  hostname: string;
+  comment: string;
+  created_at: number;
+  modified_at: number;
+}
+
+/**
+ * One row of the lease table as of the last poll. Never stored by dnsaur:
+ * it is read from the engine every `dhcp.lease_poll_seconds` and replaced
+ * whole, which is also why releasing one does not empty the row until the
+ * next poll lands.
+ */
+export interface DHCPLease {
+  scope_id: number;
+  ip: string;
+  mac: string;
+  /** The client's own name, or the reservation's when the client sent
+   * none. `""` for a device that offered nothing usable. */
+  hostname: string;
+  /** Unix ms, and **0 for a reservation nothing has leased yet** — the one
+   * field that tells such a row from a live lease. */
+  expires_at: number;
+  reserved: boolean;
+}
+
+/** What `status-get` reports about the pair. Absent on a single box, which
+ * is a different fact from a pair that is not talking. */
+export interface DHCPHAStatus {
+  mode: string;
+  local_state: string;
+  /** What the partner calls itself, as the engine talking to it reports the
+   * name. **Absent on an engine whose `status-get` does not carry it**, which
+   * the status line has to handle anyway for a box with no partner. */
+  peer?: string;
+  remote_state: string;
+  communication_interrupted: boolean;
+  unacked_clients: number;
+}
+
+/** How full one scope's pool is. `leased` may exceed `pool_size` after a
+ * pool is shrunk: the engine keeps what it has already handed out. */
+export interface DHCPScopeUsage {
+  id: number;
+  pool_size: number;
+  leased: number;
+}
+
+/**
+ * GET /dhcp/status, and the same object GET /resolver/status carries as
+ * `dhcp`.
+ *
+ * `enabled: false` — the `kea_socket` bootstrap key is empty — is the whole
+ * answer on a box with no engine, and the only DHCP answer it gives: every
+ * other route 404s. Read `enabled` first; everything else is `omitempty`.
+ *
+ * A configuration the engine would not take (`config rejected`) outranks an
+ * engine that is not there: it is the one an operator has to act on, and it
+ * is still true when the engine comes back.
+ */
+export interface DHCPStatus {
+  enabled: boolean;
+  engine?: "ok" | "unreachable" | "config rejected";
+  /** What `version-get` reported, e.g. "2.6.3". */
+  engine_version?: string;
+  /** The engine's own words: its refusal of the last `config-set`, or why
+   * it could not be reached. Cleared by the next render it accepts. */
+  message?: string;
+  /** How stale the lease table is. An engine that stops answering keeps
+   * the table it last gave — still the truth about the segment. */
+  table_age_seconds: number;
+  ha?: DHCPHAStatus;
+  scopes: DHCPScopeUsage[];
 }

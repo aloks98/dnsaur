@@ -309,3 +309,10 @@ func TestEffectiveReportsSourcePerKey(t *testing.T) {
 		t.Errorf("the DSN's password reached the startup log: %q", got["storage.dsn"].Value)
 	}
 }
+
+func TestKeaSocketPathLength(t *testing.T) {
+	t.Setenv("DNSAUR_KEA_SOCKET", "/"+strings.Repeat("d", 107)+"/kea.sock")
+	if _, err := Load(noConfigFile(t)); err == nil || !strings.Contains(err.Error(), "kea_socket is") {
+		t.Fatalf("Load = %v, want a kea_socket length error", err)
+	}
+}

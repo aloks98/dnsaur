@@ -88,6 +88,11 @@ type Bundle struct {
 	TSIGKeys []TSIGKey    `json:"tsig_keys"`
 	// Zones are definitions only, and never of type internal.
 	Zones []Zone `json:"zones"`
+	// Scopes and Reservations are the DHCP configuration (DHCP design §4.3,
+	// §4.4). Leases are not here and never will be: they are the engine's
+	// state, and each box reads its own back.
+	Scopes       []Scope       `json:"scopes"`
+	Reservations []Reservation `json:"reservations"`
 }
 
 // ExportBundle reads this instance's synced configuration into one document.
@@ -151,6 +156,13 @@ func (s *sqlStore) ExportBundle(ctx context.Context) (Bundle, error) {
 	b.Lists = make([]BundleList, len(lists))
 	for i, l := range lists {
 		b.Lists[i] = BundleList{List: l, Groups: assigned[l.ID]}
+	}
+
+	if b.Scopes, err = s.DHCP().Scopes(ctx); err != nil {
+		return Bundle{}, err
+	}
+	if b.Reservations, err = s.DHCP().Reservations(ctx); err != nil {
+		return Bundle{}, err
 	}
 
 	zs, err := s.Zones().Zones(ctx)
@@ -220,12 +232,21 @@ const (
 	upsertZoneSQL = `INSERT INTO zones (id, name, type, enabled, soa_ns, soa_mbox, soa_serial, soa_refresh, soa_retry, soa_expire, soa_minimum, soa_ttl, primaries, tsig_key_id, allow_transfer, notify_to, forward_to, created_at, modified_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT (id) DO UPDATE SET name = excluded.name, type = excluded.type, enabled = excluded.enabled, soa_ns = excluded.soa_ns, soa_mbox = excluded.soa_mbox, soa_refresh = excluded.soa_refresh, soa_retry = excluded.soa_retry, soa_expire = excluded.soa_expire, soa_minimum = excluded.soa_minimum, soa_ttl = excluded.soa_ttl, primaries = excluded.primaries, tsig_key_id = excluded.tsig_key_id, allow_transfer = excluded.allow_transfer, notify_to = excluded.notify_to, forward_to = excluded.forward_to, modified_at = excluded.modified_at`
+	// created_at is in the INSERT and not in the DO UPDATE, as everywhere
+	// else here: a row being created takes the main's creation date, and one
+	// that already exists does not have it rewritten.
+	upsertScopeSQL = `INSERT INTO dhcp_scopes (id, name, cidr, pool_start, pool_end, gateway, dns_servers, domain, lease_seconds, enabled, domain_search, ntp_servers, static_routes, next_server, server_hostname, boot_file, options, match_client_id, reservations_only, created_at, modified_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT (id) DO UPDATE SET name = excluded.name, cidr = excluded.cidr, pool_start = excluded.pool_start, pool_end = excluded.pool_end, gateway = excluded.gateway, dns_servers = excluded.dns_servers, domain = excluded.domain, lease_seconds = excluded.lease_seconds, enabled = excluded.enabled, domain_search = excluded.domain_search, ntp_servers = excluded.ntp_servers, static_routes = excluded.static_routes, next_server = excluded.next_server, server_hostname = excluded.server_hostname, boot_file = excluded.boot_file, options = excluded.options, match_client_id = excluded.match_client_id, reservations_only = excluded.reservations_only, modified_at = excluded.modified_at`
+	upsertReservationSQL = `INSERT INTO dhcp_reservations (id, scope_id, mac, ip, hostname, comment, created_at, modified_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT (id) DO UPDATE SET scope_id = excluded.scope_id, mac = excluded.mac, ip = excluded.ip, hostname = excluded.hostname, comment = excluded.comment, modified_at = excluded.modified_at`
 	assignListSQL = `INSERT INTO group_lists (group_id, list_id) VALUES (?, ?)`
 )
 
 // syncedTables are the tables whose ids come from the main, in the order the
 // sequences behind them have to be advanced on postgres.
-var syncedTables = []string{"groups", "clients", "lists", "rules", "tsig_keys", "zones"}
+var syncedTables = []string{"groups", "clients", "lists", "rules", "tsig_keys", "zones", "dhcp_reservations", "dhcp_scopes"}
 
 // parkedKeys are the unique natural keys a bundle rewrites, and parking them
 // is what stops two of them *swapping* from wedging a replica.
@@ -259,6 +280,12 @@ var parkedKeys = []struct{ table, column, where string }{
 	{table: "lists", column: "url"},
 	{table: "tsig_keys", column: "name"},
 	{table: "zones", column: "name", where: ` WHERE type <> '` + zoneTypeInternal + `'`},
+	{table: "dhcp_scopes", column: "name"},
+	// Both of a reservation's unique keys, because either can be swapped on
+	// its own: two machines trading addresses, or one NIC replaced in each
+	// of two machines.
+	{table: "dhcp_reservations", column: "mac"},
+	{table: "dhcp_reservations", column: "ip"},
 }
 
 // ImportBundle replaces every synced table with b's rows, keeping b's ids, in
@@ -302,6 +329,11 @@ func (s *sqlStore) ImportBundle(ctx context.Context, b Bundle) error {
 		{table: "lists", keep: bundleIDs(b.Lists, func(l BundleList) int64 { return l.ID })},
 		{table: "groups", keep: bundleIDs(b.Groups, func(g Group) int64 { return g.ID })},
 		{table: "tsig_keys", keep: bundleIDs(b.TSIGKeys, func(k TSIGKey) int64 { return k.ID })},
+		// Reservations before scopes: the foreign key between them carries
+		// no ON DELETE CASCADE, so a scope the main dropped can only go once
+		// its reservations have.
+		{table: "dhcp_reservations", keep: bundleIDs(b.Reservations, func(r Reservation) int64 { return r.ID })},
+		{table: "dhcp_scopes", keep: bundleIDs(b.Scopes, func(sc Scope) int64 { return sc.ID })},
 	} {
 		if err := s.pruneMissing(ctx, tx, prune.table, prune.keep, prune.where); err != nil {
 			return fmt.Errorf("pruning %s: %w", prune.table, err)
@@ -361,6 +393,20 @@ func (s *sqlStore) ImportBundle(ctx context.Context, b Bundle) error {
 	}
 	for _, r := range b.Rules {
 		if err := s.execTx(ctx, tx, upsertRuleSQL, r.ID, r.GroupID, r.Action, r.Pattern, r.IsRegex); err != nil {
+			return err
+		}
+	}
+	for _, sc := range b.Scopes {
+		if err := s.execTx(ctx, tx, upsertScopeSQL, sc.ID, sc.Name, sc.CIDR, sc.PoolStart, sc.PoolEnd, sc.Gateway,
+			sc.DNSServers, sc.Domain, sc.LeaseSeconds, sc.Enabled, sc.DomainSearch, sc.NTPServers, marshalList(sc.StaticRoutes),
+			sc.NextServer, sc.ServerHostname, sc.BootFile, marshalList(sc.Options), sc.MatchClientID, sc.ReservationsOnly,
+			sc.CreatedAt, sc.ModifiedAt); err != nil {
+			return err
+		}
+	}
+	for _, r := range b.Reservations {
+		if err := s.execTx(ctx, tx, upsertReservationSQL, r.ID, r.ScopeID, r.MAC, r.IP, r.Hostname, r.Comment,
+			r.CreatedAt, r.ModifiedAt); err != nil {
 			return err
 		}
 	}

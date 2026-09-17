@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/netip"
 	"slices"
 	"strconv"
 	"time"
@@ -80,10 +81,44 @@ func (s *Server) handleQueriesSearch(w http.ResponseWriter, r *http.Request) {
 		storeErr(w, err)
 		return
 	}
-	if entries == nil {
-		entries = []store.QueryLogEntry{}
+	rows := make([]queryRow, 0, len(entries))
+	for _, e := range entries {
+		rows = append(rows, s.withHostname(e))
 	}
-	writeJSON(w, http.StatusOK, entries)
+	writeJSON(w, http.StatusOK, rows)
+}
+
+// queryRow is a stored query-log row plus what the lease table knows about
+// the address in it. The hostname is not a column: it is joined on as the
+// row is read, and it is absent rather than empty when there is no lease,
+// so the dashboard can tell "no DHCP" from "a device with no name".
+type queryRow struct {
+	store.QueryLogEntry
+	Hostname string `json:"hostname,omitempty"`
+}
+
+func (s *Server) withHostname(e store.QueryLogEntry) queryRow {
+	row := queryRow{QueryLogEntry: e}
+	if s.deps.LeaseHostname == nil {
+		return row
+	}
+	// Anonymising only zeroes the last octet, so the stored 10.0.0.0 is an
+	// address a scope can hand out and a lease can hold — joining on it would
+	// answer with some other device's name and undo the setting the operator
+	// turned on. No row is joined at all while it is in force: which rows were
+	// written under it is not recorded, so "this one looks anonymised" is not
+	// a question that can be asked of a row.
+	if s.deps.Logger != nil && s.deps.Logger.Privacy() == "anon" {
+		return row
+	}
+	ip, err := netip.ParseAddr(e.ClientIP)
+	if err != nil {
+		return row
+	}
+	if name, ok := s.deps.LeaseHostname(ip); ok {
+		row.Hostname = name
+	}
+	return row
 }
 
 // sseHeartbeat is how often an idle tail writes a comment frame. Well
@@ -135,7 +170,7 @@ func (s *Server) handleQueriesTail(w http.ResponseWriter, r *http.Request) {
 			if !open {
 				return
 			}
-			b, err := json.Marshal(e)
+			b, err := json.Marshal(s.withHostname(e))
 			if err != nil {
 				continue
 			}

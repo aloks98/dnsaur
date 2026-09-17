@@ -1,0 +1,70 @@
+# syntax=docker/dockerfile:1
+
+# dnsaur with the DHCP engine in the image. `Dockerfile` is the plain one and
+# assumes kea-dhcp4 on the host; this variant ships it beside dnsaur for a
+# deployment that would rather run one container than install a second
+# service.
+#
+# The two build stages are `Dockerfile`'s, unchanged: the dashboard is built
+# first because //go:embed all:dist reads it at compile time (web/embed.go),
+# and the Go stage cross-compiles from the native toolchain.
+FROM --platform=$BUILDPLATFORM node:24-alpine AS web
+WORKDIR /web
+RUN corepack enable
+COPY web/package.json web/pnpm-lock.yaml web/pnpm-workspace.yaml ./
+RUN pnpm install --frozen-lockfile
+COPY web/ ./
+RUN pnpm build
+
+FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+COPY --from=web /web/dist ./web/dist
+ARG TARGETOS
+ARG TARGETARCH
+ARG VERSION=dev
+RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
+    go build -trimpath -ldflags "-s -w -X main.Version=${VERSION}" -o /out/dnsaur ./cmd/dnsaur
+
+# Alpine edge, not a stable release: Kea 3.0 and its hooks as separate
+# packages are what edge carries, and the HA and lease_cmds hooks are not
+# optional here — dnsaur reads leases over lease_cmds and renders the HA
+# hook for a paired box. Not distroless either, for the same reason: the
+# engine is a second process with its own package tree.
+FROM alpine:edge
+ARG VERSION=dev
+LABEL org.opencontainers.image.title="dnsaur-kea" \
+      org.opencontainers.image.description="dnsaur with the ISC Kea DHCP engine in the image" \
+      org.opencontainers.image.source="https://github.com/aloks98/dnsaur" \
+      org.opencontainers.image.documentation="https://github.com/aloks98/dnsaur/blob/main/docs/configuration.md" \
+      org.opencontainers.image.licenses="AGPL-3.0-only" \
+      org.opencontainers.image.version="${VERSION}"
+RUN apk add --no-cache kea-dhcp4 kea-hook-ha kea-hook-lease-cmds
+COPY deploy/kea/kea-dhcp4.conf /etc/kea/kea-dhcp4.conf
+COPY deploy/kea/entrypoint.sh /entrypoint.sh
+COPY --from=build /out/dnsaur /usr/bin/dnsaur
+RUN mkdir -p /data
+# WORKDIR, not a -config flag, for the same reason as `Dockerfile`:
+# config.DefaultPath is the relative "dnsaur.yaml" and it is the one path
+# config.Load tolerates being absent, so a container configured entirely
+# through DNSAUR_* variables starts and one with a file bind-mounted at
+# /data/dnsaur.yaml picks it up.
+WORKDIR /data
+VOLUME /data
+# The engine's lease database, which is the one piece of state in this image
+# that is not dnsaur's. memfile is a file: without a volume it goes with the
+# container, and every lease on the segment comes back as a free address on
+# the next `docker run`.
+VOLUME /var/lib/kea
+ENV DNSAUR_DATA_DIR=/data \
+    DNSAUR_KEA_SOCKET=/run/kea/kea.sock
+# Both processes run as root: kea-dhcp4 opens raw sockets on the segment it
+# serves, and dnsaur binds 53 and reads the engine's control socket.
+#
+# DHCP is broadcast on the segment, so this image is only useful with
+# --network host — EXPOSE is documentation for the DNS and HTTP halves, and
+# host networking ignores it. See docs/configuration.md, "In a container".
+EXPOSE 53/udp 53/tcp 67/udp 8080 853 443
+ENTRYPOINT ["/entrypoint.sh"]

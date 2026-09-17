@@ -47,8 +47,10 @@ type Syncer interface {
 	// error, just not a replica.
 	Authenticate(ctx context.Context, secret string) (instanceID string, ok bool, err error)
 	// Heartbeat stamps a registered replica from its version probe, which
-	// is the only heartbeat there is (§3).
-	Heartbeat(ctx context.Context, instanceID string, applied int64) error
+	// is the only heartbeat there is (§3). dhcp is whether that box runs an
+	// engine of its own, which is the one thing the main cannot find out
+	// any other way.
+	Heartbeat(ctx context.Context, instanceID string, applied int64, dhcp bool) error
 	// Follow is the replica's half: pair with the main at peerURL by
 	// spending code, store what comes back, and pull once.
 	// ErrFollowRefused is a main that would not spend the code.
@@ -92,6 +94,16 @@ type Replica struct {
 	// intervals. Never a reason to delete the entry — an operator removes
 	// one deliberately (§6).
 	Stale bool `json:"stale"`
+	// DHCP is whether that box runs a DHCP engine of its own, as its last
+	// probe reported. It is what keeps the DHCP renderer from naming a
+	// standby with nothing to stand by with (design §6): a replica whose
+	// kea_socket is empty would be handed half a hot-standby pair and
+	// answer no lease on the segment, while the main waited out
+	// max-response-delay for it on every client.
+	//
+	// False for an entry nothing has probed since this field existed, which
+	// is the safe direction: one interval of rendering single.
+	DHCP bool `json:"dhcp"`
 }
 
 // PairRequest is what a replica posts to POST /sync/pair: the code the
@@ -258,7 +270,11 @@ func (s *Server) handleSyncVersion(w http.ResponseWriter, r *http.Request) {
 	// that is not a number — or one below zero, which no count of writes
 	// ever reaches — is 0, "nothing yet", which is what a box that has only
 	// just paired truthfully reports.
-	switch err := s.deps.Sync.Heartbeat(r.Context(), replicaFrom(r), max(qInt(r, "applied"), 0)); {
+	// ?dhcp says whether that box runs an engine of its own. Absent is
+	// false, which is what an older replica reports and what a box with no
+	// kea_socket means.
+	switch err := s.deps.Sync.Heartbeat(r.Context(), replicaFrom(r),
+		max(qInt(r, "applied"), 0), r.URL.Query().Get("dhcp") == "1"); {
 	case errors.Is(err, ErrNotRegistered):
 		// Forgotten between the secret being checked and the entry being
 		// stamped. The answer is the one the next probe would get anyway,
@@ -323,6 +339,14 @@ const (
 	syncAppliedAtSetting   = "sync.applied_at"
 	syncLastPullAtSetting  = "sync.last_pull_at"
 	syncLastErrorSetting   = "sync.last_error"
+	// The HA pair the main's renderer chose (DHCP design §6): the
+	// instance.id of the box that renders as primary, and of the replica it
+	// picked as standby. Synced, because both boxes have to render the same
+	// two peers or Kea's hook has no partner to find; internal, because the
+	// choice is derived from the pairing and an operator editing either half
+	// would tell one box it is in a pair the other has never heard of.
+	dhcpHAPrimarySetting = "dhcp.ha_primary"
+	dhcpHAStandbySetting = "dhcp.ha_standby"
 )
 
 func (s *Server) handleSyncBundle(w http.ResponseWriter, r *http.Request) {
@@ -536,7 +560,8 @@ func internalSetting(key string) bool {
 	case store.StatsWatermarkKey, filter.PausesKey, syncReplicasSetting,
 		syncPairingSetting, syncKeyIDSetting,
 		syncAppliedVersionSetting, syncAppliedPeerSetting, syncAppliedAtSetting,
-		syncLastPullAtSetting, syncLastErrorSetting:
+		syncLastPullAtSetting, syncLastErrorSetting,
+		dhcpHAPrimarySetting, dhcpHAStandbySetting:
 		return true
 	}
 	return false

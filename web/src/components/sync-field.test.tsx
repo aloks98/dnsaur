@@ -55,6 +55,7 @@ test("a main lists each registered replica and marks a stale one by its last see
         version_applied: 412,
         last_seen: Date.now() - 40_000,
         stale: false,
+        dhcp: true,
       },
       {
         instance_id: "attic-pi",
@@ -62,6 +63,7 @@ test("a main lists each registered replica and marks a stale one by its last see
         version_applied: 409,
         last_seen: Date.now() - 2 * 60 * 60_000,
         stale: true,
+        dhcp: true,
       },
     ],
   });
@@ -140,6 +142,7 @@ test("a main forgets a replica on request", async () => {
         version_applied: 412,
         last_seen: Date.now() - 5 * 60_000,
         stale: false,
+        dhcp: true,
       },
     ],
   });
@@ -338,6 +341,7 @@ test("a refused forget names the replica it could not remove", async () => {
         version_applied: 412,
         last_seen: Date.now() - 60_000,
         stale: false,
+        dhcp: true,
       },
     ],
   });

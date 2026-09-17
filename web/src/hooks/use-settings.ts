@@ -47,10 +47,15 @@ const TROUBLE_POLL_MS = 5_000;
 // The server strips instance.* and stats.* internal keys before returning
 // (see internal/api/settings_handlers.go's handleSettingsGet), so this is
 // exactly the editable-settings surface plus nothing sensitive.
-export function useSettings() {
+// `enabled` exists for one caller: the DHCP lease-hostname join, which runs
+// on screens that are not about DHCP and must not make this request on a box
+// with no engine (hooks/use-dhcp.ts's useLeaseHostnames). Every other caller
+// wants the settings and takes the default.
+export function useSettings({ enabled = true } = {}) {
   return useQuery({
     queryKey: settingsKeys.all,
     queryFn: () => api.get<Settings>("/settings"),
+    enabled,
   });
 }
 

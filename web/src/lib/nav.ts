@@ -5,9 +5,12 @@ import {
   KeyRound,
   LayoutDashboard,
   ListFilter,
+  Network,
+  Router,
   ScrollText,
   Settings,
   ShieldBan,
+  Tag,
   Users,
 } from "lucide-react";
 
@@ -28,6 +31,14 @@ export const QUERY_LOG_PATH = "/queries";
 /** The Filtering section's base. `/filtering` itself only redirects to
  * Lists; the chrome uses this to recognise the section and its tabs. */
 export const FILTERING_BASE = "/filtering";
+
+/** The DHCP section's base, which is also its first screen (Scopes). The
+ * chrome hangs each of the three screens' own right-hand readout off these
+ * — how full the pools are, how fresh the lease table is, how many
+ * reservations exist. */
+export const DHCP_BASE = "/dhcp";
+export const DHCP_LEASES_PATH = "/dhcp/leases";
+export const DHCP_RESERVATIONS_PATH = "/dhcp/reservations";
 
 interface NavItem {
   to: string;
@@ -58,11 +69,16 @@ export interface NavGroup {
 /**
  * The shell's two-level nav. Row 1 of the top bar renders the groups; row 2
  * renders the active group's items as tabs. Grouping is fixed by the locked
- * design; the *contents* are only ever routes that actually exist — there are
- * no entries for DHCP, encrypted DNS or anything else unbuilt, and a group
- * with a single child (Zones) still gets its row-2 tab.
+ * design; the *contents* are only ever routes that actually exist — there is
+ * no entry for encrypted DNS or anything else unbuilt, and a group with a
+ * single child (Zones) still gets its row-2 tab.
+ *
+ * DHCP is the one group that is not always on: an instance whose
+ * `kea_socket` is empty has no engine and every DHCP route but the status
+ * 404s, so the section is dropped whole rather than offered and broken. Read
+ * this list through `navGroups` rather than directly — see there.
  */
-export const NAV_GROUPS: NavGroup[] = [
+const ALL_NAV_GROUPS: NavGroup[] = [
   {
     id: "monitor",
     label: "Monitor",
@@ -94,6 +110,18 @@ export const NAV_GROUPS: NavGroup[] = [
     items: [{ to: "/zones", label: "Zones", icon: Globe }],
   },
   {
+    id: "dhcp",
+    label: "DHCP",
+    items: [
+      // `/dhcp` *is* Scopes rather than a redirecting index: the section has
+      // a first screen, and a route that only forwards would put a dead
+      // entry in the back stack on every visit.
+      { to: DHCP_BASE, label: "Scopes", icon: Network, end: true },
+      { to: DHCP_LEASES_PATH, label: "Leases", icon: Router },
+      { to: DHCP_RESERVATIONS_PATH, label: "Reservations", icon: Tag },
+    ],
+  },
+  {
     id: "system",
     label: "System",
     items: [
@@ -106,6 +134,20 @@ export const NAV_GROUPS: NavGroup[] = [
     ],
   },
 ];
+
+/**
+ * The groups this instance actually has, which is every group except DHCP
+ * on a box with no engine.
+ *
+ * A function rather than a second constant because the answer arrives with
+ * `GET /resolver/status` and can change under a running app (a restart with
+ * `kea_socket` set). Both readers of the nav — the top bar and the command
+ * palette — go through this, so the palette cannot offer a jump to a
+ * section the bar has hidden.
+ */
+export function navGroups(dhcpEnabled: boolean): NavGroup[] {
+  return dhcpEnabled ? ALL_NAV_GROUPS : ALL_NAV_GROUPS.filter((group) => group.id !== "dhcp");
+}
 
 export function isNavItemActive(pathname: string, item: NavItem): boolean {
   if (item.end) return pathname === item.to;
@@ -122,11 +164,16 @@ export function isNavItemActive(pathname: string, item: NavItem): boolean {
  * is gone (pages/not-found.tsx renders instead), so the fallback would now
  * be a lie that persists: MONITOR marked, and a row of Dashboard/Query Log
  * tabs, on a page that is neither.
+ *
+ * Searched over *every* group, DHCP included, whatever the engine is doing:
+ * an operator who reaches `/dhcp` on a box that has since lost its engine
+ * gets the section's own tabs above the screen telling them so, rather than
+ * the not-found chrome.
  */
 export function findActiveGroup(pathname: string): NavGroup | null {
   return (
-    NAV_GROUPS.find((group) => group.items.some((item) => isNavItemActive(pathname, item))) ??
-    NAV_GROUPS.find(
+    ALL_NAV_GROUPS.find((group) => group.items.some((item) => isNavItemActive(pathname, item))) ??
+    ALL_NAV_GROUPS.find(
       (group) =>
         group.basePath !== undefined &&
         (pathname === group.basePath || pathname.startsWith(`${group.basePath}/`)),

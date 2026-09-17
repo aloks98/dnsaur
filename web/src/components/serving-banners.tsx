@@ -1,6 +1,8 @@
 import { TriangleAlert } from "lucide-react";
+import { useLocation } from "react-router";
 import { useResolverStatus } from "../hooks/use-settings";
-import { expiringSoonDetail, servingState, syncBanners } from "../lib/serving";
+import { DHCP_BASE } from "../lib/nav";
+import { dhcpBanners, expiringSoonDetail, servingState, syncBanners } from "../lib/serving";
 import { WarningStrip } from "./warning-strip";
 
 /**
@@ -20,6 +22,7 @@ import { WarningStrip } from "./warning-strip";
  */
 export function ServingBanners() {
   const status = useResolverStatus();
+  const { pathname } = useLocation();
   const serving = status.data?.serving;
   const certificate = status.data?.certificate;
 
@@ -50,6 +53,12 @@ export function ServingBanners() {
   // Config sync's own two (spec §8), derived in lib/serving.ts so the
   // status poll that clears them reads the same predicate — see syncBanners.
   banners.push(...syncBanners(status.data?.sync));
+  // DHCP's three (spec §8.4), on the same terms. They read off the copy of
+  // the status object this endpoint carries, so a screen that never opens
+  // the DHCP section still learns that the engine stopped answering. The
+  // Scopes page has the engine's line of its own, so there the strip keeps
+  // only what that line does not say.
+  banners.push(...dhcpBanners(status.data?.dhcp, pathname === DHCP_BASE));
 
   return (
     <>

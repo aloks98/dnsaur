@@ -5,6 +5,7 @@ import {
   Link2,
   ListChecks,
   Lock,
+  Router,
   ScrollText,
   Server,
   ShieldBan,
@@ -43,6 +44,7 @@ import {
 import { ApiError } from "../api/client";
 import type { Settings } from "../api/types";
 import { useBackup, useSettings, useUpdateSetting } from "../hooks/use-settings";
+import { useDHCPEnabled } from "../hooks/use-dhcp";
 import { useManagedBy } from "../hooks/use-sync";
 import { ManagedNotice } from "../components/managed-notice";
 import { ProtocolsField } from "../components/protocols-field";
@@ -57,7 +59,7 @@ import { parseUpstreams } from "../lib/upstreams";
 
 // --- field model -------------------------------------------------------
 // One row per key in internal/api/settings_handlers.go's editableSettings
-// map — 22 keys, no more, no less (see the exhaustiveness note by
+// map — 27 keys, no more, no less (see the exhaustiveness note by
 // SETTING_GROUPS below). Each field's `schema` mirrors that map's check
 // function exactly, so a value accepted here is one PUT /settings will
 // also accept, and nothing rejected here would have been rejected there
@@ -148,6 +150,14 @@ interface SettingGroup {
    * still supplies the schemas and defaults the generic form machinery
    * needs; this governs presentation only. */
   render?: (control: Control<SettingsFormValues>) => ReactNode;
+  /** The band is only shown on a box that runs a DHCP engine. `kea_socket`
+   * empty means there is nothing behind these five settings and no DHCP
+   * section in the nav either (lib/nav.ts), so a band of them would be five
+   * values nothing reads. The fields stay in ALL_FIELDS regardless — the
+   * exhaustiveness guarantee below is about editableSettings' key list, not
+   * about what is on screen, and a band nobody can see has nothing to
+   * make dirty. */
+  needsDHCP?: boolean;
 }
 
 /** Mirrors editableSettings["upstreams"], which now runs the same grammar
@@ -222,6 +232,56 @@ function minIntSchema(min: number) {
 }
 
 const positiveIntSchema = minIntSchema(1);
+
+/** Mirrors editableSettings' portNumber for dhcp.ha_port: not an address
+ * this box binds but the port in both peers' HA URLs, which Kea's own hook
+ * opens (§6). The message is the server's own. */
+const portNumberSchema = z
+  .string()
+  .trim()
+  .refine((v) => /^\d+$/.test(v) && Number(v) >= 1 && Number(v) <= 65535, {
+    message: "Must be a port number, 1-65535.",
+  });
+
+/** Mirrors editableSettings' domainSuffixOrEmpty for dhcp.domain: empty —
+ * leases get no names at all — or a dotted suffix like `home.lan`. The
+ * server's own grammar (validDomainLabels in zones_handlers.go): letters,
+ * digits, hyphen and underscore per label, no empty label, and no trailing
+ * dot, because this is a value the engine hands out as option 15 rather
+ * than a name in a zone file. */
+const domainSuffixOrEmptySchema = z
+  .string()
+  .trim()
+  .refine((v) => v === "" || /^[A-Za-z0-9_-]+(\.[A-Za-z0-9_-]+)*$/.test(v), {
+    message: "Must be a domain suffix like home.lan, with no trailing dot.",
+  });
+
+/** Mirrors editableSettings' interfaceList for serve.dhcp_interfaces: empty
+ * — Kea binds every interface — or comma-separated names (`eth0`,
+ * `eth0.10`). Whether a name exists on this box is not checked there and is
+ * not checked here: an operator configuring a box before moving a cable is
+ * not making a mistake, and the engine names the interface it could not
+ * find. The rejection quotes the entry, the way the server's does. */
+const interfaceListSchema = z
+  .string()
+  .trim()
+  .superRefine((value, ctx) => {
+    if (value === "") return;
+    for (const part of value.split(",")) {
+      const name = part.trim();
+      if (name === "") {
+        ctx.addIssue({
+          code: "custom",
+          message: "An entry is empty \u2014 separate interface names with one comma.",
+        });
+        return;
+      }
+      if (/[ \t/]/.test(name)) {
+        ctx.addIssue({ code: "custom", message: `\u201c${name}\u201d is not an interface name.` });
+        return;
+      }
+    }
+  });
 
 /** Mirrors editableSettings' `boolean`: exactly "true" or "false", not
  * anything strconv.ParseBool would also accept. In practice the only
@@ -352,6 +412,11 @@ const SETTING_DEFAULTS: Record<string, string> = {
   "sync.token": "",
   "sync.interval_seconds": "30",
   "sync.primary_dns": "",
+  "dhcp.domain": "",
+  "dhcp.lease_seconds": "3600",
+  "dhcp.lease_poll_seconds": "10",
+  "dhcp.ha_port": "8000",
+  "serve.dhcp_interfaces": "",
 };
 
 /**
@@ -365,7 +430,7 @@ const SETTING_DEFAULTS: Record<string, string> = {
  */
 const WRITE_ONLY_KEYS = new Set(["sync.token"]);
 
-// Exhaustiveness: this must list exactly the 23 keys in
+// Exhaustiveness: this must list exactly the 27 keys in
 // internal/api/settings_handlers.go's editableSettings — no fewer (an
 // editable setting the admin can't reach) and no more (a PUT the server
 // would 400 with "setting not editable").
@@ -627,6 +692,56 @@ const SETTING_GROUPS: SettingGroup[] = [
     ],
     render: (control) => <SyncField control={control} />,
   },
+  {
+    title: "DHCP",
+    description:
+      "What the engine hands out, and what dnsaur reads back. Scopes override the first two.",
+    icon: Router,
+    needsDHCP: true,
+    fields: [
+      {
+        key: "dhcp.domain",
+        kind: "text",
+        label: "Lease DNS suffix",
+        // The one setting that decides whether leases resolve at all, so
+        // the line says what empty means rather than describing the format.
+        description: "Empty means leases get no names.",
+        placeholder: "home.lan",
+        schema: domainSuffixOrEmptySchema,
+      },
+      {
+        key: "dhcp.lease_seconds",
+        kind: "int",
+        label: "Lease time (seconds)",
+        description: "The default for scopes that set none.",
+        schema: minIntSchema(300),
+      },
+      {
+        key: "dhcp.lease_poll_seconds",
+        kind: "int",
+        label: "Lease poll interval (seconds)",
+        description: "How often the lease table is read from the engine.",
+        schema: minIntSchema(2),
+      },
+      {
+        key: "dhcp.ha_port",
+        kind: "int",
+        label: "HA port",
+        // Not a port dnsaur binds: Kea's HA hook opens its own listener on
+        // it, and it is the port in both peers' URLs (§6).
+        description: "Where the two engines of a pair reach each other.",
+        schema: portNumberSchema,
+      },
+      {
+        key: "serve.dhcp_interfaces",
+        kind: "text",
+        label: "DHCP interfaces",
+        description: "Empty binds every interface.",
+        placeholder: "eth0, eth0.10",
+        schema: interfaceListSchema,
+      },
+    ],
+  },
 ];
 
 // No Storage/info section: there's no read-only endpoint (DB size, cache
@@ -730,7 +845,7 @@ function buildDefaults(settings: Settings): SettingsFormValues {
 // One schema for the whole form, keyed the same way the form is (sanitized
 // names, not API keys) so the resolver's issue paths land on the right
 // fields. Assembled from the field definitions rather than written out
-// again, which keeps the "exactly editableSettings' 18 keys" guarantee
+// again, which keeps the "exactly editableSettings' 27 keys" guarantee
 // above the single thing to maintain.
 const SETTINGS_SCHEMA = z.object(
   Object.fromEntries(ALL_FIELDS.map((field) => [rhfName(field.key), field.schema])),
@@ -760,8 +875,8 @@ function groupNeedsRestart(group: SettingGroup): boolean {
  */
 const LOCAL_SETTING_PREFIXES = ["instance.", "serve.", "sync."];
 
-function groupIsLocal(group: SettingGroup): boolean {
-  return group.fields.every((f) => LOCAL_SETTING_PREFIXES.some((p) => f.key.startsWith(p)));
+function isLocalKey(key: string): boolean {
+  return LOCAL_SETTING_PREFIXES.some((p) => key.startsWith(p));
 }
 
 /**
@@ -1003,6 +1118,9 @@ function SaveBar({
 function SettingsForm({ settings }: { settings: Settings }) {
   const updateSetting = useUpdateSetting();
   const managedBy = useManagedBy();
+  // Off the status the shell already holds, so the band's absence costs no
+  // request of its own — the same read the nav's DHCP section is gated on.
+  const dhcpEnabled = useDHCPEnabled();
   const { hash } = useLocation();
   // The baseline — what the server last confirmed, per field — is state,
   // because render compares against it: the changed count, the per-field
@@ -1229,26 +1347,38 @@ function SettingsForm({ settings }: { settings: Settings }) {
         />
 
         <div className="min-h-0 flex-1 overflow-y-auto">
-          {SETTING_GROUPS.map((group) => {
+          {SETTING_GROUPS.filter((group) => !group.needsDHCP || dhcpEnabled).map((group) => {
             const restart = groupNeedsRestart(group);
-            // A synced band on a replica: every key in it belongs to the
-            // main, so the form is shown with its values and none of its
-            // controls. A disabled <fieldset> rather than a `disabled` prop
-            // threaded through every input, radio and nested editor —
-            // that is the one thing the element is for, and it cannot miss
-            // a control the way a hand-maintained list would.
+            // A synced key on a replica belongs to the main, so the row is
+            // shown with its value and none of its controls. A disabled
+            // <fieldset> rather than a `disabled` prop threaded through
+            // every input, radio and nested editor — that is the one thing
+            // the element is for, and it cannot miss a control the way a
+            // hand-maintained list would.
+            //
+            // Per field, not per band. The DHCP band is why: four keys the
+            // main owns beside serve.dhcp_interfaces, which names this box's
+            // own NICs and never travels in a bundle. A band that renders
+            // itself gets nothing here — the two that do (Protocols, Sync)
+            // are `serve.`/`sync.` throughout, so every key in them is this
+            // box's and none of them is ever disabled.
             //
             // Wrapped only when it is actually managed, never as an
             // always-present `disabled={false}`: `display: contents` on a
             // fieldset is the one part of this a browser has historically
             // been allowed to ignore, and an unmanaged instance — which is
             // most of them — should not be able to find that out.
-            const managed = managedBy !== "" && !groupIsLocal(group);
             const body = group.render
               ? group.render(form.control)
-              : group.fields.map((field) => (
-                  <SettingRow key={field.key} field={field} control={form.control} />
-                ));
+              : group.fields.map((field) =>
+                  managedBy !== "" && !isLocalKey(field.key) ? (
+                    <fieldset key={field.key} disabled className="contents">
+                      <SettingRow field={field} control={form.control} />
+                    </fieldset>
+                  ) : (
+                    <SettingRow key={field.key} field={field} control={form.control} />
+                  ),
+                );
             return (
               <section
                 key={group.title}
@@ -1290,13 +1420,7 @@ function SettingsForm({ settings }: { settings: Settings }) {
                         ),
                   )}
                 >
-                  {managed ? (
-                    <fieldset disabled className="contents">
-                      {body}
-                    </fieldset>
-                  ) : (
-                    body
-                  )}
+                  {body}
                 </div>
               </section>
             );
@@ -1388,7 +1512,7 @@ function BackupBand() {
 // --- page ------------------------------------------------------------------
 
 /**
- * Settings — the 23 keys in internal/api/settings_handlers.go's
+ * Settings — the 27 keys in internal/api/settings_handlers.go's
  * editableSettings, saved together rather than one at a time.
  */
 export function SettingsPage() {

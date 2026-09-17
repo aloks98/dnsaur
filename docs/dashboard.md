@@ -803,6 +803,169 @@ the affected records after upgrading:
 
 ---
 
+## DHCP
+
+Three screens, and they only exist on a box that has an engine: dnsaur does
+not implement DHCP — ISC Kea does — and the `kea_socket` bootstrap key is the
+switch. Empty (the default) means the section is not in the nav at all, not
+greyed out, because there is nothing behind it to reach. Turning it on is a
+bootstrap change and a restart; see
+[`configuration.md`](configuration.md).
+
+What dnsaur owns is everything you touch. It renders Kea's whole
+configuration from the rows below and sends it over the control socket, and
+it reads the lease table back every `dhcp.lease_poll_seconds`. You never
+edit a Kea config file.
+
+### The engine line
+
+Above the Scopes table, one line saying what the engine is doing:
+
+| Line | Means |
+|---|---|
+| `Engine 2.6.3 · single` | one box, plain Kea, nothing wrong |
+| `Engine 2.6.3 · hot-standby with backup-box · hot-standby` | the pair is up; the name is what the partner calls itself, and the last state is **this** box's. An engine whose `status-get` does not report the name leaves that clause out |
+| `Engine unreachable` | the socket stopped answering. The lease table below is the one the last poll built, and still the truth about the segment |
+| `Config rejected: <Kea's words>` | the last render was refused, with **Apply again** beside it |
+| `DHCP: not in the HA pair` | this box follows a main, and the main did not choose it as the standby — so it runs plain Kea beside a pair it is not in |
+
+A configuration Kea would not take outranks an engine that is not there: it
+is the one you have to act on, and it is still true when the engine comes
+back. Nothing retries a refused configuration on a timer, which is what
+**Apply again** is for — fix what Kea complained about (a hook library, a
+socket permission) and press it.
+
+The same three facts also ride the page-wide warning strip on every other
+screen, so an operator who never opens this section still learns: `DHCP engine
+unreachable`, `DHCP config rejected: <message>`, `DHCP partner unreachable`.
+On the Scopes page the strip carries only the partner line, since the engine
+line above the table already says the other two. All three clear on their own.
+
+### Scopes
+
+A scope is one subnet, rendered as one Kea `subnet4`. The table says how
+full each pool is — `61 / 100` — and that number comes from the engine, not
+from the two ends of the pool: how many addresses are actually leased is a
+fact about the lease database. It can exceed the total after you shrink a
+pool, because the engine keeps what it has already handed out until those
+leases expire.
+
+Rules worth knowing before the form refuses you:
+
+- The subnet is written **masked**. `10.0.0.5/24` is refused rather than
+  quietly saved as `10.0.0.0/24`, because the two look alike in a form and
+  hand out different subnets.
+- The pool must be inside it, in order, and neither end may be the network
+  or the broadcast address.
+- **No two *enabled* scopes may overlap.** A disabled one is rendered into
+  nothing and is exempt in both directions, which is what makes "disable it,
+  then renumber it, then enable it" a usable sequence.
+- **Blank DNS servers is not "no DNS".** It is the automatic answer: this
+  box's address followed by its partner's, the same two in the same order on
+  both boxes, which is what DHCP-level failover needs from DNS. Fill the box
+  only to override that.
+- A blank lease time and a blank DNS suffix fall back to the `dhcp.lease_seconds`
+  and `dhcp.domain` settings. They mean "use the instance default", not "none".
+
+The form has two tabs. **Network** is the subnet itself — everything above.
+**Client options** is everything handed to the clients in it, in five
+groups: names and time (domain search list, NTP servers), routing (classless
+static routes, option 121), PXE boot, generic options by code, and
+behaviour. An option code dnsaur already emits by name (1, 3, 6, 15, 42, 51,
+54, 58, 59, 66, 67, 119, 121) is refused, so one code never has two answers.
+
+A route or option row you added and never filled in is dropped on save — it
+is the empty row the `+` button made, not a mistake. **Half** of one is a
+mistake and is refused: an option with a code and no bytes is a
+configuration the engine would take and nobody meant. The message lands on
+the field it is about, and Save pulls the tab that field is on into view
+rather than appearing to do nothing.
+
+**Ignore client identifier** is the switch for cloned VMs: it makes the engine
+key a lease on the hardware address alone and ignore option 61. Without it, a
+fleet cloned from one image shares a client id and fights over one lease.
+
+Every write renders. The row is saved and the whole configuration is sent in
+one go, and **the save succeeds whatever Kea says** — a configuration it
+refuses leaves your row stored and the engine on its previous one, with the
+refusal on the engine line. Telling you the scope was not saved would be
+false and would leave you with no row to fix.
+
+### Leases
+
+The engine's own table as of the last poll, refreshed on the same interval.
+Rows appear because devices asked for addresses; nothing on this screen
+causes one.
+
+Reservations nothing has leased yet are in the list too, with no expiry —
+a reserved device has a name and an address before its first lease, and the
+empty **Expires in** cell is what tells such a row from a live one.
+`no hostname` means the device offered none: no option 12, no FQDN, and no
+reservation to borrow one from.
+
+- **Reserve** turns the row into a reservation — scope, MAC, address and the
+  device's own name, sanitised to a DNS label so a laptop calling itself
+  "Anna's iPad" does not produce an error about a name you never typed.
+- **Release** hands the address back, and the row goes with it: dnsaur drops
+  it from its own table the moment the engine accepts, rather than waiting
+  for the next poll to rebuild one without it. The name stops answering DNS
+  at the same moment. It is off on a reservation nothing has leased — there
+  is no lease to hand back.
+
+A row whose scope reads `deleted scope` is a lease the engine still holds for
+a subnet dnsaur no longer configures: the scope was deleted and the engine
+keeps what it handed out until those leases expire. **Reserve** is off there,
+because the reservation would have to belong to that scope; **Release** works,
+and is how you take the address back early.
+
+### Reservations
+
+A reservation pins one MAC to one address inside one scope. The address must
+be inside the scope's subnet and may sit inside the pool or outside it — the
+engine keeps a reserved address out of dynamic allocation either way. One
+reservation per MAC per scope, one per address, and one per hostname.
+
+The MAC is stored in one spelling, lowercase `aa:bb:cc:dd:ee:ff`. Type it
+however you like — `AA-BB-CC-DD-EE-FF`, `aabb.ccdd.eeff` — and it is
+normalised before it is sent, so the row you get back is the value you
+entered. Anything longer than six bytes is refused: a DHCPv4 reservation is
+keyed on a 6-byte address, and one the engine cannot match would silently
+never fire.
+
+**The scope cannot be changed after creation.** An address validated against
+one subnet must not be carried into another, so moving a reservation is a
+delete and a re-create. The scope filter in the header is the same one the
+Scopes table's reservations column links to, and it lives in the URL, so it
+survives a reload and can be bookmarked. While it is set the header counts
+what is on screen (`2 in this scope`) and the bar above keeps the total; a
+filter that hides everything says so, with a way back to all of them.
+
+### What DHCP changes elsewhere
+
+- **Names.** A lease gives its device a name under the scope's suffix, answered
+  straight from the table. A record in a zone you hold wins over it: explicit
+  configuration beats inferred state.
+- **Clients.** A client matcher can be `mac:aa:bb:cc:dd:ee:ff`, which follows
+  that device's current lease instead of naming an address. A MAC with no
+  lease matches nothing.
+- **Names on other screens.** The query log's Hostname column and the client
+  rows show the name the *device* gave itself when the lease table has one.
+  A client you have named keeps your name — that is a decision, and the lease
+  name is only a report.
+
+### On a replica
+
+Scopes and reservations are synced configuration, so on a replica every write
+here is the main's: **Managed by the main** sits beside the disabled action,
+and the engine line, the pools and the whole lease table stay readable.
+
+**Release is the exception and stays live.** A lease belongs to the engine
+rather than to the configuration, and Kea's HA propagates the release to the
+partner — so you can hand an address back from whichever box you happen to
+have open.
+
+---
+
 ## Settings
 
 Server-wide configuration, stored in the database. Most of it applies the
@@ -817,6 +980,7 @@ moment you save.
 | **Lists** | How often subscriptions refresh |
 | **Protocols** | Whether clients can reach dnsaur over DNS-over-TLS / DNS-over-HTTPS, and the certificate both present |
 | **Sync** | Who follows this instance's configuration, or whose it takes (see Sync below) |
+| **DHCP** | What the engine hands out by default and how often its leases are read. Only on a box with an engine — the same switch that decides whether the DHCP section is in the nav |
 | **Backup** | Not a setting — a button that copies the database now (see Backup below) |
 
 **Upstream strategy** is one of:
@@ -835,6 +999,15 @@ moment you save.
 - `full` — the client IP as seen
 - `anon` — last octet masked (`192.168.11.104` → `192.168.11.0`)
 - `none` — nothing recorded; history already stored is kept
+
+The **DHCP** band's five: the lease DNS suffix and the lease time are the
+defaults every scope that sets neither falls back to — an empty suffix means
+leases get no names at all; the poll interval is how often the lease table is
+read back; the HA port is where the two engines of a pair reach each other,
+opened by Kea's own hook rather than by dnsaur; and the interface list is
+which NICs the engine binds, empty meaning all of them. On a replica the
+first four belong to the main and show with no controls — the interface list
+does not, because it names this box's own NICs.
 
 ### Protocols
 
@@ -924,6 +1097,14 @@ box's secret and takes its address back out of the transfer allow. Nothing
 removes one automatically — a box that is down for an afternoon is not a box
 whose permission should quietly disappear — so a replica you have actually
 retired is yours to forget here.
+
+**If that replica is the DHCP standby, promote it or stop its engine first.**
+Forget revokes its pull secret with its row, so the cleared pair never
+reaches it: its Kea keeps the pair it was last given, sees the main stop
+talking to it, and goes partner-down — serving the whole segment on its own.
+Press **Stop following** on that box's own Sync band, or stop its
+`kea-dhcp4`, and then forget it here. See
+[`configuration.md`](configuration.md#a-pair).
 
 **On a replica**, the peer it follows and how it is getting on:
 

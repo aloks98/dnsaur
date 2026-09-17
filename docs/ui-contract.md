@@ -520,7 +520,7 @@ Path ids must parse as int64 **and be > 0**, else 400 `bad id`. So `0`, `-1`,
 | 400 | `name required` | groups: `name` missing or empty |
 | 400 | `name cannot be empty` | PATCH with `"name": ""` |
 | 400 | `list_ids names list <id>, which does not exist` | `POST /groups` with an unknown list id; nothing is created |
-| 400 | `matcher must be an IP or CIDR and group_id set` | clients: bad matcher or missing group_id (decode failure is `invalid json`) |
+| 400 | `matcher must be an IP or CIDR without an interface zone, or mac:<hardware address>, and group_id set` | clients: bad matcher or missing group_id (decode failure is `invalid json`) |
 | 400 | `group_id does not name an existing group` | `POST`/`PUT /clients` naming a group that isn't there |
 | 409 | `resource in use` | deleting group id 1, or a group with clients attached |
 | 409 | `a group with that name already exists` | duplicate name on create **or** rename |
@@ -1149,9 +1149,13 @@ key, and `DELETE` refuses it with `409 resource in use` while it is
 designated. There is no select and nothing to choose.
 
 `GET /sync/version` is also the **heartbeat**: there is no registration call.
-The main stamps the calling replica's `last_seen` from the request and its
+The main stamps the calling replica's `last_seen` from the request, its
 `version_applied` from `?applied=N` — absent, unparseable or negative is `0`,
-which is what a box that has only just paired truthfully reports. `dns_port`
+which is what a box that has only just paired truthfully reports — and its
+`dhcp` from `?dhcp=1`, which a replica sends while its own `kea_socket` names
+an engine. Anything else is `false`, including an older replica that sends
+neither, so a main only ever pairs DHCP with a box it has heard say it runs
+an engine. `dns_port`
 is what a replica joins its peer URL's host to when `sync.primary_dns` names
 no override. A box forgotten between presenting its secret and being stamped
 gets the same `401` a wrong secret gets: the answer it needs is to pair
@@ -1178,6 +1182,61 @@ three intervals is shown as stale and **never removed automatically**; the
 operator removes one, because a box that is down for an afternoon is not a
 box whose transfer allow should quietly disappear.
 
+### 2.12 DHCP
+
+dnsaur does not implement DHCP: ISC Kea (`kea-dhcp4`) serves the protocol and
+dnsaur owns everything an operator touches, rendering the engine's whole
+configuration and sending it over Kea's unix control socket.
+
+**The `kea_socket` bootstrap key is the switch.** Empty — the default — means
+DHCP is off, and every route here except `GET /dhcp/status` answers **404**
+`{"error": "dhcp is not enabled"}`; the status route answers
+`{"enabled": false}`, because "is DHCP running here" is exactly what it is
+for. 404 rather than 503: nothing is temporarily unavailable, and turning
+DHCP on is a bootstrap change and a restart.
+
+| Endpoint | Success | Notes |
+|---|---|---|
+| `GET /dhcp/scopes` | 200 `DHCPScope[]` | ordered by id |
+| `POST /dhcp/scopes` | 201 the scope, `Location` | **400** the validator's own message, **409** `managed by <peer_url>` on a replica |
+| `PATCH /dhcp/scopes/{id}` | 204 | a **merge** — every key the body omits keeps its value. `match_client_id` absent means *unchanged* here and *true* on a create |
+| `DELETE /dhcp/scopes/{id}` | 204 | its reservations go with it |
+| `GET /dhcp/reservations` | 200 `DHCPReservation[]` | every scope's, ordered by id — the config is rendered from all of them at once |
+| `POST /dhcp/reservations` | 201 the reservation, `Location` | **404** `scope_id` names no scope, **409** a collision inside that scope |
+| `PATCH /dhcp/reservations/{id}` | 204 | a merge; **`scope_id` may not move** |
+| `DELETE /dhcp/reservations/{id}` | 204 | |
+| `GET /dhcp/leases` | 200 `DHCPLease[]` | the table as of the last poll, ordered by address |
+| `DELETE /dhcp/leases/{ip}` | 204 | `lease4-del` on this box's own engine, and the row leaves dnsaur's table before the answer rather than at the next poll. **Not refused on a replica.** **404** with the engine's words when it holds no such lease, **503** when it cannot be reached |
+| `POST /dhcp/leases/{ip}/reserve` | 201 the reservation, `Location` | no body — built from the table entry |
+| `GET /dhcp/status` | 200 `DHCPStatus` | the one route that answers on a box with no engine |
+| `POST /dhcp/apply` | 200 `DHCPStatus` | re-render and `config-set` now |
+
+**Scopes and reservations are synced configuration** — the ids travel in the
+bundle, so a scope means the same row on the main and on its replica — so
+every write to them is **409** `managed by <peer_url>` on a replica.
+`DELETE /dhcp/leases/{ip}` is the one exception and stays live there: a lease
+belongs to the engine rather than to the configuration, and Kea's HA
+propagates the release to the partner.
+
+**Every write renders**: the row is stored, then the whole `Dhcp4` object is
+built and sent as one `config-set`. **The answer is the normal 200/201
+whatever the engine says** — a config Kea refuses leaves the row stored and
+the engine on its previous configuration, and the refusal is in
+`GET /dhcp/status` until a render is accepted. A 5xx there would tell the
+caller the scope was not saved, which is false, and would leave them with no
+row to fix. Nothing retries a refused config on a timer; `POST /dhcp/apply`
+is the "Apply again" that re-sends it, and answers `200` with the status
+object *that* render left behind rather than 204, so the caller reads the
+message this apply produced instead of the state before it.
+
+`GET /resolver/status` carries the same status object as `dhcp`, which is
+what the shell's warning strip and the nav's section gating both read (§6.4).
+
+`dhcp.domain`, `dhcp.lease_seconds`, `dhcp.lease_poll_seconds` and
+`dhcp.ha_port` are ordinary editable settings (§2.3); `dhcp.ha_primary` and
+`dhcp.ha_standby` are internal and are stripped from `GET /settings` and
+refused on `PUT`.
+
 ---
 
 ## 3. Entities
@@ -1199,7 +1258,8 @@ box whose transfer allow should quietly disappear.
 | `upstream` | string | `host:port` | **`""` = never left the box** (blocked/authoritative/cached/stale/error) |
 | `r_code` | string | `NOERROR`, `NXDOMAIN`, `SERVFAIL`, `REFUSED`, … | |
 | `duration_ms` | int64 | whole ms, truncated | sub-millisecond answers record `0` |
-| `matched` | string | rule pattern or list entry | **`""` = nothing matched**, and `""` on every row logged before migration 0015 added the column (not backfilled) |
+| `matched` | string | rule pattern, list entry, or `dhcp` | **`""` = nothing matched**, and `""` on every row logged before migration 0015 added the column (not backfilled). `dhcp` is a name answered from the DHCP lease table |
+| `hostname` | string | lease hostname | **absent, not empty**, when DHCP is off and when no lease holds `client_ip`; and on every row while `qlog.privacy=anon`, because anonymising only zeroes the last octet and the `.0` left behind is an address a scope can hand out. Joined on at read time — nothing is stored, so an old row shows whoever holds that address *now* |
 
 **`decision` enum** (`internal/dnssrv/pipeline.go:12-20`):
 
@@ -1351,7 +1411,7 @@ creation; only `name` and `enabled` are mutable.
 |---|---|---|
 | `id` | int64 | accepted in POST bodies but ignored |
 | `name` | string | **not validated, may be empty** |
-| `matcher` | string | exact IP **or** CIDR; **DB-unique**; **stored canonically**, not as sent |
+| `matcher` | string | exact IP, CIDR **or** `mac:<hardware address>`; **DB-unique**; **stored canonically**, not as sent |
 | `group_id` | int64 | must be `> 0`; **not checked against an existing group** — a bad id fails the FK and returns 503 |
 
 Matching: exact-IP map first, then CIDR list **longest-prefix-first**.
@@ -1364,11 +1424,21 @@ plain IPv4 client. No match → `group_id 1`, hardcoded
 masked (`10.0.0.1/24` → `10.0.0.0/24`) and an IPv4-mapped form is unmapped
 (`::ffff:10.0.0.0/120` → `10.0.0.0/24`, `::ffff:192.0.2.5` → `192.0.2.5`), so
 `GET` returns the spelling that will actually be compared. A mapped prefix
-shorter than `/96` is not a v4 range and is rejected.
+shorter than `/96` is not a v4 range and is rejected. A `mac:` matcher is
+canonicalised the way every MAC in dnsaur is — lowercase colon form, so
+`mac:AA-BB-CC-DD-EE-FF` and `mac:aabb.ccdd.eeff` are both stored as
+`mac:aa:bb:cc:dd:ee:ff` — and anything after `mac:` that is not a 6-byte
+hardware address is a `400`.
+
+**A `mac` matcher names a NIC, not an address.** The registry resolves it
+through the DHCP lease table and re-resolves it on every poll, so a device
+keeps its group across a renewal that moved it. A MAC the lease table has no
+entry for **matches nothing** — it does not fall back to anything — which is
+also what every `mac` matcher does on an instance with DHCP switched off.
 
 > **IPv6 zone ids are now rejected**, both as an address and as a prefix:
 > `fe80::1%eth0` returns `400 matcher must be an IP or CIDR without an
-> interface zone, and group_id set`. The request-side address is built with
+> interface zone, or mac:<hardware address>, and group_id set`. The request-side address is built with
 > `netip.AddrFromSlice`, which never carries a zone (the UDP and TCP arms of
 > `Server.serve`'s `RemoteAddr` switch, `internal/dnssrv/server.go`), so such
 > a matcher could only ever be dead config. A stored row that predates this
@@ -1553,6 +1623,11 @@ Full editable allowlist. Values are always strings on the wire.
 | `sync.token` | *(empty)* | any string — **write-only, never in `GET /settings`** | **hot** |
 | `sync.interval_seconds` | `30` | int ≥ 5 | **hot** |
 | `sync.primary_dns` | *(empty)* | empty, or `host:port` with the **host present** | **hot** |
+| `dhcp.domain` | *(empty)* | empty, or a domain suffix like `home.lan` — **no trailing dot** | **hot** |
+| `dhcp.lease_seconds` | `3600` | int ≥ 300 | **hot** — the next render sends it |
+| `dhcp.lease_poll_seconds` | `10` | int ≥ 2 | **hot** — re-read on every tick |
+| `dhcp.ha_port` | `8000` | int 1-65535 | **hot** — the next render sends it |
+| `serve.dhcp_interfaces` | *(empty)* | empty, or comma-separated interface names (`eth0`, `eth0.10`) | **hot** — the next render sends it |
 
 No upper bound on any integer key. Two have a lower bound above zero, and
 both are rejected with `must be a whole number, one or more`:
@@ -1597,17 +1672,68 @@ and a 30-day sliding expiry; an API token has `expires_at: 0` (never) unless one
 was chosen at creation, and that one never slides. Token material is
 32 random bytes, base64url for the plaintext, SHA-256 hex stored.
 
-### 3.11 DHCP lease — **TODO, nothing exists**
+### 3.11 DHCP
 
-There is no lease entity, no table, no route, no UI type, and no `:67` listener.
-A case-insensitive search for `dhcp` across all Go, SQL, and TypeScript files
-returns **zero implementation hits**. The only occurrences are prose: the README
-feature table (`| DHCP | Planned |`), the architecture doc's "Phase 2 … not yet
-present", and one line in `openapi.yaml:6` describing the project as a
-"DNS/DHCP server" — which is aspirational; no DHCP path is defined in that
-document either.
+Three entities and a status object. Scopes and reservations are rows dnsaur
+stores and syncs; a **lease is not a row** — it is read from the engine every
+`dhcp.lease_poll_seconds` and the table is replaced whole, so nothing about a
+lease survives a restart of either process.
 
-Anything a UI shows for DHCP today would be invented.
+**Scope** — one subnet, rendered as one Kea `subnet4`.
+
+| Field | Type | Notes |
+|---|---|---|
+| `id` | int64 | travels in the sync bundle, so it names the same row on both boxes |
+| `name` | string | non-empty, unique |
+| `cidr` | string | an IPv4 prefix **in masked form**. Host bits set are refused rather than quietly masked. No two *enabled* scopes may overlap |
+| `pool_start`, `pool_end` | string | both inside `cidr`, `start <= end`, neither the network nor the broadcast address. Both may be empty **only** when `reservations_only` |
+| `gateway` | string | option 3; `""` hands out no router. Must be inside `cidr` |
+| `dns_servers` | string | comma-separated, option 6, stored one entry per comma with a single space after it — what was typed is trimmed. **`""` is not "no DNS"** — it is the automatic answer, this box's address then its HA partner's, the same two in the same order on both boxes |
+| `domain` | string | option 15; a domain suffix like `home.lan` with **no trailing dot**, the same grammar the `dhcp.domain` setting it overrides is held to. `""` falls back to that setting |
+| `lease_seconds` | int | 300 or more, or **`0` to use the `dhcp.lease_seconds` setting**. A scope that sets one also gets its own renew/rebind timers |
+| `enabled` | bool | a disabled scope renders into nothing and is exempt from the overlap rule in both directions |
+| `domain_search` | string | option 119, comma-separated suffixes |
+| `ntp_servers` | string | option 42, comma-separated IPv4 |
+| `static_routes` | `{destination, router}[]` | option 121. Each router must be inside `cidr` — a router reachable only through the route it announces is not a route |
+| `next_server`, `server_hostname`, `boot_file` | string | PXE's siaddr, sname (option 66, ≤63 bytes) and file (option 67, ≤127 bytes) |
+| `options` | `{code, hex}[]` | every code with no field of its own. A code the renderer already emits by name (1, 3, 6, 15, 42, 51, 54, 58, 59, 66, 67, 119, 121) is refused, so one code never has two answers |
+| `match_client_id` | bool | `false` keys a lease on the hardware address alone and ignores option 61 — what cloned VMs sharing a client id need. **Absent means `true` on a create and *unchanged* on a `PATCH`**, the one field where those differ |
+| `reservations_only` | bool | renders the subnet with no pool |
+| `created_at`, `modified_at` | int64 | unix ms |
+
+**Reservation** — a fixed address for one MAC inside one scope.
+
+| Field | Type | Notes |
+|---|---|---|
+| `id` | int64 | |
+| `scope_id` | int64 | **fixed once created**: a `PATCH` may not move one, because an address validated against one subnet must not be carried into another. Delete and recreate |
+| `mac` | string | stored canonically as lowercase `aa:bb:cc:dd:ee:ff` from anything `net.ParseMAC` takes. Longer than six bytes is refused — a DHCPv4 reservation is keyed on a 6-byte address, and one the engine cannot match would silently never fire. Unique within the scope |
+| `ip` | string | inside the scope's `cidr` and not its gateway. May sit inside the pool or outside it; the engine keeps it out of dynamic allocation either way. Unique within the scope |
+| `hostname` | string | one RFC 1123 label — not a dotted name, the suffix comes from the scope — or `""`. Unique within the scope, case-insensitively, when set |
+| `comment` | string | |
+
+**Lease** — one row of the table as of the last poll.
+
+| Field | Type | Notes |
+|---|---|---|
+| `scope_id` | int64 | the subnet the engine handed it out of |
+| `ip`, `mac` | string | `mac` canonical lowercase |
+| `hostname` | string | the client's own name (option 12 or FQDN), or the reservation's when the client sent none; `""` when neither |
+| `expires_at` | int64 | unix ms, and **`0` for a reservation nothing has leased yet** — the one field that tells such a row from a live lease |
+| `reserved` | bool | a reservation pins either this MAC or this address in this scope |
+
+**Status** — from `GET /dhcp/status`, and carried by `GET /resolver/status`
+as `dhcp`.
+
+| Field | Type | Notes |
+|---|---|---|
+| `enabled` | bool | **read this first.** `false` — `kea_socket` empty — is the whole answer on a box with no engine, and everything below is `omitempty` |
+| `engine` | string | `ok`, `unreachable` or `config rejected`. A configuration the engine would not take **outranks** an engine that is not there: it is the one an operator has to act on, and it is still true when the engine comes back |
+| `engine_version` | string | what `version-get` reported, e.g. `2.6.3` |
+| `message` | string | the engine's own words — its refusal of the last `config-set`, or why it could not be reached. Cleared by the next render it accepts |
+| `table_age_seconds` | int64 | how stale the lease table is. An engine that stops answering keeps the table it last gave, which is still the truth about the segment |
+| `ha` | object or absent | `{mode, local_state, peer, remote_state, communication_interrupted, unacked_clients}`. **Absent on a single box**, and on an engine too old to know `status-get`'s HA block — a different fact from a pair that is not talking. `peer` is what the partner calls itself, as the engine talking to it reports the name, and is **absent** on an engine whose `status-get` does not carry one — so the status line has to read as "hot-standby" with no partner named, the same way it does for a box with no pair at all |
+| `scopes[]` | array | `{id, pool_size, leased}` per scope the last render saw. `leased` **may exceed** `pool_size` after a pool is shrunk: the engine keeps what it has already handed out until those leases expire |
 
 ### 3.12 Never serialized
 
@@ -1633,7 +1759,7 @@ else. From `GET /sync/status` and from `GET /resolver/status`'s `sync`.
  "last_error":"","plain_http":false}
 {"role":"main","sync_key":"sync-k3n9wq.",
  "replicas":[{"instance_id":"V1StGXR8Z5jdHi6BmyT","dns_addr":"10.0.0.6:53",
-              "version_applied":412,"last_seen":1757580030000,"stale":false}]}
+              "version_applied":412,"last_seen":1757580030000,"stale":false,"dhcp":true}]}
 ```
 
 | Field | Role | Meaning |
@@ -1646,7 +1772,7 @@ else. From `GET /sync/status` and from `GET /resolver/status`'s `sync`.
 | `last_error` | both | on a replica, why the last pull failed, `""` when it did not — a failed pull leaves the previous config in force, DNS unaffected. On a main it is `sync.replicas` unreadable, which is a main that admits no transfer and notifies nobody |
 | `plain_http` | replica | the peer is `http://`, so the bundle (TSIG secrets included) crosses in the clear on every pull. Persistent while it is true; there is no certificate subsystem and this warning is the whole mitigation |
 | `sync_key` | main | the **name** of the TSIG key replicas transfer under — the main creates it on the first pairing and nobody picks it — or `""` when no replica has paired yet, or when `sync.tsig_key_id` names a key that is gone |
-| `replicas[]` | main | `instance_id`, `dns_addr`, `version_applied`, `last_seen` (unix ms, stamped by the main), `stale`. An entry appears the moment that box pairs and is refreshed by every version probe; `stale` is three `sync.interval_seconds` without one. Never the replica's secret, in any form |
+| `replicas[]` | main | `instance_id`, `dns_addr`, `version_applied`, `last_seen` (unix ms, stamped by the main), `stale`, `dhcp`. An entry appears the moment that box pairs and is refreshed by every version probe; `stale` is three `sync.interval_seconds` without one, and `dhcp` is whether that box's last probe said it runs a DHCP engine — `false` until one has, which is why the DHCP pair appears an interval after pairing rather than at it. Never the replica's secret, in any form |
 
 ---
 
@@ -1994,6 +2120,84 @@ the Sync band beside the peer it describes. The strip is for the two facts
 that are wrong and can stop being wrong — a strip that also warned about the
 normal case is a strip an operator learns to skip.
 
+### 6.4 DHCP: the section, the engine line and the replica rule
+
+**The whole section is conditional.** Every reader of the nav — the top bar's
+groups, its row-2 tabs, and the command palette — goes through one list that
+drops the DHCP group when `GET /resolver/status`'s `dhcp.enabled` is `false`,
+which is what a box with an empty `kea_socket` reports (§3.11). Not greyed
+out: there is nothing behind it, and every route but the status answers 404.
+An unanswered status reads as "off", which is the answer that changes nothing.
+The *routes* stay mounted either way, so an old link to `/dhcp` lands on the
+screen that says the engine is gone rather than on the not-found page.
+
+Three screens, and each gets its own row-2 readout in the chrome, from the
+query the page below already holds:
+
+> `<n> scopes · <leased> leased of <pool>` — `LIVE · every <n> s` — `<n> reservations · <n> scopes`
+
+Those three cells are **not uppercased** like the rest of the bar (the role
+chip is the other exception): they carry counts and an interval, and
+`every 10 s` shouted as `EVERY 10 S` reads as a unit nobody uses.
+
+**The engine line** sits above the Scopes table on `--card`, as a mono
+`ENGINE` label, a 7px square and one sentence. Verbatim, one of:
+
+> `Engine <version> · <mode> with <peer> · <local state>` — the pair is up;
+> `<peer>` is `ha.peer`, and the last state is this box's. With no `ha.peer`
+> the clause is dropped: `Engine <version> · <mode> · <local state>`
+> `Engine <version> · single` — no HA block, and this box follows nobody
+> `Engine unreachable` — destructive tone and dot
+> `Config rejected: <the engine's own message>` — destructive, with an
+> outline **Apply again** inline
+> `DHCP: not in the HA pair` — a **replica** with no HA block: the main did
+> not choose it as the standby, so it runs plain Kea beside a pair it is not
+> in. `single` would be true of the engine and wrong about the network
+
+The peer is `ha.peer` and **nothing else**. The only other name this box
+holds for the other one is its *config-sync* peer — a different fact that
+merely usually refers to the same box — so when the engine reports no name
+the clause goes rather than being filled from there.
+
+**The scope dialog is two tabs**, `Network` (the subnet) and `Client
+options` (what is handed to its clients, in five sections). Network is the
+default. A refusal on a field in the other tab **switches to that tab on
+submit**: a message on a panel nobody is looking at is a Save that did
+nothing and said nothing. A static-route or generic-option row left entirely
+blank is **dropped** before validation — it is the row the `+` button
+appended — while a half-filled one is refused with the message on the field
+it is about and `aria-invalid` on it.
+
+**The three strip facts** (§6.3's list, extended) are derived from the same
+`dhcp` object and watched by the same trouble poll, so a line and the poll
+that clears it cannot drift apart:
+
+> `DHCP engine unreachable`
+> `DHCP config rejected: <message>`
+> `DHCP partner unreachable` — HA `communication_interrupted`
+
+All three end without anyone doing anything — a restarted engine answers, a
+rebooted partner comes back, a refused configuration clears on the next
+accepted render — so the 5 s trouble poll takes them down. DHCP being *off*
+gets no line: that is what most instances are. On the Scopes page itself the
+strip carries only the partner line: the engine's line at the top of that
+page already says the other two, with **Apply again** beside it.
+
+**Replica mode.** Scopes and reservations are synced configuration, so the
+§6.1 rule applies unchanged: `Managed by the main` beside the disabled action,
+every read live.
+
+| Screen | Disabled while managed | Still live |
+|---|---|---|
+| DHCP → Scopes | New scope, Edit, Delete, the per-row enabled switch, Add reservation, **Apply again** | the engine line, the pool numbers, the reservations links |
+| DHCP → Leases | **Reserve** | **Release**, and the whole table |
+| DHCP → Reservations | New reservation, Edit, Delete | the scope filter, and the whole table |
+
+`Release` is the one DHCP write that stays live on a replica, and the server
+agrees: a lease belongs to the engine rather than to the configuration, and
+Kea's HA propagates the release to the partner. `Apply again` does *not*,
+because the render it triggers is a config write.
+
 ---
 
 ## 7. Loading / empty / error states
@@ -2133,6 +2337,9 @@ an inline script because the served CSP is `script-src 'self'` with no
 | Filtering → Groups & Clients | `/filtering/clients` |
 | Zones | `/zones` |
 | Zone detail | `/zones/{id}` |
+| DHCP → Scopes | `/dhcp` (the section's own first screen, not a redirect) |
+| DHCP → Leases | `/dhcp/leases` |
+| DHCP → Reservations | `/dhcp/reservations` (reads `?scope=<id>`) |
 | Settings | `/settings` |
 | TSIG keys | `/tsig-keys` |
 | Account & security | `/account` |
@@ -2146,23 +2353,24 @@ an inline script because the served CSP is `script-src 'self'` with no
 | **Filtering → Groups & Clients** | CRUD works, but the per-group "Lists (n)" menu has **no error state**: it's disabled only while `isPending`, not on `isError`, and its toggle rebuilds the assignment set from `groupLists.data ?? []`. If that read failed, clicking one list PUTs `[thatOne]` and **silently drops every other assignment**. |
 | **Filtering → Lists** | The table leads with the list's `name`; the URL is a muted second line and stays in the row's `title`. Actions (toggle, rename, delete) are labelled by name. The **Status** column replaces the old "Last refreshed" one and carries the badge plus a plain-language line per `last_status`. |
 | **Dashboard health** | Reduced to the shell's two row-1 readouts (blocking state, and `DNS OK`/`DNS down` from `GET /health`, whose `version` is the readout's `title`). Filter-list freshness moved off the dashboard with the redesign and now lives only on Filtering → Lists. The spec's "upstreams healthy" signal **has no code at all** — there is no upstream-health endpoint. |
-| **Settings** | All 23 editable keys work, across seven bands (the last two — Protocols and Sync — rendered wholesale rather than as label+input rows). The spec's "storage (read-only info)" section is absent, with a code comment noting no endpoint exists to source it. |
+| **Settings** | All 27 editable keys work, across eight bands (Protocols and Sync are rendered wholesale rather than as label+input rows; the DHCP band is shown only on a box whose `resolver/status.dhcp.enabled` is true, exactly as the nav is). The spec's "storage (read-only info)" section is absent, with a code comment noting no endpoint exists to source it. |
 | **Account** | TOTP, tokens and password are complete: the Password section holds a current/new/confirm form and a **Log out everywhere** action (`POST /auth/password`, `DELETE /auth/sessions`, §2.2). |
-| **Command palette** | Navigates to the 9 leaf pages only, grouped by nav section. The spec's "quick actions (pause, block a domain)" don't exist. |
+| **Command palette** | Navigates to leaf pages only, grouped by nav section, and hides the DHCP group on a box with no engine exactly as the top bar does (§6.4). The spec's "quick actions (pause, block a domain)" don't exist. |
 
 ### Not started
 
 | Screen | Status |
 |---|---|
 | **404 / unknown route** | renders a dedicated not-found screen inside the shell, no group marked in row 2 (`pages/not-found.tsx`) — this table is stale on this point in older captures; `path="*"` no longer redirects |
-| **DHCP** | nothing exists (§3.11) |
 | **DNSSEC** | **deferred by decision (2026-09-08), not a gap awaiting work** — no signing, no validation, no UI; validation is scheduled with own-recursion, signing with a hosted zone that needs a DS (README status table, main design spec decisions). Every other zone type on this row has now shipped and left it: `secondary` in D2–D4 (D2 the transfer client, D3 the AXFR server gated by `allow_transfer`, D4 NOTIFY in both directions — §9.18), and `forwarder` and `stub` in D6 (create/patch, the conditional routing table, the stub's SOA/NS fetch, and both page shapes — §3.8, §2.6). **Reverse zones were never on this list either**: `PTR` is a normal record type, a reverse zone is an ordinary `primary` zone ending in `.arpa`, the RFC 6303 §4 built-ins (`internal/store/builtins.go`'s `BuiltinZones`) are seeded as `type: internal` (read-only, `409` on any write), and an A/AAAA write maintains the matching PTR server-side in the same request |
 | **HA / cluster UI** | no code; the spec anticipated a health-strip stub, which does not exist |
 
-The nav contains exactly the nine implemented leaf routes, in four groups
+The nav contains exactly the implemented leaf routes, in five groups
 (Monitor: Dashboard, Query Log · Filtering: Lists, Rules, Groups & Clients ·
-Zones: Zones · System: Settings, TSIG keys, Account) — there are no dead nav
-entries pointing at unbuilt screens. The group holding Zones is internally still
+Zones: Zones · DHCP: Scopes, Leases, Reservations · System: Settings, TSIG
+keys, Account) — there are no dead nav entries pointing at unbuilt screens.
+DHCP is the one group that is conditional rather than constant: it is dropped
+whole on an instance with no engine (§6.4), which is most of them. The group holding Zones is internally still
 named `network` (a stable id for keys/tests), but its label and only child
 are both "Zones" — it replaced the flat Local DNS override table, not just
 its own nav entry. Theme and log out live under System too; the shell has
@@ -2416,7 +2624,11 @@ Go source. **The code is the source of truth.**
 10. `openapi.yaml` describes the SSE stream without noting the absent
     `event:`/`id:` fields, the absent heartbeat, or the 64-entry
     drop-on-slow-consumer behaviour.
-11. `openapi.yaml:6` calls the project a "DNS/DHCP server". No DHCP exists.
+11. ~~`openapi.yaml:6` calls the project a "DNS/DHCP server". No DHCP
+    exists.~~ **Resolved.** DHCP shipped: the routes are §2.12, the entities
+    §3.11, the screens §6.4. dnsaur still does not implement the protocol —
+    ISC Kea serves it and dnsaur owns the configuration and the lease table —
+    but the description is no longer aspirational.
 12. The spec's "session expired" message on a mid-session 401 is **not
     implemented** — no such string exists in the client.
 13. The spec's "keeps retrying" behaviour for the API-unreachable banner is

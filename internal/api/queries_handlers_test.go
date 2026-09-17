@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"strconv"
 	"strings"
 	"testing"
@@ -278,6 +279,96 @@ func TestStatsHoursIsClamped(t *testing.T) {
 		}
 		if strings.Contains(w.Body.String(), `"total":0`) {
 			t.Errorf("GET %s answered an empty window: %s", path, w.Body.String())
+		}
+	}
+}
+
+// TestQueryLogRowsCarryLeaseHostnames: the query log stores an address, and
+// a row that says only 10.0.0.5 leaves the operator to work out which device
+// that was. The lease table knows, so the rows are decorated with the name
+// as they are read — nothing is stored, and an address the table has no
+// lease for carries no field at all rather than an empty one.
+func TestQueryLogRowsCarryLeaseHostnames(t *testing.T) {
+	srv, s, _ := testServer(t, func(d *Deps) {
+		d.LeaseHostname = func(ip netip.Addr) (string, bool) {
+			return "my-laptop", ip == netip.MustParseAddr("10.0.0.5")
+		}
+	})
+	cookie := login(t, srv, s)
+	seedAPIQlog(t, s)
+
+	w := doReq(t, srv.Handler(), "GET", "/api/v1/queries", "", cookie)
+	if w.Code != 200 {
+		t.Fatalf("search: %d %s", w.Code, w.Body.String())
+	}
+	rows := rowsByClient(t, w.Body.Bytes())
+	if got, ok := rows["10.0.0.5"]["hostname"]; !ok || got != "my-laptop" {
+		t.Errorf("leased row hostname = %v (present %v), want my-laptop", got, ok)
+	}
+	if _, ok := rows["10.0.0.6"]["hostname"]; ok {
+		t.Errorf("a row with no lease carries a hostname field: %v", rows["10.0.0.6"])
+	}
+	// The row is otherwise untouched: the decoration adds a field, it does
+	// not replace the entry.
+	if got := rows["10.0.0.5"]["q_name"]; got != "a.example" {
+		t.Errorf("decorated row q_name = %v, want a.example", got)
+	}
+}
+
+// TestQueryLogRowsCarryNoHostnamesWithoutDHCP: with no lease table behind
+// the server there is nothing to join against, and every row has to come
+// back exactly as it is stored.
+func TestQueryLogRowsCarryNoHostnamesWithoutDHCP(t *testing.T) {
+	srv, s, _ := testServer(t)
+	cookie := login(t, srv, s)
+	seedAPIQlog(t, s)
+
+	w := doReq(t, srv.Handler(), "GET", "/api/v1/queries", "", cookie)
+	if w.Code != 200 {
+		t.Fatalf("search: %d %s", w.Code, w.Body.String())
+	}
+	for ip, row := range rowsByClient(t, w.Body.Bytes()) {
+		if _, ok := row["hostname"]; ok {
+			t.Errorf("row for %s carries a hostname with DHCP off: %v", ip, row)
+		}
+	}
+}
+
+func rowsByClient(t *testing.T, body []byte) map[string]map[string]any {
+	t.Helper()
+	var rows []map[string]any
+	if err := json.Unmarshal(body, &rows); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	byClient := map[string]map[string]any{}
+	for _, r := range rows {
+		byClient[fmt.Sprint(r["client_ip"])] = r
+	}
+	return byClient
+}
+
+// TestQueryLogRowsCarryNoHostnameWhenAnonymised: anonymising a client IP only
+// zeroes its last octet, so the stored 10.0.0.0 of an anon install can be a
+// real address inside a DHCP scope — and joining the lease table on it would
+// hand back the name of whichever device holds it, undoing the setting the
+// operator turned on.
+func TestQueryLogRowsCarryNoHostnameWhenAnonymised(t *testing.T) {
+	srv, s, _ := testServer(t, func(d *Deps) {
+		d.LeaseHostname = func(netip.Addr) (string, bool) { return "my-laptop", true }
+	})
+	srv.deps.Logger = qlog.New(&nullQLStore{}, qlog.Options{
+		InstanceID: "i", FlushEvery: time.Hour, BatchSize: 100, Privacy: "anon",
+	})
+	cookie := login(t, srv, s)
+	seedAPIQlog(t, s)
+
+	w := doReq(t, srv.Handler(), "GET", "/api/v1/queries", "", cookie)
+	if w.Code != 200 {
+		t.Fatalf("search: %d %s", w.Code, w.Body.String())
+	}
+	for ip, row := range rowsByClient(t, w.Body.Bytes()) {
+		if _, ok := row["hostname"]; ok {
+			t.Errorf("row for %s carries a hostname under qlog.privacy=anon: %v", ip, row)
 		}
 	}
 }

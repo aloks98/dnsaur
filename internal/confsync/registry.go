@@ -273,7 +273,7 @@ func (g *Registry) Authenticate(ctx context.Context, secret string) (string, boo
 // An id that is not registered is an error rather than a silent no-op: it is
 // a replica that was forgotten here, and the answer it needs is that it has
 // to pair again, not a 204.
-func (g *Registry) Heartbeat(ctx context.Context, instanceID string, applied int64) error {
+func (g *Registry) Heartbeat(ctx context.Context, instanceID string, applied int64, dhcp bool) error {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	all, err := g.load(ctx)
@@ -286,6 +286,9 @@ func (g *Registry) Heartbeat(ctx context.Context, instanceID string, applied int
 	}
 	rec.LastSeen = g.now().UnixMilli()
 	rec.VersionApplied = applied
+	// The probe's answer every time, never a latch: an engine that was
+	// turned off is a standby the main has to stop naming.
+	rec.DHCP = dhcp
 	all[instanceID] = rec
 	return g.save(ctx, all)
 }

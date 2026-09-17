@@ -1058,3 +1058,82 @@ func TestSettingsPutMap(t *testing.T) {
 		}
 	})
 }
+
+// TestDHCPSettings pins §4.2's four editable DHCP keys and the two the
+// renderer owns.
+//
+// The floors are not taste. A lease measured in seconds has every client on
+// the segment renewing continuously, and a poll per second is a hundred
+// commands a minute at the engine for no new information — both are values
+// an operator types once and lives with, so the refusal has to happen at the
+// save. dhcp.ha_primary and dhcp.ha_standby are the pair the main's renderer
+// chose: editing either would tell one box it is in a pair the other has
+// never heard of, so they are invisible on the way out and refused on the
+// way in, exactly as the rollup watermark and the sync bookkeeping are.
+func TestDHCPSettings(t *testing.T) {
+	srv, s, _ := testServer(t)
+	cookie := login(t, srv, s)
+	h := srv.Handler()
+	_ = s.Settings().SetInternal(t.Context(), "dhcp.ha_primary", "main-1")
+	_ = s.Settings().SetInternal(t.Context(), "dhcp.ha_standby", "replica-1")
+	_ = s.Settings().SetInternal(t.Context(), "dhcp.domain", "home.lan")
+
+	w := doReq(t, h, "GET", "/api/v1/settings", "", cookie)
+	var all map[string]string
+	if err := json.Unmarshal(w.Body.Bytes(), &all); err != nil {
+		t.Fatal(err)
+	}
+	if all["dhcp.domain"] != "home.lan" {
+		t.Errorf("dhcp.domain is not returned: %v", all["dhcp.domain"])
+	}
+	for _, key := range []string{"dhcp.ha_primary", "dhcp.ha_standby"} {
+		if _, leaked := all[key]; leaked {
+			t.Errorf("%s leaked into GET /settings", key)
+		}
+	}
+
+	for _, tc := range []struct {
+		key, value string
+		code       int
+	}{
+		{"dhcp.domain", "lab.lan", 204},
+		{"dhcp.domain", "", 204},
+		{"dhcp.domain", "lab.lan.", 400},
+		{"dhcp.domain", "not a domain", 400},
+		{"dhcp.lease_seconds", "3600", 204},
+		{"dhcp.lease_seconds", "299", 400},
+		{"dhcp.lease_seconds", "hour", 400},
+		{"dhcp.lease_poll_seconds", "10", 204},
+		{"dhcp.lease_poll_seconds", "1", 400},
+		{"dhcp.ha_port", "8000", 204},
+		{"dhcp.ha_port", "0", 400},
+		{"dhcp.ha_port", "70000", 400},
+		{"serve.dhcp_interfaces", "eth0, eth0.10", 204},
+		{"serve.dhcp_interfaces", "", 204},
+		{"serve.dhcp_interfaces", "eth0,,eth1", 400},
+		{"dhcp.ha_primary", "someone-else", 400},
+		{"dhcp.ha_standby", "someone-else", 400},
+	} {
+		t.Run(tc.key+"="+tc.value, func(t *testing.T) {
+			body, err := json.Marshal(map[string]string{"key": tc.key, "value": tc.value})
+			if err != nil {
+				t.Fatal(err)
+			}
+			w := doReq(t, h, "PUT", "/api/v1/settings", string(body), cookie)
+			if w.Code != tc.code {
+				t.Fatalf("= %d %s, want %d", w.Code, strings.TrimSpace(w.Body.String()), tc.code)
+			}
+			if tc.code != 204 {
+				return
+			}
+			if got, _, _ := s.Settings().Get(t.Context(), tc.key); got != tc.value {
+				t.Fatalf("stored %q, want %q", got, tc.value)
+			}
+		})
+	}
+	// Refused, and not half-written: the pair the renderer chose is still
+	// the pair it chose.
+	if got, _, _ := s.Settings().Get(t.Context(), "dhcp.ha_standby"); got != "replica-1" {
+		t.Fatalf("dhcp.ha_standby is %q after a refused write, want the renderer's own value", got)
+	}
+}

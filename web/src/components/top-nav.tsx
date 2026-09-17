@@ -19,14 +19,24 @@ import { isAlreadyLoggedOut, useLogout, useMe, useMeInitials } from "../hooks/us
 import { useHealth } from "../hooks/use-stats";
 import {
   DASHBOARD_PATH,
+  DHCP_BASE,
+  DHCP_LEASES_PATH,
+  DHCP_RESERVATIONS_PATH,
   FILTERING_BASE,
   findActiveGroup,
   isNavItemActive,
-  NAV_GROUPS,
+  navGroups,
   QUERY_LOG_PATH,
   type NavGroup,
 } from "../lib/nav";
 import { useLists } from "../hooks/use-filters";
+import {
+  useDHCPEnabled,
+  useDHCPStatus,
+  useLeasePollMs,
+  useReservations,
+  useScopes,
+} from "../hooks/use-dhcp";
 import { useManagedBy } from "../hooks/use-sync";
 import { useLiveTailStatus } from "../lib/live-tail";
 import { paletteShortcut } from "../lib/platform";
@@ -56,6 +66,15 @@ const CELL =
   // 2px rule under every cell in the bar.
   "border-b-2 border-b-transparent " +
   "outline-none focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-ring";
+
+/**
+ * The DHCP section's three row-2 readouts. Not uppercased like the rest of
+ * the bar, for the reason the role chip isn't (see RoleChip): these carry
+ * counts and an interval rather than a label, and `every 10 s` shouted as
+ * `EVERY 10 S` reads as a unit nobody uses.
+ */
+const DHCP_CELL =
+  "ml-auto border-l border-l-border tracking-wider normal-case text-muted-foreground";
 
 /** Every cell that can be "the one you're on" marks it the same way. */
 const CELL_ACTIVE = "font-semibold text-foreground border-b-primary";
@@ -98,6 +117,7 @@ export function TopNav({ onOpenCommandPalette }: TopNavProps) {
   const onDashboard = pathname === DASHBOARD_PATH;
   const onQueryLog = pathname === QUERY_LOG_PATH;
   const onFilterLists = pathname === `${FILTERING_BASE}/lists`;
+  const groups = navGroups(useDHCPEnabled());
 
   return (
     <header
@@ -117,7 +137,7 @@ export function TopNav({ onOpenCommandPalette }: TopNavProps) {
         </div>
 
         <nav aria-label="Primary" className="dnsaur-scroll-x flex min-w-0 flex-1 items-stretch">
-          {NAV_GROUPS.map((group) => (
+          {groups.map((group) => (
             <NavGroupMenu key={group.id} group={group} active={group.id === activeGroup?.id} />
           ))}
         </nav>
@@ -204,6 +224,14 @@ export function TopNav({ onOpenCommandPalette }: TopNavProps) {
           {onQueryLog && <QueryLogCells />}
 
           {onFilterLists && <FilterListsCell />}
+
+          {/* DHCP's three screens each get their own readout, on the same
+              terms as Filtering › Lists above: the page below already has
+              the query, so this is a subscription rather than a second
+              fetch, and no other screen pays for it. */}
+          {pathname === DHCP_BASE && <ScopesCell />}
+          {pathname === DHCP_LEASES_PATH && <LeasesPollCell />}
+          {pathname === DHCP_RESERVATIONS_PATH && <ReservationsCell />}
         </div>
       )}
     </header>
@@ -324,6 +352,72 @@ function FilterListsCell() {
       className={cn(CELL, "ml-auto border-l border-l-border text-muted-foreground")}
     >
       {total} {total === 1 ? "list" : "lists"} · {entries.toLocaleString()} enforcing
+    </output>
+  );
+}
+
+/**
+ * DHCP › Scopes' row-2 readout: how many subnets this box hands out on, and
+ * how much of their pools is actually in use.
+ *
+ * The pool numbers come from `GET /dhcp/status` rather than from the scope
+ * rows, because only the engine knows them: a scope stores a pool's two
+ * ends, and how many addresses inside it are leased is a fact about the
+ * lease database. `leased` can exceed the pool after a pool is shrunk —
+ * the engine keeps what it has already handed out — and the readout says so
+ * rather than clamping, since a number over the total is exactly the
+ * condition worth noticing.
+ */
+function ScopesCell() {
+  const scopes = useScopes();
+  const status = useDHCPStatus();
+  if (!scopes.data || !status.data) return null;
+
+  const total = scopes.data.length;
+  const leased = status.data.scopes.reduce((sum, s) => sum + s.leased, 0);
+  const pool = status.data.scopes.reduce((sum, s) => sum + s.pool_size, 0);
+
+  return (
+    <output aria-label="Scopes" className={cn(CELL, DHCP_CELL)}>
+      {total} {total === 1 ? "scope" : "scopes"} · {leased} leased of {pool}
+    </output>
+  );
+}
+
+/**
+ * DHCP › Leases' row-2 readout: this table is live, and on whose schedule.
+ *
+ * The interval is named because it is the one thing an operator cannot see
+ * from the rows — a release that has not disappeared yet is a lease waiting
+ * out this number, not a release that failed (see hooks/use-dhcp.ts's
+ * useReleaseLease). It is the `dhcp.lease_poll_seconds` setting, so a box
+ * polling every two seconds says two.
+ */
+function LeasesPollCell() {
+  const seconds = Math.round(useLeasePollMs() / 1000);
+
+  return (
+    <output aria-label="Lease table" className={cn(CELL, DHCP_CELL, "gap-2")}>
+      <span aria-hidden="true" className="size-1.5 shrink-0 bg-primary" />
+      LIVE · every {seconds} s
+    </output>
+  );
+}
+
+/** DHCP › Reservations' row-2 readout: how many fixed addresses exist, and
+ * across how many scopes — the second number being what makes the page's
+ * scope filter worth reaching for. */
+function ReservationsCell() {
+  const reservations = useReservations();
+  if (!reservations.data) return null;
+
+  const total = reservations.data.length;
+  const scopes = new Set(reservations.data.map((r) => r.scope_id)).size;
+
+  return (
+    <output aria-label="Reservations" className={cn(CELL, DHCP_CELL)}>
+      {total} {total === 1 ? "reservation" : "reservations"} · {scopes}{" "}
+      {scopes === 1 ? "scope" : "scopes"}
     </output>
   );
 }

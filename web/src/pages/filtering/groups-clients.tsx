@@ -52,6 +52,8 @@ import { ManagedNotice } from "../../components/managed-notice";
 import { PauseControl } from "../../components/pause-control";
 import { StaleDataAlert } from "../../components/stale-data-alert";
 import { isValidIPv4, isValidIPv6, requiredText } from "../../lib/schemas";
+import { canonicalMAC, isValidMAC } from "../../lib/mac";
+import { useLeaseHostnames } from "../../hooks/use-dhcp";
 import { DEFAULT_GROUP_ID } from "../../lib/query-rows";
 import { ConfirmDeleteDialog, RenameDialog } from "../dialogs";
 
@@ -559,12 +561,37 @@ function GroupRow({
 
 // --- clients --------------------------------------------------------------
 
+/** The `mac:` matcher's prefix, as the server spells it. */
+const MAC_PREFIX = "mac:";
+
+/**
+ * The matcher in the one spelling matching uses. The server already
+ * canonicalises a CIDR and an IPv4-mapped IPv6 form for itself, but a MAC
+ * typed `AA-BB-CC-DD-EE-FF` would come back as `aa:bb:cc:dd:ee:ff` and the
+ * row would appear to change under the operator — so the one kind this
+ * screen can normalise, it does.
+ */
+function canonicalMatcher(value: string): string {
+  const matcher = value.trim();
+  if (!matcher.toLowerCase().startsWith(MAC_PREFIX)) return matcher;
+  return MAC_PREFIX + canonicalMAC(matcher.slice(MAC_PREFIX.length));
+}
+
 const matcherSchema = z
   .string()
   .trim()
   .superRefine((value, ctx) => {
     const fail = (message: string) => ctx.addIssue({ code: "custom", message });
     if (!value) return fail("Matcher is required");
+    // The third matcher kind (spec §8.2): a hardware address, which the
+    // registry resolves to whatever address that device's lease currently
+    // holds and re-resolves on every table change. Checked before the
+    // address grammar below, since "mac:aa:bb:..." is neither an IP nor a
+    // CIDR and the message for one would be about the wrong thing.
+    if (value.toLowerCase().startsWith(MAC_PREFIX)) {
+      if (isValidMAC(value.slice(MAC_PREFIX.length))) return;
+      return fail("Enter a hardware address, e.g. mac:aa:bb:cc:dd:ee:ff");
+    }
     const parts = value.split("/");
     if (parts.length > 2) {
       return fail("Enter a single IP address or CIDR range, e.g. 192.168.1.0/24");
@@ -619,7 +646,7 @@ function AddClientRow({
     addClient.mutate(
       {
         name: values.name.trim(),
-        matcher: values.matcher.trim(),
+        matcher: canonicalMatcher(values.matcher),
         group_id: Number(values.groupId),
       },
       {
@@ -668,7 +695,7 @@ function AddClientRow({
                   <Input
                     {...field}
                     aria-label="Matcher"
-                    placeholder="192.168.150.10 or 192.168.150.64/27"
+                    placeholder="192.168.150.10, 192.168.150.64/27 or mac:aa:bb:cc:dd:ee:ff"
                     autoComplete="off"
                     className="font-mono"
                   />
@@ -746,6 +773,7 @@ export function GroupsClientsTab() {
   // screen states whose they are and stops offering to change them; reads,
   // filtering and the group selection all stay live.
   const managedBy = useManagedBy();
+  const leaseHostnames = useLeaseHostnames();
 
   const [selectedGroup, setSelectedGroup] = useState<number | null>(null);
   const [addGroupOpen, setAddGroupOpen] = useState(false);
@@ -836,6 +864,13 @@ export function GroupsClientsTab() {
   } else {
     clientsBody = shownClients.map((client) => {
       const [addr, prefix] = client.matcher.split("/");
+      // The lease table's name for this device, beside the address it was
+      // pinned by (spec §8.2). Not the client's own `name` — that is what
+      // the operator called it, and this is what the device calls itself,
+      // which is how you tell "192.168.150.31" is the attic Pi without
+      // having named it. Absent when DHCP is off, when the lease lapsed,
+      // and for a CIDR, which pins a range rather than a device.
+      const leaseName = leaseHostnames.get(client.matcher);
       return (
         <div
           key={client.id}
@@ -853,6 +888,9 @@ export function GroupsClientsTab() {
           <span className="truncate font-mono text-sm" title={client.matcher}>
             {addr}
             {prefix !== undefined && <span className="text-muted-foreground">/{prefix}</span>}
+            {leaseName !== undefined && (
+              <span className="text-muted-foreground"> · {leaseName}</span>
+            )}
           </span>
           <span>
             <Badge variant={groupBadgeVariant(client.group_id)}>

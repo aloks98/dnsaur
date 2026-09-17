@@ -9,6 +9,9 @@ import { useTheme } from "./lib/theme";
 import { TOOLTIP_DELAY_MS } from "./lib/tooltip";
 import { Account } from "./pages/account";
 import { Dashboard } from "./pages/dashboard";
+import { DHCPLeases } from "./pages/dhcp/leases";
+import { DHCPReservations } from "./pages/dhcp/reservations";
+import { DHCPScopes } from "./pages/dhcp/scopes";
 import { FilteringLayout } from "./pages/filtering";
 import { GroupsClientsTab } from "./pages/filtering/groups-clients";
 import { ListsTab } from "./pages/filtering/lists";
@@ -107,6 +110,17 @@ export function App() {
               <Route path="zones">
                 <Route index element={<ZonesList />} />
                 <Route path=":id" element={<ZoneDetail />} />
+              </Route>
+              {/* DHCP's three screens. `/dhcp` is Scopes itself rather
+                  than a redirecting index — the section has a first screen,
+                  and the nav hides the whole group on a box with no engine
+                  (lib/nav.ts). The routes stay mounted either way: an
+                  operator who follows an old link to one gets the screen
+                  saying the engine is gone, not the not-found page. */}
+              <Route path="dhcp">
+                <Route index element={<DHCPScopes />} />
+                <Route path="leases" element={<DHCPLeases />} />
+                <Route path="reservations" element={<DHCPReservations />} />
               </Route>
               <Route path="settings" element={<SettingsPage />} />
               {/* System's second tab (see lib/nav.ts): the keys that

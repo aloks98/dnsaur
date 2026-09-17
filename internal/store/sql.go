@@ -27,6 +27,7 @@ func (s *sqlStore) Tokens() TokenStore             { return &tokenStore{s} }
 func (s *sqlStore) Zones() ZoneStore               { return &zoneStore{s} }
 func (s *sqlStore) TSIGKeys() TSIGKeyStore         { return &tsigKeyStore{s} }
 func (s *sqlStore) Notifies() NotifyStore          { return &notifyStore{s: s} }
+func (s *sqlStore) DHCP() DHCPStore                { return &dhcpStore{s} }
 
 // Backup takes sqlite's own consistent copy — VACUUM INTO, which reads the
 // database through a transaction, so it includes whatever is still in the

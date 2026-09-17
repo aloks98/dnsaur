@@ -105,6 +105,11 @@ var knownRouteParams = map[string]bool{
 	// string rather than a row id — so any value routes, and "1" (what the
 	// probes substitute) is as good as any other.
 	"instance_id": true,
+	// A lease's address. Any single segment routes, and what the handler
+	// makes of a value that is not an address ("1", which these probes
+	// substitute) is a 400 it answers *after* the middleware these tests
+	// are about.
+	"ip": true,
 }
 
 // catchAllProbePath is the concrete URL used to exercise the method-less

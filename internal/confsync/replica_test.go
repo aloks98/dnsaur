@@ -184,7 +184,7 @@ func TestReplicaPullsAndApplies(t *testing.T) {
 	mustSet(t, rep, "sync.token", "tok")
 	mustSet(t, rep, "sync.primary_dns", "10.0.0.5:53")
 	reloads := &countingReloader{}
-	r := NewReplica(rep, reloads, "replica-1", "10.0.0.6:53")
+	r := NewReplica(rep, reloads, "replica-1", "10.0.0.6:53", false)
 
 	if err := r.PullOnce(ctx); err != nil {
 		t.Fatalf("PullOnce: %v", err)
@@ -298,7 +298,7 @@ func TestReplicaDerivesPrimaryDNSFromPeer(t *testing.T) {
 
 	rep := openStore(t)
 	mustSet(t, rep, "sync.peer_url", ts.URL)
-	r := NewReplica(rep, &countingReloader{}, "replica-1", "10.0.0.6:53")
+	r := NewReplica(rep, &countingReloader{}, "replica-1", "10.0.0.6:53", false)
 	if err := r.PullOnce(ctx); err != nil {
 		t.Fatalf("PullOnce: %v", err)
 	}
@@ -346,7 +346,7 @@ func TestReplicaSkipsABundleThatMovedUnderTheProbe(t *testing.T) {
 	rep := openStore(t)
 	mustSet(t, rep, "sync.peer_url", ts.URL)
 	reloads := &countingReloader{}
-	r := NewReplica(rep, reloads, "replica-1", "10.0.0.6:53")
+	r := NewReplica(rep, reloads, "replica-1", "10.0.0.6:53", false)
 
 	if err := r.PullOnce(ctx); err != nil {
 		t.Fatalf("PullOnce: %v", err)
@@ -376,7 +376,7 @@ func TestReplicaBlanksTheAppliedVersionOnPromotion(t *testing.T) {
 	ts := fakeMain(t, mainSt, "", 5353)
 	rep := openStore(t)
 	mustSet(t, rep, "sync.peer_url", ts.URL)
-	r := NewReplica(rep, &countingReloader{}, "replica-1", "10.0.0.6:53")
+	r := NewReplica(rep, &countingReloader{}, "replica-1", "10.0.0.6:53", false)
 	if err := r.PullOnce(ctx); err != nil {
 		t.Fatalf("PullOnce: %v", err)
 	}
@@ -417,7 +417,7 @@ func TestReplicaRefetchesWhenRepointedToTheSameVersion(t *testing.T) {
 
 	rep := openStore(t)
 	mustSet(t, rep, "sync.peer_url", ts1.URL)
-	r := NewReplica(rep, &countingReloader{}, "replica-1", "10.0.0.6:53")
+	r := NewReplica(rep, &countingReloader{}, "replica-1", "10.0.0.6:53", false)
 	if err := r.PullOnce(ctx); err != nil {
 		t.Fatalf("PullOnce: %v", err)
 	}
@@ -466,7 +466,7 @@ func TestReplicaKeepsThePeerVersionWhenTheProbeFails(t *testing.T) {
 	ts := fakeMain(t, mainSt, "", 5353)
 	rep := openStore(t)
 	mustSet(t, rep, "sync.peer_url", ts.URL)
-	r := NewReplica(rep, &countingReloader{}, "replica-1", "10.0.0.6:53")
+	r := NewReplica(rep, &countingReloader{}, "replica-1", "10.0.0.6:53", false)
 
 	if err := r.PullOnce(ctx); err != nil {
 		t.Fatalf("PullOnce: %v", err)
@@ -525,7 +525,7 @@ func TestDecodeLimitedRefusesAnOversizeBody(t *testing.T) {
 func TestReplicaIdlesWithoutPeer(t *testing.T) {
 	ctx := t.Context()
 	st := openStore(t)
-	r := NewReplica(st, &countingReloader{}, "main-1", "10.0.0.5:53")
+	r := NewReplica(st, &countingReloader{}, "main-1", "10.0.0.5:53", false)
 	if err := r.PullOnce(ctx); err != nil {
 		t.Fatalf("PullOnce on a main: %v", err)
 	}
@@ -556,7 +556,7 @@ func TestReplicaRefusesToFollowItself(t *testing.T) {
 	st := openStore(t)
 	ts := fakeMain(t, st, "", 5353)
 	mustSet(t, st, "sync.peer_url", ts.URL)
-	r := NewReplica(st, &countingReloader{}, "main-1", "10.0.0.5:53")
+	r := NewReplica(st, &countingReloader{}, "main-1", "10.0.0.5:53", false)
 	// Naming instance.id is the point: the way a box ends up pointed at
 	// itself in practice is a "replica" restored from the main's database,
 	// and the error has to be the thing that explains that.
@@ -588,7 +588,7 @@ func TestFollowStoresThePeerAndSecret(t *testing.T) {
 	ts := fakeMain(t, mainSt, "s3", 5353)
 
 	rep := openStore(t)
-	r := NewReplica(rep, &countingReloader{}, "replica-1", "10.0.0.6:53")
+	r := NewReplica(rep, &countingReloader{}, "replica-1", "10.0.0.6:53", false)
 	// The trailing slash an operator pastes is theirs to get wrong.
 	if err := r.Follow(ctx, ts.URL+"/", pairCode); err != nil {
 		t.Fatalf("Follow: %v", err)
@@ -626,7 +626,7 @@ func TestFollowRefusedLeavesSettingsUntouched(t *testing.T) {
 	ctx := t.Context()
 	ts := fakeMain(t, openStore(t), "s3", 5353)
 	rep := openStore(t)
-	r := NewReplica(rep, &countingReloader{}, "replica-1", "10.0.0.6:53")
+	r := NewReplica(rep, &countingReloader{}, "replica-1", "10.0.0.6:53", false)
 
 	err := r.Follow(ctx, ts.URL, "K7PQ-4M2Y")
 	if !errors.Is(err, ErrFollowRefused) {
@@ -654,7 +654,7 @@ func TestFollowRejectsAPeerURLWithAPath(t *testing.T) {
 	ctx := t.Context()
 	ts := fakeMain(t, openStore(t), "s3", 5353)
 	rep := openStore(t)
-	r := NewReplica(rep, &countingReloader{}, "replica-1", "10.0.0.6:53")
+	r := NewReplica(rep, &countingReloader{}, "replica-1", "10.0.0.6:53", false)
 
 	err := r.Follow(ctx, ts.URL+"/x", pairCode)
 	if err == nil || errors.Is(err, ErrFollowRefused) {
@@ -684,7 +684,7 @@ func TestProbeCarriesAppliedVersionAndBearer(t *testing.T) {
 	rep := openStore(t)
 	mustSet(t, rep, peerURLSetting, ts.URL)
 	mustSet(t, rep, tokenSetting, "tok")
-	r := NewReplica(rep, &countingReloader{}, "replica-1", "10.0.0.6:53")
+	r := NewReplica(rep, &countingReloader{}, "replica-1", "10.0.0.6:53", false)
 
 	if err := r.PullOnce(ctx); err != nil {
 		t.Fatalf("PullOnce: %v", err)
@@ -712,6 +712,40 @@ func TestProbeCarriesAppliedVersionAndBearer(t *testing.T) {
 	}
 }
 
+// TestProbeSaysWhetherThisBoxRunsAnEngine: the probe is the only thing the
+// main ever hears from a replica, and whether that box runs a DHCP engine is
+// a bootstrap key on it — so this is how the main learns it. A main that
+// named a standby with no engine would hand Kea a hot-standby pair whose
+// partner answers nothing, and the primary would wait out max-response-delay
+// for it on every client (design §6).
+func TestProbeSaysWhetherThisBoxRunsAnEngine(t *testing.T) {
+	ctx := t.Context()
+	for _, tc := range []struct {
+		name  string
+		dhcp  bool
+		query string
+	}{
+		{name: "no engine", dhcp: false, query: "applied=0"},
+		{name: "an engine", dhcp: true, query: "applied=0&dhcp=1"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ts := fakeMain(t, openStore(t), "tok", 5353)
+			rep := openStore(t)
+			mustSet(t, rep, peerURLSetting, ts.URL)
+			mustSet(t, rep, tokenSetting, "tok")
+			r := NewReplica(rep, &countingReloader{}, "replica-1", "10.0.0.6:53", tc.dhcp)
+
+			if err := r.PullOnce(ctx); err != nil {
+				t.Fatalf("PullOnce: %v", err)
+			}
+			probes, _, _ := ts.state()
+			if len(probes) != 1 || probes[0].query != tc.query {
+				t.Fatalf("probes = %+v, want one with query %q", probes, tc.query)
+			}
+		})
+	}
+}
+
 // TestProbeDNSPortDrivesPrimaryDNS: §8's fallback is the peer's host on the
 // port the main advertises in the probe, and sync.primary_dns is an override
 // for the deployment where the main's API and its DNS are not one address.
@@ -726,7 +760,7 @@ func TestProbeDNSPortDrivesPrimaryDNS(t *testing.T) {
 
 	rep := openStore(t)
 	mustSet(t, rep, peerURLSetting, ts.URL)
-	r := NewReplica(rep, &countingReloader{}, "replica-1", "10.0.0.6:53")
+	r := NewReplica(rep, &countingReloader{}, "replica-1", "10.0.0.6:53", false)
 	if err := r.PullOnce(ctx); err != nil {
 		t.Fatalf("PullOnce: %v", err)
 	}
@@ -838,7 +872,7 @@ func TestFollowMapsThePeersAnswer(t *testing.T) {
 			}))
 			t.Cleanup(ts.Close)
 			rep := openStore(t)
-			r := NewReplica(rep, &countingReloader{}, "replica-1", "10.0.0.6:53")
+			r := NewReplica(rep, &countingReloader{}, "replica-1", "10.0.0.6:53", false)
 
 			err := r.Follow(t.Context(), ts.URL, pairCode)
 			if err == nil {
@@ -878,7 +912,7 @@ func TestProbeKeepsTheLastAdvertisedDNSPort(t *testing.T) {
 
 	rep := openStore(t)
 	mustSet(t, rep, peerURLSetting, ts.URL)
-	r := NewReplica(rep, &countingReloader{}, "replica-1", "10.0.0.6:53")
+	r := NewReplica(rep, &countingReloader{}, "replica-1", "10.0.0.6:53", false)
 	if err := r.PullOnce(ctx); err != nil {
 		t.Fatalf("PullOnce: %v", err)
 	}
@@ -916,7 +950,7 @@ func TestFollowDoesNotWaitForThePull(t *testing.T) {
 	t.Cleanup(ts.releaseBundle)
 
 	rep := openStore(t)
-	r := NewReplica(rep, &countingReloader{}, "replica-1", "10.0.0.6:53")
+	r := NewReplica(rep, &countingReloader{}, "replica-1", "10.0.0.6:53", false)
 	start := time.Now()
 	if err := r.Follow(ctx, ts.URL, pairCode); err != nil {
 		t.Fatalf("Follow: %v", err)
@@ -959,7 +993,7 @@ func TestPullOnceWaitsForTheCycleInFlight(t *testing.T) {
 
 	rep := openStore(t)
 	mustSet(t, rep, peerURLSetting, ts.URL)
-	r := NewReplica(rep, &countingReloader{}, "replica-1", "10.0.0.6:53")
+	r := NewReplica(rep, &countingReloader{}, "replica-1", "10.0.0.6:53", false)
 
 	first := make(chan error, 1)
 	go func() { first <- r.PullOnce(ctx) }()
@@ -1009,7 +1043,7 @@ func TestFollowSeedsTheDNSPortFromThePairing(t *testing.T) {
 	t.Cleanup(ts.Close)
 
 	rep := openStore(t)
-	r := NewReplica(rep, &countingReloader{}, "replica-1", "10.0.0.6:53")
+	r := NewReplica(rep, &countingReloader{}, "replica-1", "10.0.0.6:53", false)
 	if err := r.Follow(ctx, ts.URL, pairCode); err != nil {
 		t.Fatalf("Follow: %v", err)
 	}
@@ -1041,7 +1075,7 @@ func TestFollowWakesThePollLoopInsteadOfPullingBesideIt(t *testing.T) {
 	mustSet(t, rep, intervalSetting, "3600")
 	mustSet(t, rep, peerURLSetting, ts.URL)
 	mustSet(t, rep, tokenSetting, "s3")
-	r := NewReplica(rep, &countingReloader{}, "replica-1", "10.0.0.6:53")
+	r := NewReplica(rep, &countingReloader{}, "replica-1", "10.0.0.6:53", false)
 
 	ts.holdBundle()
 	runCtx, stop := context.WithCancel(ctx)

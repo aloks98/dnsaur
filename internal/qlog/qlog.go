@@ -93,7 +93,11 @@ func (l *Logger) SetPrivacy(p string) {
 	l.privacy.Store(p)
 }
 
-func (l *Logger) getPrivacy() string {
+// Privacy is the mode in force right now: "full", "anon" or "none". It is
+// read per query by Middleware and by anything that has to know what a stored
+// row means — an anonymised client_ip is a network rather than a host, so it
+// must not be joined against anything keyed on an address.
+func (l *Logger) Privacy() string {
 	if v, ok := l.privacy.Load().(string); ok {
 		return v
 	}
@@ -176,7 +180,7 @@ func (l *Logger) Middleware() dnssrv.Middleware {
 		return dnssrv.HandlerFunc(func(ctx context.Context, req *dnssrv.Request) (*dnssrv.Response, error) {
 			start := l.o.Now()
 			resp, err := next.ServeDNS(ctx, req)
-			privacy := l.getPrivacy()
+			privacy := l.Privacy()
 			if privacy == "none" {
 				return resp, err
 			}

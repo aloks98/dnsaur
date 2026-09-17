@@ -72,6 +72,11 @@ func TestClientsCRUDAndValidation(t *testing.T) {
 	if w := doReq(t, h, "POST", "/api/v1/clients", `{"name":"tv","matcher":"not-an-ip","group_id":1}`, cookie); w.Code != 400 {
 		t.Fatalf("bad matcher accepted: %d", w.Code)
 	}
+	// A `mac` matcher that is not a hardware address is refused here rather
+	// than stored as a row that can never resolve to a lease.
+	if w := doReq(t, h, "POST", "/api/v1/clients", `{"name":"tv","matcher":"mac:not-a-mac","group_id":1}`, cookie); w.Code != 400 {
+		t.Fatalf("bad mac matcher accepted: %d %s", w.Code, w.Body.String())
+	}
 	w := doReq(t, h, "POST", "/api/v1/clients", `{"name":"tv","matcher":"10.0.0.7","group_id":1}`, cookie)
 	if w.Code != 201 {
 		t.Fatalf("create: %d %s", w.Code, w.Body.String())
@@ -109,6 +114,8 @@ func TestClientMatcherCanonicalisation(t *testing.T) {
 		{"::ffff:192.168.1.0/120", "192.168.1.0/24"},
 		{"::ffff:192.0.2.5", "192.0.2.5"},
 		{"2001:db8::1/64", "2001:db8::/64"},
+		{"mac:AA-BB-CC-DD-EE-FF", "mac:aa:bb:cc:dd:ee:ff"},
+		{"mac:aabb.ccdd.ee01", "mac:aa:bb:cc:dd:ee:01"},
 	} {
 		body := fmt.Sprintf(`{"name":"c","matcher":%q,"group_id":1}`, tc.in)
 		w := doReq(t, h, "POST", "/api/v1/clients", body, cookie)

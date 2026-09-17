@@ -47,6 +47,7 @@ type fakeSync struct {
 type heartbeat struct {
 	instanceID string
 	applied    int64
+	dhcp       bool
 }
 
 type followCall struct{ peerURL, code string }
@@ -80,11 +81,11 @@ func (f *fakeSync) Authenticate(_ context.Context, secret string) (string, bool,
 	return f.instanceID, true, nil
 }
 
-func (f *fakeSync) Heartbeat(_ context.Context, instanceID string, applied int64) error {
+func (f *fakeSync) Heartbeat(_ context.Context, instanceID string, applied int64, dhcp bool) error {
 	if f.beatErr != nil {
 		return f.beatErr
 	}
-	f.beats = append(f.beats, heartbeat{instanceID, applied})
+	f.beats = append(f.beats, heartbeat{instanceID, applied, dhcp})
 	return nil
 }
 
@@ -374,7 +375,7 @@ func TestSyncReadsTakeOnlyAReplicaSecret(t *testing.T) {
 		t.Errorf("dns_port = %d, want %d", got.DNSPort, fs.dnsPort)
 	}
 	// The probe is the heartbeat: there is no separate registration call.
-	if len(fs.beats) != 1 || fs.beats[0] != (heartbeat{"r1", 7}) {
+	if len(fs.beats) != 1 || fs.beats[0] != (heartbeat{"r1", 7, false}) {
 		t.Errorf("heartbeats = %+v, want one for r1 at version 7", fs.beats)
 	}
 
@@ -421,7 +422,7 @@ func TestVersionProbeWithNoAppliedParameter(t *testing.T) {
 		}
 	}
 	for _, b := range fs.beats {
-		if b != (heartbeat{"r1", 0}) {
+		if b != (heartbeat{"r1", 0, false}) {
 			t.Errorf("heartbeat = %+v, want r1 at 0", b)
 		}
 	}
@@ -698,6 +699,11 @@ var syncUnguardedWrites = map[string]string{
 		"does not keep is already the state the caller asked for, and it is how an operator clears " +
 		"one left behind by a box that was a main.",
 
+	"DELETE /api/v1/dhcp/leases/{ip}": "a lease belongs to the engine, not to the " +
+		"configuration (DHCP design §8.3): Kea's HA propagates the release to the partner, and " +
+		"the Leases page's Release button stays live on a replica. Every other DHCP write is " +
+		"synced config and is guarded.",
+
 	"POST /api/v1/sync/follow": "the replica's own action, and the only write that is *about* " +
 		"following: it writes sync.peer_url and sync.token, which are local (§4.3). It refuses " +
 		"a box that already follows a main, with \"already following <peer>\" rather than " +
@@ -738,7 +744,7 @@ func TestReplicaRefusesSyncedWrites(t *testing.T) {
 		}
 	}
 
-	fill := strings.NewReplacer("{id}", "1", "{rid}", "1", "{instance_id}", "r1")
+	fill := strings.NewReplacer("{id}", "1", "{rid}", "1", "{instance_id}", "r1", "{ip}", "192.168.1.50")
 	for _, rt := range srv.routes {
 		method, path, ok := strings.Cut(rt.pattern, " ")
 		if !ok || method == http.MethodGet || method == http.MethodHead {

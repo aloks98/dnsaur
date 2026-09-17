@@ -36,7 +36,7 @@ func TestRegistryStaleness(t *testing.T) {
 	g.staleAfter = 90 * time.Second
 
 	mustPair(t, g, "r1", "10.0.0.6:53")
-	if err := g.Heartbeat(ctx, "r1", 3); err != nil {
+	if err := g.Heartbeat(ctx, "r1", 3, false); err != nil {
 		t.Fatalf("Heartbeat: %v", err)
 	}
 	rs, err := g.List(ctx)
@@ -49,7 +49,7 @@ func TestRegistryStaleness(t *testing.T) {
 
 	// A second heartbeat updates the one entry rather than adding another.
 	now = now.Add(30 * time.Second)
-	if err := g.Heartbeat(ctx, "r1", 4); err != nil {
+	if err := g.Heartbeat(ctx, "r1", 4, false); err != nil {
 		t.Fatalf("second Heartbeat: %v", err)
 	}
 	if rs, _ := g.List(ctx); len(rs) != 1 || rs[0].VersionApplied != 4 || rs[0].LastSeen != now.UnixMilli() {
@@ -295,7 +295,7 @@ func TestHeartbeatStampsLastSeenAndApplied(t *testing.T) {
 	}
 
 	now = now.Add(30 * time.Second)
-	if err := g.Heartbeat(ctx, "r1", 42); err != nil {
+	if err := g.Heartbeat(ctx, "r1", 42, true); err != nil {
 		t.Fatalf("Heartbeat: %v", err)
 	}
 	rs, err := g.List(ctx)
@@ -305,8 +305,25 @@ func TestHeartbeatStampsLastSeenAndApplied(t *testing.T) {
 	if len(rs) != 1 || rs[0].VersionApplied != 42 || rs[0].LastSeen != now.UnixMilli() || rs[0].DNSAddr != "10.0.0.6:53" {
 		t.Fatalf("after a heartbeat: %+v", rs)
 	}
+	// Whether that box runs a DHCP engine is stamped from the same probe:
+	// it is the only thing the main ever hears from a replica, and the DHCP
+	// renderer will not pair with a box that has no engine to pair with
+	// (design §6).
+	if !rs[0].DHCP {
+		t.Error("a heartbeat from a box running an engine did not record it")
+	}
+	// And it is the probe's answer every time, not a latch: an engine that
+	// was turned off is a standby that has to be dropped.
+	if err := g.Heartbeat(ctx, "r1", 43, false); err != nil {
+		t.Fatalf("Heartbeat: %v", err)
+	}
+	if rs, err = g.List(ctx); err != nil {
+		t.Fatalf("List: %v", err)
+	} else if rs[0].DHCP {
+		t.Error("a box that stopped running an engine is still recorded as running one")
+	}
 
-	if err := g.Heartbeat(ctx, "nobody", 1); err == nil {
+	if err := g.Heartbeat(ctx, "nobody", 1, false); err == nil {
 		t.Fatal("a heartbeat from an unregistered id was accepted")
 	}
 }

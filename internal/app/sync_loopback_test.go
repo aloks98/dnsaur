@@ -237,7 +237,17 @@ func TestReplicaFollowsMainAndTransfersItsZones(t *testing.T) {
 // other is a start that fails rather than a test that adapts.
 func replicaConfig(t *testing.T) *config.Config {
 	t.Helper()
-	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	return boxConfig(t, "127.0.0.1")
+}
+
+// boxConfig is replicaConfig with the address named, for the DHCP loopback:
+// its two boxes have to sit on different hosts, because what they render for
+// each other's HA peer is built from those hosts on one side and from the
+// pairing on the other, and two boxes on one address could not tell the two
+// apart.
+func boxConfig(t *testing.T, host string) *config.Config {
+	t.Helper()
+	pc, err := net.ListenPacket("udp", host+":0")
 	if err != nil {
 		t.Fatalf("finding a free port: %v", err)
 	}

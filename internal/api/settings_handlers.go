@@ -49,6 +49,76 @@ var editableSettings = map[string]func(string) error{
 	syncTokenSetting:        anyString,
 	"sync.interval_seconds": syncInterval,
 	"sync.primary_dns":      hostPortOrEmpty,
+	// DHCP (design §4.2). dhcp.ha_standby and dhcp.ha_primary are absent on
+	// purpose: the main's renderer writes the pair it chose, and an operator
+	// editing either would tell one box it is in a pair the other box has
+	// never heard of. See internalSetting.
+	"dhcp.domain":             domainSuffixOrEmpty,
+	"dhcp.lease_seconds":      atLeast(300),
+	"dhcp.lease_poll_seconds": atLeast(2),
+	"dhcp.ha_port":            portNumber,
+	"serve.dhcp_interfaces":   interfaceList,
+}
+
+// atLeast is nonNegInt with a floor the caller names, for the two DHCP
+// durations §4.2 puts one on. A lease measured in seconds has every client
+// on the segment renewing continuously, and a poll per second is a hundred
+// commands a minute at the engine for no new information.
+func atLeast(floor int64) func(string) error {
+	return func(v string) error {
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil || n < floor {
+			return fmt.Errorf("must be a whole number of seconds, %d or more", floor)
+		}
+		return nil
+	}
+}
+
+// portNumber is listenAddr's port half on its own, for dhcp.ha_port: it is
+// not an address this box binds but the port in both peers' HA URLs, which
+// Kea's own hook opens (§6).
+func portNumber(v string) error {
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 1 || n > 65535 {
+		return errors.New("must be a port number, 1-65535")
+	}
+	return nil
+}
+
+// domainSuffixOrEmpty is the grammar for dhcp.domain: empty — leases get no
+// names at all — or a dotted suffix like "home.lan", which is handed to
+// clients as option 15 and is the suffix a lease's hostname is published
+// under (§8.1). No trailing dot: it is a value the engine hands out, not a
+// name in a zone file.
+func domainSuffixOrEmpty(v string) error {
+	if v == "" {
+		return nil
+	}
+	if !validDomainLabels(v, false) {
+		return errors.New("must be a domain suffix like home.lan, with no trailing dot")
+	}
+	return nil
+}
+
+// interfaceList is the grammar for serve.dhcp_interfaces: empty — Kea binds
+// every interface — or comma-separated interface names ("eth0", "eth0.10").
+// Whether a name exists on this box is not checked: the list is local, an
+// operator configuring a box before moving a cable is not making a mistake,
+// and the engine names the interface it could not find.
+func interfaceList(v string) error {
+	if strings.TrimSpace(v) == "" {
+		return nil
+	}
+	for _, part := range strings.Split(v, ",") {
+		name := strings.TrimSpace(part)
+		if name == "" {
+			return errors.New("an entry is empty; separate interface names with one comma")
+		}
+		if strings.ContainsAny(name, " \t/") {
+			return fmt.Errorf("%q is not an interface name", name)
+		}
+	}
+	return nil
 }
 
 // validUpstreams runs the same parser applySettings runs, so a value that
@@ -380,6 +450,11 @@ type resolverStatus struct {
 	// Always present — "role" alone is a fact every screen needs — and on a
 	// server with no sync subsystem it reads as a main with no replicas.
 	Sync SyncStatus `json:"sync"`
+	// DHCP is GET /dhcp/status's object, embedded here so the warning strip
+	// reads "engine unreachable" and "config rejected" on the same round
+	// trip it reads everything else on (§8.3). A box with no engine reads
+	// as enabled: false.
+	DHCP dhcpStatusView `json:"dhcp"`
 }
 
 // servingStatus carries DoT and DoH's api.ProtocolStatus side by side.
@@ -412,6 +487,7 @@ func (s *Server) handleResolverStatus(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	out.Sync = s.syncStatus()
+	out.DHCP = s.dhcpStatus()
 	writeJSON(w, http.StatusOK, out)
 }
 

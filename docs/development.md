@@ -64,6 +64,20 @@ around. [`docs/configuration.md`](configuration.md) covers running it —
 what the entrypoint deliberately does *not* pass, and why port 53 is
 published rather than bound.
 
+`Dockerfile.kea` is the same binary with the DHCP engine beside it — Alpine
+edge for Kea 3.0 and its hook packages, `deploy/kea/entrypoint.sh` starting
+`kea-dhcp4` with `deploy/kea/kea-dhcp4.conf` and then becoming dnsaur. It
+shares the two build stages verbatim with `Dockerfile`:
+
+```sh
+docker build -f Dockerfile.kea -t dnsaur-kea:local .
+```
+
+Neither workflow builds it — `release.yml`'s image step is `Dockerfile`
+only, so this one is a local build for now.
+[`docs/configuration.md`](configuration.md#dhcp) covers running it, which
+needs host networking.
+
 ## Test
 
 ```sh
@@ -73,6 +87,60 @@ go test -race ./...    # what CI runs
 cd web && pnpm test    # dashboard component tests (Vitest)
 cd web && pnpm test:e2e  # Playwright smoke test against the real embedded build
 ```
+
+### A real Kea for the DHCP test
+
+`internal/dhcp` runs against `keatest`'s fake control socket, which answers
+whatever a test tells it to. `TestRealEngine`
+(`internal/dhcp/kea_real_test.go`) is the one that does not: it renders a
+scope, `config-set`s it into a live `kea-dhcp4`, adds a lease, reads it back
+through `lease4-get-page`, deletes it and asks for `status-get`. It skips
+unless `DNSAUR_TEST_KEA_SOCKET` names a control socket the test process can
+read and write, so `go test ./...` is unaffected.
+
+CI's `test-kea` job starts one from the Debian package in a throwaway
+container and runs the compiled test inside it, next to the socket (the
+runner's Docker daemon does not share the job's filesystem, so nothing is
+bind mounted). The same thing by hand, with the config CI uses
+(`ci/kea/kea-dhcp4.conf`):
+
+```sh
+CGO_ENABLED=0 go test -c -o /tmp/kea.test ./internal/dhcp/
+docker create --name kea-ci debian:trixie-slim \
+  sh -c 'set -e
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -qq
+    apt-get install -y --no-install-recommends kea-dhcp4-server
+    mkdir -p /run/kea /var/lib/kea /var/log/kea
+    chmod 750 /run/kea
+    exec kea-dhcp4 -c /etc/kea-ci/kea-dhcp4.conf'
+docker cp ci/kea kea-ci:/etc/kea-ci
+docker cp /tmp/kea.test kea-ci:/kea.test
+docker start kea-ci
+until docker exec kea-ci test -S /run/kea/kea.sock; do sleep 1; done   # the apt-get is the wait
+docker exec -e DNSAUR_TEST_KEA_SOCKET=/run/kea/kea.sock kea-ci /kea.test -test.run Real -test.v
+docker rm -f kea-ci
+```
+
+Against an engine on this machine, `DNSAUR_TEST_KEA_SOCKET=/run/kea/kea.sock
+go test -race -count=1 -run Real ./internal/dhcp/` does the same from the
+checkout; the socket must be one the test process can read and write, and
+its path is capped at 107 bytes, which rules out anything under a deep
+worktree. The test replaces
+the engine's whole configuration, so point it at a throwaway engine and never
+at one serving a segment.
+
+**This assumes the runner executes jobs on the Docker host**, because the
+`-v /tmp/kea-ci:/run/kea` bind mount puts the socket somewhere the job's own
+filesystem can see. A runner that runs its jobs inside a container of their
+own (socket-mounted DinD) shares no `/tmp` with the engine, and the first run
+hangs at "Wait for the control socket".
+
+If that happens, the fix is to give the job the engine's volume instead of
+the host's path: start the container with a named volume or `VOLUME` at
+`/run/kea`, run the job step with `--volumes-from kea-ci`, and point
+`DNSAUR_TEST_KEA_SOCKET` at `/run/kea/kea.sock` — the path inside both
+containers rather than on the host.
 
 ## Lint
 
@@ -134,6 +202,14 @@ requests:
   and an intermittent race never gets the chance to show. The per-package
   coverage lines are written to the job summary; nothing gates on the
   number.
+- **`test-kea`** (runner label `medium`): starts `kea-dhcp4` from the
+  Debian trixie package in a `debian:trixie-slim` container with
+  `ci/kea/kea-dhcp4.conf`, waits for its control socket to appear in the
+  bind-mounted `/tmp/kea-ci`, and runs
+  `go test -race -count=1 -run Real ./internal/dhcp/` against it. The
+  container is always removed, and its log is printed either way — a
+  failure here is usually something Kea said about the rendered config. See
+  "A real Kea for the DHCP test" above.
 - **`e2e`** (runner label `medium`, needs `web`, `continue-on-error:
   true`): checkout, Go + Node/pnpm setup, downloads `web-dist`, installs
   Chromium (`npx playwright install --with-deps chromium`), runs the

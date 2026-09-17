@@ -1,0 +1,88 @@
+{
+  "control-sockets": [
+    {
+      "socket-name": "/run/kea/kea.sock",
+      "socket-type": "unix"
+    }
+  ],
+  "hooks-libraries": [
+    {
+      "library": "/usr/lib/x86_64-linux-gnu/kea/hooks/libdhcp_lease_cmds.so"
+    },
+    {
+      "library": "/usr/lib/x86_64-linux-gnu/kea/hooks/libdhcp_ha.so",
+      "parameters": {
+        "high-availability": [
+          {
+            "heartbeat-delay": 10000,
+            "max-ack-delay": 5000,
+            "max-response-delay": 60000,
+            "max-unacked-clients": 5,
+            "mode": "hot-standby",
+            "peers": [
+              {
+                "auto-failover": true,
+                "name": "main",
+                "role": "primary",
+                "url": "http://10.42.0.2:8000/"
+              },
+              {
+                "auto-failover": true,
+                "name": "replica",
+                "role": "standby",
+                "url": "http://10.42.0.3:8000/"
+              }
+            ],
+            "this-server-name": "main"
+          }
+        ]
+      }
+    }
+  ],
+  "interfaces-config": {
+    "dhcp-socket-type": "raw",
+    "interfaces": [
+      "eth0",
+      "eth0.10"
+    ]
+  },
+  "lease-database": {
+    "persist": true,
+    "type": "memfile"
+  },
+  "rebind-timer": 3150,
+  "renew-timer": 1800,
+  "subnet4": [
+    {
+      "id": 1,
+      "option-data": [
+        {
+          "data": "10.42.0.1",
+          "name": "routers"
+        },
+        {
+          "data": "10.42.0.2, 10.42.0.3",
+          "name": "domain-name-servers"
+        },
+        {
+          "data": "home.lan",
+          "name": "domain-name"
+        }
+      ],
+      "pools": [
+        {
+          "pool": "10.42.0.100 - 10.42.0.200"
+        }
+      ],
+      "reservations": [
+        {
+          "hostname": "printer",
+          "hw-address": "aa:bb:cc:dd:ee:01",
+          "ip-address": "10.42.0.50"
+        }
+      ],
+      "subnet": "10.42.0.0/24"
+    }
+  ],
+  "valid-lifetime": 3600
+}

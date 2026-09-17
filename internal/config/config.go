@@ -32,6 +32,14 @@ type Config struct {
 	// install that predates this key was already emitting) or "text", which
 	// is what a human reading `journalctl` actually wants.
 	LogFormat string `yaml:"log_format"`
+	// KeaSocket is the path of kea-dhcp4's unix control socket (DHCP design
+	// §4.1). Empty — the default — means DHCP is off: no engine is talked
+	// to, no lease table is polled, no DNS names come from leases, and
+	// every /dhcp route but the status one answers 404. It is bootstrap
+	// rather than a setting because dnsaur cannot move a socket the engine
+	// was started with, and because a box with no Kea on it has nothing to
+	// point at.
+	KeaSocket string `yaml:"kea_socket"`
 	// TrustedProxies are the networks a reverse proxy in front of dnsaur
 	// may connect from. A request arriving from one of them has its
 	// X-Forwarded-Proto and X-Forwarded-For headers believed; a request
@@ -86,6 +94,7 @@ func (c *Config) Effective() []Entry {
 		{Key: "data_dir", Value: c.DataDir},
 		{Key: "log_level", Value: c.LogLevel},
 		{Key: "log_format", Value: c.LogFormat},
+		{Key: "kea_socket", Value: c.KeaSocket},
 		{Key: "trusted_proxies", Value: strings.Join(proxies, ",")},
 		{Key: "storage.driver", Value: c.Storage.Driver},
 		{Key: "storage.dsn", Value: redactDSN(c.Storage.DSN)},
@@ -230,6 +239,7 @@ func Load(path string) (*Config, error) {
 		"DNSAUR_LOG_FORMAT":     "log_format",
 		"DNSAUR_STORAGE_DRIVER": "storage.driver",
 		"DNSAUR_STORAGE_DSN":    "storage.dsn",
+		"DNSAUR_KEA_SOCKET":     "kea_socket",
 	}
 	for envKey, koanfKey := range envMap {
 		if v := os.Getenv(envKey); v != "" {
@@ -276,6 +286,12 @@ func Load(path string) (*Config, error) {
 	// Validation
 	if len(c.DNSListen) == 0 {
 		return nil, fmt.Errorf("dns_listen must name at least one address")
+	}
+	// sun_path is 108 bytes with its terminator; connect() on a longer one
+	// fails with EINVAL, which Go reports as "invalid argument" and which
+	// says nothing about why.
+	if len(c.KeaSocket) > 107 {
+		return nil, fmt.Errorf("kea_socket is %d bytes; a unix socket path is capped at 107", len(c.KeaSocket))
 	}
 	// Parsed with the same call cmd/dnsaur uses to configure the handler, so
 	// a value that loads here is a value that will set the level there. It

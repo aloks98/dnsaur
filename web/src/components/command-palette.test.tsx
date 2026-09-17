@@ -3,6 +3,8 @@ import { screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { useLocation } from "react-router";
 import { renderWithProviders } from "../test/render";
+import { server } from "../test/msw-server";
+import { dhcpHandlers } from "../test/msw-handlers";
 import { CommandPalette } from "./command-palette";
 
 // The palette shipped broken: rnui's CommandDialog is only the Dialog shell
@@ -83,4 +85,22 @@ test("selecting a page navigates to it", async () => {
 
   await waitFor(() => expect(screen.getByTestId("pathname")).toHaveTextContent("/zones"));
   expect(onOpenChange).toHaveBeenCalledWith(false);
+});
+
+// The palette is a keyboard route into the nav, so it must not offer a jump
+// to a section the top bar has hidden (lib/nav.ts's navGroups).
+test("the palette hides DHCP on a box with no engine, and lists it on one with an engine", async () => {
+  const off = renderWithProviders(<Harness open />);
+  // Something that is always there first, so this is a settled negative
+  // rather than a race with the status fetch.
+  expect(await screen.findByRole("option", { name: "Zones" })).toBeInTheDocument();
+  expect(screen.queryByRole("option", { name: "Scopes" })).not.toBeInTheDocument();
+  off.unmount();
+
+  server.use(...dhcpHandlers());
+  renderWithProviders(<Harness open />);
+
+  expect(await screen.findByRole("option", { name: "Scopes" })).toBeInTheDocument();
+  expect(screen.getByRole("option", { name: "Leases" })).toBeInTheDocument();
+  expect(screen.getByRole("option", { name: "Reservations" })).toBeInTheDocument();
 });

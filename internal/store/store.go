@@ -116,6 +116,7 @@ type Store interface {
 	Zones() ZoneStore
 	TSIGKeys() TSIGKeyStore
 	Notifies() NotifyStore
+	DHCP() DHCPStore
 	Close() error
 }
 

@@ -26,6 +26,7 @@ over built-in defaults, then overridden by environment variables.
 | `log_format` | `DNSAUR_LOG_FORMAT` | `json` | slog handler: `json` (machine-readable, what a log shipper wants) or `text` (`key=value` lines, what a human reading `journalctl` wants). Anything else is refused at startup |
 | `storage.driver` | `DNSAUR_STORAGE_DRIVER` | `sqlite` | `sqlite` or `postgres` |
 | `storage.dsn` | `DNSAUR_STORAGE_DSN` | `<data_dir>/dnsaur.db` (sqlite) | Data source name; **required** when `storage.driver` is `postgres` |
+| `kea_socket` | `DNSAUR_KEA_SOCKET` | *(empty)* | Path of `kea-dhcp4`'s unix control socket. Empty — the default — means DHCP is off: no engine is talked to, no leases are polled, no DNS names come from leases, and every `/api/v1/dhcp/*` route but `GET /dhcp/status` answers `404 {"error": "dhcp is not enabled"}`. Bootstrap rather than a setting because dnsaur cannot move a socket the engine was started with, and because a box with no Kea on it has nothing to point at. dnsaur needs read *and write* on the socket — see DHCP below, where group membership alone turns out not to be enough |
 | `trusted_proxies` | `DNSAUR_TRUSTED_PROXIES` (comma-separated) | *(empty)* | Networks a reverse proxy in front of dnsaur may connect from, as CIDRs (a bare address means that one host). A request arriving from one of them has its `X-Forwarded-Proto` and `X-Forwarded-For` believed; every other request does not. See Behind a reverse proxy below |
 
 Example `dnsaur.yaml`:
@@ -141,6 +142,10 @@ out — needed for `--network host`, where there is no publishing to remap.
 `storage.driver: postgres` works the same way:
 `-e DNSAUR_STORAGE_DRIVER=postgres -e DNSAUR_STORAGE_DSN=postgres://…`.
 
+`Dockerfile.kea` is the variant with the DHCP engine in the image, and it
+has rules of its own — host networking, root, a bundled Kea config. See
+*DHCP* below.
+
 ## Behind a reverse proxy
 
 dnsaur speaks plain HTTP behind nginx, Caddy or Traefik, which is the usual
@@ -209,6 +214,11 @@ it — none of them travels in a config bundle.
 | `sync.peer_url` | *(empty)* | The main instance this one follows, as an absolute `http`/`https` URL, scheme and host only. Empty means this instance is a main and accepts writes; non-empty makes it a replica, which pulls the main's configuration and refuses local writes to anything that configuration covers. Pairing writes it; clearing it is the promotion. Writing it by hand requires `sync.token` in the same request or already stored |
 | `sync.token` | *(empty)* | The secret this replica pulls with: 32 random bytes the main minted for this box alone when the two paired, good for the two sync reads and nothing else. Pairing writes it — it is never shown and never typed, and the only time an operator writes it by hand is clearing it to stop following. **Never returned by `GET /api/v1/settings`** — it is a credential, and the settings screen shows only whether one is set |
 | `sync.interval_seconds` | `30` | How often a replica probes the main's config version. The main reads its own copy too: a replica it has not heard from for three intervals is shown as stale. **Minimum 5** — below that the probe costs the main more than the drift it removes |
+| `dhcp.domain` | *(empty)* | The DNS suffix DHCP clients are given (option 15), and the one a lease's hostname is published under. A scope may override it; empty means leases get no names at all. Written without a trailing dot |
+| `dhcp.lease_seconds` | `3600` | The lease lifetime scopes that set none inherit. **Minimum 300** — a lease measured in seconds has every client on the segment renewing continuously, and the operator who typed it meant minutes. Renew and rebind timers are derived from it (50% and 87.5%) |
+| `dhcp.lease_poll_seconds` | `10` | How often dnsaur reads the engine's lease database into its in-memory table. **Minimum 2** — below that the poll costs the engine more than the freshness it buys. Read on every tick, so a change takes effect at the next poll rather than at the next restart |
+| `dhcp.ha_port` | `8000` | The port each box's Kea HA listener answers on. It is not a port dnsaur binds: it is the port in both peers' URLs, and the HA hook opens the listener itself. Both boxes must agree, which they do — the value is synced. Each box's own peer URL is built from the host half of its first `dns_listen`, so **a pair needs a real address there on both boxes** rather than the default wildcard; that is the same rule pairing already depends on (a replica registers its `dns_listen` verbatim). A box whose listener names no host renders `http://:8000/` for itself, which the engine refuses — the message is on the DHCP page |
+| `serve.dhcp_interfaces` | *(empty)* | Comma-separated interface names Kea binds (`eth0`, `eth0.10`). Empty means every interface. Local to the box, like the rest of `serve.` |
 | `sync.primary_dns` | *(empty)* | An **override** for where the main answers DNS — the address a replica's derived secondary zones transfer from. The host is required when it is set. Empty, which is the ordinary case, means the peer URL's host on the port the main advertises in its version probe (53 when it advertises none) |
 
 **†** — Restart-required exception. `cache.*` sizing/TTL settings and
@@ -216,16 +226,19 @@ it — none of them travels in a config bundle.
 background refresh ticker are sized/scheduled then); a running instance
 must be restarted to pick up changes to these keys. Everything else in the
 table — blocking mode/TTL, upstreams, upstream strategy, the six
-`serve.*` encrypted-serving keys, clients, groups, lists, rules, zones and
-their records, and query-log privacy — applies live, no restart needed:
+`serve.*` encrypted-serving keys, the four `dhcp.*` keys and
+`serve.dhcp_interfaces` (a change to any of them re-renders the engine's
+configuration, and only when it actually changed), clients, groups, lists,
+rules, zones and their records, and query-log privacy — applies live, no
+restart needed:
 settings keys through the change-notification channel, and clients,
 filters and zones through a reload the write handler triggers directly.
 This is a documented Phase 1 limitation, expected to be revisited in a
 later phase.
 
 Bookkeeping rows are not configuration: the `instance.*` prefix, the
-rollup watermark `stats.watermark`, and the eight sync rows listed under
-Config sync below. None of them is editable through
+rollup watermark `stats.watermark`, the eight sync rows listed under
+Config sync below, and the two `dhcp.ha_*` rows beside them. None of them is editable through
 `PUT /api/v1/settings`, and `GET /api/v1/settings` omits them all.
 `sync.token` is excluded from that read too, and is the only *editable* key
 that is: a read must not be a way to copy the credential out.
@@ -257,6 +270,13 @@ by `GET /api/v1/sync/status` instead, in a shape the dashboard can use —
 `sync.pairing` excepted, since a live code is shown once when it is minted
 and never read back.
 
+Two `dhcp.*` rows get the same treatment for the same reason, and are in the
+table below beside them: the main's DHCP renderer writes the HA pair it
+chose from this registry, so the choice is derived from the pairing rather
+than typed. Unlike the `sync.*` rows they are **synced** — both boxes have to
+render the same pair — and `GET /api/v1/dhcp/status` is where the result is
+visible.
+
 | Key | On | Meaning |
 |---|---|---|
 | `sync.applied_version` | replica | `config_version` of the last bundle it applied. Blanked when the box is promoted: a counter it no longer follows is not a number to compare the next main against |
@@ -267,6 +287,8 @@ and never read back.
 | `sync.replicas` | main | the registered replicas, as JSON keyed by instance id, each with the hash of the secret that box pulls with |
 | `sync.pairing` | main | the live pairing code — its hash, when it expires, and how many wrong attempts have been made against it. Never the code itself: 40 bits would not survive being ground offline in the ten minutes it is alive |
 | `sync.tsig_key_id` | main | the TSIG key replicas transfer under, created and recorded by the first pairing. Nobody picks it, and `GET /api/v1/sync/status` reports its name |
+| `dhcp.ha_primary` | both | the `instance.id` of the box that renders as the HA primary. Written by the main's renderer and carried to the replica in the bundle — both boxes have to render the same two peers under the same names, or Kea's hook has no partner to find |
+| `dhcp.ha_standby` | both | the `instance.id` of the replica the main chose as standby: the non-stale registered replica with the lexicographically smallest id. A replica renders the pair when this is its own id, and no HA section otherwise |
 
 ### Setting up a pair
 
@@ -371,6 +393,356 @@ To promote the replica, clear both keys in one write —
 the Sync band's **Stop following** sends. It keeps the configuration it last
 applied and takes writes again; the zones it derived stay secondaries until
 you change each one's type on its own page.
+
+## DHCP
+
+dnsaur does not implement DHCP. ISC Kea (`kea-dhcp4`) serves the protocol,
+and dnsaur is its control plane: it renders Kea's whole configuration from
+the scopes, reservations and settings you edit, sends it over Kea's unix
+control socket, and reads the lease table and the engine's status back. You
+write one Kea config file, once, and never edit it again.
+
+This section is the install and the wiring. The screens are in
+[`docs/dashboard.md`](dashboard.md#dhcp), every field's rules in
+[`docs/ui-contract.md`](ui-contract.md#311-dhcp), and the routes in
+[`docs/api.md`](api.md); what happens to a lease after it is handed out —
+the DNS names, the `mac` client matcher — is in
+[`docs/architecture.md`](architecture.md#dhcp).
+
+### Installing the engine
+
+Debian 13 (trixie) ships Kea 2.6.3. The HA and `lease_cmds` hooks are
+delivered with the server package rather than inside it — they are in
+`kea-common`, which `kea-dhcp4-server` depends on at the same version — so
+one install is still all it takes:
+
+```sh
+sudo apt install kea-dhcp4-server
+```
+
+Alpine edge ships Kea 3.0.3 and packages every hook separately. Both of
+these are needed — leases are read over `lease_cmds`, and a pair renders the
+HA hook:
+
+```sh
+apk add kea-dhcp4 kea-hook-ha kea-hook-lease-cmds
+```
+
+2.6 and 3.0 are the tested range (both were driven by hand on 2026-09-13,
+and CI runs the Debian package on every push). The renderer emits only keys
+both versions understand, with one exception it asks about: the control
+socket is `control-socket` below 2.7.2 and `control-sockets` from 2.7.2 on,
+so dnsaur reads the version once at start (`version-get`) and spells it
+accordingly. The hook directory is the other thing it asks rather than
+assumes: it reads the one the engine's own configuration names
+(`config-get`), which is why the file below names a hook library, and is how
+Debian's `/usr/lib/<triplet>/kea/hooks` and Alpine's `/usr/lib/kea/hooks`
+both work with no setting.
+
+### The Kea config file you write once
+
+Kea will not start without a valid configuration, and dnsaur replaces that
+configuration the moment it connects. So the file only has to be startable,
+and it only has to say four things: bind nothing, listen on the control
+socket dnsaur will be given, keep leases in a file, and name one hook
+library so dnsaur can see where the hooks live.
+
+`/etc/kea/kea-dhcp4.conf`, replacing what the package shipped:
+
+```json
+{
+  "Dhcp4": {
+    "interfaces-config": { "interfaces": [ ] },
+    "control-socket": { "socket-type": "unix", "socket-name": "/run/kea/kea.sock" },
+    "lease-database": { "type": "memfile", "persist": true, "name": "/var/lib/kea/kea-leases4.csv" },
+    "valid-lifetime": 3600,
+    "hooks-libraries": [
+      { "library": "/usr/lib/x86_64-linux-gnu/kea/hooks/libdhcp_lease_cmds.so" }
+    ],
+    "subnet4": [ ]
+  }
+}
+```
+
+**That hook path is Debian's on amd64.** Use your own architecture's
+(`dpkg -L kea-common | grep hooks`), or `/usr/lib/kea/hooks` on Alpine. The
+line is there for dnsaur rather than for Kea: dnsaur reads the hook
+directory out of the engine's running configuration, and naming one library
+is what makes that answer right anywhere. A configuration that names none
+leaves it guessing — `/usr/lib/x86_64-linux-gnu/kea/hooks` first, then
+`/usr/lib/kea/hooks`, whichever exists — which is the wrong guess on, say,
+an arm64 Debian box, and the render is then refused with Kea naming the
+file it could not open.
+
+On Kea 2.7.2 and later — Alpine's 3.0 — write
+`"control-sockets": [ { "socket-type": "unix", "socket-name": "…" } ]`
+instead. Not both: 3.0 refuses a configuration carrying the two spellings.
+
+No subnets and no interfaces is deliberate. It means a Kea started before
+dnsaur has ever rendered hands out nothing at all, rather than serving
+whatever was in the file; the first render is what puts subnets in it.
+
+**The paths are restricted** — on both builds, not just Debian's: control
+sockets under `/run/kea`, lease files under `/var/lib/kea`, logs under
+`/var/log/kea`. Anything else is refused at start with
+`invalid path specified: '<yours>', supported path is '<theirs>'`, which is
+at least a message that says what to do. Debian's packaged unit creates all
+three — `RuntimeDirectory=kea` at mode 0750, plus `StateDirectory` and
+`LogsDirectory` — which matters because `/run` is a tmpfs, so `/run/kea` has
+to be made again on every boot; running `kea-dhcp4` by hand outside the unit
+means making it yourself.
+
+### Letting dnsaur reach the socket
+
+Point dnsaur at the same path, in `dnsaur.yaml` or as
+`DNSAUR_KEA_SOCKET=/run/kea/kea.sock`:
+
+```yaml
+kea_socket: /run/kea/kea.sock
+```
+
+Empty — the default — means DHCP is off entirely: nothing is rendered, no
+leases are polled, no names come from leases, and the dashboard has no DHCP
+section. It is bootstrap rather than a setting because Kea keeps the socket
+it was started with, so this is a restart either way.
+
+Then make the socket reachable, and check the mode rather than assuming it:
+Kea creates the socket owned by the user it runs as, but the two builds do
+not agree on the bits. **Debian's 2.6.3 creates it `0750`** — and connecting
+to a unix socket needs *write* permission, so a member of the `_kea` group
+holding `r-x` gets `permission denied`, which makes group membership alone
+useless there. **Alpine's 3.0.3 creates it `0770`**, where a group member
+does get in. Both checked; `ls -l` on your own box settles it.
+
+On Debian, then, dnsaur has to *be* `_kea`. The packaged unit runs under
+`DynamicUser=`, which has no fixed user to put in a group in the first
+place, so override it —
+`/etc/systemd/system/dnsaur.service.d/kea.conf`:
+
+```ini
+[Service]
+DynamicUser=no
+User=_kea
+Group=_kea
+```
+
+`systemctl daemon-reload && systemctl restart dnsaur` after writing it, and
+check the database is where you expect on the first start: `DynamicUser=`
+keeps the state directory under `/var/lib/private/` with `/var/lib/dnsaur` a
+symlink into it, and turning it off moves that back. The
+other way round works as well — run `kea-dhcp4` as whatever user dnsaur
+already runs as — but then Kea's own state and log directories are the ones
+that need re-owning.
+
+A wrong permission is not a silent failure, but the page is terse about it:
+the engine line reads `Engine unreachable` and nothing more, and the dial
+error itself — `permission denied` on the path — is in
+`GET /api/v1/dhcp/status`'s `message` and in dnsaur's log. Fix the
+permission and the next poll renders; nothing needs restarting.
+
+### The settings
+
+The four `dhcp.*` keys and `serve.dhcp_interfaces` are in the settings table
+under *Database-managed settings* above. In short:
+
+- `dhcp.domain` — the suffix clients are handed and leases are named under.
+  Empty means leases get no names at all.
+- `dhcp.lease_seconds` — the lease lifetime a scope that sets none inherits.
+- `dhcp.lease_poll_seconds` — how often the lease table is re-read.
+- `dhcp.ha_port` — the port in both peers' HA URLs (see below).
+- `serve.dhcp_interfaces` — comma-separated interface names Kea binds
+  (`eth0`, `eth0.10`); empty binds every interface. Local to the box, so
+  each half of a pair names its own. Whether the name exists is not checked
+  here; Kea names the interface it could not find, and the message lands on
+  the DHCP page.
+
+Changing any of them re-renders the engine's configuration. So does every
+scope and reservation write, and so does a bundle arriving on a replica.
+
+### A pair
+
+A main and a replica that have paired for config sync render **one Kea
+hot-standby pair** between their two engines, from the same synced
+configuration. Kea does the rest: lease synchronisation, the standby
+answering only once the primary has left clients unacknowledged, and the
+reconciliation afterwards.
+
+Four things have to be true for it:
+
+- **Both boxes need a real address in `dns_listen`**, not the default
+  wildcard. Each box's peer URL is built from the host half of its first
+  `dns_listen` entry, and each box's own address is what its scopes hand out
+  as the first DNS server. A wildcard listener names no host, so the render
+  is refused with `HA pair needs a host in this box's dns_listen (it is
+  0.0.0.0:53); set one such as 192.168.150.40:53` rather than sent as
+  `http://:8000/` for Kea to reject. This is the same
+  rule pairing already depends on — a replica registers its `dns_listen`
+  verbatim — and a main reached by name needs `sync.primary_dns` set to an
+  address.
+- **`dhcp.ha_port` (8000 by default) has to be reachable between the two
+  boxes.** It is not a port dnsaur binds: Kea's HA hook opens its own HTTP
+  listener on it. Verified on 2026-09-13 on both 2.6 and 3.0 with nothing
+  but a unix control socket configured — which is why dnsaur renders **no**
+  HTTP control socket and **no `kea-ctrl-agent` is needed**. An HTTP control
+  socket on that port collides with the hook's own listener and fails the
+  whole configuration.
+- **The choice of standby is the main's.** It picks the non-stale registered
+  replica with the lexicographically smallest `instance.id` — deterministic,
+  so every render on either box makes the same choice — and records it in
+  the synced settings `dhcp.ha_primary` and `dhcp.ha_standby`, which travel
+  in the next bundle. The chosen replica renders the identical pair; every
+  other replica renders no HA section, runs plain Kea and says
+  `DHCP: not in the HA pair`. A replica whose registered address is a
+  hostname rather than an address is skipped, with a line in the log saying
+  so, and so is one that runs no DHCP engine of its own: every replica says
+  whether its `kea_socket` names one on each version probe, and a standby
+  with nothing behind it would leave the primary waiting out
+  `max-response-delay` on every client before serving it. Because that
+  answer arrives with the probe rather than with the pairing, the pair
+  appears one `sync.interval_seconds` after a replica pairs, not at the
+  moment it does. The two settings are written only once this box's own Kea
+  has accepted a configuration carrying the pair — a main that cannot render
+  one never tells a replica it is paired.
+- **Same Kea version on both boxes.** One main on 2.6 and a standby on 3.0 is
+  not something this renders for: each box asks its own engine what it is and
+  spells the control socket accordingly, but the HA hook itself is the pair's
+  and only a matching pair is the tested configuration.
+
+**Forget the standby last.** Before pressing **Forget** on the replica that
+is the standby, either promote it (**Stop following** on its own Sync band)
+or stop its `kea-dhcp4` — clearing its `kea_socket` does the same. Forget
+revokes that box's pull secret along with its row, so the cleared pair never
+reaches it in a bundle: its Kea keeps the pair it was last given, finds the
+main no longer talking to it, and goes `partner-down` — which means it starts
+answering the whole segment on its own. dnsaur drops the pair from that
+replica's *next* render, because a pull the main refused the token on is this
+box having been removed rather than a network hiccup; but nothing renders
+until something on that box changes, so do it in the order above.
+
+Scopes and reservations are synced configuration, so they are the main's to
+edit; releasing a lease stays live on both boxes, because a lease belongs to
+the engine and not to the configuration.
+
+The HA channel between the two engines is **plain HTTP on the LAN**. It
+carries leases — addresses, hardware addresses, hostnames — and no
+credentials. Kea supports TLS and basic auth on it; dnsaur renders neither
+in this milestone. Keep `dhcp.ha_port` off any untrusted segment.
+
+Both boxes hand out the same two DNS servers in the same order, main first.
+That is what DHCP-level failover needs from DNS: a client keeping its lease
+through a takeover keeps its resolvers with it.
+
+### VLANs and relays
+
+One scope is one subnet, and a router relaying DHCP is how a box serves a
+segment it has no interface on. Two notes:
+
+- **Relay to both boxes.** In hot-standby both engines have to see the
+  traffic — the standby answers only when the primary does not, and it can
+  only do that for requests that reach it. Most routers take a list of
+  helper addresses per interface.
+- **The scope is chosen by `giaddr`**, the address the relay stamps on the
+  request, so a relayed request is served from the scope whose subnet
+  contains the relay's own address on that segment — not from the scope the
+  packet arrived on an interface for.
+
+A box serving a VLAN it *does* hold an interface on wants that interface in
+`serve.dhcp_interfaces` (`eth0.10`), or the default of every interface.
+
+Scopes for segments this box has no address inside need their `dns_servers`
+filled in: the automatic answer is the box's own address on the scope's
+segment, and a render that cannot find one is refused with
+`scope <name>: set dns_servers, no local address is inside <cidr>` rather
+than handing clients a resolver they cannot reach.
+
+### In a container
+
+`Dockerfile.kea` is the image variant with the engine beside dnsaur — Alpine
+edge for Kea 3.0 and its hooks, an entrypoint that starts `kea-dhcp4` with a
+bundled minimal configuration and then becomes dnsaur. Build it as described
+in [`docs/development.md`](development.md#container-image).
+
+**Host networking, and nothing else will do.** DHCP is broadcast on the
+segment: a bridged container never sees a `DHCPDISCOVER`, and published
+ports do not help, because the client has no address yet to send a unicast
+from.
+
+```sh
+docker run -d --name dnsaur --network host \
+  -e DNSAUR_DNS_LISTEN=:53 \
+  -v dnsaur-data:/data \
+  -v dnsaur-kea-leases:/var/lib/kea \
+  dnsaur-kea:local
+```
+
+Both processes run as root in that image — `kea-dhcp4` opens raw sockets and
+dnsaur binds 53 — so the socket permissions above are already satisfied.
+`DNSAUR_KEA_SOCKET=/run/kea/kea.sock` is baked in. Mount your own file at
+`/etc/kea/kea-dhcp4.conf` to change what the engine starts with, keeping the
+control socket where it is.
+
+Nothing supervises the engine: if `kea-dhcp4` exits, the container keeps
+serving DNS and the DHCP page reports the engine unreachable. A `docker stop`
+does reach it — the entrypoint passes the signal on and waits for the engine
+to write out its lease file before the container ends.
+
+**The lease database wants a volume of its own.** Kea's memfile lives in
+`/var/lib/kea`, which is declared a volume so `docker run` gives it an
+anonymous one; name it — `-v dnsaur-kea-leases:/var/lib/kea` — or every lease
+on the segment comes back as a free address the next time the container is
+recreated.
+
+The plain `Dockerfile` assumes Kea on the host: bind-mount the socket
+directory (`-v /run/kea:/run/kea`) and set `DNSAUR_KEA_SOCKET`. That image
+runs as uid 65532, which a 0750 socket does not admit, so run it as the uid
+that owns the socket — `--user "$(stat -c %u /run/kea/kea.sock)"`, since the
+container has no idea what `_kea` means.
+
+### What this does not do
+
+Everything below is deliberate, not missing by accident:
+
+- **dnsaur does not manage the Kea process.** Starting, stopping and
+  upgrading it is your service manager's job, exactly as above.
+- **No DHCPv6 and no router advertisements.** Kea has a DHCPv6 server;
+  nothing here talks to it.
+- **No client classes, vendor-class matching or option 82 policies**, and no
+  ping check before an offer — the `ping_check` hook is not in Debian's 2.6
+  package.
+- **One pool per scope, and no exclusions.** A scope is one range, plus
+  reservations, which may sit inside the pool or outside it.
+- **A reservation lives inside its scope's subnet.** Moving one between
+  scopes is a delete and a re-create.
+- **One standby.** Kea's HA supports more in load-balancing mode; a main and
+  a backup is what this renders.
+- **Generic options cover the rest.** Anything dnsaur has no field for goes
+  in by code and hex value — WINS (44), CAPWAP (138), TFTP (150), vendor
+  info (43) — and the PXE trio has fields of its own.
+
+### From nothing to a lease
+
+1. Install Kea and write the config file above. `systemctl enable --now
+   kea-dhcp4-server`, then check that `/run/kea/kea.sock` exists.
+2. Set `kea_socket` in dnsaur's bootstrap config, sort out the socket
+   permission, and restart dnsaur. The DHCP section appears in the nav and
+   its engine line reads `Engine 2.6.3 · single`.
+3. Give leases a DNS suffix — `home.lan`, no trailing dot. The scope form's
+   DNS suffix field sets it per scope; a global default for every scope is
+   the setting `dhcp.domain`, in **Settings → DHCP** beside the lease time,
+   the poll interval, the HA port and this box's DHCP interfaces (the band
+   appears only on a box with an engine). **An empty suffix means leases get no
+   names at all**: addresses still work, nothing resolves, and step 5 has
+   nothing to show.
+4. Create a scope on the Scopes page: the subnet in masked form
+   (`192.168.1.0/24`), a pool inside it, the gateway. Leave the DNS servers,
+   the suffix and the lease time blank unless you mean to override them —
+   blank means "use the instance default", which is what step 3 set. Saving
+   renders; if Kea refuses the configuration, its own words are on the
+   engine line and **Apply again** re-sends once you have fixed it.
+5. Point a device at the segment and watch the Leases page. A row appears on
+   the next poll, at most `dhcp.lease_poll_seconds` after the engine hands
+   the address out, and `<hostname>.<suffix>` starts resolving from the same
+   table.
 
 ## Encrypted upstreams
 

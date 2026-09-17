@@ -1,4 +1,10 @@
-import type { CertificateStatus, ProtocolStatus, ResolverStatus, SyncStatus } from "../api/types";
+import type {
+  CertificateStatus,
+  DHCPStatus,
+  ProtocolStatus,
+  ResolverStatus,
+  SyncStatus,
+} from "../api/types";
 import { formatDuration } from "./format";
 
 /**
@@ -44,8 +50,60 @@ export function somethingIsWrong(status: ResolverStatus | undefined): boolean {
     servingState(status.serving.dot) === "failed" ||
     servingState(status.serving.doh) === "failed" ||
     (status.certificate?.expiring_soon ?? false) ||
-    syncTrouble(status.sync)
+    syncTrouble(status.sync) ||
+    dhcpTrouble(status.dhcp)
   );
+}
+
+/**
+ * The DHCP facts worth asking again about, and exactly the three the strip
+ * shows — one predicate, so "we show a banner for this" and "we keep asking
+ * about this" cannot drift apart (the mistake this file's header describes).
+ *
+ * All three end without anyone doing anything: an engine that was restarted
+ * answers again, a partner that was rebooted comes back, and a refused
+ * configuration clears the moment a render is accepted — including the
+ * render a *scope edit* performs, which is what makes polling worth the
+ * request rather than leaving a stale line up until the operator navigates
+ * away and back.
+ */
+function dhcpTrouble(dhcp: DHCPStatus | undefined): boolean {
+  return dhcpBanners(dhcp).length > 0;
+}
+
+/**
+ * DHCP's failures, as the lines the shell shows (spec §8.4).
+ *
+ * Only failures, on the same rule as syncBanners above: DHCP being off is
+ * not a fault and gets no line, and neither does a healthy pair. A box with
+ * no engine (`enabled: false`) is the whole of what most instances are, and
+ * a strip that warned about that would be a strip nobody reads.
+ *
+ * `config rejected` carries the engine's own words rather than a
+ * translation: the message is Kea's refusal of a configuration dnsaur
+ * built, and paraphrasing it would leave the operator matching an
+ * approximation against the engine's log.
+ *
+ * The rejection and the unreachable engine are one line, not two, because
+ * the server already ranks them — a configuration the engine would not take
+ * outranks an engine that is not there, since it is the one an operator has
+ * to act on and is still true when the engine comes back.
+ */
+export function dhcpBanners(dhcp: DHCPStatus | undefined, engineLineOnPage = false): string[] {
+  if (!dhcp?.enabled) return [];
+  const lines: string[] = [];
+  // The Scopes page carries the engine's own status line, with Apply again
+  // beside it: the strip saying the same words above it is two warnings
+  // for one fact. The partner line stays, since the engine line does not
+  // say that.
+  if (!engineLineOnPage) {
+    if (dhcp.engine === "unreachable") lines.push("DHCP engine unreachable");
+    if (dhcp.engine === "config rejected") {
+      lines.push(`DHCP config rejected: ${dhcp.message ?? ""}`);
+    }
+  }
+  if (dhcp.ha?.communication_interrupted ?? false) lines.push("DHCP partner unreachable");
+  return lines;
 }
 
 /**

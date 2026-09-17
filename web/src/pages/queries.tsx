@@ -720,13 +720,22 @@ const QUERY_COLUMNS: ColumnDef<QueryEntry>[] = [
     cell: ({ row }) => row.original.client_ip,
   },
   {
-    // A display column: the value isn't on the row at all, it's the row's
-    // `client_id` looked up in GET /clients.
+    // A display column with two sources, in this order: the name the
+    // operator gave this client (looked up from the row's `client_id` in
+    // GET /clients), and failing that the name the *device* gave itself,
+    // which the server joins on from the DHCP lease table as the row is
+    // read (spec §8.2, absent rather than empty when there is none).
+    //
+    // The registered name wins because it is a decision and the lease name
+    // is a report: an operator who has called a box "Kitchen display" does
+    // not want the column to start saying "esp32-7f2a" the moment DHCP is
+    // turned on.
     id: "hostname",
     header: "Hostname",
     size: 128,
     meta: { headerClassName: "px-4", cellClassName: "truncate px-4 text-muted-foreground" },
-    cell: ({ row, table }) => tableMeta(table).hostnames.get(row.original.client_id) ?? UNKNOWN,
+    cell: ({ row, table }) =>
+      tableMeta(table).hostnames.get(row.original.client_id) ?? row.original.hostname ?? UNKNOWN,
   },
   {
     accessorKey: "decision",

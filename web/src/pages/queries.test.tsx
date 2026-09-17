@@ -519,6 +519,58 @@ test("hostname resolves through client_id, and says nothing rather than guessing
   expect(within(rowFor("anon.example.com")).getByText("—")).toBeInTheDocument();
 });
 
+// Spec §8.2: a row carries `hostname`, the DHCP lease table's name for
+// `client_ip`, joined on as the row is read. It fills the column for every
+// device nobody has bothered to register — which is most of them.
+//
+// The registered name still wins: it is a decision, and the lease name is a
+// report. An operator who called a box "Kitchen display" does not want the
+// column to start saying "esp32-7f2a" the moment DHCP is turned on.
+test("a lease hostname fills the column, and a registered client name outranks it", async () => {
+  server.use(
+    http.get("/api/v1/clients", () =>
+      HttpResponse.json([{ id: 7, name: "Kitchen display", matcher: "192.168.1.42", group_id: 1 }]),
+    ),
+  );
+
+  renderQueryLog();
+  const source = await firstSource();
+  act(() => source.emitOpen());
+  act(() =>
+    source.emit(
+      entry({
+        q_name: "registered.example.com",
+        client_id: 7,
+        client_ip: "192.168.1.42",
+        hostname: "esp32-7f2a",
+      }),
+    ),
+  );
+  // client_id 0: nobody registered this device, and the lease table is the
+  // only thing that knows what it calls itself.
+  act(() =>
+    source.emit(
+      entry({
+        q_name: "leased.example.com",
+        client_id: 0,
+        client_ip: "192.168.150.31",
+        hostname: "attic-pi",
+      }),
+    ),
+  );
+
+  await screen.findByText("leased.example.com");
+  await waitFor(() =>
+    expect(
+      within(rowFor("registered.example.com")).getByText("Kitchen display"),
+    ).toBeInTheDocument(),
+  );
+  expect(
+    within(rowFor("registered.example.com")).queryByText("esp32-7f2a"),
+  ).not.toBeInTheDocument();
+  expect(within(rowFor("leased.example.com")).getByText("attic-pi")).toBeInTheDocument();
+});
+
 // A client's name is not validated server-side and may be empty
 // (ui-contract §3.4), and the Add-client form allows it. An empty string in
 // the lookup map is a hit, so the `?? UNKNOWN` fallback never fires and the

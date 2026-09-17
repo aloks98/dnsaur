@@ -1,8 +1,11 @@
 package clients
 
 import (
+	"bytes"
 	"context"
+	"log/slog"
 	"net/netip"
+	"strings"
 	"testing"
 
 	"github.com/aloks98/dnsaur/internal/store"
@@ -136,5 +139,134 @@ func TestNormalizeMatcher(t *testing.T) {
 		if got, ok := NormalizeMatcher(bad); ok {
 			t.Errorf("NormalizeMatcher(%q) = %q, true; want it rejected", bad, got)
 		}
+	}
+}
+
+// TestMACMatcherFollowsTheLease: a `mac` matcher names a NIC, not an
+// address, so the registry has to resolve it through the lease table and
+// re-resolve it every time that table changes — otherwise a device drops
+// back to the default group the first time DHCP hands it a new address.
+func TestMACMatcherFollowsTheLease(t *testing.T) {
+	fs := &fakeClientStore{
+		groups: []store.Group{{ID: 1, Name: "default", Enabled: true}, {ID: 2, Name: "kids"}},
+		clients: []store.Client{
+			{ID: 10, Name: "tablet", Matcher: "mac:aa:bb:cc:dd:ee:01", GroupID: 2},
+		},
+	}
+	r := NewRegistry(fs)
+	if err := r.Reload(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	// No lease table yet: the MAC names nothing, and nothing matches.
+	if c := r.Lookup(netip.MustParseAddr("10.0.0.5")); c.GroupID != 1 {
+		t.Fatalf("a mac matcher matched before any lease was known: %+v", c)
+	}
+
+	leases := map[string]netip.Addr{"aa:bb:cc:dd:ee:01": netip.MustParseAddr("10.0.0.5")}
+	r.SetLeaseLookup(func(mac string) (netip.Addr, bool) {
+		ip, ok := leases[mac]
+		return ip, ok
+	})
+	if c := r.Lookup(netip.MustParseAddr("10.0.0.5")); c.GroupName != "kids" {
+		t.Fatalf("the lease's address did not match: %+v", c)
+	}
+
+	// The lease moves: the old address goes back to the default group and
+	// the new one takes the client.
+	leases["aa:bb:cc:dd:ee:01"] = netip.MustParseAddr("10.0.0.9")
+	r.SetLeaseLookup(func(mac string) (netip.Addr, bool) {
+		ip, ok := leases[mac]
+		return ip, ok
+	})
+	if c := r.Lookup(netip.MustParseAddr("10.0.0.5")); c.GroupID != 1 {
+		t.Errorf("the old address still matched after the lease moved: %+v", c)
+	}
+	if c := r.Lookup(netip.MustParseAddr("10.0.0.9")); c.GroupName != "kids" {
+		t.Errorf("the new address did not match after the lease moved: %+v", c)
+	}
+}
+
+// TestMACMatcherWithNoLeaseMatchesNothing: a MAC the lease table has never
+// seen must not borrow anyone else's address.
+func TestMACMatcherWithNoLeaseMatchesNothing(t *testing.T) {
+	fs := &fakeClientStore{
+		groups: []store.Group{{ID: 1, Name: "default", Enabled: true}, {ID: 2, Name: "kids"}},
+		clients: []store.Client{
+			{ID: 10, Name: "absent", Matcher: "mac:aa:bb:cc:dd:ee:02", GroupID: 2},
+			{ID: 11, Name: "present", Matcher: "mac:aa:bb:cc:dd:ee:03", GroupID: 2},
+		},
+	}
+	r := NewRegistry(fs)
+	r.SetLeaseLookup(func(mac string) (netip.Addr, bool) {
+		if mac == "aa:bb:cc:dd:ee:03" {
+			return netip.MustParseAddr("10.0.0.3"), true
+		}
+		return netip.Addr{}, false
+	})
+	if err := r.Reload(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if c := r.Lookup(netip.MustParseAddr("10.0.0.3")); c.GroupName != "kids" {
+		t.Fatalf("the leased MAC did not match: %+v", c)
+	}
+	for _, ip := range []string{"10.0.0.2", "0.0.0.0", "10.0.0.4"} {
+		if c := r.Lookup(netip.MustParseAddr(ip)); c.GroupID != 1 {
+			t.Errorf("%s matched a MAC with no lease: %+v", ip, c)
+		}
+	}
+	// "no address" is not an address either: a request whose client IP never
+	// parsed must not land on the unleased MAC's client.
+	if c := r.Lookup(netip.Addr{}); c.GroupID != 1 {
+		t.Errorf("an invalid address matched a MAC with no lease: %+v", c)
+	}
+}
+
+func TestNormalizeMACMatcher(t *testing.T) {
+	for _, tc := range []struct{ in, want string }{
+		{"mac:aa:bb:cc:dd:ee:ff", "mac:aa:bb:cc:dd:ee:ff"},
+		{"mac:AA-BB-CC-DD-EE-FF", "mac:aa:bb:cc:dd:ee:ff"},
+		{"mac:aabb.ccdd.eeff", "mac:aa:bb:cc:dd:ee:ff"},
+	} {
+		if got, ok := NormalizeMatcher(tc.in); !ok || got != tc.want {
+			t.Errorf("NormalizeMatcher(%q) = %q, %v; want %q, true", tc.in, got, ok, tc.want)
+		}
+	}
+	for _, bad := range []string{"mac:", "mac:nonsense", "mac:aa:bb:cc:dd:ee", "mac:10.0.0.1", "aa:bb:cc:dd:ee:ff"} {
+		if got, ok := NormalizeMatcher(bad); ok {
+			t.Errorf("NormalizeMatcher(%q) = %q, true; want it rejected", bad, got)
+		}
+	}
+}
+
+// TestAMACMatcherLandingOnAnotherMatchersAddressIsLogged: a lease can put a
+// `mac` matcher on an address an explicit matcher already claims, and one of
+// the two rows then silently does nothing — a client that "has a group" on
+// the dashboard and never gets it. Nothing can pick a winner here, so it says
+// so out loud instead.
+func TestAMACMatcherLandingOnAnotherMatchersAddressIsLogged(t *testing.T) {
+	var buf bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+
+	fs := &fakeClientStore{
+		groups: []store.Group{{ID: 1, Name: "default", Enabled: true}, {ID: 2, Name: "kids"}, {ID: 3, Name: "iot"}},
+		clients: []store.Client{
+			{ID: 10, Name: "by-address", Matcher: "10.0.0.5", GroupID: 2},
+			{ID: 11, Name: "by-nic", Matcher: "mac:aa:bb:cc:dd:ee:01", GroupID: 3},
+		},
+	}
+	r := NewRegistry(fs)
+	r.SetLeaseLookup(func(string) (netip.Addr, bool) { return netip.MustParseAddr("10.0.0.5"), true })
+	if err := r.Reload(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	line := buf.String()
+	if !strings.Contains(line, "10.0.0.5") || !strings.Contains(line, "mac:aa:bb:cc:dd:ee:01") {
+		t.Fatalf("the collision names neither the address nor both matchers: %q", line)
+	}
+	if n := strings.Count(line, "level=WARN"); n != 1 {
+		t.Errorf("logged %d warnings for one collision, want 1: %q", n, line)
 	}
 }

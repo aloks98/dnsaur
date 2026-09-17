@@ -9,7 +9,8 @@ import {
   CommandItem,
   CommandList,
 } from "@e412/rnui-react";
-import { NAV_GROUPS } from "../lib/nav";
+import { navGroups } from "../lib/nav";
+import { useDHCPEnabled } from "../hooks/use-dhcp";
 
 interface CommandPaletteProps {
   open: boolean;
@@ -18,6 +19,9 @@ interface CommandPaletteProps {
 
 export function CommandPalette({ open, onOpenChange }: CommandPaletteProps) {
   const navigate = useNavigate();
+  // The same list the top bar renders, so the palette cannot offer a jump
+  // to a section the bar has hidden — see lib/nav.ts's navGroups.
+  const groups = navGroups(useDHCPEnabled());
 
   useEffect(() => {
     function onKeyDown(event: KeyboardEvent) {
@@ -52,10 +56,10 @@ export function CommandPalette({ open, onOpenChange }: CommandPaletteProps) {
         <CommandList>
           <CommandEmpty>No matching pages.</CommandEmpty>
           {/* One CommandGroup per nav group, so the palette's headings are
-              the same four sections the top bar shows — the palette is a
+              the same sections the top bar shows — the palette is a
               keyboard route into the nav, not a second, differently-shaped
               index of it. */}
-          {NAV_GROUPS.map((group) => (
+          {groups.map((group) => (
             <CommandGroup key={group.id} heading={group.label}>
               {group.items.map((item) => {
                 const Icon = item.icon;

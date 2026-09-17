@@ -5,7 +5,7 @@ import { act, fireEvent, screen, waitFor, within } from "@testing-library/react"
 import userEvent from "@testing-library/user-event";
 import { Link, Route, Routes } from "react-router";
 import { server } from "../test/msw-server";
-import { replicaHandlers } from "../test/msw-handlers";
+import { dhcpHandlers, replicaHandlers } from "../test/msw-handlers";
 import { renderWithProviders } from "../test/render";
 import type { Settings } from "../api/types";
 import { SettingsPage } from "./settings";
@@ -39,6 +39,11 @@ function fullSettings(overrides: Partial<Settings> = {}): Settings {
     "sync.peer_url": "",
     "sync.interval_seconds": "30",
     "sync.primary_dns": "",
+    "dhcp.domain": "",
+    "dhcp.lease_seconds": "3600",
+    "dhcp.lease_poll_seconds": "10",
+    "dhcp.ha_port": "8000",
+    "serve.dhcp_interfaces": "",
     ...overrides,
   };
 }
@@ -1037,4 +1042,121 @@ test("saving a setting re-reads the sync status the band renders", async () => {
   await user.click(screen.getAllByRole("button", { name: /^save changes$/i })[0]);
 
   await waitFor(() => expect(statusReads).toBe(2));
+});
+
+// --- the DHCP band -------------------------------------------------------
+//
+// Five settings §4.2 gives the engine, four of them synced and one local.
+// They were reachable only over the API until now, which made
+// `dhcp.lease_seconds` — the default every scope that sets none falls back
+// to — a thing you could read on the Scopes page and not change anywhere.
+
+test("the DHCP band is not on a box with no engine", async () => {
+  mockSettings(fullSettings());
+
+  renderWithProviders(<SettingsPage />);
+
+  // The default resolver status carries no `dhcp`, which is a box whose
+  // kea_socket is empty: nothing reads these five, and the nav has no DHCP
+  // section either.
+  expect(await screen.findByText("Upstreams")).toBeInTheDocument();
+  expect(screen.queryByText("DHCP")).not.toBeInTheDocument();
+});
+
+test("the DHCP band saves exactly its own five keys", async () => {
+  server.use(...dhcpHandlers());
+  mockSettings(
+    fullSettings({
+      "dhcp.domain": "home.lan",
+      "dhcp.lease_seconds": "3600",
+      "dhcp.lease_poll_seconds": "10",
+      "dhcp.ha_port": "8000",
+      "serve.dhcp_interfaces": "",
+    }),
+  );
+  const sent: { key: string; value: string }[] = [];
+  server.use(
+    http.put("/api/v1/settings", async ({ request }) => {
+      sent.push((await request.json()) as { key: string; value: string });
+      return new HttpResponse(null, { status: 204 });
+    }),
+  );
+
+  renderWithProviders(<SettingsPage />);
+  expect(await screen.findByText("DHCP")).toBeInTheDocument();
+
+  const retype = async (label: RegExp, value: string) => {
+    const field = screen.getByLabelText(label);
+    await userEvent.clear(field);
+    await userEvent.type(field, value);
+  };
+  await retype(/^lease dns suffix/i, "lan.example");
+  await retype(/^lease time/i, "7200");
+  await retype(/^lease poll interval/i, "15");
+  await retype(/^ha port/i, "8001");
+  await retype(/^dhcp interfaces/i, "eth0, eth0.10");
+
+  await userEvent.click(screen.getByRole("button", { name: /^save changes$/i }));
+
+  await waitFor(() => expect(sent).toHaveLength(5));
+  expect(Object.fromEntries(sent.map((s) => [s.key, s.value]))).toEqual({
+    "dhcp.domain": "lan.example",
+    "dhcp.lease_seconds": "7200",
+    "dhcp.lease_poll_seconds": "15",
+    "dhcp.ha_port": "8001",
+    "serve.dhcp_interfaces": "eth0, eth0.10",
+  });
+});
+
+test("the DHCP band refuses what the server would refuse", async () => {
+  server.use(...dhcpHandlers());
+  mockSettings(fullSettings({ "dhcp.lease_seconds": "3600", "dhcp.ha_port": "8000" }));
+  const sent: string[] = [];
+  server.use(
+    http.put("/api/v1/settings", async ({ request }) => {
+      sent.push(((await request.json()) as { key: string }).key);
+      return new HttpResponse(null, { status: 204 });
+    }),
+  );
+
+  renderWithProviders(<SettingsPage />);
+  expect(await screen.findByText("DHCP")).toBeInTheDocument();
+
+  const retype = async (label: RegExp, value: string) => {
+    const field = screen.getByLabelText(label);
+    await userEvent.clear(field);
+    await userEvent.type(field, value);
+  };
+  // Each one is a rule the Go validator applies (editableSettings): a lease
+  // measured in seconds has every client renewing continuously, a poll per
+  // second is a hundred commands a minute at the engine, a port is a port,
+  // and a suffix is a suffix with no trailing dot.
+  await retype(/^lease time/i, "60");
+  await retype(/^ha port/i, "70000");
+  await retype(/^lease dns suffix/i, "home.lan.");
+  await retype(/^dhcp interfaces/i, "eth0, eth 1");
+
+  await userEvent.click(screen.getByRole("button", { name: /^save changes$/i }));
+
+  expect(await screen.findByText("Must be 300 or more.")).toBeInTheDocument();
+  expect(screen.getByText("Must be a port number, 1-65535.")).toBeInTheDocument();
+  expect(
+    screen.getByText("Must be a domain suffix like home.lan, with no trailing dot."),
+  ).toBeInTheDocument();
+  expect(screen.getByText(/is not an interface name/)).toBeInTheDocument();
+  expect(sent).toEqual([]);
+});
+
+test("a replica may still name its own DHCP interfaces", async () => {
+  server.use(...dhcpHandlers({ sync: { role: "replica", peer_url: "https://main.lan" } }));
+  mockSettings(fullSettings({ "dhcp.domain": "home.lan", "serve.dhcp_interfaces": "eth0" }));
+
+  renderWithProviders(<SettingsPage />);
+  expect(await screen.findByText("DHCP")).toBeInTheDocument();
+
+  // The four dhcp.* keys are the main's — they arrive in a bundle, and a
+  // write to one answers 409. serve.dhcp_interfaces names this box's own
+  // NICs and never travels, so it stays this box's to set.
+  expect(screen.getByLabelText(/^lease dns suffix/i)).toBeDisabled();
+  expect(screen.getByLabelText(/^dhcp interfaces/i)).toBeEnabled();
 });

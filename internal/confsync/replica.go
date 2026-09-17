@@ -40,6 +40,15 @@ const (
 	lastPullAtSetting  = "sync.last_pull_at"
 	lastErrorSetting   = "sync.last_error"
 
+	// LastErrorSetting is lastErrorSetting for the one reader outside this
+	// package, and TokenRefused the phrase it looks for there: a peer that
+	// would not take this box's secret, which is what Forget leaves behind.
+	// Being refused is not a failed pull like any other — it is this box
+	// having been removed from the main's configuration — so the DHCP render
+	// stops claiming a pair on the strength of it (design §6, §10).
+	LastErrorSetting = lastErrorSetting
+	TokenRefused     = "peer refused the token"
+
 	versionPath = "/api/v1/sync/version"
 	bundlePath  = "/api/v1/sync/bundle"
 	pairPath    = "/api/v1/sync/pair"
@@ -110,6 +119,11 @@ type Replica struct {
 	client              *http.Client
 	now                 func() time.Time
 	instanceID, dnsAddr string
+	// dhcp is whether this box runs an engine of its own, reported on every
+	// probe so the main knows whether it can be the DHCP standby (§6 of the
+	// DHCP design). Fixed for the life of the process: kea_socket is a
+	// bootstrap key, and turning it on is a restart.
+	dhcp bool
 
 	// dnsPort is the DNS port the peer last advertised in a probe, which is
 	// what a derived secondary transfers from when sync.primary_dns names no
@@ -141,7 +155,11 @@ type Replica struct {
 	peer atomic.Value // string
 }
 
-func NewReplica(st store.Store, reload Reloader, instanceID, dnsAddr string) *Replica {
+// dhcp says whether this box runs a DHCP engine of its own (its kea_socket
+// names one). It travels on every probe, because the probe is the only thing
+// the main ever hears from a replica and the main's DHCP renderer will not
+// name a standby that has no engine to be one with (§6 of the DHCP design).
+func NewReplica(st store.Store, reload Reloader, instanceID, dnsAddr string, dhcp bool) *Replica {
 	return &Replica{
 		st:     st,
 		reload: reload,
@@ -155,6 +173,7 @@ func NewReplica(st store.Store, reload Reloader, instanceID, dnsAddr string) *Re
 		now:        time.Now,
 		instanceID: instanceID,
 		dnsAddr:    dnsAddr,
+		dhcp:       dhcp,
 		kick:       make(chan struct{}, 1),
 	}
 }
@@ -535,6 +554,9 @@ func (r *Replica) pull(ctx context.Context, peer string, all map[string]string, 
 		reported = s.AppliedVersion
 	}
 	probeURL := peer + versionPath + "?applied=" + strconv.FormatInt(reported, 10)
+	if r.dhcp {
+		probeURL += "&dhcp=1"
+	}
 	var probe syncVersion
 	if err := r.get(ctx, probeTimeout, maxProbeBytes, probeURL, token, &probe); err != nil {
 		return err
@@ -726,7 +748,7 @@ func statusErr(url string, resp *http.Response) error {
 		return fmt.Errorf("%s: %s, not followed, to %q", url, resp.Status, loc)
 	}
 	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-		return fmt.Errorf("%s: peer refused the token (%s)", url, resp.Status)
+		return fmt.Errorf("%s: %s (%s)", url, TokenRefused, resp.Status)
 	}
 	return fmt.Errorf("%s: %s", url, resp.Status)
 }

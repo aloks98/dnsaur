@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/aloks98/dnsaur/internal/auth"
+	"github.com/aloks98/dnsaur/internal/dhcp"
 	"github.com/aloks98/dnsaur/internal/filter"
 	"github.com/aloks98/dnsaur/internal/qlog"
 	"github.com/aloks98/dnsaur/internal/store"
@@ -148,6 +149,15 @@ type Deps struct {
 	// behind it. The handler then answers "nothing wrong", which is the
 	// truthful answer for a server that has no forwarder to have downgraded.
 	ResolverStatus ResolverStatus
+	// DHCP is the engine manager: what renders kea-dhcp4's configuration,
+	// holds the lease table and knows whether the engine is answering. Nil
+	// — a box whose kea_socket is empty — is DHCP switched off, which every
+	// route but GET /dhcp/status answers 404 to (see dhcpEnabled).
+	//
+	// The concrete type, not an interface: the manager talks to one unix
+	// socket, and a test stands a fake engine up on one (internal/dhcp/
+	// keatest) rather than standing a second implementation of it up here.
+	DHCP *dhcp.Manager
 	// Sync may be nil, and is in every test server with no App behind it.
 	// A nil Syncer is a main that follows nobody: the write guard lifts and
 	// the status endpoint answers role "main" with no replicas. See Syncer.
@@ -160,6 +170,13 @@ type Deps struct {
 	// POST /backup writes into a "backups" subdirectory of it, which is the
 	// one thing this package uses it for.
 	DataDir string
+	// LeaseHostname is the DHCP lease table's name for an address, used to
+	// decorate query-log rows as they are read (§8.2). Nil — a server with
+	// no DHCP behind it — leaves every row exactly as it is stored; nothing
+	// is ever written from it, so a lease that has since moved changes what
+	// old rows say about it, which is the honest answer for a join done at
+	// read time.
+	LeaseHostname func(netip.Addr) (string, bool)
 	// TrustedProxies are the networks a reverse proxy in front of this
 	// server may connect from (config.Config.TrustedProxies). A request
 	// arriving from one of them has its X-Forwarded-* headers believed;
@@ -259,6 +276,7 @@ func (s *Server) registerRoutes() {
 	s.tsigKeysRoutes()
 	s.notifiesRoutes()
 	s.syncRoutes()
+	s.dhcpRoutes()
 	// Later tasks append their routes here.
 	//
 	// This catch-all is registered through route() like everything else —
@@ -529,6 +547,23 @@ func decodeOr400[T any](w http.ResponseWriter, r *http.Request) (T, bool) {
 		return v, false
 	}
 	return v, true
+}
+
+// decodeInto merges the request body onto v, which the caller has already
+// filled with the row as it is stored — so a PATCH body naming one field
+// leaves every other field at the value it has, and there is no patch
+// struct of pointers to keep in step with the row it patches.
+//
+// Strict about unknown fields and about the answer, exactly as decodeOr400
+// is: the same "invalid json" every other endpoint gives.
+func decodeInto[T any](w http.ResponseWriter, r *http.Request, v *T) bool {
+	dec := json.NewDecoder(io.LimitReader(r.Body, 1<<20))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(v); err != nil {
+		errJSON(w, http.StatusBadRequest, "invalid json")
+		return false
+	}
+	return true
 }
 
 type ctxKey int
