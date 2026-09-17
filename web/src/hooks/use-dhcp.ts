@@ -146,7 +146,7 @@ export function useLeaseHostnames(): Map<string, string> {
  * a saved scope and an engine line still describing the previous attempt.
  *
  * `resolver/status` too, since it carries a copy of that same object for
- * the shell's warning strip — without this the strip spent up to a poll
+ * the top bar's status panel — without this the panel spent up to a poll
  * contradicting the page that had just fixed it.
  */
 function invalidateDHCP(qc: QueryClient, ...keys: readonly (readonly string[])[]): void {

@@ -975,7 +975,7 @@ Full parameter/response detail lives in `internal/api/openapi.yaml`
   name nobody typed.
   `GET /dhcp/status` is `{enabled, engine, engine_version, message,
   table_age_seconds, ha, scopes[]}`, and the same object is embedded in
-  `GET /resolver/status` as `dhcp` for the warning strip. `engine` is `ok`,
+  `GET /resolver/status` as `dhcp` for the top bar's status panel. `engine` is `ok`,
   `unreachable` or `config rejected`; a configuration the engine would not
   take outranks an engine that is not there, because it is the one an
   operator has to act on and it is still true when the engine comes back.

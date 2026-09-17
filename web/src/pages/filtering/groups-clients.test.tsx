@@ -772,8 +772,8 @@ test("a replica says who manages it and won't offer to add a group", async () =>
   renderWithProviders(<GroupsClientsTab />);
 
   // One muted line in the section header, beside the control it explains —
-  // not a page-wide warning strip. Being a replica is a state; the strip is
-  // reserved for the two sync facts that are actually wrong.
+  // not a page-wide warning strip. Being a replica is a state; the top
+  // bar's status panel is reserved for the sync facts that are wrong.
   const notice = await screen.findByText("Managed by the main");
   const addGroup = screen.getByRole("button", { name: "Add group" });
   expect(addGroup).toBeDisabled();

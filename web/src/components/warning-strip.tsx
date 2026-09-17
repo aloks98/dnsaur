@@ -9,10 +9,11 @@ import { cn } from "@e412/rnui-react";
  * drifting in wording") — and had already started to diverge: two sites at
  * a 3px inset, one at 2px.
  *
- * Covers exactly two of those three sites: the encryption-downgrade banner
- * (encryption-downgrade-banner.tsx) and upstreams-field's transport-switch
- * notice. Both are standalone warning notices — they exist only when
- * something is wrong, and carrying that warning is their whole job.
+ * Covers one of those three sites today: upstreams-field's transport-switch
+ * notice. It is a standalone warning notice — it exists only when something
+ * is wrong, and carrying that warning is its whole job. The second site was
+ * the encryption-downgrade banner, which is now a row in the top bar's
+ * status panel (top-nav.tsx) rather than a strip of its own.
  *
  * The Settings save bar (settings.tsx) is not built on this component even
  * though it wears the same tint: it is always present, showing save state,

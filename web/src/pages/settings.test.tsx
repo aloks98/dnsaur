@@ -401,11 +401,11 @@ test("a failing background refetch after a partial save keeps the form and its d
 });
 
 // The encryption-downgrade warning used to be mounted directly on this page;
-// it now lives in the app shell (see components/app-shell.test.tsx and
-// components/encryption-downgrade-banner.tsx) because it is a fact about the
-// running server, not about Settings specifically. SettingsPage rendered in
-// isolation — as every other test in this file does — no longer mounts any
-// banner at all, so there is nothing left to pin here.
+// it is now one row in the top bar's status panel (see
+// components/app-shell.test.tsx) because it is a fact about the running
+// server, not about Settings specifically. SettingsPage rendered in
+// isolation — as every other test in this file does — carries no shell, so
+// there is nothing left to pin here.
 
 // --- multi-key saves: the ordering PUT /settings actually requires --------
 //

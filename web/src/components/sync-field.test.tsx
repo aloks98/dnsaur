@@ -264,7 +264,7 @@ test("a replica whose last pull failed says so, and says when the peer is plaint
 
   expect(await screen.findByText("Last pull failed: connection refused")).toBeInTheDocument();
   // plain_http is a fact about the peer URL, so it belongs beside the peer
-  // rather than in the shell strip (lib/serving.ts's syncBanners).
+  // rather than in the status panel (lib/serving.ts's statusFacts).
   expect(screen.getByText("Peer reached over plain HTTP")).toBeInTheDocument();
   expect(screen.getByText("applied 409 of 412 · last pull 6m ago")).toBeInTheDocument();
 });

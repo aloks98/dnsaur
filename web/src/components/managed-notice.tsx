@@ -9,9 +9,10 @@
  * explanation an operator reads once.
  *
  * Muted text, not a warning strip. Being a replica is the configuration
- * working as intended; the page-wide strip is kept for the two sync facts
- * that are actually wrong (lib/serving.ts's syncBanners), and a screen that
- * warned about the normal case would teach an operator to skip it.
+ * working as intended; the top bar's status panel is kept for the sync
+ * facts that are actually wrong (lib/serving.ts's statusFacts), and a
+ * screen that warned about the normal case would teach an operator to skip
+ * it.
  *
  * `<output>` rather than a `role="alert"` banner: this is standing state for
  * as long as the instance follows a peer, not an event to interrupt for. It

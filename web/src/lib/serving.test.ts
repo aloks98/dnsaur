@@ -8,12 +8,13 @@ import type {
 } from "../api/types";
 import {
   daysUntil,
-  dhcpBanners,
   expiringSoonDetail,
+  FACT_TARGETS,
+  factBand,
   formatCertDate,
   servingState,
   somethingIsWrong,
-  syncBanners,
+  statusFacts,
 } from "./serving";
 
 test("servingState reads off intent and reality, not just one bool", () => {
@@ -95,7 +96,8 @@ test("expiringSoonDetail says whether the certificate has already lapsed", () =>
   ).toEqual({ days: 9, date: "17 Sep 2026", expired: false });
 });
 
-// somethingIsWrong is what the status poll and the shell banners both read.
+// somethingIsWrong is what the status poll reads, defined as "statusFacts
+// found something".
 // It was `encryption_downgraded` alone, which was every fact the endpoint
 // carried when the poll was written and is now one of three.
 test("somethingIsWrong covers every fact the status endpoint reports", () => {
@@ -145,8 +147,8 @@ test("somethingIsWrong covers every fact the status endpoint reports", () => {
   // `plain_http` is not one of them. It is a fact about the peer URL the
   // operator typed, and nothing but editing that URL will change it — so
   // polling for it every five seconds asks a question whose answer cannot
-  // move. The banner still shows (see syncBanners below); only the poll
-  // stays off.
+  // move. It is not a panel row either — it is stated once, in the Sync
+  // band beside the peer it describes.
   expect(somethingIsWrong({ ...clean, sync: { role: "replica", plain_http: true } })).toBe(false);
 
   // DHCP's three, on the same terms: all of them end without anyone doing
@@ -204,45 +206,6 @@ function ha(overrides: Partial<DHCPHAStatus> = {}): DHCPHAStatus {
   };
 }
 
-// The three lines spec §8.4 names, verbatim. Only failures: DHCP being off
-// is what most instances are, and a healthy pair is the configuration
-// working — a strip that warned about either is a strip nobody reads.
-test("dhcpBanners states each failure once, in the engine's own words", () => {
-  expect(dhcpBanners(undefined)).toEqual([]);
-  expect(dhcpBanners({ enabled: false, table_age_seconds: 0, scopes: [] })).toEqual([]);
-  expect(dhcpBanners(dhcp())).toEqual([]);
-  expect(dhcpBanners(dhcp({ ha: ha() }))).toEqual([]);
-
-  expect(dhcpBanners(dhcp({ engine: "unreachable" }))).toEqual(["DHCP engine unreachable"]);
-  expect(
-    dhcpBanners(
-      dhcp({
-        engine: "config rejected",
-        message: "subnet4[1]: pool 192.168.150.100-192.168.150.199 is not in subnet",
-      }),
-    ),
-  ).toEqual([
-    "DHCP config rejected: subnet4[1]: pool 192.168.150.100-192.168.150.199 is not in subnet",
-  ]);
-  expect(dhcpBanners(dhcp({ ha: ha({ communication_interrupted: true }) }))).toEqual([
-    "DHCP partner unreachable",
-  ]);
-
-  // Independent facts, shown together: the engine can be gone while the
-  // partner is also unreachable, and one line would hide the other.
-  expect(
-    dhcpBanners(dhcp({ engine: "unreachable", ha: ha({ communication_interrupted: true }) })),
-  ).toEqual(["DHCP engine unreachable", "DHCP partner unreachable"]);
-
-  // Where the page shows the engine's own line, the strip does not repeat
-  // it; the partner fact is not on that line, so it stays.
-  expect(dhcpBanners(dhcp({ engine: "unreachable" }), true)).toEqual([]);
-  expect(dhcpBanners(dhcp({ engine: "config rejected", message: "no" }), true)).toEqual([]);
-  expect(
-    dhcpBanners(dhcp({ engine: "unreachable", ha: ha({ communication_interrupted: true }) }), true),
-  ).toEqual(["DHCP partner unreachable"]);
-});
-
 function replica(overrides: Partial<SyncReplica> = {}): SyncReplica {
   return {
     instance_id: "eve-2",
@@ -255,49 +218,201 @@ function replica(overrides: Partial<SyncReplica> = {}): SyncReplica {
   };
 }
 
-// The exact lines the shell renders, pinned here rather than only through
-// the shell, because the durations are arithmetic and a banner test that
-// matched loosely would not have caught "56 years".
-test("syncBanners states each fact once, and says how long a stale replica has been quiet", () => {
-  const now = Date.UTC(2026, 8, 12, 12, 0, 0);
-  expect(syncBanners(undefined, now)).toEqual([]);
-  expect(syncBanners({ role: "main" }, now)).toEqual([]);
-  expect(
-    syncBanners(
-      {
-        role: "replica",
-        peer_url: "http://main.lan",
-        last_error: "dial tcp: connection refused",
-        plain_http: true,
+// The exact rows the status panel renders, pinned here rather than only
+// through the panel, because the durations are arithmetic and a row test
+// that matched loosely would not have caught "56 years", and because the
+// ids are what decide whether a row keeps its place between polls.
+
+const NOW = Date.UTC(2026, 8, 16, 12, 0, 0);
+
+/** Everything the endpoint can report going wrong at once, so one call
+ * answers for all ten facts. `engine` can only hold one value, so the
+ * rejected configuration and the unreachable engine are separate cases. */
+function allWrong(overrides: Partial<ResolverStatus> = {}): ResolverStatus {
+  return {
+    encryption_downgraded: true,
+    reason: 'unexpected character ";" at position 14',
+    serving: {
+      dot: {
+        enabled: true,
+        listening: false,
+        addr: ":853",
+        error: "listen tcp :853: bind: permission denied",
       },
-      now,
-    ),
-  ).toEqual(["Last pull failed: dial tcp: connection refused"]);
-  // A main's `last_error` is not a pull: it is `sync.replicas`, the one row
-  // its whole registry lives in, unreadable — so the line may not say the
-  // box failed to pull from a main it does not have.
+      doh: { enabled: true, listening: false, addr: ":443", error: "listen tcp :443: bind: x" },
+    },
+    certificate: { not_after: "2026-09-28T00:00:00Z", expiring_soon: true },
+    sync: {
+      role: "main",
+      last_error: "sync.replicas is not the JSON this build wrote",
+      replicas: [replica({ instance_id: "2IB4ABB4", stale: true, last_seen: NOW - 3 * 3_600_000 })],
+    },
+    dhcp: dhcp({
+      engine: "config rejected",
+      message: "subnet4[1]: pool 192.168.150.100-192.168.150.199 is not in subnet",
+      ha: ha({ communication_interrupted: true }),
+    }),
+    ...overrides,
+  };
+}
+
+test("statusFacts states each fact once, in the server's own words", () => {
+  expect(statusFacts(undefined, NOW)).toEqual([]);
+
+  const facts = statusFacts(allWrong(), NOW);
+  expect(facts.map((f) => [f.id, f.text, f.sub])).toEqual([
+    [
+      "encryption",
+      'Encryption is off — upstreams could not be parsed, unexpected character ";" at position 14',
+      undefined,
+    ],
+    [
+      "dot",
+      "DNS-over-TLS is enabled but not listening",
+      "listen tcp :853: bind: permission denied",
+    ],
+    ["doh", "DNS-over-HTTPS is enabled but not listening", "listen tcp :443: bind: x"],
+    ["certificate", "TLS certificate expires in 11 days — 28 Sep 2026", undefined],
+    ["sync-error", "Sync: sync.replicas is not the JSON this build wrote", undefined],
+    ["replica-stale:2IB4ABB4", "Replica 2IB4ABB4 not seen for 3h", undefined],
+    [
+      "dhcp-config",
+      "DHCP config rejected: subnet4[1]: pool 192.168.150.100-192.168.150.199 is not in subnet",
+      undefined,
+    ],
+    ["dhcp-partner", "DHCP partner unreachable", undefined],
+  ]);
+});
+
+// The listener's error is the row's muted second line, not part of the
+// sentence: the fact is one line an operator recognises, and three lines of
+// Go under it is detail.
+test("a bind error is the row's second line, and a listener with none still gets a row", () => {
+  const status = allWrong({
+    serving: {
+      dot: { enabled: true, listening: false, addr: ":853" },
+      doh: { enabled: false, listening: false, addr: "" },
+    },
+  });
+  const dot = statusFacts(status, NOW).find((f) => f.id === "dot");
+  expect(dot?.text).toBe("DNS-over-TLS is enabled but not listening");
+  expect(dot?.sub).toBeUndefined();
+});
+
+// The one red fact, and the only one that is not amber: every query is
+// going out in the clear. With no reason from the server the sentence keeps
+// the tail the banner carried before the endpoint reported one.
+test("encryption is the red fact and carries the server's reason, or the old tail without one", () => {
+  const facts = statusFacts(allWrong(), NOW);
+  expect(facts.filter((f) => f.tone === "red").map((f) => f.id)).toEqual(["encryption"]);
+  expect(statusFacts(allWrong({ reason: "" }), NOW)[0].text).toBe(
+    "Encryption is off — upstreams could not be parsed, falling back to plaintext resolvers",
+  );
+});
+
+test("every fact links to the band that fixes it", () => {
+  const targets = Object.fromEntries(statusFacts(allWrong(), NOW).map((f) => [f.id, f.target]));
+  expect(targets).toEqual({
+    encryption: "/settings#upstreams",
+    dot: "/settings#protocols",
+    doh: "/settings#protocols",
+    certificate: "/settings#protocols",
+    "sync-error": "/settings#sync",
+    "replica-stale:2IB4ABB4": "/settings#sync",
+    "dhcp-config": "/dhcp",
+    "dhcp-partner": "/dhcp",
+  });
+  // Every target the facts use has a name for the row that links to it.
+  for (const fact of statusFacts(allWrong({ dhcp: dhcp({ engine: "unreachable" }) }), NOW)) {
+    expect(FACT_TARGETS[fact.target]).toBeTruthy();
+  }
+});
+
+// The middle of the panel's three bands: a fact that stands until somebody
+// edits something outranks one that will end on its own. It is a claim
+// about the fact, not about its tone — which is why a refused DHCP
+// configuration and an unreachable engine part company here.
+test("waitsOnOperator splits the facts nobody can wait out from the ones that clear", () => {
+  const waits = (status: ResolverStatus) =>
+    Object.fromEntries(statusFacts(status, NOW).map((f) => [f.id, f.waitsOnOperator]));
+
+  expect(waits(allWrong())).toEqual({
+    encryption: true,
+    dot: true,
+    doh: true,
+    certificate: true,
+    "sync-error": true,
+    "replica-stale:2IB4ABB4": false,
+    "dhcp-config": true,
+    "dhcp-partner": false,
+  });
+  // The same `last_error` field, two facts: a main's registry row waits for
+  // somebody to repair it, a replica's failed pull ends at the next one
+  // that succeeds.
+  const asReplica = allWrong({ sync: { role: "replica", last_error: "dial tcp: refused" } });
+  expect(statusFacts(asReplica, NOW).find((f) => f.id === "sync-error")).toEqual({
+    id: "sync-error",
+    tone: "amber",
+    text: "Last pull failed: dial tcp: refused",
+    target: "/settings#sync",
+    waitsOnOperator: false,
+  });
+  // An engine that is not there comes back by itself; the configuration it
+  // refused does not.
+  expect(waits(allWrong({ dhcp: dhcp({ engine: "unreachable" }) }))["dhcp-engine"]).toBe(false);
+});
+
+// Emission order is not what the panel shows — it groups by tone and
+// waitsOnOperator first — but it is the tie-breaker inside a group, so on a
+// fresh load it is what makes the rows come out in the boards' order.
+test("emission order is by subject, and the panel's grouping turns it into the boards' order", () => {
+  const facts = statusFacts(allWrong({ dhcp: dhcp({ engine: "unreachable" }) }), NOW);
+  // The panel's own band function, not a copy of it: a copy would keep this
+  // test passing while the rows on screen came out in another order.
+  const shown = facts
+    .map((fact, seq) => ({ fact, seq }))
+    .sort((a, b) => factBand(a.fact) - factBand(b.fact) || a.seq - b.seq)
+    .map(({ fact }) => fact.id);
+  expect(shown).toEqual([
+    "encryption",
+    "dot",
+    "doh",
+    "certificate",
+    "sync-error",
+    "replica-stale:2IB4ABB4",
+    "dhcp-engine",
+  ]);
+});
+
+// The strip used to take a flag saying "the Scopes page is showing the
+// engine's own line, so drop the two facts that line repeats". The panel is
+// one list on every screen — nothing stacks above the page any more — so
+// the flag is gone and the row for a refused configuration links to that
+// line instead of hiding for it.
+test("the facts do not depend on which page is open", () => {
+  const rejected = allWrong({
+    dhcp: dhcp({ engine: "config rejected", message: "no local address is inside 10.0.0.0/16" }),
+  });
+  expect(statusFacts(rejected, NOW).map((f) => f.id)).toContain("dhcp-config");
+});
+
+// Only failures. DHCP being off is what most instances are, a healthy pair
+// is the configuration working, and being a replica is a state — a panel
+// that also carried the normal case is a panel an operator learns to skip.
+test("nothing that is merely the normal case becomes a fact", () => {
+  const clean: ResolverStatus = {
+    encryption_downgraded: false,
+    reason: "",
+    serving: {
+      dot: { enabled: true, listening: true, addr: ":853" },
+      doh: { enabled: false, listening: false, addr: "" },
+    },
+    certificate: { not_after: "2027-09-17T00:00:00Z", expiring_soon: false },
+    sync: { role: "replica", peer_url: "http://main.lan", plain_http: true, replicas: [replica()] },
+    dhcp: dhcp({ ha: ha() }),
+  };
+  expect(statusFacts(clean, NOW)).toEqual([]);
   expect(
-    syncBanners(
-      { role: "main", last_error: "sync.replicas is not the JSON this build wrote" },
-      now,
-    ),
-  ).toEqual(["Sync: sync.replicas is not the JSON this build wrote"]);
-  // A plaintext peer is a reading of the URL in the Sync band, so it is
-  // stated there and nowhere else — the strip is for the two facts that
-  // clear on their own.
-  expect(
-    syncBanners({ role: "replica", peer_url: "http://main.lan", plain_http: true }, now),
+    statusFacts({ ...clean, dhcp: { enabled: false, table_age_seconds: 0, scopes: [] } }, NOW),
   ).toEqual([]);
-  expect(
-    syncBanners(
-      {
-        role: "main",
-        replicas: [
-          replica({ instance_id: "eve-2", stale: true, last_seen: now - 95 * 60_000 }),
-          replica({ instance_id: "eve-3", stale: false, last_seen: now - 30_000 }),
-        ],
-      },
-      now,
-    ),
-  ).toEqual(["Replica eve-2 not seen for 1h 35m"]);
 });

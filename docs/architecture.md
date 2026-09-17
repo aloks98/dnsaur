@@ -1195,7 +1195,7 @@ reconciliation when they meet again.
 | a 3.0 engine that comes up after dnsaur's first render | dnsaur discovered nothing, so it rendered for the older syntax — `control-socket`, which 3.0 refuses. That is one refused render, reported as one; the poll that first reaches the engine re-reads its version and renders again, and the second one is accepted |
 | a replica is forgotten while it is the standby | its pull is refused, and the render after that drops the pair — but nothing renders on that box until something changes, so promote it or stop its engine before forgetting it (`configuration.md`) |
 | the store cannot be read on a poll | the poll runs against the scopes last read — a table built from stale scopes beats no table |
-| the HA partner is unreachable | Kea's problem to solve; the strip shows `DHCP partner unreachable` for as long as it says so |
+| the HA partner is unreachable | Kea's problem to solve; the status panel shows `DHCP partner unreachable` for as long as it says so |
 | a replica pairs later, or is forgotten | the next lease poll on both boxes adds or drops the standby peer. Nothing else has to notice, and nothing else would: the registry is written without moving `config_version`, so no settings write and no handler is involved |
 | a pool is shrunk below its live leases | Kea keeps what it has handed out until those leases expire, and the Scopes page shows `leased` above the pool size |
 | two devices claim one hostname | the newer lease keeps the name; the other is logged with both hardware addresses |

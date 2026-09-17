@@ -359,7 +359,7 @@ function FollowingState() {
             Last pull failed: {sync?.last_error}
           </p>
         )}
-        {/* Beside the peer URL rather than in the shell strip: it is a
+        {/* Beside the peer URL rather than in the status panel: it is a
             reading of that URL and nothing else can change it. */}
         {sync?.plain_http && (
           <p className="pl-[15px] text-[11.5px] text-muted-foreground">

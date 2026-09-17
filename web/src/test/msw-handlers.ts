@@ -293,7 +293,7 @@ export function dhcpStatus(overrides: Partial<DHCPStatus> = {}): DHCPStatus {
  *     server.use(...dhcpHandlers({ status: dhcpStatus({ engine: "unreachable" }) }));
  *
  * `GET /resolver/status` is re-registered too, because that is the copy the
- * shell's nav and warning strip read — a fixture that turned DHCP on for
+ * shell's nav and status panel read — a fixture that turned DHCP on for
  * `/dhcp/status` alone would leave the section hidden on every screen.
  * Writes are deliberately absent: they are registered per-test, the same way
  * zones' and clients' are, so a test that asserts on a request body owns the

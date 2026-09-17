@@ -413,16 +413,15 @@ when none has ever loaded. That is a different fact from "not expiring
 soon", and conflating them would put an expiry warning on a fresh install.
 
 `sync` is **always present** and is the same object `GET /sync/status`
-answers on its own (§2.11 and §3.13). It rides here so the warning strip can
-show "behind by N", a failed pull, a peer reached over plain HTTP or a stale
-replica without a second round trip. An instance with no sync configured
+answers on its own (§2.11 and §3.13). It rides here so the status panel can
+show a failed pull or a stale replica without a second round trip (§6.3). An instance with no sync configured
 reads as `{"role": "main"}` and nothing else — the `omitempty` on every other
 field means a main with no replicas is exactly that one key.
 
 **Polling.** The dashboard polls this while `somethingIsWrong`
-(`web/src/lib/serving.ts`) — a downgrade, either protocol enabled and not
-listening, or a certificate expiring soon — every 5s, and not at all
-otherwise. One predicate, shared with the shell banners, so "we warn about
+(`web/src/lib/serving.ts`) — defined as "the status panel has a row", so
+every fact §6.3 lists counts — every 5s, and not at all otherwise. One
+definition, not a second list beside the one that is rendered, so "we show
 this" and "we keep asking about this" cannot drift.
 
 It also polls every 1s for 5s after **any `serve.*` write**, whatever the
@@ -1230,7 +1229,8 @@ object *that* render left behind rather than 204, so the caller reads the
 message this apply produced instead of the state before it.
 
 `GET /resolver/status` carries the same status object as `dhcp`, which is
-what the shell's warning strip and the nav's section gating both read (§6.4).
+what the top bar's status panel and the nav's section gating both read
+(§6.3, §6.4).
 
 `dhcp.domain`, `dhcp.lease_seconds`, `dhcp.lease_poll_seconds` and
 `dhcp.ha_port` are ordinary editable settings (§2.3); `dhcp.ha_primary` and
@@ -1957,7 +1957,7 @@ discarded on save, and lost its row error on the resync.
 ### 6.1 Replica mode: which controls are live
 
 Every screen reads `GET /resolver/status`'s `sync` block (§3.13) — already
-held by the shell for its banners, so this costs no request — and treats
+held by the shell for the status panel, so this costs no request — and treats
 `role === "replica"` as "the write controls here are not this box's". The
 server refuses the write regardless (**409** `managed by <peer_url>`, §1);
 this is the screen agreeing with it up front instead of offering a form that
@@ -2081,44 +2081,118 @@ internal — the main creates the key on the first pairing — and `sync.token`
 is written by `POST /sync/follow` and cleared by `Stop following`; neither is
 returned by `GET /settings` and neither has a control.
 
-### 6.3 Sync's shell banners
+### 6.3 The status cell and its panel
 
-The warning strip (`serving-banners.tsx`, mounted in the shell) gains the
-lines below, derived by `syncBanners` in `lib/serving.ts`. That same function
-backs `syncTrouble`, which `somethingIsWrong` reads — and that is what keeps
-the status poll running while a fact is up, so a banner does not sit there
-after it has cleared.
+Everything that is wrong with the *running server* — as opposed to with the
+screen you are on — is one cell in the top bar and one panel under it. It
+used to be a stack of page-wide `role="alert"` warning strips, one per fact,
+on every screen; there are ten such facts and most of them stand for hours,
+so three bars regularly ate the top of every page and the operator stopped
+reading them. `web/src/lib/serving.ts`'s `statusFacts` derives the list;
+`components/top-nav.tsx`'s `StatusCell` renders it.
 
-| Condition | Line (verbatim) |
+**The cell** is row 1's resolver readout (`DNS OK` / `DNS down` /
+`Checking DNS…`), which becomes a button when there is anything to report:
+
+| State | Cell |
 |---|---|
-| `last_error` non-empty, `role: "replica"` | `Last pull failed: <last_error>` |
-| `last_error` non-empty, `role: "main"` | `Sync: <last_error>` |
-| a `replicas[]` entry with `stale: true` (one line each) | `Replica <instance_id> not seen for <duration>` |
+| nothing wrong | `● DNS OK` — an `<output>`, exactly as before |
+| n facts, none red | `● 3 ISSUES ▾`, amber tint, amber bottom rule |
+| any fact red | the same, in the destructive tone |
+| **`GET /health` failing** | `● DNS down`, destructive, **whatever the count** |
 
-The field is one, the failure is not: on a replica it is the last pull, and
-on a main it is `sync.replicas` — the row the whole registry lives in —
+A resolver that is not answering outranks every fact in the panel: it is the
+one thing on that bar nothing else can be more urgent than, and a cell
+reading `4 ISSUES` while DNS is off the air buries the only one that stops
+the network working. The panel still opens from it.
+
+The button is `aria-haspopup="dialog"` with `aria-expanded` and
+`aria-label="3 issues"` (`"DNS down, 3 issues"` while down); the panel is
+`role="dialog"` labelled by its `STATUS` header. Escape closes it and focus
+returns to the cell.
+
+**The panel** is a 460px popover anchored under the cell (rnui `Popover`,
+`align="end"`, `sideOffset={0}`, radius 0); at ≤640px it is an rnui `Sheet
+side="bottom"` across the full width, with the same rows. A header counts
+what is open (`6 open · 1 red`) and every row is a link to the band that
+fixes that fact, with the destination named on the row.
+
+**The ten facts**, with their tone and where each is fixed:
+
+| # | Tone | Text (verbatim) | Fix |
+|---|---|---|---|
+| 1 | red | `Encryption is off — upstreams could not be parsed, <reason>` | Settings › Upstreams |
+| 2 | amber | `DNS-over-TLS is enabled but not listening` · second line: the bind error | Settings › Protocols |
+| 3 | amber | `DNS-over-HTTPS is enabled but not listening` · second line: the bind error | Settings › Protocols |
+| 4 | amber | `TLS certificate expires in N days — <date>` / `TLS certificate expired — <date>` | Settings › Protocols |
+| 5 | amber | `Sync: <last_error>` (on a **main**) | Settings › Sync |
+| 6 | amber | `DHCP config rejected: <the engine's own message>` | DHCP › Scopes |
+| 7 | amber | `Last pull failed: <last_error>` (on a **replica**) | Settings › Sync |
+| 8 | amber | `Replica <instance_id> not seen for <duration>` (one row each) | Settings › Sync |
+| 9 | amber | `DHCP engine unreachable` | DHCP › Scopes |
+| 10 | amber | `DHCP partner unreachable` | DHCP › Scopes |
+
+`<duration>` is `formatDuration(now - last_seen)` — `42m`, `1h 35m`, `2d 6h`
+— how long it has been quiet, not a wall-clock stamp the reader has to
+subtract from. `<reason>` and the engine's message are the server's own
+words: paraphrasing Kea's refusal would leave the operator matching an
+approximation against the engine's log.
+
+Rows 5 and 7 are the same field. On a replica it is the last pull, and on a
+main it is `sync.replicas` — the row the whole registry lives in —
 unreadable, which is a main that admits no transfer and notifies nobody
 while the band reads "no replicas". A main has no pull to have failed, so it
 does not get the replica's line.
 
-`<duration>` is `formatDuration(now - last_seen)` — `42m`, `1h 35m`, `2d 6h`
-— how long it has been quiet, not a wall-clock stamp the reader has to
-subtract from. A replica that is merely *behind* gets no banner: that is what
-a pull interval looks like from outside, and the Sync band's `applied n of m`
-already says it on the one screen where the number is worth reading.
+**Order** is red first, then amber facts that **wait on the operator**, then
+amber facts that clear on their own; within a band, first-seen first, and a
+row never moves once it is on screen. `waitsOnOperator` is a claim about the
+fact rather than about its tone, which is why a refused DHCP configuration
+(6) sits above a failed pull (7): the configuration stands until somebody
+edits the scope, while the pull ends at the next one that succeeds. The
+table above is the order a box with everything wrong at once shows.
 
-A replica's two clear on their own — the next successful pull empties
-`last_error`, the next check-in un-stales a replica — which is exactly what
-`syncTrouble` watches, so the 5 s trouble poll is what takes them down. A
-main's `Sync:` line does not: `sync.replicas` stays unreadable until somebody
-repairs the row, and the poll only takes the line down once they have.
+**Arrival.** The count goes up and the tint switches to red if the arrival
+is red. The row carries a `NEW` tag until the panel has been opened and
+closed again — closed by Escape, by clicking away, or by following one of
+its own rows. There is no dismiss, no toast, and **the panel never opens
+itself**, including after the last fact cleared under an open panel and a
+new one arrived. A fact that clears takes its row with it, and at zero the
+cell goes back to `DNS OK`; a fact that clears and comes back is a fresh
+arrival — a new place at the bottom of its band, and `NEW` again.
 
-**`plain_http` is deliberately not a banner**, and neither is being a replica
-at all. A plaintext peer is a reading of the peer URL the operator typed, so
-nothing but an edit to that URL can change the answer; it is stated once, in
-the Sync band beside the peer it describes. The strip is for the two facts
-that are wrong and can stop being wrong — a strip that also warned about the
-normal case is a strip an operator learns to skip.
+**Announcement** (`components/app-shell.tsx`'s `StatusAnnouncer`, mounted
+once in the shell). One visually hidden `aria-live="polite"
+aria-atomic="true"` region receives each arriving amber fact's text; red
+facts go to a second region with `role="alert"`. Every strip used to be
+`role="alert"`, which announced all nine assertively and interrupted
+whatever was being read — only the red fact earns that now. Everything
+already true at page load counts as one arrival: that is the load, and it is
+the only moment a reader who cannot see the cell would otherwise never learn
+there is anything in it. **Clearing is not announced** — nobody needs
+telling that a thing they may never have heard about has stopped being true
+— but once the last fact of that tone has cleared, the region is *emptied*,
+so a fault that ended is not left in the accessible tree for someone who
+navigates into it (while another fact of the same tone is still true, the
+region keeps the last text it announced). The text hangs off a keyed node,
+so the same fault coming back with the same words still announces.
+
+**`somethingIsWrong`** — the predicate `useResolverStatus`'s 5s trouble poll
+reads — is defined as "the panel has a row". It is the same definition, not
+a second list beside it: the poll was once gated on `encryption_downgraded`
+alone, and when a milestone added two more facts to the same endpoint nobody
+widened it, so a bind failure that had cleared left its banner up until the
+operator navigated away and back.
+
+**What is deliberately not a fact.** `plain_http` is a reading of the peer
+URL the operator typed — nothing but an edit to that URL can change the
+answer — so it is stated once, in the Sync band beside the peer it
+describes. Being a replica at all is a state and reads as the top bar's
+chip; a replica that is merely *behind* is what a pull interval looks like
+from outside. DHCP being off is what most instances are, and a healthy HA
+pair is the configuration working. A panel that carried the normal case is a
+panel an operator learns to skip — which is the complaint that got the bars
+removed in the first place.
 
 ### 6.4 DHCP: the section, the engine line and the replica rule
 
@@ -2168,20 +2242,25 @@ blank is **dropped** before validation — it is the row the `+` button
 appended — while a half-filled one is refused with the message on the field
 it is about and `aria-invalid` on it.
 
-**The three strip facts** (§6.3's list, extended) are derived from the same
-`dhcp` object and watched by the same trouble poll, so a line and the poll
-that clears it cannot drift apart:
+**DHCP's three status facts** (§6.3's rows 6, 9 and 10) are derived from the
+same `dhcp` object and watched by the same trouble poll, so a row and the
+poll that clears it cannot drift apart:
 
-> `DHCP engine unreachable`
 > `DHCP config rejected: <message>`
+> `DHCP engine unreachable`
 > `DHCP partner unreachable` — HA `communication_interrupted`
 
-All three end without anyone doing anything — a restarted engine answers, a
-rebooted partner comes back, a refused configuration clears on the next
-accepted render — so the 5 s trouble poll takes them down. DHCP being *off*
-gets no line: that is what most instances are. On the Scopes page itself the
-strip carries only the partner line: the engine's line at the top of that
-page already says the other two, with **Apply again** beside it.
+Two of the three end without anyone doing anything — a restarted engine
+answers, a rebooted partner comes back — so the 5 s trouble poll takes them
+down; a refused configuration clears on the next accepted render, which is
+what **Apply again** is for. DHCP being *off* gets no row: that is what most
+instances are.
+
+**The engine line stays on this page**, and it is the only place the refused
+message prints here — the panel row for it links to this line rather than
+being suppressed for it. Nothing stacks above the page any more, so there is
+no second copy to hide: the panel lists all three on the Scopes page exactly
+as it does everywhere else.
 
 **Replica mode.** Scopes and reservations are synced configuration, so the
 §6.1 rule applies unchanged: `Managed by the main` beside the disabled action,

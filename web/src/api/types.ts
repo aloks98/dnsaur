@@ -150,7 +150,7 @@ export interface ResolverStatus {
    * fixture written before it existed. Absent reads as a main. */
   sync?: SyncStatus;
   /** GET /dhcp/status' object, carried here for the same reason `sync` is:
-   * the shell's warning strip and the nav both have to know what the engine
+   * the top bar's status panel and the nav both have to know what the engine
    * is doing on every screen, not only on the DHCP ones. Absent reads as
    * DHCP off — see DHCPStatus. */
   dhcp?: DHCPStatus;

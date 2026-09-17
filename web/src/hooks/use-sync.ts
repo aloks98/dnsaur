@@ -35,7 +35,7 @@ export function useSyncStatus() {
  * it from nobody.
  *
  * Read off `GET /resolver/status` rather than `/sync/status` because the
- * shell already holds that query for its banners (see serving-banners.tsx),
+ * shell already holds that query for the status panel (see top-nav.tsx),
  * so every screen that has to know whether its write controls are live gets
  * the answer without a round trip of its own.
  *

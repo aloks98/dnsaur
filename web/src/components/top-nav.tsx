@@ -1,3 +1,4 @@
+import { useMemo, useState, useSyncExternalStore } from "react";
 import { LogOut } from "lucide-react";
 import { Link, NavLink, useLocation, useSearchParams } from "react-router";
 import { toast } from "sonner";
@@ -13,9 +14,17 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
   Kbd,
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+  Sheet,
+  SheetContent,
+  SheetTrigger,
 } from "@e412/rnui-react";
 import type { SseState } from "../api/sse";
 import { isAlreadyLoggedOut, useLogout, useMe, useMeInitials } from "../hooks/use-auth";
+import { useResolverStatus } from "../hooks/use-settings";
+import { FACT_TARGETS, factBand, statusFacts, type StatusFact } from "../lib/serving";
 import { useHealth } from "../hooks/use-stats";
 import {
   DASHBOARD_PATH,
@@ -173,8 +182,9 @@ export function TopNav({ onOpenCommandPalette }: TopNavProps) {
               read as a pair. It stays flat text while blocking is filled —
               one of them governs what dnsaur does and the other reports a
               status that is green nearly all the time, and filling both
-              would make the bar shout twice. */}
-          <ResolverStatusCell />
+              would make the bar shout twice. The same cell carries whatever
+              else is currently wrong — see StatusCell. */}
+          <StatusCell />
           <RoleChip />
         </div>
       </div>
@@ -243,9 +253,9 @@ export function TopNav({ onOpenCommandPalette }: TopNavProps) {
  * box takes its configuration from another one.
  *
  * A chip beside the two health cells rather than a page-wide banner, because
- * being a replica is a *state* and not a fault — the strip above the page is
- * kept for the two sync facts that are actually wrong (lib/serving.ts's
- * syncBanners). Its square is hollow — an outline, no fill — which is the
+ * being a replica is a *state* and not a fault — the status panel beside it
+ * is kept for the sync facts that are actually wrong (lib/serving.ts's
+ * statusFacts). Its square is hollow — an outline, no fill — which is the
  * bar's quietest possible marker: present, and lit up about nothing.
  *
  * The host, not the whole URL: this is an identity, and at this type size a
@@ -665,7 +675,331 @@ function LogOutItem() {
 }
 
 /**
- * Row 1's second readout: is the *resolver* answering (GET /health)?
+ * Row 1's second readout, and the shell's one place for everything that is
+ * currently wrong with this server.
+ *
+ * It used to be two things in two places: this cell said whether the
+ * resolver was answering, and the shell stacked a page-wide warning bar
+ * under the top bar for every other fact that was true. There are ten such
+ * facts now, most of them persistent for hours, so three bars regularly ate
+ * the top of every screen and the operator stopped reading them. They are
+ * one count here, and a panel of rows under it.
+ *
+ * With nothing open the cell is exactly the liveness readout it has always
+ * been (ResolverReadout). With facts it is a button — `3 ISSUES ▾`, tinted
+ * amber, or red when any fact is red — opening a panel whose every row
+ * links to the band that fixes that fact.
+ *
+ * **A resolver that is not answering outranks all of it.** `DNS down` keeps
+ * the cell whatever the count: it is the one thing on this bar that nothing
+ * else can be more urgent than, and a cell reading `4 ISSUES` while DNS is
+ * off the air buries the only one that stops the network working. The panel
+ * still opens from it — the facts have not gone anywhere.
+ *
+ * No dismiss and no toast: rows leave when the fact clears, and at zero the
+ * cell goes back to `DNS OK`. The panel never opens itself. How a screen
+ * reader learns about an arrival is app-shell.tsx's StatusAnnouncer.
+ */
+function StatusCell() {
+  const health = useHealth();
+  const { facts, markSeen } = useStatusFacts();
+  const [open, setOpen] = useState(false);
+  const phone = useIsPhone();
+
+  function onOpenChange(next: boolean) {
+    setOpen(next);
+    // On the way *out*, not on the way in: the tag's whole job is to say
+    // which rows the reader has not seen yet, and clearing it as the panel
+    // opens would clear it before they had looked. Closing is the moment
+    // every row that was on screen stops being new — including one that
+    // arrived while it was open, and one the reader left by clicking it.
+    if (!next) markSeen();
+  }
+
+  if (facts.length === 0) {
+    // The panel unmounts with its last row, and `open` would outlive it:
+    // the next fact to arrive would mount the popover *already open*, which
+    // is the one thing the boards say never happens. Closing here marks the
+    // rows seen as any close does. Focus is not returned to the cell — the
+    // trigger unmounts with the popover, so there is nothing to return it
+    // to; the readout that replaces it is not focusable.
+    if (open) onOpenChange(false);
+    return <ResolverReadout />;
+  }
+
+  const issues = `${facts.length} ${facts.length === 1 ? "issue" : "issues"}`;
+  const down = health.isError;
+  const tone = down || facts.some((fact) => fact.tone === "red") ? TONE.red : TONE.amber;
+
+  // Same button either way — only what it opens changes with the width.
+  // `children` as a prop because both triggers render the element for us.
+  const cell = {
+    // Uppercased by CSS like every other cell, so the accessible name stays
+    // "3 issues" rather than being spelled out letter by letter.
+    "aria-label": down ? `DNS down, ${issues}` : issues,
+    className: cn(CELL, "gap-2 border-l border-l-border font-medium tracking-wider", tone.cell),
+    children: (
+      <>
+        <span aria-hidden className={cn("size-[7px] shrink-0", tone.dot)} />
+        {down ? "DNS down" : issues}
+        <span aria-hidden className="opacity-70">
+          ▾
+        </span>
+      </>
+    ),
+  };
+
+  // Below `sm` the bar is mostly this cell, so a 460px card anchored to it
+  // would be the width of the screen with nowhere to hang — the boards put
+  // the panel across the bottom instead. A real media query rather than a
+  // CSS-only swap: the two are different components, not one in two skins.
+  if (phone) {
+    return (
+      <Sheet open={open} onOpenChange={onOpenChange}>
+        <SheetTrigger {...cell} />
+        <SheetContent
+          side="bottom"
+          // The panel's own header carries the ESC hint at the right, which
+          // is exactly where rnui floats its close button.
+          showCloseButton={false}
+          aria-labelledby={PANEL_TITLE_ID}
+          className="max-h-[80svh] gap-0 overflow-y-auto rounded-none p-0"
+        >
+          <StatusPanel facts={facts} onNavigate={() => onOpenChange(false)} />
+        </SheetContent>
+      </Sheet>
+    );
+  }
+
+  return (
+    <Popover open={open} onOpenChange={onOpenChange}>
+      {/* base-ui's trigger carries aria-haspopup="dialog", aria-expanded and
+          aria-controls itself, and returns focus here when the panel closes
+          — including on Esc. */}
+      <PopoverTrigger {...cell} />
+      <PopoverContent
+        align="end"
+        sideOffset={0}
+        aria-labelledby={PANEL_TITLE_ID}
+        className={cn(
+          "w-[460px] max-w-[calc(100vw-0.5rem)] gap-0 rounded-none border border-border p-0",
+          "max-h-[70vh] overflow-y-auto shadow-[0_14px_40px_rgba(0,0,0,0.18)] ring-0",
+        )}
+      >
+        <StatusPanel facts={facts} onNavigate={() => onOpenChange(false)} />
+      </PopoverContent>
+    </Popover>
+  );
+}
+
+const PANEL_TITLE_ID = "status-panel-title";
+
+/**
+ * The panel: a header that counts what is open, then one row per fact.
+ *
+ * Every row is a link, because every fact has a place it is fixed and the
+ * point of collapsing the bars was that the fix was a screen away with no
+ * way to get there. The destination is named on the row rather than left to
+ * the operator to infer from the wording.
+ */
+function StatusPanel({ facts, onNavigate }: { facts: PanelFact[]; onNavigate: () => void }) {
+  const red = facts.filter((fact) => fact.tone === "red").length;
+
+  return (
+    <>
+      <div className="flex items-center gap-2.5 border-b border-border px-3.5 py-2.5">
+        <span
+          id={PANEL_TITLE_ID}
+          className="font-mono text-[9.5px] leading-none font-semibold tracking-[0.14em] text-muted-foreground uppercase"
+        >
+          Status
+        </span>
+        <span className="font-mono text-[11px] leading-none text-muted-foreground">
+          {facts.length} open{red > 0 && ` · ${red} red`}
+        </span>
+        <span className="ml-auto font-mono text-[9.5px] leading-none tracking-[0.1em] text-muted-foreground">
+          ESC
+        </span>
+      </div>
+      {facts.map((fact) => {
+        const tone = TONE[fact.tone];
+        return (
+          <Link
+            key={fact.id}
+            to={fact.target}
+            onClick={onNavigate}
+            className={cn(
+              "grid grid-cols-[minmax(0,1fr)_auto] items-start gap-x-4 gap-y-1",
+              "border-b border-border-muted py-2.5 pr-3.5 pl-[17px] no-underline",
+              tone.row,
+            )}
+          >
+            <span className="flex min-w-0 items-center gap-2">
+              <span className="font-mono text-[12.5px] leading-[1.35] break-words">
+                {fact.text}
+              </span>
+              {fact.isNew && (
+                <span
+                  className={cn(
+                    "shrink-0 border px-1 py-0.5 font-mono text-[9px] leading-none font-semibold",
+                    "tracking-[0.12em]",
+                    tone.tag,
+                  )}
+                >
+                  NEW
+                </span>
+              )}
+            </span>
+            <span className="pt-0.5 font-mono text-[9.5px] leading-[1.35] tracking-[0.1em] whitespace-nowrap text-muted-foreground uppercase">
+              {FACT_TARGETS[fact.target]} <span aria-hidden>→</span>
+            </span>
+            {/* The listener's error, under the fact it belongs to rather
+                than appended to it: the fact is one sentence an operator
+                recognises, and the bind error is three lines of Go. */}
+            {fact.sub !== undefined && fact.sub !== "" && (
+              <span className="col-span-full font-mono text-[11.5px] leading-[1.35] break-words text-muted-foreground">
+                {fact.sub}
+              </span>
+            )}
+          </Link>
+        );
+      })}
+    </>
+  );
+}
+
+/**
+ * The two tones, exactly as the boards give them: the tint is `--warning` /
+ * `--destructive` at the board's own light and dark opacities, the text is
+ * the matching `-foreground`, and the solid token draws the rule — 3px down
+ * the left of a panel row, and the bar's own active-cell bottom border on
+ * the cell, which is how every other marked cell up here does it.
+ */
+const TONE = {
+  amber: {
+    cell: "border-b-warning bg-warning/7 text-warning-foreground dark:bg-warning/9",
+    row: "bg-warning/7 text-warning-foreground shadow-[inset_3px_0_0_var(--warning)] dark:bg-warning/9",
+    dot: "bg-warning",
+    tag: "border-warning",
+  },
+  red: {
+    cell: "border-b-destructive bg-destructive/5 text-destructive-foreground dark:bg-destructive/7",
+    row: "bg-destructive/5 text-destructive-foreground shadow-[inset_3px_0_0_var(--destructive)] dark:bg-destructive/7",
+    dot: "bg-destructive",
+    tag: "border-destructive",
+  },
+} as const;
+
+type PanelFact = StatusFact & { isNew: boolean };
+
+/**
+ * The facts in the order the panel lists them, each knowing whether it
+ * arrived since the panel was last opened.
+ *
+ * Ordering is red first, then amber that waits on the operator, then amber
+ * that clears on its own; within a group, oldest first. The grouping is a
+ * claim about what the reader can do next, and first-seen inside it is what
+ * stops a row the reader has already placed from moving under their eyes
+ * when the poll comes back with the same facts in a different arithmetic.
+ */
+function useStatusFacts(): { facts: PanelFact[]; markSeen: () => void } {
+  const status = useResolverStatus();
+  // Memoised on the query's own data so the facts move only when the
+  // server's answer does. One of them reads the clock (how long a replica
+  // has been quiet), and the bar re-renders for reasons that have nothing
+  // to do with this — a route change, a stats window — none of which should
+  // rewrite a row.
+  const facts = useMemo(() => statusFacts(status.data), [status.data]);
+
+  // First-seen order, so a row never moves once it is on screen: the sort
+  // below only ever groups, and inside a group this number is what keeps the
+  // third row third while the poll comes back with the same facts in a
+  // different arithmetic.
+  //
+  // Set during render rather than from an effect — React's own shape for
+  // state derived from what the last render saw. The new numbering is used
+  // *this* render, so a row is never painted in one place and moved to
+  // another a frame later, and React re-runs the component before the
+  // browser sees either version.
+  const [order, setOrder] = useState(NO_ORDER);
+  const numbered = reorder(order, facts);
+  if (numbered !== order) setOrder(numbered);
+
+  // What the panel has already shown. Empty until it is first closed, so
+  // everything waiting on a fresh load carries NEW — which is what "arrived
+  // since the panel was last opened" means when it never has been.
+  //
+  // Pruned in the same breath as the numbering above, and for the same
+  // reason: a fact that cleared and came back is a new arrival. Without
+  // this it kept its place in the "already shown" set while `reorder` gave
+  // it a fresh position — a row that had moved to the bottom of its band
+  // with nothing on it saying why.
+  const [seen, setSeen] = useState(NOTHING_SEEN);
+  const remembered = prune(seen, facts);
+  if (remembered !== seen) setSeen(remembered);
+
+  return {
+    facts: facts
+      .slice()
+      .sort((a, b) => factBand(a) - factBand(b) || num(numbered, a) - num(numbered, b))
+      .map((fact) => ({ ...fact, isNew: !remembered.has(fact.id) })),
+    markSeen: () => setSeen(new Set(facts.map((fact) => fact.id))),
+  };
+}
+
+const NO_ORDER: ReadonlyMap<string, number> = new Map();
+const NOTHING_SEEN: ReadonlySet<string> = new Set();
+
+/** `reorder` numbers every fact that is currently true, so this cannot
+ * miss; the fallback says what an unnumbered fact would be — the newest
+ * one there is, which is where it would sort anyway. */
+function num(order: ReadonlyMap<string, number>, fact: StatusFact): number {
+  return order.get(fact.id) ?? Number.MAX_SAFE_INTEGER;
+}
+
+/**
+ * Numbers the facts that are new to `order` and forgets the ones that have
+ * cleared — a fact that comes back is a new arrival, not the old row
+ * returning to the place it used to hold.
+ *
+ * Returns `order` itself when neither happened, so a poll that reports the
+ * same facts costs no render.
+ */
+function reorder(
+  order: ReadonlyMap<string, number>,
+  facts: StatusFact[],
+): ReadonlyMap<string, number> {
+  const live = new Set(facts.map((fact) => fact.id));
+  const kept = [...order].filter(([id]) => live.has(id));
+  const arrived = facts.filter((fact) => !order.has(fact.id));
+  if (kept.length === order.size && arrived.length === 0) return order;
+  let next = kept.length === 0 ? 0 : Math.max(...kept.map(([, n]) => n)) + 1;
+  return new Map([...kept, ...arrived.map((fact) => [fact.id, next++] as const)]);
+}
+
+/** The boards' phone breakpoint, which is also Tailwind's `sm`. */
+const PHONE = "(max-width: 640px)";
+
+function subscribePhone(onChange: () => void): () => void {
+  const query = window.matchMedia(PHONE);
+  query.addEventListener("change", onChange);
+  return () => query.removeEventListener("change", onChange);
+}
+
+function isPhone(): boolean {
+  return window.matchMedia(PHONE).matches;
+}
+
+/** Which panel the cell opens. The rest of the bar meets narrow widths with
+ * CSS alone (see TopNav's own comment), but a popover and a bottom sheet are
+ * two components rather than one restyled, so this one needs the answer in
+ * JavaScript. */
+function useIsPhone(): boolean {
+  return useSyncExternalStore(subscribePhone, isPhone);
+}
+
+/**
+ * Is the *resolver* answering (GET /health)?
  *
  * This is the app's only liveness signal and it used to be the sidebar
  * footer's single status dot. It sits beside the blocking readout, in the
@@ -680,8 +1014,11 @@ function LogOutItem() {
  * reads as an action in progress ("…resolving what? is it stuck?") rather
  * than as a state. "DNS OK" / "DNS down" parallel the blocking readout
  * beside it, so the pair scans as two answers to the same question.
+ *
+ * This is the cell with nothing else to report; StatusCell above takes the
+ * same slot over as a button when there is.
  */
-function ResolverStatusCell() {
+function ResolverReadout() {
   const health = useHealth();
   const label = health.isPending ? "Checking DNS…" : health.isError ? "DNS down" : "DNS OK";
 
@@ -696,7 +1033,7 @@ function ResolverStatusCell() {
       title={health.data ? `dnsaur ${health.data.version}` : undefined}
       className={cn(
         CELL,
-        "border-l border-l-border text-xs font-medium tracking-wider",
+        "gap-2 border-l border-l-border text-xs font-medium tracking-wider",
         health.isError
           ? "text-destructive"
           : health.isPending
@@ -704,8 +1041,21 @@ function ResolverStatusCell() {
             : "text-primary",
       )}
     >
+      {/* The boards' 7px square. `bg-current` rather than a tone of its own:
+          the cell already picks a colour per state, and a dot that had to
+          be told the same thing twice is a second place to get it wrong. */}
+      <span aria-hidden className="size-[7px] shrink-0 bg-current" />
       <span className="sr-only">Resolver: </span>
       {label}
     </output>
   );
+}
+
+/** Forgets what the panel has shown about facts that have since cleared, so
+ * one that comes back is new again — the rule `reorder` applies to a row's
+ * position, applied to its tag. Returns `seen` itself when nothing went. */
+function prune(seen: ReadonlySet<string>, facts: StatusFact[]): ReadonlySet<string> {
+  const live = facts.filter((fact) => seen.has(fact.id)).map((fact) => fact.id);
+  if (live.length === seen.size) return seen;
+  return new Set(live);
 }

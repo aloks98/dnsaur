@@ -393,8 +393,8 @@ test("an unreachable resolver says so rather than staying green", async () => {
 });
 
 // Being a replica is a state, not a warning (spec §8): it reads as a chip
-// beside the health readouts, and the page-wide strip is left for the two
-// facts that actually need fixing.
+// beside the health readout, and the status panel that readout opens is
+// left for the sync facts that actually need fixing.
 test("a replica names the main it follows, and the chip opens the Sync band", async () => {
   server.use(...replicaHandlers("https://adam.dns"));
 

@@ -835,11 +835,12 @@ back. Nothing retries a refused configuration on a timer, which is what
 **Apply again** is for — fix what Kea complained about (a hook library, a
 socket permission) and press it.
 
-The same three facts also ride the page-wide warning strip on every other
-screen, so an operator who never opens this section still learns: `DHCP engine
-unreachable`, `DHCP config rejected: <message>`, `DHCP partner unreachable`.
-On the Scopes page the strip carries only the partner line, since the engine
-line above the table already says the other two. All three clear on their own.
+The same three facts also sit in the top bar's status panel, on every screen
+including this one, so an operator who never opens this section still learns:
+`DHCP config rejected: <message>`, `DHCP engine unreachable`, `DHCP partner
+unreachable`. The panel's row for a refused configuration links back to the
+line above — that line is still the only place the message prints on this
+page, and the only place **Apply again** lives. All three clear on their own.
 
 ### Scopes
 
@@ -1039,8 +1040,8 @@ the live configuration, and accepting it would take the listener down at
 the next reconcile.
 
 The three states that mean something is wrong — a failed bind, an expiring
-certificate, and the upstream-encryption downgrade — also appear as banners
-across the top of every screen, not just this one.
+certificate, and the upstream-encryption downgrade — also appear in the top
+bar's status panel, reachable from every screen, not just this one.
 
 ### Sync
 
@@ -1147,8 +1148,8 @@ had to switch off:
 > Managed by the main
 
 That is the whole of it. Being a replica is a state, not a fault, so it gets
-no warning banner; the strip across the top is kept for the two things that
-are actually wrong (below).
+no warning of its own; the top bar's status panel is kept for the two things
+that are actually wrong (below).
 
 #### What a replica can still change
 
@@ -1185,8 +1186,9 @@ ever taking writes.
 
 #### When something is wrong
 
-These facts appear as banners across the top of every screen, all of them
-failures — the first and the last end on their own:
+These facts appear as rows in the top bar's status panel, reachable from
+every screen, all of them failures — the first and the last end on their own,
+and each row links straight back to this band:
 
 - **Last pull failed: <reason>** — on a replica, the reason verbatim from
   the server. The previously applied configuration is still in force; DNS is
