@@ -412,6 +412,42 @@ func TestImportBundleRefusesUnknownFormat(t *testing.T) {
 	})
 }
 
+// TestImportBundleRefusesFormatOne is the older main meeting a round-two
+// replica: its scopes carry pool_start/pool_end, which decode here as no
+// pools at all. Applying it would strip every pool on this box, so it is
+// refused whole — nothing pruned, the version left where it was — with both
+// formats named and the side to upgrade.
+func TestImportBundleRefusesFormatOne(t *testing.T) {
+	forEachDriver(t, func(t *testing.T, s Store) {
+		ctx := t.Context()
+		f := newFixture()
+		id, err := s.DHCP().AddScope(ctx, scopeFixture(f))
+		if err != nil {
+			t.Fatal(err)
+		}
+		before, err := s.Settings().ConfigVersion(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// A format-1 bundle without this scope: were it applied, the scope
+		// here would be pruned and the one it carries left with no pools.
+		var b Bundle
+		if err := json.Unmarshal([]byte(`{"format":1,"scopes":[{"id":1,"name":"lan","cidr":"10.0.0.0/24","pool_start":"10.0.0.100","pool_end":"10.0.0.200"}]}`), &b); err != nil {
+			t.Fatal(err)
+		}
+		err = s.ImportBundle(ctx, b)
+		if want := "bundle format 1 from the main, this box reads format 2: upgrade the main"; err == nil || err.Error() != want {
+			t.Fatalf("import of a format-1 bundle = %v, want %q", err, want)
+		}
+		if after, _ := s.Settings().ConfigVersion(ctx); after != before {
+			t.Errorf("a refused bundle moved config_version %d -> %d", before, after)
+		}
+		if got, err := s.DHCP().Scope(ctx, id); err != nil || len(got.Pools) != 2 {
+			t.Errorf("scope %d after a refused bundle = %+v (err %v), want it and its pools untouched", id, got, err)
+		}
+	})
+}
+
 // TestImportBundleRefusesToOverwriteABuiltinZone is the other half of §4.2's
 // "both boxes seed their own". An id that lands on an RFC 6303 zone would
 // rewrite it into a synced one, and the prune exempts internal zones, so that

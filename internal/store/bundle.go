@@ -14,9 +14,13 @@ import (
 
 // BundleFormat is the bundle document this build reads and writes. A replica
 // refuses a format it does not know rather than applying the part of it it
-// happens to understand (spec §10): an unknown format means the main is
-// newer, and the answer is to upgrade the replica, not to guess.
-const BundleFormat = 1
+// happens to understand (spec §10): an unknown format means one side is
+// older than the other, and the answer is to upgrade it, not to guess.
+//
+// 2 is DHCP round two: classes, and a scope's pools as a list in place of
+// pool_start/pool_end. A format-1 scope decodes here with no pools at all,
+// so applying one would strip every pool on the replica.
+const BundleFormat = 2
 
 const (
 	// instanceIDSetting identifies the box a bundle came from. It is a
@@ -310,8 +314,14 @@ var parkedKeys = []struct{ table, column, where string }{
 // transfer state, a list's refresh state, and every local setting of §4.3 —
 // users, tokens, the query log and the stats are not synced tables at all.
 func (s *sqlStore) ImportBundle(ctx context.Context, b Bundle) error {
-	if b.Format != BundleFormat {
-		return fmt.Errorf("bundle format %d: this instance reads %d", b.Format, BundleFormat)
+	// Named from both ends, since either can be the stale one: an older main
+	// sends a format this box has moved past, a newer one a format it has
+	// not reached yet.
+	switch {
+	case b.Format < BundleFormat:
+		return fmt.Errorf("bundle format %d from the main, this box reads format %d: upgrade the main", b.Format, BundleFormat)
+	case b.Format > BundleFormat:
+		return fmt.Errorf("bundle format %d from the main, this box reads format %d: upgrade this box", b.Format, BundleFormat)
 	}
 	// class_id is no foreign key — 0 names no row — so the reference a
 	// pool makes is checked here, before anything is written. A pool naming

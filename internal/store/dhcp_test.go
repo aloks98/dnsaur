@@ -1039,6 +1039,9 @@ func TestMigration0017CopiesThePool(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if len(lan.Pools) != 1 {
+		t.Fatalf("migrated pools = %+v, want exactly one", lan.Pools)
+	}
 	if want := []Pool{{ID: lan.Pools[0].ID, ScopeID: 1, Start: "10.0.0.100", End: "10.0.0.200"}}; !reflect.DeepEqual(lan.Pools, want) {
 		t.Errorf("migrated pools = %+v, want %+v", lan.Pools, want)
 	}
@@ -1062,4 +1065,61 @@ func TestMigration0017CopiesThePool(t *testing.T) {
 	if err := rows.Err(); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// TestScopeWriteRefusesADeletedClass is the race between the API's
+// ValidateScope and the write: a class deleted after the form was validated
+// must not end up named by a pool. Both write paths share the check.
+func TestScopeWriteRefusesADeletedClass(t *testing.T) {
+	forEachDriver(t, func(t *testing.T, s Store) {
+		ctx := t.Context()
+		f := newFixture()
+		dhcp := s.DHCP()
+		cid, err := dhcp.AddClass(ctx, Class{Name: f.group, Matchers: []string{"mac:aa"}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		sc := Scope{Name: f.scope, CIDR: f.cidr(), Enabled: true, MatchClientID: true,
+			Pools: []Pool{{Start: f.host(10), End: f.host(19)}, {Start: f.host(20), End: f.host(29), ClassID: cid}}}
+		classes, err := dhcp.Classes(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := ValidateScope(sc, nil, classes); err != nil {
+			t.Fatal(err)
+		}
+		// Validated; now the class goes before the write lands.
+		if err := dhcp.DeleteClass(ctx, cid); err != nil {
+			t.Fatal(err)
+		}
+		before, _ := s.Settings().ConfigVersion(ctx)
+		want := fmt.Sprintf("pools[1]: no class with id %d", cid)
+		_, err = dhcp.AddScope(ctx, sc)
+		if !errors.Is(err, ErrReference) || !strings.HasPrefix(err.Error(), want) {
+			t.Fatalf("AddScope = %v, want ErrReference starting %q", err, want)
+		}
+		if after, _ := s.Settings().ConfigVersion(ctx); after != before {
+			t.Errorf("a refused AddScope moved config_version %d -> %d", before, after)
+		}
+		all, err := dhcp.Scopes(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if slices.ContainsFunc(all, func(x Scope) bool { return x.Name == f.scope }) {
+			t.Error("the scope was created despite the refused pool")
+		}
+
+		sc.Pools = sc.Pools[:1]
+		id, err := dhcp.AddScope(ctx, sc)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sc.ID, sc.Pools = id, []Pool{{Start: f.host(10), End: f.host(19), ClassID: cid}}
+		if err := dhcp.UpdateScope(ctx, sc); !errors.Is(err, ErrReference) {
+			t.Errorf("UpdateScope = %v, want ErrReference", err)
+		}
+		if got, err := dhcp.Scope(ctx, id); err != nil || len(got.Pools) != 1 || got.Pools[0].ClassID != 0 {
+			t.Errorf("pools after a refused UpdateScope = %+v (err %v), want the one class-free pool kept", got.Pools, err)
+		}
+	})
 }

@@ -200,10 +200,10 @@ type DHCPStore interface {
 	Scope(ctx context.Context, id int64) (Scope, error)
 	AddScope(ctx context.Context, s Scope) (int64, error)
 	UpdateScope(ctx context.Context, s Scope) error
-	// DeleteScope removes the scope and its reservations in one
-	// transaction. The foreign key carries no ON DELETE CASCADE, for the
+	// DeleteScope removes the scope, its reservations and its pools in one
+	// transaction. The foreign keys carry no ON DELETE CASCADE, for the
 	// reason the 0016 migration gives: the bundle's prune orders children
-	// before parents for every table, and this pair is no exception.
+	// before parents for every table, and these are no exception.
 	DeleteScope(ctx context.Context, id int64) error
 	// Classes returns every class ordered by id, which is the order the
 	// renderer emits them in.
@@ -523,6 +523,9 @@ func (d *dhcpStore) UpdateScope(ctx context.Context, sc Scope) error {
 // Rewritten whole rather than diffed: the list is edited as one table in one
 // form, and the ids a pool had before carry nothing that anything keeps.
 func (d *dhcpStore) writePools(ctx context.Context, tx *sql.Tx, scopeID int64, pools []Pool) error {
+	if err := d.checkPoolClasses(ctx, tx, pools); err != nil {
+		return err
+	}
 	if err := d.s.execTx(ctx, tx, `DELETE FROM dhcp_pools WHERE scope_id = ?`, scopeID); err != nil {
 		return err
 	}
@@ -530,6 +533,46 @@ func (d *dhcpStore) writePools(ctx context.Context, tx *sql.Tx, scopeID int64, p
 		if err := d.s.execTx(ctx, tx, `INSERT INTO dhcp_pools (scope_id, position, start, "end", class_id) VALUES (?, ?, ?, ?, ?)`,
 			scopeID, i, p.Start, p.End, p.ClassID); err != nil {
 			return err
+		}
+	}
+	return nil
+}
+
+// checkPoolClasses is ValidateScope's class rule again, inside the write's
+// transaction. The API validates against the classes it read a moment
+// earlier, and a DeleteClass landing in between would otherwise leave a pool
+// reserved for a class that no longer exists — no foreign key catches it,
+// since class_id 0 names no row. On sqlite, one connection makes this check
+// and the write a unit; on postgres it narrows the window to the commit.
+func (d *dhcpStore) checkPoolClasses(ctx context.Context, tx *sql.Tx, pools []Pool) error {
+	var ids []int64
+	for _, p := range pools {
+		if p.ClassID != 0 && !slices.Contains(ids, p.ClassID) {
+			ids = append(ids, p.ClassID)
+		}
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	rows, err := tx.QueryContext(ctx, d.s.q(`SELECT id FROM dhcp_classes WHERE id IN (`+placeholders(len(ids))+`)`), anyIDs(ids)...)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	found := map[int64]bool{}
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return err
+		}
+		found[id] = true
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for i, p := range pools {
+		if p.ClassID != 0 && !found[p.ClassID] {
+			return fmt.Errorf("pools[%d]: no class with id %d: %w", i, p.ClassID, ErrReference)
 		}
 	}
 	return nil
