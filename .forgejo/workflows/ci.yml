@@ -135,7 +135,9 @@ jobs:
         # chance to.
         run: |
           set -o pipefail
-          go test -race -cover -count=1 ./... | tee /tmp/cover.txt
+          # -timeout: internal/api takes about eight minutes under -race on
+          # the runner and Go stops a package at ten by default.
+          go test -race -cover -count=1 -timeout 25m ./... | tee /tmp/cover.txt
       # Per-package coverage where the run reports it, rather than in the
       # scrollback. Not a gate: nothing fails on a number moving.
       - name: Coverage summary
