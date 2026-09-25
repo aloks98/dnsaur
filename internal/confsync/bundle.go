@@ -45,8 +45,8 @@ func DeriveZones(zones []store.Zone, primaryDNS string, syncKey int64) []store.Z
 // that settings carries no local key (§4.3: a main must not set or clear
 // what stays on the instance).
 func Validate(b store.Bundle) error {
-	if b.Format != store.BundleFormat {
-		return fmt.Errorf("bundle format %d: this instance reads %d", b.Format, store.BundleFormat)
+	if err := store.CheckBundleFormat(b.Format); err != nil {
+		return err
 	}
 
 	groupIDs := make(map[int64]bool, len(b.Groups))

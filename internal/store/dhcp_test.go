@@ -826,8 +826,9 @@ func TestValidateScopeRefusesOverlappingPools(t *testing.T) {
 
 func TestValidateScopeRefusesUnknownClass(t *testing.T) {
 	s := Scope{Name: "lan", CIDR: "10.0.0.0/24", Enabled: true, Pools: []Pool{{Start: "10.0.0.10", End: "10.0.0.50", ClassID: 7}}}
-	if err := ValidateScope(s, nil, []Class{{ID: 1, Name: "iot"}}); err == nil || !strings.Contains(err.Error(), "class") {
-		t.Fatalf("err = %v, want an unknown-class error", err)
+	err := ValidateScope(s, nil, []Class{{ID: 1, Name: "iot"}})
+	if !errors.Is(err, ErrReference) || err.Error() != "pools[0]: no class with id 7" {
+		t.Fatalf("err = %v, want ErrReference reading pools[0]: no class with id 7", err)
 	}
 }
 
@@ -881,6 +882,7 @@ func TestValidateClassMatchers(t *testing.T) {
 		"Unknown":       "Unknown is a class Kea defines itself",
 		"all":           "all is a class Kea defines itself",
 		"booting":       "booting is a class Kea defines itself",
+		"it's":          "name cannot contain '",
 	} {
 		err := ValidateClass(Class{Name: name, Matchers: []string{"mac:aa"}}, nil)
 		if err == nil || err.Error() != want {

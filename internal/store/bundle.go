@@ -305,6 +305,20 @@ var parkedKeys = []struct{ table, column, where string }{
 	{table: "dhcp_reservations", column: "ip"},
 }
 
+// CheckBundleFormat refuses a bundle format this build does not read. Named
+// from both ends, since either can be the stale one: an older main sends a
+// format this box has moved past, a newer one a format it has not reached
+// yet. Exported so confsync's own check says the same thing.
+func CheckBundleFormat(format int) error {
+	switch {
+	case format < BundleFormat:
+		return fmt.Errorf("bundle format %d from the main, this box reads format %d: upgrade the main", format, BundleFormat)
+	case format > BundleFormat:
+		return fmt.Errorf("bundle format %d from the main, this box reads format %d: upgrade this box", format, BundleFormat)
+	}
+	return nil
+}
+
 // ImportBundle replaces every synced table with b's rows, keeping b's ids, in
 // one transaction, and bumps config_version once. Partial application is not
 // a state a replica can be left in (§5): either the box matches the bundle or
@@ -314,14 +328,8 @@ var parkedKeys = []struct{ table, column, where string }{
 // transfer state, a list's refresh state, and every local setting of §4.3 —
 // users, tokens, the query log and the stats are not synced tables at all.
 func (s *sqlStore) ImportBundle(ctx context.Context, b Bundle) error {
-	// Named from both ends, since either can be the stale one: an older main
-	// sends a format this box has moved past, a newer one a format it has
-	// not reached yet.
-	switch {
-	case b.Format < BundleFormat:
-		return fmt.Errorf("bundle format %d from the main, this box reads format %d: upgrade the main", b.Format, BundleFormat)
-	case b.Format > BundleFormat:
-		return fmt.Errorf("bundle format %d from the main, this box reads format %d: upgrade this box", b.Format, BundleFormat)
+	if err := CheckBundleFormat(b.Format); err != nil {
+		return err
 	}
 	// class_id is no foreign key — 0 names no row — so the reference a
 	// pool makes is checked here, before anything is written. A pool naming

@@ -27,6 +27,11 @@ func (s *Server) dhcpRoutes() {
 	s.route("POST /api/v1/dhcp/scopes", s.requireAuth(s.managed(s.dhcpEnabled(s.handleDHCPScopeCreate))))
 	s.route("PATCH /api/v1/dhcp/scopes/{id}", s.requireAuth(s.managed(s.dhcpEnabled(s.handleDHCPScopePatch))))
 	s.route("DELETE /api/v1/dhcp/scopes/{id}", s.requireAuth(s.managed(s.dhcpEnabled(s.handleDHCPScopeDelete))))
+	s.route("GET /api/v1/dhcp/classes", s.requireAuth(s.dhcpEnabled(s.handleDHCPClasses)))
+	s.route("POST /api/v1/dhcp/classes", s.requireAuth(s.managed(s.dhcpEnabled(s.handleDHCPClassCreate))))
+	s.route("GET /api/v1/dhcp/classes/{id}", s.requireAuth(s.dhcpEnabled(s.handleDHCPClass)))
+	s.route("PATCH /api/v1/dhcp/classes/{id}", s.requireAuth(s.managed(s.dhcpEnabled(s.handleDHCPClassPatch))))
+	s.route("DELETE /api/v1/dhcp/classes/{id}", s.requireAuth(s.managed(s.dhcpEnabled(s.handleDHCPClassDelete))))
 	s.route("GET /api/v1/dhcp/reservations", s.requireAuth(s.dhcpEnabled(s.handleDHCPReservations)))
 	s.route("POST /api/v1/dhcp/reservations", s.requireAuth(s.managed(s.dhcpEnabled(s.handleDHCPReservationCreate))))
 	s.route("PATCH /api/v1/dhcp/reservations/{id}", s.requireAuth(s.managed(s.dhcpEnabled(s.handleDHCPReservationPatch))))
@@ -109,6 +114,17 @@ func (s *Server) dhcpScopes(w http.ResponseWriter, r *http.Request) ([]store.Sco
 	return all, true
 }
 
+// dhcpClasses reads every class: a pool's class_id has to name one, and a
+// class's name is unique among them.
+func (s *Server) dhcpClasses(w http.ResponseWriter, r *http.Request) ([]store.Class, bool) {
+	all, err := s.deps.Store.DHCP().Classes(r.Context())
+	if err != nil {
+		storeErr(w, err)
+		return nil, false
+	}
+	return all, true
+}
+
 func (s *Server) dhcpReservations(w http.ResponseWriter, r *http.Request) ([]store.Reservation, bool) {
 	all, err := s.deps.Store.DHCP().Reservations(r.Context())
 	if err != nil {
@@ -138,12 +154,45 @@ func (s *Server) handleDHCPReservations(w http.ResponseWriter, r *http.Request) 
 // own, because it names the column and the value — and the two sentinels
 // §4.3 and §4.4 keep apart are refusals of the same kind, not failures:
 // ErrDuplicate is the one that is about another row rather than this one.
+// ErrReference is a pool naming a class that does not exist (§5): 422, the
+// message naming pools[i], whether the validator saw it or the write's own
+// re-check did.
 func dhcpInvalid(w http.ResponseWriter, err error) {
-	if errors.Is(err, store.ErrDuplicate) {
+	switch {
+	case errors.Is(err, store.ErrDuplicate):
 		errJSON(w, http.StatusConflict, err.Error())
+	case errors.Is(err, store.ErrReference):
+		errJSON(w, http.StatusUnprocessableEntity, err.Error())
+	default:
+		errJSON(w, http.StatusBadRequest, err.Error())
+	}
+}
+
+// scopeWriteErr answers a failed AddScope or UpdateScope: a class deleted
+// between the validation and the write is the validator's refusal, late.
+func scopeWriteErr(w http.ResponseWriter, err error) {
+	if errors.Is(err, store.ErrReference) {
+		dhcpInvalid(w, err)
 		return
 	}
-	errJSON(w, http.StatusBadRequest, err.Error())
+	storeErrDup(w, err, "a scope with that name already exists")
+}
+
+// oldPoolKeys refuses round one's pool_start and pool_end by name. The strict
+// decode would refuse them anyway, as "invalid json", which does not tell a
+// script written against the old API what to send instead.
+func oldPoolKeys(w http.ResponseWriter, raw []byte) bool {
+	var keys map[string]json.RawMessage
+	if json.Unmarshal(raw, &keys) != nil {
+		return false
+	}
+	_, start := keys["pool_start"]
+	_, end := keys["pool_end"]
+	if start || end {
+		errJSON(w, http.StatusUnprocessableEntity, "pools replaces pool_start and pool_end")
+		return true
+	}
+	return false
 }
 
 // scopeWire is store.Scope without its UnmarshalJSON. The method is what
@@ -164,7 +213,7 @@ type scopeWire store.Scope
 // copy of it here.
 func decodeScope(w http.ResponseWriter, r *http.Request) (store.Scope, bool) {
 	raw, ok := readBody(w, r)
-	if !ok {
+	if !ok || oldPoolKeys(w, raw) {
 		return store.Scope{}, false
 	}
 	var strict scopeWire
@@ -202,8 +251,12 @@ func (s *Server) handleDHCPScopeCreate(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	classes, ok := s.dhcpClasses(w, r)
+	if !ok {
+		return
+	}
 	sc.ID = 0
-	if err := store.ValidateScope(sc, others); err != nil {
+	if err := store.ValidateScope(sc, others, classes); err != nil {
 		dhcpInvalid(w, err)
 		return
 	}
@@ -211,7 +264,7 @@ func (s *Server) handleDHCPScopeCreate(w http.ResponseWriter, r *http.Request) {
 	sc.CreatedAt, sc.ModifiedAt = now, now
 	id, err := s.deps.Store.DHCP().AddScope(r.Context(), sc)
 	if err != nil {
-		storeErrDup(w, err, "a scope with that name already exists")
+		scopeWriteErr(w, err)
 		return
 	}
 	sc.ID = id
@@ -232,7 +285,7 @@ func (s *Server) handleDHCPScopeCreate(w http.ResponseWriter, r *http.Request) {
 // DisallowUnknownFields see the keys at all.
 func patchScope(w http.ResponseWriter, r *http.Request, cur store.Scope) (store.Scope, bool) {
 	raw, ok := readBody(w, r)
-	if !ok {
+	if !ok || oldPoolKeys(w, raw) {
 		return cur, false
 	}
 	merged := scopeWire(cur)
@@ -267,7 +320,11 @@ func (s *Server) handleDHCPScopePatch(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if err := store.ValidateScope(sc, others); err != nil {
+	classes, ok := s.dhcpClasses(w, r)
+	if !ok {
+		return
+	}
+	if err := store.ValidateScope(sc, others, classes); err != nil {
 		dhcpInvalid(w, err)
 		return
 	}
@@ -295,7 +352,7 @@ func (s *Server) handleDHCPScopePatch(w http.ResponseWriter, r *http.Request) {
 	}
 	sc.ModifiedAt = time.Now().UnixMilli()
 	if err := s.deps.Store.DHCP().UpdateScope(r.Context(), sc); err != nil {
-		storeErrDup(w, err, "a scope with that name already exists")
+		scopeWriteErr(w, err)
 		return
 	}
 	s.applyDHCP(r)
@@ -309,6 +366,113 @@ func (s *Server) handleDHCPScopeDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.deps.Store.DHCP().DeleteScope(r.Context(), id); err != nil {
+		storeErr(w, err)
+		return
+	}
+	s.applyDHCP(r)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) handleDHCPClasses(w http.ResponseWriter, r *http.Request) {
+	all, ok := s.dhcpClasses(w, r)
+	if !ok {
+		return
+	}
+	writeJSON(w, http.StatusOK, all)
+}
+
+func (s *Server) handleDHCPClass(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(r)
+	if !ok {
+		errJSON(w, http.StatusBadRequest, "bad id")
+		return
+	}
+	c, err := s.deps.Store.DHCP().Class(r.Context(), id)
+	if err != nil {
+		storeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, c)
+}
+
+// A class body decodes strictly through decode: store.Class has no
+// UnmarshalJSON of its own, so DisallowUnknownFields sees every key, the
+// embedded options' included.
+func (s *Server) handleDHCPClassCreate(w http.ResponseWriter, r *http.Request) {
+	c, ok := decodeOr400[store.Class](w, r)
+	if !ok {
+		return
+	}
+	others, ok := s.dhcpClasses(w, r)
+	if !ok {
+		return
+	}
+	c.ID = 0
+	if err := store.ValidateClass(c, others); err != nil {
+		dhcpInvalid(w, err)
+		return
+	}
+	now := time.Now().UnixMilli()
+	c.CreatedAt, c.ModifiedAt = now, now
+	id, err := s.deps.Store.DHCP().AddClass(r.Context(), c)
+	if err != nil {
+		storeErrDup(w, err, "a class with that name already exists")
+		return
+	}
+	c.ID = id
+	s.applyDHCP(r)
+	created(w, resourceURL("dhcp/classes", id), c)
+}
+
+// handleDHCPClassPatch merges the body onto the stored class, as a scope's
+// patch does; matchers, like every list, are replaced whole.
+func (s *Server) handleDHCPClassPatch(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(r)
+	if !ok {
+		errJSON(w, http.StatusBadRequest, "bad id")
+		return
+	}
+	cur, err := s.deps.Store.DHCP().Class(r.Context(), id)
+	if err != nil {
+		storeErr(w, err)
+		return
+	}
+	c := cur
+	if !decodeInto(w, r, &c) {
+		return
+	}
+	c.ID, c.CreatedAt = cur.ID, cur.CreatedAt
+	others, ok := s.dhcpClasses(w, r)
+	if !ok {
+		return
+	}
+	if err := store.ValidateClass(c, others); err != nil {
+		dhcpInvalid(w, err)
+		return
+	}
+	c.ModifiedAt = time.Now().UnixMilli()
+	if err := s.deps.Store.DHCP().UpdateClass(r.Context(), c); err != nil {
+		storeErrDup(w, err, "a class with that name already exists")
+		return
+	}
+	s.applyDHCP(r)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleDHCPClassDelete answers 409 in the store's own words while a pool
+// names the class (§7): deleting it would turn that pool into one serving
+// anyone.
+func (s *Server) handleDHCPClassDelete(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(r)
+	if !ok {
+		errJSON(w, http.StatusBadRequest, "bad id")
+		return
+	}
+	if err := s.deps.Store.DHCP().DeleteClass(r.Context(), id); err != nil {
+		if errors.Is(err, store.ErrClassInUse) {
+			errJSON(w, http.StatusConflict, err.Error())
+			return
+		}
 		storeErr(w, err)
 		return
 	}

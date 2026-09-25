@@ -60,8 +60,13 @@ func (a *App) RenderInput(ctx context.Context) (dhcp.RenderInput, error) {
 	if err != nil {
 		return dhcp.RenderInput{}, err
 	}
+	classes, err := a.st.DHCP().Classes(ctx)
+	if err != nil {
+		return dhcp.RenderInput{}, err
+	}
 	in := dhcp.RenderInput{
 		Scopes:       scopes,
+		Classes:      classes,
 		Reservations: reservations,
 		Domain:       a.getSetting(ctx, dhcpDomainSetting),
 		LeaseSeconds: int(a.getInt(ctx, dhcpLeaseSetting, defaultLeaseSeconds)),

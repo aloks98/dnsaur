@@ -146,8 +146,13 @@ func TestEveryCreateAnswersLocation(t *testing.T) {
 		},
 		{
 			pattern: "POST /api/v1/dhcp/scopes", url: "/api/v1/dhcp/scopes",
-			body:     `{"name":"location-probe-scope","cidr":"10.44.0.0/24","pool_start":"10.44.0.10","pool_end":"10.44.0.20"}`,
+			body:     `{"name":"location-probe-scope","cidr":"10.44.0.0/24","pools":[{"start":"10.44.0.10","end":"10.44.0.20"}]}`,
 			location: func(id int64) string { return fmt.Sprintf("/api/v1/dhcp/scopes/%d", id) },
+		},
+		{
+			pattern: "POST /api/v1/dhcp/classes", url: "/api/v1/dhcp/classes",
+			body:     `{"name":"location-probe-class","matchers":["mac:aa"]}`,
+			location: func(id int64) string { return fmt.Sprintf("/api/v1/dhcp/classes/%d", id) },
 		},
 		{
 			pattern: "POST /api/v1/dhcp/reservations", url: "/api/v1/dhcp/reservations",

@@ -34,7 +34,12 @@ func TestDeriveZonesMapsTypes(t *testing.T) {
 }
 
 func TestValidateRejectsDanglingReferences(t *testing.T) {
-	b := store.Bundle{Format: store.BundleFormat, Groups: []store.Group{{ID: 1, Name: "default"}}}
+	b := store.Bundle{Format: 1, Groups: []store.Group{{ID: 1, Name: "default"}}}
+	// The store's wording, so the replica says one thing about a stale main.
+	if err := Validate(b); err == nil || err.Error() != "bundle format 1 from the main, this box reads format 2: upgrade the main" {
+		t.Fatalf("format 1: err = %v", err)
+	}
+	b.Format = store.BundleFormat
 	b.Clients = []store.Client{{ID: 1, Matcher: "10.0.0.1", GroupID: 9}}
 	if err := Validate(b); err == nil || !strings.Contains(err.Error(), "group 9") {
 		t.Fatalf("err = %v", err)

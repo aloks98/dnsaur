@@ -1112,3 +1112,31 @@ func TestFollowWakesThePollLoopInsteadOfPullingBesideIt(t *testing.T) {
 		return len(got) == 1 && got[0] == "kids"
 	})
 }
+
+// TestReplicaRefusesAFormatOneBundle is a main one release behind: its
+// bundle is refused before import with the store's own wording, so the
+// operator reads one message — which side to upgrade — in sync.last_error.
+func TestReplicaRefusesAFormatOneBundle(t *testing.T) {
+	ctx := t.Context()
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/v1/sync/version", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"config_version": 7, "instance_id": "main-1", "dns_port": 53})
+	})
+	mux.HandleFunc("GET /api/v1/sync/bundle", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"format": 1, "config_version": 7})
+	})
+	ts := httptest.NewServer(mux)
+	t.Cleanup(ts.Close)
+
+	rep := openStore(t)
+	mustSet(t, rep, "sync.peer_url", ts.URL)
+	mustSet(t, rep, "sync.token", "tok")
+	r := NewReplica(rep, &countingReloader{}, "replica-1", "10.0.0.6:53", false)
+	if err := r.PullOnce(ctx); err == nil {
+		t.Fatal("a format-1 bundle was applied")
+	}
+	want := "bundle format 1 from the main, this box reads format 2: upgrade the main"
+	if v, _, _ := rep.Settings().Get(ctx, "sync.last_error"); !strings.HasSuffix(v, want) {
+		t.Fatalf("stored last_error %q, want it to end %q", v, want)
+	}
+}

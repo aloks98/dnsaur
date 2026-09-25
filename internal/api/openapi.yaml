@@ -20,7 +20,7 @@ info:
     An instance with the "sync.peer_url" setting is a replica: it follows
     another instance's configuration, and every write to a resource that
     configuration covers -- groups, clients, filter lists, rules, TSIG keys,
-    zones, zone records, DHCP scopes and reservations, and a blocking pause
+    zones, zone records, DHCP scopes, classes and reservations, and a blocking pause
     (the pause state is a synced
     setting, since a pause is a decision about the network and clients reach
     either box) -- is refused with 409 {"error": "managed by <peer_url>"}
@@ -112,14 +112,14 @@ components:
             are rejected rather than quietly masked, since "10.0.0.5/24" and
             "10.0.0.0/24" look alike in a form and hand out different
             subnets. No two enabled scopes may overlap.
-        pool_start: { type: string, description: first address of the dynamic range }
-        pool_end:
-          type: string
+        pools:
+          type: array
           description: >
-            last address of the dynamic range, inclusive. Both ends must be
-            inside cidr, start <= end, and neither may be the subnet's
-            network or broadcast address. Both may be empty only when
-            reservations_only is true.
+            the dynamic ranges, in order; a write replaces the list whole. At
+            least one, unless reservations_only is true. No two may overlap.
+            Round one's "pool_start" and "pool_end" are refused with 422
+            {"error": "pools replaces pool_start and pool_end"}.
+          items: { $ref: "#/components/schemas/DHCPPool" }
         gateway: { type: string, description: "option 3; empty hands out no router. Must be inside cidr" }
         dns_servers:
           type: string
@@ -175,6 +175,71 @@ components:
         reservations_only:
           type: boolean
           description: renders the subnet with no pool, so only reserved devices get an address
+        created_at: { type: integer, format: int64, description: unix ms }
+        modified_at: { type: integer, format: int64, description: unix ms }
+    DHCPPool:
+      type: object
+      description: one dynamic range of a scope, inclusive at both ends
+      properties:
+        id: { type: integer, format: int64, description: "the server's; not stable across edits of the scope" }
+        scope_id: { type: integer, format: int64, description: "the server's" }
+        start: { type: string }
+        end:
+          type: string
+          description: >
+            both ends inside the scope's cidr, start <= end, and neither the
+            subnet's network or broadcast address
+        class_id:
+          type: integer
+          format: int64
+          description: >
+            0 serves any client not in a class that owns a pool in this
+            scope; otherwise the pool serves only that class's members. An
+            id naming no class is 422 {"error": "pools[1]: no class with id 9"}.
+    DHCPClass:
+      type: object
+      description: >
+        A client class: a set of matchers, and the options its members get.
+        Pools name a class to reserve addresses for it. Global to the
+        instance and synced, like a scope.
+      properties:
+        id: { type: integer, format: int64 }
+        name:
+          type: string
+          description: >
+            1-63 characters, unique ignoring case, no "'". Names starting
+            with "dnsaur-" and Kea's own classes (ALL, KNOWN, UNKNOWN,
+            BOOTING, DROP) are refused.
+        matchers:
+          type: array
+          description: >
+            at least one; a client is a member when any matches.
+            "vendor:<prefix>" matches the start of option 60 (1-255 bytes,
+            no control characters, no "'"); "mac:<hex>" matches the start of
+            the hardware address (1-6 colon-separated bytes, stored
+            lower-case).
+          items: { type: string }
+        dns_servers: { type: string, description: "as on a scope; empty uses the scope's value" }
+        domain: { type: string, description: "as on a scope; empty uses the scope's value" }
+        domain_search: { type: string }
+        ntp_servers: { type: string }
+        static_routes:
+          type: array
+          items:
+            type: object
+            properties:
+              destination: { type: string }
+              router: { type: string }
+        next_server: { type: string }
+        server_hostname: { type: string }
+        boot_file: { type: string }
+        options:
+          type: array
+          items:
+            type: object
+            properties:
+              code: { type: integer }
+              hex: { type: string }
         created_at: { type: integer, format: int64, description: unix ms }
         modified_at: { type: integer, format: int64, description: unix ms }
     DHCPReservation:
@@ -286,7 +351,8 @@ components:
           description: >
             one entry per scope the last render saw. "leased" may exceed
             "pool_size" after a pool is shrunk: the engine keeps the leases it
-            has already handed out until they expire.
+            has already handed out until they expire. "pool_size" is the sum
+            of the scope's pools, and 0 for a reservations_only scope.
           items:
             type: object
             properties:
@@ -942,6 +1008,14 @@ components:
         one DHCP route that still answers, with {"enabled": false}. Turning
         DHCP on is a bootstrap change and a restart, which is why this is 404
         rather than 503.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    DHCPPoolRefused:
+      description: >
+        a pool names a class that does not exist ({"error": "pools[1]: no
+        class with id 9"}), or the body uses round one's keys ({"error":
+        "pools replaces pool_start and pool_end"})
       content:
         application/json:
           schema: { $ref: "#/components/schemas/Error" }
@@ -4449,8 +4523,9 @@ paths:
             example:
               name: lan
               cidr: 192.168.1.0/24
-              pool_start: 192.168.1.100
-              pool_end: 192.168.1.200
+              pools:
+                - { start: 192.168.1.100, end: 192.168.1.199 }
+                - { start: 192.168.1.200, end: 192.168.1.220, class_id: 1 }
               gateway: 192.168.1.1
               domain: home.lan
               enabled: true
@@ -4473,6 +4548,8 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
+        "422":
+          $ref: "#/components/responses/DHCPPoolRefused"
         "401":
           description: authentication required
           content:
@@ -4534,6 +4611,8 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
+        "422":
+          $ref: "#/components/responses/DHCPPoolRefused"
         "401":
           description: authentication required
           content:
@@ -4563,7 +4642,7 @@ paths:
       tags: [DHCP]
       summary: Delete a DHCP scope
       description: >
-        Removes the scope and its reservations in one transaction. The leases
+        Removes the scope, its pools and its reservations in one transaction. The leases
         the engine already handed out of it are not touched here -- the next
         render drops the subnet, and the engine forgets them.
       responses:
@@ -4588,6 +4667,200 @@ paths:
               schema: { $ref: "#/components/schemas/Error" }
         "409":
           $ref: "#/components/responses/ManagedByMain"
+        "503":
+          description: storage unavailable
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /dhcp/classes:
+    get:
+      tags: [DHCP]
+      summary: List DHCP client classes
+      description: ordered by id, which is the order they are rendered in
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/DHCPClass" }
+        "401":
+          description: authentication required
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "404":
+          $ref: "#/components/responses/DHCPDisabled"
+        "503":
+          description: storage unavailable
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+    post:
+      tags: [DHCP]
+      summary: Create a DHCP client class
+      description: >
+        Validated against every other class, stored, then rendered and sent
+        to the engine; 201 whatever the engine says, as for a scope.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/DHCPClass" }
+            example:
+              name: iot
+              matchers: ["mac:a4:cf:12", "vendor:ESP"]
+              domain: iot.lan
+      responses:
+        "201":
+          description: Created; Location names the new class
+          headers:
+            Location: { schema: { type: string } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DHCPClass" }
+        "400":
+          description: invalid json, or the validator's own message naming the field
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401":
+          description: authentication required
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "403":
+          $ref: "#/components/responses/ReadOnlyToken"
+        "404":
+          $ref: "#/components/responses/DHCPDisabled"
+        "409":
+          description: >
+            this instance is a replica ({"error": "managed by <peer_url>"}),
+            or another class has that name, ignoring case
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503":
+          description: storage unavailable
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /dhcp/classes/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: integer, format: int64 }
+    get:
+      tags: [DHCP]
+      summary: Read one DHCP client class
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DHCPClass" }
+        "400":
+          description: bad id
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401":
+          description: authentication required
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "404":
+          description: no class with this id, or DHCP is not enabled on this instance
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503":
+          description: storage unavailable
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+    patch:
+      tags: [DHCP]
+      summary: Edit a DHCP client class
+      description: >
+        A merge: every key the body omits keeps its value. "matchers", like
+        every list, is replaced whole.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/DHCPClass" }
+            example: { matchers: ["mac:a4:cf:12"] }
+      responses:
+        "204":
+          description: No Content
+        "400":
+          description: bad id, invalid json, or the validator's message
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401":
+          description: authentication required
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "403":
+          $ref: "#/components/responses/ReadOnlyToken"
+        "404":
+          description: no class with this id, or DHCP is not enabled on this instance
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "409":
+          description: >
+            this instance is a replica ({"error": "managed by <peer_url>"}),
+            or another class has that name, ignoring case
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503":
+          description: storage unavailable
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+    delete:
+      tags: [DHCP]
+      summary: Delete a DHCP client class
+      description: >
+        Refused while any pool names the class: deleting it would turn that
+        pool into one serving anyone.
+      responses:
+        "204":
+          description: No Content
+        "400":
+          description: bad id
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401":
+          description: authentication required
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "403":
+          $ref: "#/components/responses/ReadOnlyToken"
+        "404":
+          description: no class with this id, or DHCP is not enabled on this instance
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "409":
+          description: >
+            this instance is a replica ({"error": "managed by <peer_url>"}),
+            or a pool names the class ({"error": "class \"iot\" is in use by 2
+            pools (Office, IoT)"})
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
         "503":
           description: storage unavailable
           content:

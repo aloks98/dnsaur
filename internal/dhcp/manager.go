@@ -770,8 +770,12 @@ func (m *Manager) interval(ctx context.Context) time.Duration {
 
 // poolSize is how many addresses a scope's pools hold, both ends of each
 // included. A pool that does not parse is not a pool anything was handed out
-// of, which is a size of zero rather than a guess.
+// of, which is a size of zero rather than a guess. A reservations_only scope
+// renders no pool at all, whatever it still lists, so its size is zero too.
 func poolSize(s store.Scope) int {
+	if s.ReservationsOnly {
+		return 0
+	}
 	n := 0
 	for _, p := range s.Pools {
 		start, err := netip.ParseAddr(p.Start)

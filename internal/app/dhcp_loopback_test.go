@@ -201,8 +201,8 @@ func TestDHCPPairRendersFromThePairing(t *testing.T) {
 	// The choice of standby is made while that render's input is read, and
 	// published once the engine has taken a configuration carrying it (§6).
 	code, body := apiPost(t, httpURL(t, main)+"/api/v1/dhcp/scopes", token,
-		`{"name":"lan","cidr":"192.168.7.0/24","pool_start":"192.168.7.100",`+
-			`"pool_end":"192.168.7.200","gateway":"192.168.7.1","enabled":true}`)
+		`{"name":"lan","cidr":"192.168.7.0/24","pools":[{"start":"192.168.7.100",`+
+			`"end":"192.168.7.200"}],"gateway":"192.168.7.1","enabled":true}`)
 	if code != http.StatusCreated {
 		t.Fatalf("POST /dhcp/scopes on the main = %d %q, want 201", code, body)
 	}
@@ -382,7 +382,7 @@ func TestDHCPRendersOnlyWhatChanged(t *testing.T) {
 	// that configuration rather than nothing.
 	a := newTestAppWith(t, cfg, withUpstreams(pub), withScope(t, store.Scope{
 		Name: "lan", CIDR: "192.168.7.0/24",
-		PoolStart: "192.168.7.100", PoolEnd: "192.168.7.200",
+		Pools:   []store.Pool{{Start: "192.168.7.100", End: "192.168.7.200"}},
 		Enabled: true, MatchClientID: true,
 	}))
 	dhcpStarted(t, a)
@@ -513,8 +513,8 @@ func TestDHCPRefusesAPairWithNoAddressToPairOn(t *testing.T) {
 	// render is the peer's host — §5.3's own dead end is a different test.
 	a := newTestAppWith(t, cfg, withUpstreams(mockDNS(t, answerA("9.9.9.9"))), withScope(t, store.Scope{
 		Name: "lan", CIDR: "192.168.7.0/24",
-		PoolStart: "192.168.7.100", PoolEnd: "192.168.7.200",
-		DNSServers: "192.168.7.1", Enabled: true, MatchClientID: true,
+		Pools:      []store.Pool{{Start: "192.168.7.100", End: "192.168.7.200"}},
+		ClientOptions: store.ClientOptions{DNSServers: "192.168.7.1"}, Enabled: true, MatchClientID: true,
 	}))
 	dhcpStarted(t, a)
 	// Unpaired it renders fine, which is what makes the refusal below about
@@ -697,8 +697,8 @@ func TestDHCPWriteDoesNotWaitOutAHungEngine(t *testing.T) {
 
 	start := time.Now()
 	code, body := apiPost(t, httpURL(t, a)+"/api/v1/dhcp/scopes", token,
-		`{"name":"lan","cidr":"192.168.7.0/24","pool_start":"192.168.7.100",`+
-			`"pool_end":"192.168.7.200","dns_servers":"192.168.7.1","enabled":true}`)
+		`{"name":"lan","cidr":"192.168.7.0/24","pools":[{"start":"192.168.7.100",`+
+			`"end":"192.168.7.200"}],"dns_servers":"192.168.7.1","enabled":true}`)
 	elapsed := time.Since(start)
 	if code != http.StatusCreated {
 		t.Fatalf("POST /dhcp/scopes = %d %q, want 201 — the row is stored whatever the engine says", code, body)
@@ -724,8 +724,8 @@ func TestDHCPPublishesThePairOnlyFromAnAcceptedRender(t *testing.T) {
 	cfg, kea := dhcpBox(t, "127.0.0.1")
 	a := newTestAppWith(t, cfg, withUpstreams(mockDNS(t, answerA("9.9.9.9"))), withScope(t, store.Scope{
 		Name: "lan", CIDR: "192.168.7.0/24",
-		PoolStart: "192.168.7.100", PoolEnd: "192.168.7.200",
-		DNSServers: "192.168.7.1", Enabled: true, MatchClientID: true,
+		Pools:      []store.Pool{{Start: "192.168.7.100", End: "192.168.7.200"}},
+		ClientOptions: store.ClientOptions{DNSServers: "192.168.7.1"}, Enabled: true, MatchClientID: true,
 	}))
 	dhcpStarted(t, a)
 	mustRegister(t, a, map[string]api.Replica{
@@ -778,8 +778,8 @@ func TestDHCPPairConvergesOnTheLeasePoll(t *testing.T) {
 	cfg, kea := dhcpBox(t, "127.0.0.1")
 	a := newTestAppWith(t, cfg, withUpstreams(pub), withScope(t, store.Scope{
 		Name: "lan", CIDR: "192.168.7.0/24",
-		PoolStart: "192.168.7.100", PoolEnd: "192.168.7.200",
-		DNSServers: "192.168.7.1", Enabled: true, MatchClientID: true,
+		Pools:      []store.Pool{{Start: "192.168.7.100", End: "192.168.7.200"}},
+		ClientOptions: store.ClientOptions{DNSServers: "192.168.7.1"}, Enabled: true, MatchClientID: true,
 	}))
 	dhcpStarted(t, a)
 	if got := kea.renders(); got != 1 {
@@ -851,8 +851,8 @@ func TestDHCPStandbyMustRunAnEngine(t *testing.T) {
 	mainCfg, mainKea := dhcpBox(t, "127.0.0.1")
 	main := newTestAppWith(t, mainCfg, withUpstreams(pub), withScope(t, store.Scope{
 		Name: "lan", CIDR: "192.168.7.0/24",
-		PoolStart: "192.168.7.100", PoolEnd: "192.168.7.200",
-		DNSServers: "192.168.7.1", Enabled: true, MatchClientID: true,
+		Pools:      []store.Pool{{Start: "192.168.7.100", End: "192.168.7.200"}},
+		ClientOptions: store.ClientOptions{DNSServers: "192.168.7.1"}, Enabled: true, MatchClientID: true,
 	}))
 	dhcpStarted(t, main)
 

@@ -132,8 +132,12 @@ func (i storeInputs) RenderInput(ctx context.Context) (dhcp.RenderInput, error) 
 	if err != nil {
 		return dhcp.RenderInput{}, err
 	}
+	classes, err := i.st.DHCP().Classes(ctx)
+	if err != nil {
+		return dhcp.RenderInput{}, err
+	}
 	return dhcp.RenderInput{
-		Scopes: scopes, Reservations: reservations,
+		Scopes: scopes, Classes: classes, Reservations: reservations,
 		Domain: "home.lan", LeaseSeconds: 3600, Socket: i.socket,
 		ThisServer: "main-1", DNSServers: []string{"192.168.1.1"},
 	}, nil
@@ -176,8 +180,8 @@ func mustJSON[T any](t *testing.T, w interface{ String() string }) T {
 	return v
 }
 
-const probeScope = `{"name":"lan","cidr":"192.168.1.0/24","pool_start":"192.168.1.100",` +
-	`"pool_end":"192.168.1.200","gateway":"192.168.1.1","enabled":true}`
+const probeScope = `{"name":"lan","cidr":"192.168.1.0/24","pools":[{"start":"192.168.1.100",` +
+	`"end":"192.168.1.200"}],"gateway":"192.168.1.1","enabled":true}`
 
 // TestDHCPStatusDisabledWithoutASocket is §10's first row: kea_socket empty
 // means nothing DHCP runs. The status route still answers — "is DHCP running
@@ -253,14 +257,15 @@ func TestDHCPScopeWritesReachTheEngine(t *testing.T) {
 	}
 
 	// The edit, and the disable. Both are merges: the body names one field.
-	if w := doReq(t, h, "PATCH", resourceURL("dhcp/scopes", id), `{"pool_end":"192.168.1.150"}`, cookie); w.Code != http.StatusNoContent {
-		t.Fatalf("PATCH pool_end = %d %s, want 204", w.Code, strings.TrimSpace(w.Body.String()))
+	if w := doReq(t, h, "PATCH", resourceURL("dhcp/scopes", id),
+		`{"pools":[{"start":"192.168.1.100","end":"192.168.1.150"}]}`, cookie); w.Code != http.StatusNoContent {
+		t.Fatalf("PATCH pools = %d %s, want 204", w.Code, strings.TrimSpace(w.Body.String()))
 	}
 	scope, err := s.DHCP().Scope(t.Context(), id)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if scope.PoolEnd != "192.168.1.150" || scope.PoolStart != "192.168.1.100" || scope.Name != "lan" {
+	if len(scope.Pools) != 1 || scope.Pools[0].End != "192.168.1.150" || scope.Gateway != "192.168.1.1" || scope.Name != "lan" {
 		t.Fatalf("after a one-field patch the scope is %+v; a merge leaves every other field alone", scope)
 	}
 	if w := doReq(t, h, "DELETE", resourceURL("dhcp/scopes", id), "", cookie); w.Code != http.StatusNoContent {
@@ -289,15 +294,15 @@ func TestDHCPScopeRefusals(t *testing.T) {
 		code       int
 		contains   string
 	}{
-		{"host bits set", `{"name":"a","cidr":"192.168.9.5/24","pool_start":"192.168.9.10","pool_end":"192.168.9.20"}`,
+		{"host bits set", `{"name":"a","cidr":"192.168.9.5/24","pools":[{"start":"192.168.9.10","end":"192.168.9.20"}]}`,
 			http.StatusBadRequest, "host bits set"},
-		{"pool outside the subnet", `{"name":"b","cidr":"10.9.0.0/24","pool_start":"10.9.1.10","pool_end":"10.9.1.20"}`,
+		{"pool outside the subnet", `{"name":"b","cidr":"10.9.0.0/24","pools":[{"start":"10.9.1.10","end":"10.9.1.20"}]}`,
 			http.StatusBadRequest, "not inside"},
-		{"lease below the floor", `{"name":"c","cidr":"10.8.0.0/24","pool_start":"10.8.0.10","pool_end":"10.8.0.20","lease_seconds":60}`,
+		{"lease below the floor", `{"name":"c","cidr":"10.8.0.0/24","pools":[{"start":"10.8.0.10","end":"10.8.0.20"}],"lease_seconds":60}`,
 			http.StatusBadRequest, "floor"},
-		{"overlaps an enabled scope", `{"name":"d","cidr":"192.168.1.0/25","pool_start":"192.168.1.10","pool_end":"192.168.1.20","enabled":true}`,
+		{"overlaps an enabled scope", `{"name":"d","cidr":"192.168.1.0/25","pools":[{"start":"192.168.1.10","end":"192.168.1.20"}],"enabled":true}`,
 			http.StatusBadRequest, "overlaps an enabled scope"},
-		{"duplicate name", `{"name":"lan","cidr":"10.7.0.0/24","pool_start":"10.7.0.10","pool_end":"10.7.0.20"}`,
+		{"duplicate name", `{"name":"lan","cidr":"10.7.0.0/24","pools":[{"start":"10.7.0.10","end":"10.7.0.20"}]}`,
 			http.StatusConflict, "already exists"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -326,7 +331,7 @@ func TestDHCPScopeRefusesUnknownFields(t *testing.T) {
 	// is the key nobody knows — a body the validator would refuse anyway
 	// would pass this test with the strictness gone.
 	w := doReq(t, h, "POST", "/api/v1/dhcp/scopes",
-		`{"name":"typo","cidr":"10.3.0.0/24","pool_start":"10.3.0.10","pool_end":"10.3.0.20","poolstart":"10.3.0.11"}`, cookie)
+		`{"name":"typo","cidr":"10.3.0.0/24","pools":[{"start":"10.3.0.10","end":"10.3.0.20"}],"poolstart":"10.3.0.11"}`, cookie)
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("a misspelled key = %d %s, want 400", w.Code, strings.TrimSpace(w.Body.String()))
 	}
@@ -338,8 +343,8 @@ func TestDHCPScopeRefusesUnknownFields(t *testing.T) {
 	if w := doReq(t, h, "PATCH", resourceURL("dhcp/scopes", id), `{"poolstart":"10.3.0.10"}`, cookie); w.Code != http.StatusBadRequest {
 		t.Fatalf("a misspelled key on a patch = %d %s, want 400", w.Code, strings.TrimSpace(w.Body.String()))
 	}
-	if sc, err := s.DHCP().Scope(t.Context(), id); err != nil || sc.PoolStart != "192.168.1.100" {
-		t.Fatalf("the scope's pool is %q (err %v) after a refused patch", sc.PoolStart, err)
+	if sc, err := s.DHCP().Scope(t.Context(), id); err != nil || len(sc.Pools) != 1 || sc.Pools[0].Start != "192.168.1.100" {
+		t.Fatalf("the scope's pools are %+v (err %v) after a refused patch", sc.Pools, err)
 	}
 	// A reservation body is decoded strictly too — it has no unmarshaler of
 	// its own, so this is the ordinary path, and it must stay that way.
@@ -365,7 +370,7 @@ func TestDHCPScopePatchKeepsMatchClientID(t *testing.T) {
 	cookie := login(t, srv, s)
 
 	id := mustCreate(t, h, cookie, "/api/v1/dhcp/scopes",
-		`{"name":"vms","cidr":"10.6.0.0/24","pool_start":"10.6.0.10","pool_end":"10.6.0.20","enabled":true,"match_client_id":false}`)
+		`{"name":"vms","cidr":"10.6.0.0/24","pools":[{"start":"10.6.0.10","end":"10.6.0.20"}],"enabled":true,"match_client_id":false}`)
 	if sc, err := s.DHCP().Scope(t.Context(), id); err != nil || sc.MatchClientID {
 		t.Fatalf("created scope has match_client_id %v (err %v), want the false that was sent", sc.MatchClientID, err)
 	}
@@ -406,7 +411,7 @@ func TestDHCPScopePatchRefusesAStrandedReservation(t *testing.T) {
 		`{"scope_id":`+strconv.FormatInt(id, 10)+`,"mac":"aa:bb:cc:dd:ee:01","ip":"192.168.1.50","hostname":"nas"}`)
 
 	w := doReq(t, h, "PATCH", resourceURL("dhcp/scopes", id),
-		`{"cidr":"10.5.0.0/24","pool_start":"10.5.0.100","pool_end":"10.5.0.200","gateway":"10.5.0.1"}`, cookie)
+		`{"cidr":"10.5.0.0/24","pools":[{"start":"10.5.0.100","end":"10.5.0.200"}],"gateway":"10.5.0.1"}`, cookie)
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("renumbering out from under a reservation = %d %s, want 400", w.Code, strings.TrimSpace(w.Body.String()))
 	}
@@ -690,5 +695,105 @@ func TestAWriteIsSavedEvenWhenTheEngineRefuses(t *testing.T) {
 	}
 	if status := mustJSON[dhcpStatusView](t, w.Body); status.Engine != "ok" || status.Message != "" {
 		t.Fatalf("apply answered %+v, want an engine that took the configuration", status)
+	}
+}
+
+// TestDHCPClassRoutes is §5's class half: CRUD that re-renders like a scope
+// write, a pool naming a class that is not there refused as 422 naming the
+// pool, and a class a pool still names kept, with the store's own words.
+func TestDHCPClassRoutes(t *testing.T) {
+	srv, s, fake := dhcpServer(t)
+	h := srv.Handler()
+	cookie := login(t, srv, s)
+
+	renders := len(fake.sent())
+	w := doReq(t, h, "POST", "/api/v1/dhcp/classes", `{"name":"iot","matchers":["mac:a4:cf:12"],"domain":"iot.lan"}`, cookie)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("POST class = %d %s, want 201", w.Code, strings.TrimSpace(w.Body.String()))
+	}
+	cls := mustJSON[store.Class](t, w.Body)
+	if got := w.Header().Get("Location"); got != resourceURL("dhcp/classes", cls.ID) {
+		t.Errorf("Location = %q", got)
+	}
+	if len(fake.sent()) != renders+1 {
+		t.Fatalf("creating a class sent %d config-sets, want one", len(fake.sent())-renders)
+	}
+	cid := strconv.FormatInt(cls.ID, 10)
+
+	if list := mustJSON[[]store.Class](t, doReq(t, h, "GET", "/api/v1/dhcp/classes", "", cookie).Body); len(list) != 1 || list[0].Name != "iot" {
+		t.Fatalf("GET classes = %+v", list)
+	}
+	if w := doReq(t, h, "PATCH", resourceURL("dhcp/classes", cls.ID), `{"matchers":["mac:a4:cf:12","vendor:ESP"]}`, cookie); w.Code != http.StatusNoContent {
+		t.Fatalf("PATCH matchers = %d %s, want 204", w.Code, strings.TrimSpace(w.Body.String()))
+	}
+	got := mustJSON[store.Class](t, doReq(t, h, "GET", resourceURL("dhcp/classes", cls.ID), "", cookie).Body)
+	if len(got.Matchers) != 2 || got.Domain != "iot.lan" || got.Name != "iot" {
+		t.Fatalf("after a matchers patch the class is %+v; a merge leaves the rest alone", got)
+	}
+
+	for _, tc := range []struct {
+		name, method, url, body string
+		code                    int
+		want                    string
+	}{
+		{"duplicate name", "POST", "/api/v1/dhcp/classes", `{"name":"IoT","matchers":["mac:aa"]}`,
+			http.StatusConflict, `a class named "iot" exists`},
+		{"bad matcher", "POST", "/api/v1/dhcp/classes", `{"name":"x","matchers":["host:x"]}`, http.StatusBadRequest, "matchers[0]"},
+		{"unknown key", "POST", "/api/v1/dhcp/classes", `{"name":"x","matchers":["mac:aa"],"matcher":"mac:bb"}`,
+			http.StatusBadRequest, "invalid json"},
+		{"unknown class", "POST", "/api/v1/dhcp/scopes", `{"name":"lan","cidr":"192.168.1.0/24","pools":[` +
+			`{"start":"192.168.1.10","end":"192.168.1.20"},{"start":"192.168.1.30","end":"192.168.1.40","class_id":9999}]}`,
+			http.StatusUnprocessableEntity, "pools[1]: no class with id 9999"},
+		{"old keys on a create", "POST", "/api/v1/dhcp/scopes",
+			`{"name":"lan","cidr":"192.168.1.0/24","pool_start":"192.168.1.10","pool_end":"192.168.1.20"}`,
+			http.StatusUnprocessableEntity, "pools replaces pool_start and pool_end"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := doReq(t, h, tc.method, tc.url, tc.body, cookie)
+			if w.Code != tc.code || errorOf(t, w) != tc.want && !strings.Contains(errorOf(t, w), tc.want) {
+				t.Fatalf("= %d %s, want %d naming %q", w.Code, strings.TrimSpace(w.Body.String()), tc.code, tc.want)
+			}
+		})
+	}
+
+	// A scope with a pool of the class's own, then the class may not go.
+	sid := mustCreate(t, h, cookie, "/api/v1/dhcp/scopes", `{"name":"lan","cidr":"192.168.1.0/24","enabled":true,"pools":[`+
+		`{"start":"192.168.1.10","end":"192.168.1.20"},{"start":"192.168.1.30","end":"192.168.1.40","class_id":`+cid+`}]}`)
+	if w := doReq(t, h, "PATCH", resourceURL("dhcp/scopes", sid), `{"pool_end":"192.168.1.50"}`, cookie); w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("old key on a patch = %d %s, want 422", w.Code, strings.TrimSpace(w.Body.String()))
+	}
+	last := fake.sent()[len(fake.sent())-1]
+	if classes, _ := last["client-classes"].([]any); len(classes) == 0 {
+		t.Fatalf("the engine was sent no client-classes after a class and its pool were written: %v", last)
+	}
+	w = doReq(t, h, "DELETE", resourceURL("dhcp/classes", cls.ID), "", cookie)
+	if w.Code != http.StatusConflict || errorOf(t, w) != `class "iot" is in use by 1 pool (lan)` {
+		t.Fatalf("DELETE a class in use = %d %s, want 409 with the store's text", w.Code, strings.TrimSpace(w.Body.String()))
+	}
+
+	// Pool sizes sum; a reservations_only scope hands out none of its pools.
+	mustCreate(t, h, cookie, "/api/v1/dhcp/scopes", `{"name":"pins","cidr":"10.2.0.0/24","enabled":true,`+
+		`"reservations_only":true,"pools":[{"start":"10.2.0.10","end":"10.2.0.20"}]}`)
+	sizes := map[int64]int{}
+	for _, u := range mustJSON[dhcpStatusView](t, doReq(t, h, "GET", "/api/v1/dhcp/status", "", cookie).Body).Scopes {
+		sizes[u.ID] = u.PoolSize
+	}
+	if sizes[sid] != 22 || len(sizes) != 2 {
+		t.Fatalf("pool sizes %v, want lan at 11+11 and pins at 0", sizes)
+	}
+	for id, n := range sizes {
+		if id != sid && n != 0 {
+			t.Fatalf("a reservations_only scope reports pool_size %d, want 0", n)
+		}
+	}
+
+	if w := doReq(t, h, "DELETE", resourceURL("dhcp/scopes", sid), "", cookie); w.Code != http.StatusNoContent {
+		t.Fatalf("DELETE scope = %d", w.Code)
+	}
+	if w := doReq(t, h, "DELETE", resourceURL("dhcp/classes", cls.ID), "", cookie); w.Code != http.StatusNoContent {
+		t.Fatalf("DELETE an unused class = %d %s, want 204", w.Code, strings.TrimSpace(w.Body.String()))
+	}
+	if w := doReq(t, h, "GET", resourceURL("dhcp/classes", cls.ID), "", cookie); w.Code != http.StatusNotFound {
+		t.Fatalf("GET a deleted class = %d, want 404", w.Code)
 	}
 }

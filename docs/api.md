@@ -58,8 +58,8 @@ curl or any HTTP client.
 - **On a replica, writes to synced configuration are `409
   {"error": "managed by <peer_url>"}`.** An instance with `sync.peer_url`
   set follows another instance's configuration, so groups, clients, filter
-  lists, rules, TSIG keys, zones, zone records, and DHCP scopes and
-  reservations are read-only on it, as is
+  lists, rules, TSIG keys, zones, zone records, and DHCP scopes, classes
+  and reservations are read-only on it, as is
   `PUT /settings` for any key outside the instance-local set. A blocking
   pause is refused too: the pause state is persisted to the synced
   `blocking.pauses` setting, because a pause is a decision about the network
@@ -872,10 +872,16 @@ Full parameter/response detail lives in `internal/api/openapi.yaml`
   `GET /sync/bundle` answers the whole synced configuration: settings
   (everything except the instance-local `instance.*`, `serve.*`, `sync.*`
   and `stats.watermark`), groups, clients, lists with their group
-  assignments, rules, TSIG keys and zone *definitions*. Zone records are
+  assignments, rules, TSIG keys, zone *definitions*, and DHCP classes,
+  scopes (with their pools) and reservations. Zone records are
   deliberately absent — a replica gets those by AXFR, on the schedule the
   SOA gives. Ids are the main's and are kept on the replica, so a
   `group_id` or a query log's `rule_id` means the same row on both boxes.
+  The bundle carries `format`, currently `2` (round one's scopes carried
+  `pool_start`/`pool_end`; format 2 carries `pools` and `classes`). A
+  replica refuses any other format whole, before anything is written, and
+  its `sync.last_error` says which side to upgrade: `bundle format 1 from
+  the main, this box reads format 2: upgrade the main`.
   Both reads are `409 managed by <peer_url>` on a replica: the bundle a
   replica could answer with is the main's, one pull stale, and a box that
   followed it would be following a copy of a copy — and a box that was a
@@ -905,6 +911,7 @@ Full parameter/response detail lives in `internal/api/openapi.yaml`
   admitted to a transfer and none is notified. An instance with no sync
   configured reads as a main with no replicas.
 - **DHCP** — `GET/POST /dhcp/scopes`, `PATCH/DELETE /dhcp/scopes/{id}`,
+  `GET/POST /dhcp/classes`, `GET/PATCH/DELETE /dhcp/classes/{id}`,
   `GET/POST /dhcp/reservations`, `PATCH/DELETE /dhcp/reservations/{id}`,
   `GET /dhcp/leases`, `DELETE /dhcp/leases/{ip}`,
   `POST /dhcp/leases/{ip}/reserve`, `GET /dhcp/status`, `POST /dhcp/apply`.
@@ -917,15 +924,15 @@ Full parameter/response detail lives in `internal/api/openapi.yaml`
   `{"enabled": false}`, because "is DHCP running here" is what it is for.
   404 rather than 503: nothing is temporarily unavailable, and turning DHCP
   on is a bootstrap change and a restart.
-  **Scopes and reservations are synced configuration** — the ids travel in
+  **Scopes, classes and reservations are synced configuration** — the ids travel in
   the bundle, so a scope means the same row on both boxes — so every write
   to them is `409 managed by <peer_url>` on a replica. `DELETE
   /dhcp/leases/{ip}` is the exception and stays live there: a lease belongs
   to the engine rather than to the configuration, and Kea's HA propagates
   the release to the partner.
   A **scope** is one subnet, rendered as one Kea `subnet4`: `cidr` in masked
-  form (host bits set are refused rather than quietly masked), a pool inside
-  it that is not the network or broadcast address, an optional gateway,
+  form (host bits set are refused rather than quietly masked), its `pools`,
+  an optional gateway,
   suffix, lease time, and the option fields (`domain_search`, `ntp_servers`,
   `static_routes`, the PXE trio, and `options` for every code with no field
   of its own, as hex). No two *enabled* scopes may overlap — a disabled one
@@ -934,6 +941,26 @@ Full parameter/response detail lives in `internal/api/openapi.yaml`
   empty is not "no DNS": it is the automatic answer of this box's address
   followed by its HA partner's, the same two in the same order on both
   boxes, which is what DHCP-level failover needs from DNS.
+  `pools` is an ordered list of `{id, start, end, class_id}`, replaced whole
+  on every write (pool ids are the server's and are not stable across
+  edits). Each is inclusive at both ends, inside `cidr`, `start <= end`,
+  and neither end the network or broadcast address; no two overlap. A
+  scope needs at least one unless it is `reservations_only`. `class_id` 0
+  serves any client not in a class that owns a pool in this scope; any
+  other value reserves the pool for that class's members, and one naming
+  no class is `422 {"error": "pools[1]: no class with id 9"}`. Round one's
+  `pool_start` and `pool_end` are `422 {"error": "pools replaces
+  pool_start and pool_end"}` on both a create and a `PATCH`.
+  A **class** is `{id, name, matchers, …the scope's option fields,
+  created_at, modified_at}`: a client is a member when any matcher matches
+  — `vendor:<prefix>` against the start of option 60, `mac:<hex>` against
+  the start of the hardware address (1–6 bytes, stored lower-case) — and
+  gets the class's options on the class's own pools. The name is 1–63
+  characters, unique ignoring case (`409` otherwise), without `'`, and not
+  `dnsaur-…` or one of Kea's own classes. `DELETE /dhcp/classes/{id}` is
+  `409` while any pool names the class, in the store's words —
+  `class "iot" is in use by 2 pools (Office, IoT)` — since deleting it
+  would turn that pool into one serving anyone.
   `match_client_id` is the one field whose column default (`true`) and Go
   zero value (`false`) disagree: **absent means `true` on a create and
   unchanged on a `PATCH`**, since a merge that turned client-id matching
@@ -984,8 +1011,9 @@ Full parameter/response detail lives in `internal/api/openapi.yaml`
   leases on the segment. `ha` is absent on a single box; its `peer` is what
   the partner calls itself, as the engine talking to it reports the name, and
   is absent on an engine whose `status-get` does not carry one. In `scopes[]`,
-  `leased` may exceed `pool_size` after a pool is shrunk: the engine keeps
-  the leases it already handed out until they expire.
+  `pool_size` is the sum of the scope's pools (0 for a `reservations_only`
+  scope), and `leased` may exceed it after a pool is shrunk: the engine
+  keeps the leases it already handed out until they expire.
 - **Tokens** — `GET /tokens` (list this user's API tokens; session tokens
   and hashes are never included), `POST /tokens`
   (`{name, scope[, expires_at]}`, returns the plaintext token once
