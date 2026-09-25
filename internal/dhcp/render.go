@@ -8,6 +8,7 @@ import (
 	"net/netip"
 	"net/url"
 	"path"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -40,6 +41,11 @@ var ErrNoPeerHost = errors.New("HA pair needs a host in this box's dns_listen")
 // carrying both ("duplicate control-socket entries").
 var controlSocketsFrom = [3]int{2, 7, 2}
 
+// clientClassesFrom is the first Kea that spells a pool's class as the
+// "client-classes" list. 3.0 still takes the singular "client-class" but logs
+// it as deprecated on every config-set; older engines know only that one.
+var clientClassesFrom = [3]int{3, 0, 0}
+
 // Peer is one member of the HA pair as the hook wants it. Role is "primary"
 // or "standby"; URL arrives fully formed, because the caller is the one that
 // knows each box's address and the HA port.
@@ -52,6 +58,9 @@ type Peer struct{ Name, URL, Role string }
 type RenderInput struct {
 	Scopes       []store.Scope
 	Reservations []store.Reservation
+	// Classes are every class, whether or not a pool names one: a class
+	// with no pool still hands its members what their scope leaves blank.
+	Classes []store.Class
 
 	// Domain and LeaseSeconds are the dhcp.domain and dhcp.lease_seconds
 	// settings: what a scope that overrides neither gets.
@@ -104,7 +113,7 @@ func Render(in RenderInput) (map[string]any, error) {
 	if len(interfaces) == 0 {
 		interfaces = []string{"*"}
 	}
-	subnets, err := renderSubnets(in)
+	subnets, guards, err := renderSubnets(in)
 	if err != nil {
 		return nil, err
 	}
@@ -130,6 +139,15 @@ func Render(in RenderInput) (map[string]any, error) {
 	// on that port fails the whole config with "CmdHttpListener::run
 	// failed".
 	socket := map[string]any{"socket-type": "unix", "socket-name": cmp.Or(in.EngineSocket, in.Socket)}
+	if len(in.Classes) > 0 {
+		classes, err := renderClasses(in.Classes)
+		if err != nil {
+			return nil, err
+		}
+		// The guards last: Kea evaluates classes in order, and member() can
+		// only ask about a class already evaluated.
+		cfg["client-classes"] = append(classes, guards...)
+	}
 	if atLeast(in.KeaVersion, controlSocketsFrom) {
 		cfg["control-sockets"] = []any{socket}
 	} else {
@@ -204,36 +222,42 @@ func suggestedHost(in RenderInput) string {
 	return ""
 }
 
-func renderSubnets(in RenderInput) ([]any, error) {
+// renderSubnets also returns the guard classes its pools name, one per
+// scope that needs one, for Render to list after the operator's classes.
+func renderSubnets(in RenderInput) ([]any, []any, error) {
 	byScope := make(map[int64][]store.Reservation, len(in.Scopes))
 	for _, r := range in.Reservations {
 		byScope[r.ScopeID] = append(byScope[r.ScopeID], r)
 	}
+	classes := make(map[int64]store.Class, len(in.Classes))
+	for _, c := range in.Classes {
+		classes[c.ID] = c
+	}
 	subnets := make([]any, 0, len(in.Scopes))
+	var guards []any
 	for _, s := range in.Scopes {
 		if !s.Enabled {
 			continue
 		}
 		options, err := renderOptions(in, s)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		subnet := map[string]any{"id": s.ID, "subnet": s.CIDR}
 		// No pools at all is how Kea is told "reservations only": there is
 		// no flag for it, and a pool the scope still carries is not one the
 		// engine should be handing out of.
-		if !s.ReservationsOnly {
-			subnet["pools"] = []any{map[string]any{"pool": s.PoolStart + " - " + s.PoolEnd}}
+		if !s.ReservationsOnly && len(s.Pools) > 0 {
+			pools, guard, err := renderPools(in.KeaVersion, s, classes)
+			if err != nil {
+				return nil, nil, err
+			}
+			subnet["pools"] = pools
+			if guard != nil {
+				guards = append(guards, guard)
+			}
 		}
-		if s.NextServer != "" {
-			subnet["next-server"] = s.NextServer
-		}
-		if s.ServerHostname != "" {
-			subnet["server-hostname"] = s.ServerHostname
-		}
-		if s.BootFile != "" {
-			subnet["boot-file-name"] = s.BootFile
-		}
+		pxeFields(subnet, s.ClientOptions)
 		// Kea's own default is true, so the key is rendered only to turn it
 		// off: the scopes that asked for it are the ones the config names.
 		if !s.MatchClientID {
@@ -255,11 +279,144 @@ func renderSubnets(in RenderInput) ([]any, error) {
 		}
 		subnets = append(subnets, subnet)
 	}
-	return subnets, nil
+	return subnets, guards, nil
 }
 
-// renderOptions emits an option only when it has a value: Kea reads an empty
-// option-data entry as an error, not as "hand out nothing".
+// renderPools spells a scope's pools in the order the operator listed them.
+// A pool with a class carries that class's options again, on the pool: Kea
+// ranks pool options above the subnet's and class options below them, so
+// only there do the class's values beat the ones the scope sets itself.
+//
+// Kea has no preference between the pools a client may use: its allocator
+// takes the first one that admits it, and a pool with no class admits
+// everyone. So in a scope where a class owns a pool, the pools with no class
+// are closed to that class's members by a guard class — returned for Render
+// to list — or its members would be handed addresses, and options, from the
+// open pools. A member whose own pool is full gets nothing in this scope.
+func renderPools(version string, s store.Scope, classes map[int64]store.Class) ([]any, map[string]any, error) {
+	var owners []store.Class
+	for _, p := range s.Pools {
+		if p.ClassID == 0 {
+			continue
+		}
+		c, ok := classes[p.ClassID]
+		if !ok {
+			return nil, nil, fmt.Errorf("pool %s-%s names class %d, which does not exist", p.Start, p.End, p.ClassID)
+		}
+		if !slices.ContainsFunc(owners, func(o store.Class) bool { return o.ID == c.ID }) {
+			owners = append(owners, c)
+		}
+	}
+	var guard map[string]any
+	if len(owners) > 0 && slices.ContainsFunc(s.Pools, func(p store.Pool) bool { return p.ClassID == 0 }) {
+		slices.SortFunc(owners, func(a, b store.Class) int { return cmp.Compare(a.ID, b.ID) })
+		tests := make([]string, len(owners))
+		for i, c := range owners {
+			// Inside single quotes, which Kea gives no way to escape.
+			if strings.Contains(c.Name, "'") {
+				return nil, nil, fmt.Errorf("class %s: a name with ' cannot be rendered", c.Name)
+			}
+			tests[i] = "not member('" + c.Name + "')"
+		}
+		guard = map[string]any{
+			"name": fmt.Sprintf("dnsaur-open-%d", s.ID),
+			"test": strings.Join(tests, " and "),
+		}
+	}
+	out := make([]any, 0, len(s.Pools))
+	for _, p := range s.Pools {
+		pool := map[string]any{"pool": p.Start + " - " + p.End}
+		switch c := classes[p.ClassID]; {
+		case p.ClassID != 0:
+			poolClass(pool, version, c.Name)
+			if options := renderClientOptions(c.ClientOptions, c.DNSServers, c.Domain); len(options) > 0 {
+				pool["option-data"] = options
+			}
+		case guard != nil:
+			poolClass(pool, version, guard["name"].(string))
+		}
+		out = append(out, pool)
+	}
+	return out, guard, nil
+}
+
+// poolClass restricts a pool to one class, under whichever key this engine
+// knows.
+func poolClass(pool map[string]any, version, name string) {
+	if atLeast(version, clientClassesFrom) {
+		pool["client-classes"] = []any{name}
+		return
+	}
+	pool["client-class"] = name
+}
+
+// renderClasses is one client-classes entry per class, in id order so the
+// output does not depend on the order the store read them in. The class's
+// own values only: a blank field is the scope's to answer, and copying the
+// scope's value here would be a second copy of it that loses anyway.
+func renderClasses(cs []store.Class) ([]any, error) {
+	cs = slices.Clone(cs)
+	slices.SortFunc(cs, func(a, b store.Class) int { return cmp.Compare(a.ID, b.ID) })
+	out := make([]any, 0, len(cs))
+	for _, c := range cs {
+		test, err := classTest(c.Matchers)
+		if err != nil {
+			return nil, fmt.Errorf("class %s: %w", c.Name, err)
+		}
+		class := map[string]any{"name": c.Name, "test": test}
+		if options := renderClientOptions(c.ClientOptions, c.DNSServers, c.Domain); len(options) > 0 {
+			class["option-data"] = options
+		}
+		// The fixed header fields are not options, and a class's win over
+		// the subnet's (Kea sets them from the classes after the subnet), so
+		// a class with no pool still boots its members from its own file.
+		pxeFields(class, c.ClientOptions)
+		out = append(out, class)
+	}
+	return out, nil
+}
+
+// classTest spells one class's matchers as a Kea evaluation expression. The
+// store refuses a matcher this cannot spell; the refusal here is for an input
+// that did not come through it, because a quote in a vendor prefix would end
+// the string literal and hand Kea an expression the operator never wrote.
+func classTest(matchers []string) (string, error) {
+	parts := make([]string, 0, len(matchers))
+	for _, m := range matchers {
+		kind, value, _ := strings.Cut(m, ":")
+		switch {
+		case kind == "mac" && value != "":
+			parts = append(parts, fmt.Sprintf("substring(pkt4.mac,0,%d) == 0x%s",
+				(len(value)+1)/3, strings.ReplaceAll(value, ":", "")))
+		case kind == "vendor" && value != "" && !strings.Contains(value, "'"):
+			parts = append(parts, fmt.Sprintf("substring(option[60].text,0,%d) == '%s'", len(value), value))
+		default:
+			return "", fmt.Errorf("matcher %q cannot be rendered", m)
+		}
+	}
+	if len(parts) == 0 {
+		return "", errors.New("no matchers")
+	}
+	return strings.Join(parts, " or "), nil
+}
+
+// pxeFields sets PXE's three fixed fields on a subnet or a class, each only
+// when it has a value.
+func pxeFields(into map[string]any, o store.ClientOptions) {
+	if o.NextServer != "" {
+		into["next-server"] = o.NextServer
+	}
+	if o.ServerHostname != "" {
+		into["server-hostname"] = o.ServerHostname
+	}
+	if o.BootFile != "" {
+		into["boot-file-name"] = o.BootFile
+	}
+}
+
+// renderOptions is a scope's option-data: its router, then its client
+// options with §5.3's automatic DNS list and the dhcp.domain setting filling
+// in what it leaves blank.
 func renderOptions(in RenderInput, s store.Scope) ([]any, error) {
 	var options []any
 	if s.Gateway != "" {
@@ -269,31 +426,36 @@ func renderOptions(in RenderInput, s store.Scope) ([]any, error) {
 	if err != nil {
 		return nil, err
 	}
-	if servers != "" {
-		options = append(options, option("domain-name-servers", servers))
-	}
-	domain := s.Domain
-	if domain == "" {
-		domain = in.Domain
+	return append(options, renderClientOptions(s.ClientOptions, servers, cmp.Or(s.Domain, in.Domain))...), nil
+}
+
+// renderClientOptions emits an option only when it has a value: Kea reads an
+// empty option-data entry as an error, not as "hand out nothing". The DNS
+// servers and domain arrive resolved, because a scope and a class fill them
+// in differently.
+func renderClientOptions(o store.ClientOptions, dnsServers, domain string) []any {
+	var options []any
+	if dnsServers != "" {
+		options = append(options, option("domain-name-servers", dnsServers))
 	}
 	if domain != "" {
 		options = append(options, option("domain-name", domain))
 	}
-	if s.DomainSearch != "" {
-		options = append(options, option("domain-search", s.DomainSearch))
+	if o.DomainSearch != "" {
+		options = append(options, option("domain-search", o.DomainSearch))
 	}
-	if s.NTPServers != "" {
-		options = append(options, option("ntp-servers", s.NTPServers))
+	if o.NTPServers != "" {
+		options = append(options, option("ntp-servers", o.NTPServers))
 	}
-	if len(s.StaticRoutes) > 0 {
-		options = append(options, option("classless-static-route", staticRoutes(s.StaticRoutes)))
+	if len(o.StaticRoutes) > 0 {
+		options = append(options, option("classless-static-route", staticRoutes(o.StaticRoutes)))
 	}
 	// Last, and in the order they were typed: these are the codes dnsaur has
 	// no opinion about, handed over as the bytes the operator gave.
-	for _, o := range s.Options {
-		options = append(options, map[string]any{"code": o.Code, "csv-format": false, "data": o.Hex})
+	for _, g := range o.Options {
+		options = append(options, map[string]any{"code": g.Code, "csv-format": false, "data": g.Hex})
 	}
-	return options, nil
+	return options
 }
 
 // staticRoutes spells option 121 the way Kea's built-in definition takes it:

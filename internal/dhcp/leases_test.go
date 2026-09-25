@@ -76,3 +76,60 @@ func TestUnnamedReservationsAreStillReservations(t *testing.T) {
 		t.Errorf("printer.home.lan = %+v, %v; want the named reservation", named, ok)
 	}
 }
+
+// A lease from a pool whose class sets a domain is named under the class's
+// suffix; one from the scope's other pool, and a reservation wherever its
+// address sits, under the scope's. The suffix belongs to the entry, so a
+// release — which rebuilds the table from its entries — keeps every other
+// name where it was.
+func TestLeaseNamesFollowThePoolsClass(t *testing.T) {
+	ctx := t.Context()
+	e := newEngine(t, "3.0.3", alpineHooks)
+	in := managerInput(e.Socket())
+	in.Classes = []store.Class{
+		{ID: 1, Name: "iot", Matchers: []string{"mac:a4:cf:12"}, ClientOptions: store.ClientOptions{Domain: "things.lan"}},
+		// A domain on a class no pool names moves no name.
+		{ID: 2, Name: "pxe", Matchers: []string{"vendor:PXEClient"}, ClientOptions: store.ClientOptions{Domain: "boot.lan"}},
+	}
+	in.Scopes[0].Pools = []store.Pool{
+		{Start: "10.42.0.100", End: "10.42.0.149"},
+		{Start: "10.42.0.150", End: "10.42.0.200", ClassID: 1},
+	}
+	in.Reservations = []store.Reservation{
+		{ID: 1, ScopeID: 1, MAC: "aa:bb:cc:dd:ee:01", IP: "10.42.0.170", Hostname: "printer"},
+		{ID: 2, ScopeID: 1, MAC: "aa:bb:cc:dd:ee:02", IP: "10.42.0.180"},
+	}
+	e.setLeases(
+		dhcp.Lease{IP: "10.42.0.160", MAC: "a4:cf:12:00:00:01", Hostname: "plug", SubnetID: 1, CLTT: 1000, ValidLft: 3600},
+		dhcp.Lease{IP: "10.42.0.161", MAC: "a4:cf:12:00:00:02", Hostname: "bulb", SubnetID: 1, CLTT: 1000, ValidLft: 3600},
+		dhcp.Lease{IP: "10.42.0.110", MAC: "aa:bb:cc:dd:ee:10", Hostname: "laptop", SubnetID: 1, CLTT: 1000, ValidLft: 3600},
+		// Reserved, leased, and inside the class's pool: the pin placed it.
+		dhcp.Lease{IP: "10.42.0.180", MAC: "aa:bb:cc:dd:ee:02", Hostname: "cam", SubnetID: 1, CLTT: 1000, ValidLft: 3600},
+	)
+	m := dhcp.NewManager(dhcp.NewClient(e.Socket()), &fakeInputs{in: in}, openSettings(t), nil)
+	if err := m.Poll(ctx); err != nil {
+		t.Fatalf("Poll: %v", err)
+	}
+	names := func(when string) {
+		t.Helper()
+		table := m.Table()
+		for _, c := range []struct {
+			label, suffix string
+			want          bool
+		}{
+			{"plug", "things.lan", true}, {"plug", "home.lan", false},
+			{"laptop", "home.lan", true}, {"laptop", "things.lan", false},
+			{"printer", "home.lan", true}, {"printer", "things.lan", false},
+			{"cam", "home.lan", true}, {"cam", "things.lan", false},
+		} {
+			if _, ok := table.ByName(c.label, c.suffix); ok != c.want {
+				t.Errorf("%s: %s.%s resolves = %v, want %v", when, c.label, c.suffix, ok, c.want)
+			}
+		}
+	}
+	names("after a poll")
+	if err := m.Release(ctx, netip.MustParseAddr("10.42.0.161")); err != nil {
+		t.Fatalf("Release: %v", err)
+	}
+	names("after a release")
+}

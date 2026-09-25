@@ -1117,6 +1117,47 @@ are different paths, and Kea will not move its socket: a config naming
 another path is refused, and Debian's build then closes the socket it had
 (`DHCP4_CONFIG_UNRECOVERABLE_ERROR`) until the engine is restarted.
 
+### Classes and pools
+
+A scope's pools render as Kea `pools` in the order they are listed, and each
+class renders as a `client-classes` entry whose `test` joins its matchers
+with `or`: `vendor:PXEClient` becomes
+`substring(option[60].text,0,9) == 'PXEClient'` and `mac:a4:cf:12` becomes
+`substring(pkt4.mac,0,3) == 0xa4cf12`. A pool that names a class is
+restricted to it, with `client-class` below Kea 3.0 and the one-element
+`client-classes` list from 3.0 on, since 3.0 logs the singular key as
+deprecated on every `config-set`.
+
+Two Kea rules decide the rest, and the real-engine test
+(`internal/dhcp/kea_real_test.go`) checks both with DHCP exchanges on 2.6.3
+and 3.0.3:
+
+- **Option precedence is reservation > pool > subnet > class.** A class's
+  options only beat the scope's when they sit on a pool, so they are
+  rendered twice: on the class's own pools and on the class. The class-level
+  copy only fills in what the scope leaves blank. PXE's three fields are
+  header fields rather than options, and Kea sets them from the classes
+  after the subnet, so a class's boot file wins even with no pool. Kea's
+  pool grammar has no place for them anyway.
+- **Kea has no pool preference.** Its allocator hands out the first pool
+  that admits the client, and a pool with no class admits everyone. So in a
+  scope where a class owns a pool, the renderer closes that scope's open
+  pools to the owning classes. It adds one guard class per scope,
+  `dnsaur-open-<scope id>`, with the test
+  `not member('iot') and not member('cams')`, and restricts every open pool
+  to the guard. The guards come after the operator's classes, because
+  `member()` can only ask about a class Kea has already evaluated. As a
+  result, a class member draws only from its own pools in that scope, and
+  **a full class pool means no address for that class there**. The store
+  refuses class names that start with `dnsaur-`, and Kea's built-in names
+  (`ALL`, `KNOWN`, `UNKNOWN`, `BOOTING`, `DROP`), so no operator class can
+  collide with a guard or a built-in.
+
+A lease's DNS name follows its pool. If the address is inside a pool whose
+class sets a domain, the name uses that domain; otherwise it uses the
+scope's domain, then `dhcp.domain`. A reservation, leased or not, keeps the
+scope's domain: the operator placed it, not the pool.
+
 ### The lease table
 
 Every `dhcp.lease_poll_seconds` the manager pages through `lease4-get-page`
@@ -1197,6 +1238,7 @@ reconciliation when they meet again.
 | the store cannot be read on a poll | the poll runs against the scopes last read — a table built from stale scopes beats no table |
 | the HA partner is unreachable | Kea's problem to solve; the status panel shows `DHCP partner unreachable` for as long as it says so |
 | a replica pairs later, or is forgotten | the next lease poll on both boxes adds or drops the standby peer. Nothing else has to notice, and nothing else would: the registry is written without moving `config_version`, so no settings write and no handler is involved |
+| a class's pool is full | its members get no address in that scope: the open pools are closed to them (Classes and pools above). Kea logs the allocation failure |
 | a pool is shrunk below its live leases | Kea keeps what it has handed out until those leases expire, and the Scopes page shows `leased` above the pool size |
 | two devices claim one hostname | the newer lease keeps the name; the other is logged with both hardware addresses |
 

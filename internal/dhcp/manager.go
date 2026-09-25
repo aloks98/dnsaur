@@ -145,6 +145,7 @@ type Manager struct {
 	// mark reserved leases without asking the app again when it cannot.
 	scopes       []store.Scope
 	reservations []store.Reservation
+	classes      []store.Class
 	domain       string
 }
 
@@ -164,7 +165,7 @@ func NewManager(client *Client, inputs Inputs, settings store.SettingsStore, log
 		down:    true,
 		hookDir: hookDirs[0],
 	}
-	m.table.Store(newTable(nil, nil))
+	m.table.Store(newTable(nil))
 	return m
 }
 
@@ -452,8 +453,8 @@ func (m *Manager) Poll(ctx context.Context) error {
 		return err
 	}
 	in, read := m.config(ctx)
-	scopes, reservations, domain := m.remembered()
-	table := tableFrom(leases, scopes, reservations, domain)
+	scopes, classes, reservations, domain := m.remembered()
+	table := tableFrom(leases, scopes, classes, reservations, domain)
 	m.tableMu.Lock()
 	m.table.Store(table)
 	m.tableMu.Unlock()
@@ -522,16 +523,16 @@ func (m *Manager) config(ctx context.Context) (RenderInput, bool) {
 }
 
 // remembered is the last input's half the lease table is built from.
-func (m *Manager) remembered() ([]store.Scope, []store.Reservation, string) {
+func (m *Manager) remembered() ([]store.Scope, []store.Class, []store.Reservation, string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.scopes, m.reservations, m.domain
+	return m.scopes, m.classes, m.reservations, m.domain
 }
 
 func (m *Manager) remember(in RenderInput) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.scopes, m.reservations, m.domain = in.Scopes, in.Reservations, in.Domain
+	m.scopes, m.classes, m.reservations, m.domain = in.Scopes, in.Classes, in.Reservations, in.Domain
 }
 
 // readHA reads the HA relationship on the same poll (§7.2). A single box has
@@ -767,22 +768,25 @@ func (m *Manager) interval(ctx context.Context) time.Duration {
 	return max(time.Duration(n), minPollSeconds) * time.Second
 }
 
-// poolSize is how many addresses a scope's pool holds, both ends included. A
-// pool that does not parse is not a pool anything was handed out of, which is
-// a size of zero rather than a guess.
+// poolSize is how many addresses a scope's pools hold, both ends of each
+// included. A pool that does not parse is not a pool anything was handed out
+// of, which is a size of zero rather than a guess.
 func poolSize(s store.Scope) int {
-	start, err := netip.ParseAddr(s.PoolStart)
-	if err != nil || !start.Is4() {
-		return 0
+	n := 0
+	for _, p := range s.Pools {
+		start, err := netip.ParseAddr(p.Start)
+		if err != nil || !start.Is4() {
+			continue
+		}
+		end, err := netip.ParseAddr(p.End)
+		if err != nil || !end.Is4() {
+			continue
+		}
+		from, to := start.As4(), end.As4()
+		first, last := binary.BigEndian.Uint32(from[:]), binary.BigEndian.Uint32(to[:])
+		if last >= first {
+			n += int(last-first) + 1
+		}
 	}
-	end, err := netip.ParseAddr(s.PoolEnd)
-	if err != nil || !end.Is4() {
-		return 0
-	}
-	from, to := start.As4(), end.As4()
-	first, last := binary.BigEndian.Uint32(from[:]), binary.BigEndian.Uint32(to[:])
-	if last < first {
-		return 0
-	}
-	return int(last-first) + 1
+	return n
 }

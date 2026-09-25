@@ -779,6 +779,18 @@ func ValidateClass(c Class, others []Class) error {
 		return err
 	}
 	name := strings.TrimSpace(c.Name)
+	// The class is rendered under this name into Kea's one namespace, which
+	// already holds the renderer's own guard classes (dnsaur-open-<scope>)
+	// and Kea's built-ins — DROP among them, which drops its members'
+	// packets unanswered.
+	if strings.HasPrefix(strings.ToLower(name), "dnsaur-") {
+		return errors.New("names starting with dnsaur- are reserved")
+	}
+	for _, k := range []string{"ALL", "KNOWN", "UNKNOWN", "BOOTING", "DROP"} {
+		if strings.EqualFold(name, k) {
+			return fmt.Errorf("%s is a class Kea defines itself", name)
+		}
+	}
 	for _, o := range others {
 		if o.ID != c.ID && strings.EqualFold(strings.TrimSpace(o.Name), name) {
 			return fmt.Errorf("%w: a class named %q exists", ErrDuplicate, o.Name)

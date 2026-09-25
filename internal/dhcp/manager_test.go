@@ -264,7 +264,7 @@ func openSettings(t *testing.T) store.SettingsStore {
 func lanScope() store.Scope {
 	return store.Scope{
 		ID: 1, Name: "lan", CIDR: "10.42.0.0/24",
-		PoolStart: "10.42.0.100", PoolEnd: "10.42.0.200",
+		Pools:   []store.Pool{{Start: "10.42.0.100", End: "10.42.0.200"}},
 		Gateway: "10.42.0.1", Enabled: true,
 	}
 }
@@ -272,8 +272,8 @@ func lanScope() store.Scope {
 func iotScope() store.Scope {
 	return store.Scope{
 		ID: 2, Name: "iot", CIDR: "10.43.0.0/16",
-		PoolStart: "10.43.0.1", PoolEnd: "10.43.1.250",
-		Domain: "iot.lan", Enabled: true,
+		Pools:         []store.Pool{{Start: "10.43.0.1", End: "10.43.1.250"}},
+		ClientOptions: store.ClientOptions{Domain: "iot.lan"}, Enabled: true,
 	}
 }
 
@@ -1130,7 +1130,7 @@ func TestApplyIfChangedIsAboutWhatTheEngineIsGiven(t *testing.T) {
 	// And the thing the gate exists to let through still goes.
 	edited := in
 	edited.Scopes = slices.Clone(in.Scopes)
-	edited.Scopes[0].PoolEnd = "10.42.0.150"
+	edited.Scopes[0].Pools = []store.Pool{{Start: "10.42.0.100", End: "10.42.0.150"}}
 	if err := m.ApplyIfChanged(ctx, edited); err != nil {
 		t.Fatalf("ApplyIfChanged after a scope edit: %v", err)
 	}

@@ -30,7 +30,7 @@ func baseInput() dhcp.RenderInput {
 	return dhcp.RenderInput{
 		Scopes: []store.Scope{{
 			ID: 1, Name: "lan", CIDR: "10.42.0.0/24",
-			PoolStart: "10.42.0.100", PoolEnd: "10.42.0.200",
+			Pools:   []store.Pool{{Start: "10.42.0.100", End: "10.42.0.200"}},
 			Gateway: "10.42.0.1", Enabled: true, MatchClientID: true,
 		}},
 		Reservations: []store.Reservation{
@@ -84,17 +84,18 @@ func twoScopes() dhcp.RenderInput {
 	in.Scopes = []store.Scope{
 		{
 			ID: 1, Name: "lan", CIDR: "10.42.0.0/24",
-			PoolStart: "10.42.0.100", PoolEnd: "10.42.0.200",
-			Gateway: "10.42.0.1", DNSServers: "1.1.1.1, 8.8.8.8",
-			Domain: "lab.lan", LeaseSeconds: 900, Enabled: true, MatchClientID: true,
+			Pools:         []store.Pool{{Start: "10.42.0.100", End: "10.42.0.200"}},
+			Gateway:       "10.42.0.1",
+			ClientOptions: store.ClientOptions{DNSServers: "1.1.1.1, 8.8.8.8", Domain: "lab.lan"},
+			LeaseSeconds:  900, Enabled: true, MatchClientID: true,
 		},
 		{
 			ID: 2, Name: "guest", CIDR: "10.43.0.0/24",
-			PoolStart: "10.43.0.10", PoolEnd: "10.43.0.250", Enabled: true, MatchClientID: true,
+			Pools: []store.Pool{{Start: "10.43.0.10", End: "10.43.0.250"}}, Enabled: true, MatchClientID: true,
 		},
 		{
 			ID: 3, Name: "retired", CIDR: "10.44.0.0/24",
-			PoolStart: "10.44.0.10", PoolEnd: "10.44.0.250", Enabled: false, MatchClientID: true,
+			Pools: []store.Pool{{Start: "10.44.0.10", End: "10.44.0.250"}}, Enabled: false, MatchClientID: true,
 		},
 	}
 	in.Reservations = []store.Reservation{
@@ -171,27 +172,229 @@ func TestRenderGolden(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Render: %v", err)
 			}
-			b, err := json.MarshalIndent(got, "", "  ")
-			if err != nil {
-				t.Fatalf("marshalling the rendered config: %v", err)
-			}
-			b = append(b, '\n')
-			path := filepath.Join("testdata", tc.name+".golden.json")
-			if *update {
-				if err := os.WriteFile(path, b, 0o644); err != nil {
-					t.Fatalf("writing %s: %v", path, err)
-				}
-			}
-			want, err := os.ReadFile(path)
-			if err != nil {
-				t.Fatalf("reading %s (run with -update to create it): %v", path, err)
-			}
-			oneControlSocket(t, got)
-			if !bytes.Equal(b, want) {
-				t.Errorf("rendered config does not match %s\n--- got ---\n%s\n--- want ---\n%s", path, b, want)
-			}
+			golden(t, tc.name, got)
 		})
 	}
+}
+
+// golden compares a rendered config with testdata/<name>.golden.json, and
+// rewrites the file instead under -update.
+func golden(t *testing.T, name string, got map[string]any) {
+	t.Helper()
+	b, err := json.MarshalIndent(got, "", "  ")
+	if err != nil {
+		t.Fatalf("marshalling the rendered config: %v", err)
+	}
+	b = append(b, '\n')
+	path := filepath.Join("testdata", name+".golden.json")
+	if *update {
+		if err := os.WriteFile(path, b, 0o644); err != nil {
+			t.Fatalf("writing %s: %v", path, err)
+		}
+	}
+	want, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading %s (run with -update to create it): %v", path, err)
+	}
+	oneControlSocket(t, got)
+	if !bytes.Equal(b, want) {
+		t.Errorf("rendered config does not match %s\n--- got ---\n%s\n--- want ---\n%s", path, b, want)
+	}
+}
+
+// Two classes, one with a pool of its own and one with none. The class's
+// options are rendered twice: on its pool, where Kea ranks them above the
+// subnet's, and on the class, for a member drawing from the scope's other
+// pool. The class with no pool renders on the class alone.
+func TestRenderClassesAndPools(t *testing.T) {
+	in := baseInput()
+	// Listed out of id order: the rendered order is the ids'.
+	in.Classes = []store.Class{
+		{ID: 2, Name: "pxe-uefi", Matchers: []string{"vendor:PXEClient:Arch:00007"},
+			ClientOptions: store.ClientOptions{NextServer: "10.42.0.5", BootFile: "bootx64.efi"}},
+		{ID: 1, Name: "iot", Matchers: []string{"mac:a4:cf:12", "vendor:ESP"},
+			ClientOptions: store.ClientOptions{DNSServers: "10.42.0.9", Domain: "iot.lan"}},
+	}
+	in.Scopes[0].Pools = []store.Pool{
+		{Start: "10.42.0.100", End: "10.42.0.149"},
+		{Start: "10.42.0.150", End: "10.42.0.200", ClassID: 1},
+	}
+	cfg, err := dhcp.Render(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	classes := cfg["client-classes"].([]any)
+	first := classes[0].(map[string]any)
+	if first["test"] != "substring(pkt4.mac,0,3) == 0xa4cf12 or substring(option[60].text,0,3) == 'ESP'" {
+		t.Errorf("test = %v", first["test"])
+	}
+	pools := cfg["subnet4"].([]any)[0].(map[string]any)["pools"].([]any)
+	// Kea hands a client the first pool that admits it, so the open pool
+	// is closed to the class that owns a pool here — and only to that one:
+	// pxe-uefi owns none, and its members still draw from it.
+	if open := pools[0].(map[string]any); open["client-class"] != "dnsaur-open-1" || len(open) != 2 {
+		t.Errorf("the pool with no class renders %v, want its range and the guard", open)
+	}
+	if len(classes) != 3 {
+		t.Fatalf("client-classes = %v, want the two classes and the scope's guard", classes)
+	}
+	guard := classes[2].(map[string]any)
+	if guard["name"] != "dnsaur-open-1" || guard["test"] != "not member('iot')" || len(guard) != 2 {
+		t.Errorf("guard = %v", guard)
+	}
+	classed := pools[1].(map[string]any)
+	if classed["client-class"] != "iot" {
+		t.Errorf("pool[1] = %v", classed)
+	}
+	if !hasOption(classed["option-data"], "domain-name-servers", "10.42.0.9") {
+		t.Errorf("pool option-data = %v", classed["option-data"])
+	}
+	if !hasOption(first["option-data"], "domain-name", "iot.lan") {
+		t.Errorf("class option-data = %v", first["option-data"])
+	}
+	pxe := classes[1].(map[string]any)
+	if pxe["boot-file-name"] != "bootx64.efi" || pxe["next-server"] != "10.42.0.5" {
+		t.Errorf("pxe class = %v, want its boot file and next server", pxe)
+	}
+	// Blank on the class means the scope's: nothing is copied in.
+	if _, ok := pxe["option-data"]; ok {
+		t.Errorf("pxe class carries option-data %v it never set", pxe["option-data"])
+	}
+	golden(t, "classes", cfg)
+
+	// From 3.0 the pool's class is the "client-classes" list; 3.0 logs the
+	// singular key as deprecated on every config-set.
+	in.KeaVersion = "3.0.3"
+	if cfg, err = dhcp.Render(in); err != nil {
+		t.Fatal(err)
+	}
+	pools = cfg["subnet4"].([]any)[0].(map[string]any)["pools"].([]any)
+	for i, want := range []string{"dnsaur-open-1", "iot"} {
+		pool := pools[i].(map[string]any)
+		if _, singular := pool["client-class"]; singular || !reflect.DeepEqual(pool["client-classes"], []any{want}) {
+			t.Errorf("3.0.3 pool[%d] = %v, want client-classes [%s]", i, pool, want)
+		}
+	}
+	golden(t, "classes-kea3", cfg)
+}
+
+// One guard per scope, over every class owning a pool in it and no other,
+// and none where no pool is open or no class owns one.
+func TestRenderGuardsTheOpenPools(t *testing.T) {
+	in := baseInput()
+	in.Classes = []store.Class{
+		{ID: 1, Name: "iot", Matchers: []string{"mac:a4:cf:12"}},
+		{ID: 2, Name: "cams", Matchers: []string{"vendor:cam"}},
+		{ID: 3, Name: "pxe", Matchers: []string{"vendor:PXEClient"}},
+	}
+	in.Scopes = []store.Scope{
+		{ID: 1, Name: "lan", CIDR: "10.42.0.0/24", Enabled: true, Pools: []store.Pool{
+			{Start: "10.42.0.10", End: "10.42.0.19", ClassID: 2},
+			{Start: "10.42.0.20", End: "10.42.0.29"},
+			{Start: "10.42.0.30", End: "10.42.0.39", ClassID: 1},
+			{Start: "10.42.0.40", End: "10.42.0.49"},
+			{Start: "10.42.0.50", End: "10.42.0.59", ClassID: 1},
+		}},
+		// Every pool owned: nothing open to guard.
+		{ID: 2, Name: "iot", CIDR: "10.43.0.0/24", Enabled: true, Pools: []store.Pool{
+			{Start: "10.43.0.10", End: "10.43.0.19", ClassID: 1},
+		}},
+		// No pool owned: nothing to guard against.
+		{ID: 3, Name: "guest", CIDR: "10.44.0.0/24", Enabled: true, Pools: []store.Pool{
+			{Start: "10.44.0.10", End: "10.44.0.19"},
+		}},
+	}
+	in.DNSServers = []string{"10.42.0.2"}
+	cfg, err := dhcp.Render(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	classes := cfg["client-classes"].([]any)
+	want := map[string]any{"name": "dnsaur-open-1", "test": "not member('iot') and not member('cams')"}
+	if len(classes) != 4 || !reflect.DeepEqual(classes[3], want) {
+		t.Fatalf("client-classes = %v, want the three classes then %v", classes, want)
+	}
+	subnets := cfg["subnet4"].([]any)
+	for i, pool := range subnets[0].(map[string]any)["pools"].([]any) {
+		if got, open := pool.(map[string]any)["client-class"], i == 1 || i == 3; open != (got == "dnsaur-open-1") {
+			t.Errorf("lan pool[%d] = %v", i, pool)
+		}
+	}
+	for _, i := range []int{1, 2} {
+		for _, pool := range subnets[i].(map[string]any)["pools"].([]any) {
+			if c := pool.(map[string]any)["client-class"]; c != nil && c != "iot" {
+				t.Errorf("subnet %d pool %v names %v", i, pool, c)
+			}
+		}
+	}
+}
+
+// Three pools around two gaps, no classes: no client-classes key at all, the
+// pools in the order listed. The same scope asking for reservations only
+// renders none of them.
+func TestRenderPoolsMulti(t *testing.T) {
+	in := baseInput()
+	in.Scopes[0].Pools = []store.Pool{
+		{Start: "10.42.0.150", End: "10.42.0.200"},
+		{Start: "10.42.0.20", End: "10.42.0.40"},
+		{Start: "10.42.0.100", End: "10.42.0.120"},
+	}
+	cfg, err := dhcp.Render(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := cfg["client-classes"]; ok {
+		t.Error("client-classes rendered with no classes")
+	}
+	golden(t, "pools-multi", cfg)
+
+	in.Scopes[0].ReservationsOnly = true
+	if cfg, err = dhcp.Render(in); err != nil {
+		t.Fatal(err)
+	}
+	if pools, ok := cfg["subnet4"].([]any)[0].(map[string]any)["pools"]; ok {
+		t.Errorf("a reservations-only scope rendered pools %v", pools)
+	}
+}
+
+// The store refuses both of these; the renderer refuses them too, because
+// the first would hand Kea an expression the operator never wrote and the
+// second a pool restricted to a class Kea has never heard of.
+func TestRenderRefusesMatcherKeaCannotParse(t *testing.T) {
+	in := baseInput()
+	in.Classes = []store.Class{{ID: 1, Name: "odd", Matchers: []string{"vendor:it's"}}}
+	if _, err := dhcp.Render(in); err == nil || !strings.Contains(err.Error(), `"vendor:it's"`) {
+		t.Errorf("Render error = %v, want the matcher refused by name", err)
+	}
+
+	// A guard names each class inside single quotes too.
+	in = baseInput()
+	in.Classes = []store.Class{{ID: 1, Name: "bob's", Matchers: []string{"mac:aa"}}}
+	in.Scopes[0].Pools = []store.Pool{
+		{Start: "10.42.0.100", End: "10.42.0.149"},
+		{Start: "10.42.0.150", End: "10.42.0.200", ClassID: 1},
+	}
+	if _, err := dhcp.Render(in); err == nil {
+		t.Error("a class named with a quote rendered into a guard")
+	}
+
+	in = baseInput()
+	in.Scopes[0].Pools = []store.Pool{{Start: "10.42.0.100", End: "10.42.0.200", ClassID: 7}}
+	_, err := dhcp.Render(in)
+	if err == nil || err.Error() != "pool 10.42.0.100-10.42.0.200 names class 7, which does not exist" {
+		t.Errorf("Render error = %v", err)
+	}
+}
+
+// hasOption reports whether an option-data list holds name with data.
+func hasOption(list any, name, data string) bool {
+	options, _ := list.([]any)
+	for _, o := range options {
+		if o, _ := o.(map[string]any); o["name"] == name && o["data"] == data {
+			return true
+		}
+	}
+	return false
 }
 
 // The control socket's key is spelled differently either side of 2.7.2, and

@@ -430,9 +430,10 @@ apk add kea-dhcp4 kea-hook-ha kea-hook-lease-cmds
 
 2.6 and 3.0 are the tested range (both were driven by hand on 2026-09-13,
 and CI runs the Debian package on every push). The renderer emits only keys
-both versions understand, with one exception it asks about: the control
+both versions understand, with two exceptions it asks about: the control
 socket is `control-socket` below 2.7.2 and `control-sockets` from 2.7.2 on,
-so dnsaur reads the version once at start (`version-get`) and spells it
+and a pool's class is `client-class` below 3.0 and `client-classes` from 3.0
+on. dnsaur reads the version once at start (`version-get`) and spells both
 accordingly. The hook directory is the other thing it asks rather than
 assumes: it reads the one the engine's own configuration names
 (`config-get`), which is why the file below names a hook library, and is how
@@ -632,6 +633,46 @@ Both boxes hand out the same two DNS servers in the same order, main first.
 That is what DHCP-level failover needs from DNS: a client keeping its lease
 through a takeover keeps its resolvers with it.
 
+### Client classes and pools
+
+A class sorts clients by what they send and gives its members their own
+options and, through a pool, their own addresses. A class needs at least
+one matcher, and a client is a member when any one of them matches:
+
+- `vendor:<prefix>` matches when option 60 (the vendor class identifier)
+  starts with the prefix, for example `vendor:PXEClient:Arch:00007` or
+  `vendor:MSFT`. The prefix is 1–255 bytes, with no control characters and
+  no `'`.
+- `mac:<hex>` matches when the hardware address starts with 1–6 bytes, for
+  example `mac:a4:cf:12`. This is the same syntax as the `mac` client
+  matcher.
+
+A class's options are the same set a scope has. A blank field means the
+scope's value.
+
+A scope has one or more pools, listed in order, that do not overlap. Each
+pool is open to any client or reserved for one class. Two rules follow from
+how Kea works:
+
+- **A class without a pool in a scope changes only what that scope leaves
+  blank.** Kea ranks a scope's options above a class's, so a class that only
+  sets DNS servers does nothing in a scope, because every scope hands out
+  DNS servers. Its boot file, NTP servers or search list do apply wherever
+  the scope has none. The PXE fields apply even where the scope sets them.
+- **A class with a pool in a scope gets everything it sets, and draws only
+  from its own pools there.** The scope's open pools are closed to its
+  members. When the class's pools are full, its members get no address in
+  that scope; they do not fall back to an open pool. Size a class's pool
+  for every device that matches it.
+
+A lease from a class's pool is named under the class's DNS suffix when the
+class sets one.
+
+Class names follow the scope-name rules. Names starting with `dnsaur-` are
+reserved, because the renderer uses them for its own classes. `ALL`,
+`KNOWN`, `UNKNOWN`, `BOOTING` and `DROP` are refused in any case, because
+Kea defines them itself.
+
 ### VLANs and relays
 
 One scope is one subnet, and a router relaying DHCP is how a box serves a
@@ -706,11 +747,9 @@ Everything below is deliberate, not missing by accident:
   upgrading it is your service manager's job, exactly as above.
 - **No DHCPv6 and no router advertisements.** Kea has a DHCPv6 server;
   nothing here talks to it.
-- **No client classes, vendor-class matching or option 82 policies**, and no
-  ping check before an offer — the `ping_check` hook is not in Debian's 2.6
-  package.
-- **One pool per scope, and no exclusions.** A scope is one range, plus
-  reservations, which may sit inside the pool or outside it.
+- **No option 82 (relay) matchers**, and no ping check before an offer —
+  the `ping_check` hook is not in Debian's 2.6 package.
+- **No exclusions.** Carve a gap out of a scope with two pools around it.
 - **A reservation lives inside its scope's subnet.** Moving one between
   scopes is a delete and a re-create.
 - **One standby.** Kea's HA supports more in load-balancing mode; a main and

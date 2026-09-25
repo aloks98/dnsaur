@@ -871,6 +871,25 @@ func TestValidateClassMatchers(t *testing.T) {
 			t.Errorf("name %q accepted", name)
 		}
 	}
+	// Names Kea's namespace already holds: the renderer's guards and Kea's
+	// own classes, in any case.
+	for name, want := range map[string]string{
+		"dnsaur-open-1": "names starting with dnsaur- are reserved",
+		"DNSAUR-x":      "names starting with dnsaur- are reserved",
+		"drop":          "drop is a class Kea defines itself",
+		"KNOWN":         "KNOWN is a class Kea defines itself",
+		"Unknown":       "Unknown is a class Kea defines itself",
+		"all":           "all is a class Kea defines itself",
+		"booting":       "booting is a class Kea defines itself",
+	} {
+		err := ValidateClass(Class{Name: name, Matchers: []string{"mac:aa"}}, nil)
+		if err == nil || err.Error() != want {
+			t.Errorf("name %q: error %v, want %q", name, err, want)
+		}
+	}
+	if err := ValidateClass(Class{Name: "dnsaur", Matchers: []string{"mac:aa"}}, nil); err != nil {
+		t.Errorf("name dnsaur (no hyphen) refused: %v", err)
+	}
 	// The options are the scope's rules, applied to a class.
 	for _, o := range []ClientOptions{
 		{DNSServers: "bad"},

@@ -98,6 +98,15 @@ through `lease4-get-page`, deletes it and asks for `status-get`. It skips
 unless `DNSAUR_TEST_KEA_SOCKET` names a control socket the test process can
 read and write, so `go test ./...` is unaffected.
 
+It also renders two classes and two pools and runs three real DHCP
+exchanges against the engine: a class member, a PXE client and a plain
+client. This checks Kea's option precedence and the guarded open pool (see
+architecture.md, Classes and pools). The exchanges run on the interface
+named by `DNSAUR_TEST_KEA_IFACE` (`eth0` by default), which must be on
+Docker's default bridge, 172.17.0.0/16, because that is the subnet the test
+renders. `DNSAUR_TEST_KEA_IFACE=none` still does the `config-set` but skips
+the exchanges; use it against an engine on this machine.
+
 CI's `test-kea` job starts one from the Debian package in a throwaway
 container and runs the compiled test inside it, next to the socket (the
 runner's Docker daemon does not share the job's filesystem, so nothing is

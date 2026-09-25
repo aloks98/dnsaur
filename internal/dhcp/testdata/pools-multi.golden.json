@@ -1,0 +1,62 @@
+{
+  "control-socket": {
+    "socket-name": "/run/kea/kea.sock",
+    "socket-type": "unix"
+  },
+  "hooks-libraries": [
+    {
+      "library": "/usr/lib/x86_64-linux-gnu/kea/hooks/libdhcp_lease_cmds.so"
+    }
+  ],
+  "interfaces-config": {
+    "dhcp-socket-type": "raw",
+    "interfaces": [
+      "*"
+    ]
+  },
+  "lease-database": {
+    "persist": true,
+    "type": "memfile"
+  },
+  "rebind-timer": 3150,
+  "renew-timer": 1800,
+  "subnet4": [
+    {
+      "id": 1,
+      "option-data": [
+        {
+          "data": "10.42.0.1",
+          "name": "routers"
+        },
+        {
+          "data": "10.42.0.2",
+          "name": "domain-name-servers"
+        },
+        {
+          "data": "home.lan",
+          "name": "domain-name"
+        }
+      ],
+      "pools": [
+        {
+          "pool": "10.42.0.150 - 10.42.0.200"
+        },
+        {
+          "pool": "10.42.0.20 - 10.42.0.40"
+        },
+        {
+          "pool": "10.42.0.100 - 10.42.0.120"
+        }
+      ],
+      "reservations": [
+        {
+          "hostname": "printer",
+          "hw-address": "aa:bb:cc:dd:ee:01",
+          "ip-address": "10.42.0.50"
+        }
+      ],
+      "subnet": "10.42.0.0/24"
+    }
+  ],
+  "valid-lifetime": 3600
+}

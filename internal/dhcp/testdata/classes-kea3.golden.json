@@ -1,0 +1,103 @@
+{
+  "client-classes": [
+    {
+      "name": "iot",
+      "option-data": [
+        {
+          "data": "10.42.0.9",
+          "name": "domain-name-servers"
+        },
+        {
+          "data": "iot.lan",
+          "name": "domain-name"
+        }
+      ],
+      "test": "substring(pkt4.mac,0,3) == 0xa4cf12 or substring(option[60].text,0,3) == 'ESP'"
+    },
+    {
+      "boot-file-name": "bootx64.efi",
+      "name": "pxe-uefi",
+      "next-server": "10.42.0.5",
+      "test": "substring(option[60].text,0,20) == 'PXEClient:Arch:00007'"
+    },
+    {
+      "name": "dnsaur-open-1",
+      "test": "not member('iot')"
+    }
+  ],
+  "control-sockets": [
+    {
+      "socket-name": "/run/kea/kea.sock",
+      "socket-type": "unix"
+    }
+  ],
+  "hooks-libraries": [
+    {
+      "library": "/usr/lib/x86_64-linux-gnu/kea/hooks/libdhcp_lease_cmds.so"
+    }
+  ],
+  "interfaces-config": {
+    "dhcp-socket-type": "raw",
+    "interfaces": [
+      "*"
+    ]
+  },
+  "lease-database": {
+    "persist": true,
+    "type": "memfile"
+  },
+  "rebind-timer": 3150,
+  "renew-timer": 1800,
+  "subnet4": [
+    {
+      "id": 1,
+      "option-data": [
+        {
+          "data": "10.42.0.1",
+          "name": "routers"
+        },
+        {
+          "data": "10.42.0.2",
+          "name": "domain-name-servers"
+        },
+        {
+          "data": "home.lan",
+          "name": "domain-name"
+        }
+      ],
+      "pools": [
+        {
+          "client-classes": [
+            "dnsaur-open-1"
+          ],
+          "pool": "10.42.0.100 - 10.42.0.149"
+        },
+        {
+          "client-classes": [
+            "iot"
+          ],
+          "option-data": [
+            {
+              "data": "10.42.0.9",
+              "name": "domain-name-servers"
+            },
+            {
+              "data": "iot.lan",
+              "name": "domain-name"
+            }
+          ],
+          "pool": "10.42.0.150 - 10.42.0.200"
+        }
+      ],
+      "reservations": [
+        {
+          "hostname": "printer",
+          "hw-address": "aa:bb:cc:dd:ee:01",
+          "ip-address": "10.42.0.50"
+        }
+      ],
+      "subnet": "10.42.0.0/24"
+    }
+  ],
+  "valid-lifetime": 3600
+}

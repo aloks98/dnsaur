@@ -1,6 +1,7 @@
 package dhcp
 
 import (
+	"cmp"
 	"net/netip"
 	"slices"
 	"strings"
@@ -27,6 +28,11 @@ type LeaseEntry struct {
 	Hostname  string
 	ExpiresAt time.Time
 	Reserved  bool
+	// Suffix is the domain this entry's name sits under: the suffix of the
+	// class whose pool the address came from, else its scope's, else the
+	// dhcp.domain setting. Per entry, because two leases in one scope can
+	// sit under two suffixes.
+	Suffix string
 }
 
 // Table is one poll's leases, indexed the three ways they are asked for: by
@@ -40,11 +46,6 @@ type Table struct {
 	byIP    map[netip.Addr]int
 	byMAC   map[string]int
 	byName  map[string]int
-	// suffixes is the domain each scope's names sit under, as the poll that
-	// built this table read it. Kept so a table derived from this one —
-	// without, after a release — indexes its names the same way rather than
-	// dropping every name until the next poll.
-	suffixes map[int64]string
 }
 
 // ByIP returns the entry holding ip.
@@ -105,14 +106,29 @@ func (t *Table) Age() time.Duration { return time.Since(t.at) }
 // the reservations that back them marked, plus the reservations that have a
 // name and nothing leasing it. domain is the dhcp.domain setting, which a
 // scope that names no suffix of its own hands out.
-func tableFrom(leases []Lease, scopes []store.Scope, reservations []store.Reservation, domain string) *Table {
-	suffixes := make(map[int64]string, len(scopes))
+func tableFrom(leases []Lease, scopes []store.Scope, classes []store.Class, reservations []store.Reservation, domain string) *Table {
+	byScope := make(map[int64]store.Scope, len(scopes))
 	for _, s := range scopes {
-		if s.Domain != "" {
-			suffixes[s.ID] = s.Domain
-			continue
+		byScope[s.ID] = s
+	}
+	classDomain := make(map[int64]string, len(classes))
+	for _, c := range classes {
+		classDomain[c.ID] = c.Domain
+	}
+	// suffix is where a name sits: under the class of the pool the address
+	// came from when that class sets a domain, else the scope's own. A
+	// reservation passes no address and keeps the scope's: it was never
+	// drawn from a pool.
+	suffix := func(scopeID int64, ip netip.Addr) string {
+		s := byScope[scopeID]
+		if ip.IsValid() {
+			for _, p := range s.Pools {
+				if d := classDomain[p.ClassID]; d != "" && inPool(p, ip) {
+					return d
+				}
+			}
 		}
-		suffixes[s.ID] = domain
+		return cmp.Or(s.Domain, domain)
 	}
 	byMAC := make(map[scopeKey]int, len(reservations))
 	byIP := make(map[scopeKey]int, len(reservations))
@@ -141,6 +157,7 @@ func tableFrom(leases []Lease, scopes []store.Scope, reservations []store.Reserv
 			MAC:       mac,
 			Hostname:  l.Hostname,
 			ExpiresAt: time.Unix(l.CLTT+l.ValidLft, 0),
+			Suffix:    suffix(l.SubnetID, ip),
 		}
 		// A lease is reserved when the operator pinned either end of it: the
 		// MAC in this scope, or the address in it.
@@ -150,6 +167,8 @@ func tableFrom(leases []Lease, scopes []store.Scope, reservations []store.Reserv
 		}
 		if ok {
 			e.Reserved = true
+			// The operator's pin, not the pool, placed this address.
+			e.Suffix = suffix(l.SubnetID, netip.Addr{})
 			leased[res] = true
 			// A client that sent no hostname still answers to the name the
 			// operator gave its reservation.
@@ -174,9 +193,24 @@ func tableFrom(leases []Lease, scopes []store.Scope, reservations []store.Reserv
 		}
 		entries = append(entries, LeaseEntry{
 			ScopeID: r.ScopeID, IP: ip, MAC: r.MAC, Hostname: r.Hostname, Reserved: true,
+			Suffix: suffix(r.ScopeID, netip.Addr{}),
 		})
 	}
-	return newTable(entries, suffixes)
+	return newTable(entries)
+}
+
+// inPool reports whether ip is inside p, both ends included. A pool that
+// does not parse holds nothing.
+func inPool(p store.Pool, ip netip.Addr) bool {
+	start, err := netip.ParseAddr(p.Start)
+	if err != nil {
+		return false
+	}
+	end, err := netip.ParseAddr(p.End)
+	if err != nil {
+		return false
+	}
+	return start.Compare(ip) <= 0 && ip.Compare(end) <= 0
 }
 
 // without is this table with the lease on ip gone: what the engine holds the
@@ -203,7 +237,7 @@ func (t *Table) without(ip netip.Addr) *Table {
 			entries = append(entries, e)
 		}
 	}
-	out := newTable(entries, t.suffixes)
+	out := newTable(entries)
 	out.at = t.at
 	return out
 }
@@ -215,21 +249,20 @@ type scopeKey struct {
 	value string
 }
 
-func newTable(entries []LeaseEntry, suffixes map[int64]string) *Table {
+func newTable(entries []LeaseEntry) *Table {
 	t := &Table{
-		at:       time.Now(),
-		entries:  entries,
-		byIP:     make(map[netip.Addr]int, len(entries)),
-		byMAC:    make(map[string]int, len(entries)),
-		byName:   make(map[string]int, len(entries)),
-		suffixes: suffixes,
+		at:      time.Now(),
+		entries: entries,
+		byIP:    make(map[netip.Addr]int, len(entries)),
+		byMAC:   make(map[string]int, len(entries)),
+		byName:  make(map[string]int, len(entries)),
 	}
 	for i, e := range entries {
 		t.byIP[e.IP] = i
 		if e.MAC != "" && !claimed(t.byMAC, e.MAC, e, entries) {
 			t.byMAC[e.MAC] = i
 		}
-		key := nameKey(SanitizeLabel(e.Hostname), suffixes[e.ScopeID])
+		key := nameKey(SanitizeLabel(e.Hostname), e.Suffix)
 		if key == "" {
 			continue
 		}
