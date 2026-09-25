@@ -595,10 +595,16 @@ test("a refusal naming pools[i] lands on that row", async () => {
   await userEvent.click(add);
   await userEvent.type(within(dialog).getByLabelText("Pool 3 start"), "192.168.153.150");
   await userEvent.type(within(dialog).getByLabelText("Pool 3 end"), "192.168.153.159");
+  // Saved from the other tab: the refusal pulls Network back into view.
+  await userEvent.click(within(dialog).getByRole("tab", { name: "Client options" }));
   await userEvent.click(within(dialog).getByRole("button", { name: "Save" }));
 
   expect(await within(dialog).findByRole("alert")).toHaveTextContent(
     "pools[1]: no class with id 9",
+  );
+  expect(within(dialog).getByRole("tab", { name: "Network" })).toHaveAttribute(
+    "aria-selected",
+    "true",
   );
   expect(within(dialog).getByLabelText("Pool 3 start")).toHaveAttribute("aria-invalid", "true");
   expect(within(dialog).getByLabelText("Pool 1 start")).toHaveAttribute("aria-invalid", "false");
@@ -622,9 +628,73 @@ test("the Pool column reads the first range and how many more, Leased the sum", 
 
   await waitFor(() => expect(scopeRows()).toHaveLength(1));
   const row = scopeRows()[0];
-  expect(within(row).getByText("+1 more")).toBeInTheDocument();
+  // `+1 more` is its own element beside the truncating range, so it is
+  // never the part clipped; the cell's title lists every range.
+  const more = within(row).getByText("+1 more");
+  expect(more).not.toHaveTextContent("192.168.150.100");
+  expect(within(row).getByTestId("scope-pool")).toHaveAttribute(
+    "title",
+    "192.168.150.100 – 192.168.150.199, 192.168.150.200 – 192.168.150.239",
+  );
   expect(row).toHaveTextContent("192.168.150.100 – 192.168.150.199");
   expect(row).not.toHaveTextContent("192.168.150.239");
   expect(within(row).getByText("65")).toBeInTheDocument();
   expect(within(row).getByText("/ 140")).toBeInTheDocument();
+});
+
+test("a server overlap marks both rows it names", async () => {
+  server.use(
+    ...dhcpHandlers({ scopes: [] }),
+    http.post("/api/v1/dhcp/scopes", () =>
+      HttpResponse.json(
+        {
+          error:
+            "pools[0] 192.168.153.50-192.168.153.99 overlaps pools[1] 192.168.153.100-192.168.153.120",
+        },
+        { status: 400 },
+      ),
+    ),
+  );
+  await renderScopes();
+
+  await userEvent.click(screen.getByRole("button", { name: /new scope/i }));
+  const dialog = await screen.findByRole("dialog");
+  await fillBasics(dialog);
+  await userEvent.click(within(dialog).getByRole("button", { name: /add pool/i }));
+  await userEvent.type(within(dialog).getByLabelText("Pool 2 start"), "192.168.153.100");
+  await userEvent.type(within(dialog).getByLabelText("Pool 2 end"), "192.168.153.120");
+  await userEvent.click(within(dialog).getByRole("button", { name: "Save" }));
+
+  await waitFor(() => expect(within(dialog).getAllByRole("alert")).toHaveLength(2));
+  expect(within(dialog).getByLabelText("Pool 1 start")).toHaveAttribute("aria-invalid", "true");
+  expect(within(dialog).getByLabelText("Pool 2 start")).toHaveAttribute("aria-invalid", "true");
+});
+
+test("a pool whose class is gone keeps its option, says so, and blocks Save", async () => {
+  server.use(
+    ...dhcpHandlers({
+      scopes: [
+        dhcpScope({
+          pools: [
+            { id: 1, scope_id: 1, start: "192.168.150.100", end: "192.168.150.199", class_id: 9 },
+          ],
+        }),
+      ],
+      classes: [dhcpClass()],
+    }),
+  );
+  await renderScopes();
+
+  await userEvent.click(await screen.findByRole("button", { name: "Edit" }));
+  const dialog = await screen.findByRole("dialog");
+  const select = within(dialog).getByLabelText("Pool 1 class");
+  expect(await within(dialog).findByRole("alert")).toHaveTextContent("Unknown class 9");
+  expect(select).toHaveValue("9");
+  expect(
+    within(select)
+      .getAllByRole("option")
+      .map((o) => o.textContent),
+  ).toEqual(["any", "iot", "9"]);
+  expect(select).toHaveAttribute("aria-invalid", "true");
+  expect(within(dialog).getByRole("button", { name: "Save" })).toBeDisabled();
 });

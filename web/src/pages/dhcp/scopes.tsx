@@ -882,7 +882,12 @@ function PoolsTable({
                 const id = Number(field.value);
                 const listed = id === 0 || (classes ?? []).some((c) => c.id === id);
                 return (
-                  <NativeSelect {...field} size="sm" aria-label={`Pool ${index + 1} class`}>
+                  <NativeSelect
+                    {...field}
+                    size="sm"
+                    aria-label={`Pool ${index + 1} class`}
+                    aria-invalid={live[index]?.startsWith("Unknown class") === true}
+                  >
                     <NativeSelectOption value="0">any</NativeSelectOption>
                     {(classes ?? []).map((c) => (
                       <NativeSelectOption key={c.id} value={String(c.id)}>
@@ -975,11 +980,21 @@ function ScopeDialog({
     const sent = poolIndexes(values);
     const onError = (err: unknown) => {
       // A refusal naming `pools[i]` belongs on that row, in the server's
-      // words; everything else is a toast.
-      const match = err instanceof ApiError ? /^pools\[(\d+)\]/.exec(err.message) : null;
-      const row = match ? sent[Number(match[1])] : undefined;
-      if (err instanceof ApiError && row !== undefined) {
-        form.setError(`pools.${row}.start`, { type: "server", message: err.message });
+      // words — and an overlap on its partner too, since the server names
+      // the earlier row and the live check marks the later one. Everything
+      // else is a toast.
+      const match =
+        err instanceof ApiError
+          ? /^pools\[(\d+)\](?:.* overlaps pools\[(\d+)\])?/.exec(err.message)
+          : null;
+      const rows = (match ? [match[1], match[2]] : [])
+        .filter((i) => i !== undefined)
+        .map((i) => sent[Number(i)])
+        .filter((row) => row !== undefined);
+      if (err instanceof ApiError && rows.length > 0) {
+        for (const row of rows) {
+          form.setError(`pools.${row}.start`, { type: "server", message: err.message });
+        }
         setTab(TAB_NETWORK);
         return;
       }
@@ -1194,16 +1209,24 @@ function ScopeRow({
         )}
       </span>
       <span className="truncate font-mono text-[12.5px]">{scope.cidr}</span>
-      <span className="truncate font-mono text-[12.5px]">
+      {/* The range truncates and `+N more` does not: a full range is
+          already about as wide as the column. The title has every range. */}
+      <span
+        data-testid="scope-pool"
+        className="flex min-w-0 font-mono text-[12.5px]"
+        title={scope.pools.map((p) => `${p.start} – ${p.end}`).join(", ")}
+      >
         {first && (
-          <>
+          <span className="min-w-0 truncate">
             {first.start}
             <span className="text-muted-foreground"> – </span>
             {first.end}
-          </>
+          </span>
         )}
         {scope.pools.length > 1 && (
-          <span className="text-muted-foreground">{`  +${scope.pools.length - 1} more`}</span>
+          <span className="ml-2 shrink-0 text-muted-foreground">
+            +{scope.pools.length - 1} more
+          </span>
         )}
       </span>
       <span className="truncate text-right font-mono text-[12.5px]">

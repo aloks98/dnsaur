@@ -1201,9 +1201,9 @@ DHCP on is a bootstrap change and a restart.
 | `PATCH /dhcp/scopes/{id}` | 204 | a **merge** — every key the body omits keeps its value. `match_client_id` absent means *unchanged* here and *true* on a create |
 | `DELETE /dhcp/scopes/{id}` | 204 | its reservations go with it |
 | `GET /dhcp/classes` | 200 `DHCPClass[]` | ordered by id |
-| `POST /dhcp/classes` | 201 the class, `Location` | **409** a name already taken, ignoring case |
+| `POST /dhcp/classes` | 201 the class, `Location` | **400** the validator's own message, **409** a name already taken, ignoring case |
 | `GET /dhcp/classes/{id}` | 200 `DHCPClass` | |
-| `PATCH /dhcp/classes/{id}` | 204 | a merge; a list in the body replaces the stored one whole |
+| `PATCH /dhcp/classes/{id}` | 204 | a merge; a list in the body replaces the stored one whole. **400** the validator's own message, **409** a taken name |
 | `DELETE /dhcp/classes/{id}` | 204 | **409** while any pool names it, in the store's words: `class "iot" is in use by 2 pools (Office, IoT)` |
 | `GET /dhcp/reservations` | 200 `DHCPReservation[]` | every scope's, ordered by id — the config is rendered from all of them at once |
 | `POST /dhcp/reservations` | 201 the reservation, `Location` | **404** `scope_id` names no scope, **409** a collision inside that scope |
@@ -2274,8 +2274,8 @@ shows one**:
 
 A blank row is dropped like a blank route; with none left the table says
 `Add a pool` unless **Reservations only** is on. A server refusal that names
-`pools[i]` lands on the row it came from, in the server's words, and pulls
-Network into view. The Scopes table's POOL cell is the first range plus a
+`pools[i]` lands on the row it came from, in the server's words — an overlap
+on both rows it names — and pulls Network into view. The Scopes table's POOL cell is the first range plus a
 muted `+N more`; LEASED is `leased / pool_size` from the status, both summed
 across the scope's pools.
 
