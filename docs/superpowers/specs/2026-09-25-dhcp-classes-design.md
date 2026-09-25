@@ -13,7 +13,7 @@ One scope treats every client alike: the same options, an address from anywhere 
 ## 2. Terms
 
 - **Class**: a named rule. `name`, `matchers`, options. Global to the instance, synced, referenced by pools by name.
-- **Matcher**: one test. `vendor:<prefix>` matches when option 60 (vendor class identifier) starts with the prefix; `mac:<prefix>` matches when the hardware address starts with the 1–3 given bytes. The `mac:` syntax is the filtering groups'. A class matches a client when any matcher matches.
+- **Matcher**: one test. `vendor:<prefix>` matches when option 60 (vendor class identifier) starts with the prefix; `mac:<prefix>` matches when the hardware address starts with the 1–6 given bytes. The `mac:` syntax is the filtering groups'. A class matches a client when any matcher matches.
 - **Pool**: a `start`–`end` range inside a scope's subnet, with an optional `class`. A pool with a class serves only clients in that class; a pool without one serves anyone (members of a class included, when their own pool is full or absent — Kea's rule).
 - **Class options**: the scope's Client-options set (DNS servers, DNS suffix, domain search list, NTP servers, static routes, next server, server hostname, boot file, generic options). Blank means the scope's value.
 
@@ -25,7 +25,7 @@ One scope treats every client alike: the same options, an address from anywhere 
 |---|---|---|
 | `id` | integer pk | |
 | `name` | text unique (case-insensitive) | same rules as a scope name: 1–63 chars, not blank |
-| `matchers` | json list of strings | each `vendor:<prefix>` (1–255 chars, no control characters) or `mac:<hex>` (1–3 bytes as `aa`, `aa:bb`, `aa:bb:cc`; lower-cased on write); at least one |
+| `matchers` | json list of strings | each `vendor:<prefix>` (1–255 chars, no control characters) or `mac:<hex>` (1–6 bytes as `aa` … `aa:bb:cc:dd:ee:ff`; lower-cased on write); at least one |
 | `dns_servers`, `domain`, `domain_search`, `ntp_servers`, `static_routes`, `next_server`, `server_hostname`, `boot_file`, `options` | as on `dhcp_scopes` | same validation, same normalisation; all optional |
 | `created_at`, `modified_at` | integer ms | |
 
