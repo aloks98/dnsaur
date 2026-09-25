@@ -85,6 +85,8 @@ go test ./...          # full suite; the Postgres halves skip without Docker
 go test -race ./...    # what CI runs
 
 cd web && pnpm test    # dashboard component tests (Vitest)
+cd web && pnpm exec vite --host 0.0.0.0   # dashboard dev server with hot reload, /api proxied to 127.0.0.1:8380
+cd web && DNSAUR_API=http://127.0.0.1:8395 pnpm exec vite --host 0.0.0.0   # …proxied to another instance, e.g. a branch over a scratch data dir
 cd web && pnpm test:e2e  # Playwright smoke test against the real embedded build
 ```
 

@@ -7,7 +7,9 @@ export default defineConfig({
   server: {
     host: "127.0.0.1",
     port: 5280,
-    proxy: { "/api": "http://127.0.0.1:8380" },
+    // DNSAUR_API points the dev server at another dnsaur, e.g. one running a
+    // branch over a scratch data dir while the usual one keeps its database.
+    proxy: { "/api": process.env.DNSAUR_API ?? "http://127.0.0.1:8380" },
   },
   build: { outDir: "dist", emptyOutDir: true },
 });
