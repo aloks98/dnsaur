@@ -7,7 +7,7 @@ import { useForm } from "react-hook-form";
 import { dhcpHandlers } from "../test/msw-handlers";
 import { server } from "../test/msw-server";
 import { renderWithProviders } from "../test/render";
-import type { SyncStatus } from "../api/types";
+import type { SyncReplica, SyncStatus } from "../api/types";
 import { rhfName } from "../lib/rhf-name";
 import { SyncField } from "./sync-field";
 
@@ -109,6 +109,17 @@ test("the DHCP column says engine or no engine, the second muted", async () => {
   const without = screen.getByRole("row", { name: /attic-pi/ });
   expect(within(without).getByText("no engine")).toHaveClass("text-muted-foreground");
   expect(screen.getByRole("columnheader", { name: "DHCP" })).toBeInTheDocument();
+});
+
+test("a replica from before the dhcp key reads as no engine", async () => {
+  const status = twoReplicas();
+  // An older replica's registry row has no dhcp key at all.
+  const { dhcp: _absent, ...older } = status.replicas![1];
+  mockSyncStatus({ ...status, replicas: [status.replicas![0], older as SyncReplica] });
+  renderWithProviders(<Harness />);
+
+  const row = await screen.findByRole("row", { name: /attic-pi/ });
+  expect(within(row).getByText("no engine")).toHaveClass("text-muted-foreground");
 });
 
 test("a replica with no engine gets the standby line when this box runs DHCP", async () => {

@@ -196,7 +196,7 @@ export interface ClientOptionFields {
 
 /** One row of the Pools table. `class_id` is the select's value: "0" is
  * any client. */
-export interface PoolRow {
+interface PoolRow {
   start: string;
   end: string;
   class_id: string;
@@ -275,11 +275,11 @@ export function poolRowErrors(
  * an option with a code and no bytes is a configuration the engine will take
  * and nobody meant.
  */
-export function isBlankRow(a: string, b: string): boolean {
+function isBlankRow(a: string, b: string): boolean {
   return a.trim() === "" && b.trim() === "";
 }
 
-export function halfFilled(ctx: z.RefinementCtx, index: number, field: string, what: string): void {
+function halfFilled(ctx: z.RefinementCtx, index: number, field: string, what: string): void {
   ctx.addIssue({ code: "custom", path: [index, field], message: `Enter ${what}` });
 }
 
@@ -794,6 +794,7 @@ export function MiniTable({
   noun,
   rows,
   rowError,
+  errorId,
   onRemove,
   onAdd,
   addLabel,
@@ -807,6 +808,9 @@ export function MiniTable({
   /** What the form refused about row `index`, if anything. A half-filled row
    * has to say so where it is, or Save reads as dead. */
   rowError: (index: number) => string | undefined;
+  /** The id row `index`'s refusal renders under, for the row's inputs to
+   * name in aria-describedby; see describedBy. */
+  errorId?: (index: number) => string;
   onRemove: (index: number) => void;
   onAdd: () => void;
   addLabel: string;
@@ -855,6 +859,7 @@ export function MiniTable({
             {error !== undefined && (
               <p
                 role="alert"
+                id={errorId?.(index)}
                 className="px-2.5 pb-1.5 font-mono text-[11px] text-destructive-foreground"
               >
                 {error}
@@ -871,6 +876,16 @@ export function MiniTable({
       </span>
     </div>
   );
+}
+
+/** MiniTable's errorId and the aria-describedby its rows' inputs carry:
+ * the row's refusal, when there is one, describes every input in the row. */
+export function useRowErrorIds(rowError: (index: number) => string | undefined) {
+  const base = useId();
+  const errorId = (index: number) => `${base}-row-${index}-error`;
+  const describedBy = (index: number) =>
+    rowError(index) === undefined ? undefined : errorId(index);
+  return { errorId, describedBy };
 }
 
 /**
@@ -892,6 +907,9 @@ function PoolsTable({
   const pools = useFieldArray({ control: form.control, name: "pools" });
   const errors = form.formState.errors.pools;
   const tableError = errors?.message ?? errors?.root?.message;
+  const rowError = (index: number) =>
+    live[index] ?? errors?.[index]?.start?.message ?? errors?.[index]?.end?.message;
+  const { errorId, describedBy } = useRowErrorIds(rowError);
 
   return (
     <div className="flex min-w-0 flex-col gap-1.5 sm:col-span-2">
@@ -900,9 +918,8 @@ function PoolsTable({
         columns={["Start", "End", "Class"]}
         template="grid-cols-[1fr_1fr_150px_64px]"
         noun="pool"
-        rowError={(index) =>
-          live[index] ?? errors?.[index]?.start?.message ?? errors?.[index]?.end?.message
-        }
+        rowError={rowError}
+        errorId={errorId}
         rows={pools.fields.map((row, index) => (
           <Fragment key={row.id}>
             <FormField
@@ -915,6 +932,7 @@ function PoolsTable({
                   autoComplete="off"
                   aria-label={`Pool ${index + 1} start`}
                   aria-invalid={live[index] !== undefined || fieldState.error !== undefined}
+                  aria-describedby={describedBy(index)}
                   className="font-mono"
                 />
               )}
@@ -929,6 +947,7 @@ function PoolsTable({
                   autoComplete="off"
                   aria-label={`Pool ${index + 1} end`}
                   aria-invalid={live[index] !== undefined || fieldState.error !== undefined}
+                  aria-describedby={describedBy(index)}
                   className="font-mono"
                 />
               )}
@@ -945,6 +964,7 @@ function PoolsTable({
                     size="sm"
                     aria-label={`Pool ${index + 1} class`}
                     aria-invalid={live[index]?.startsWith("Unknown class") === true}
+                    aria-describedby={describedBy(index)}
                   >
                     <NativeSelectOption value="0">any</NativeSelectOption>
                     {(classes ?? []).map((c) => (

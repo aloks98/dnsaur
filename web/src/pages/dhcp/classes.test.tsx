@@ -113,6 +113,19 @@ test("a class row shows its matchers, what it sets and how many pools name it", 
   expect(within(pxe).getByText("0 pools")).toHaveClass("text-muted-foreground");
 });
 
+test("the POOLS column shows a dash, not 0 pools, while the scopes have not loaded", async () => {
+  server.use(...dhcpHandlers({ classes: [dhcpClass()] }));
+  // A later use() wins over the handlers above.
+  server.use(
+    http.get("/api/v1/dhcp/scopes", () => HttpResponse.json({ error: "down" }, { status: 503 })),
+  );
+  await renderClasses();
+
+  const row = await firstRow();
+  expect(within(row).getByText("—")).toHaveClass("text-muted-foreground");
+  expect(within(row).queryByText(/pools?$/)).not.toBeInTheDocument();
+});
+
 test("no classes says so and offers the first one", async () => {
   server.use(...dhcpHandlers({ classes: [] }));
   await renderClasses();
@@ -156,8 +169,16 @@ test("a bad mac prefix is refused on its row, and Save posts kind:value strings"
   expect(value2).toHaveAttribute("placeholder", "a4:cf:12");
   await userEvent.type(value2, "84:F3:E");
 
-  expect(within(dialog).getByRole("alert")).toHaveTextContent("Not a MAC prefix: 84:F3:E");
+  const alert = within(dialog).getByRole("alert");
+  expect(alert.id).not.toBe("");
+  expect(alert).toHaveTextContent("Not a MAC prefix: 84:F3:E");
   expect(value2).toHaveAttribute("aria-invalid", "true");
+  expect(value2).toHaveAttribute("aria-describedby", alert.id);
+  expect(within(dialog).getByLabelText("Matcher 2 kind")).toHaveAttribute(
+    "aria-describedby",
+    alert.id,
+  );
+  expect(value1).not.toHaveAttribute("aria-describedby");
   expect(within(dialog).getByRole("button", { name: "Save" })).toBeDisabled();
 
   await userEvent.type(value2, "B");

@@ -56,6 +56,7 @@ import {
   clientOptionsToInput,
   Field,
   MiniTable,
+  useRowErrorIds,
   OptionsSection,
   type ClientOptionFields,
 } from "./scopes";
@@ -216,6 +217,8 @@ function MatchersTable({
   const kinds = useWatch({ control: form.control, name: "matchers" });
   const errors = form.formState.errors.matchers;
   const tableError = errors?.message ?? errors?.root?.message;
+  const rowError = (index: number) => live[index] ?? errors?.[index]?.value?.message;
+  const { errorId, describedBy } = useRowErrorIds(rowError);
 
   return (
     <div className="flex min-w-0 flex-col gap-1.5">
@@ -224,14 +227,20 @@ function MatchersTable({
         columns={["Kind", "Value"]}
         template="grid-cols-[120px_1fr_64px]"
         noun="matcher"
-        rowError={(index) => live[index] ?? errors?.[index]?.value?.message}
+        rowError={rowError}
+        errorId={errorId}
         rows={matchers.fields.map((row, index) => (
           <Fragment key={row.id}>
             <FormField
               control={form.control}
               name={`matchers.${index}.kind`}
               render={({ field }) => (
-                <NativeSelect {...field} size="sm" aria-label={`Matcher ${index + 1} kind`}>
+                <NativeSelect
+                  {...field}
+                  size="sm"
+                  aria-label={`Matcher ${index + 1} kind`}
+                  aria-describedby={describedBy(index)}
+                >
                   <NativeSelectOption value="vendor">vendor</NativeSelectOption>
                   <NativeSelectOption value="mac">mac</NativeSelectOption>
                 </NativeSelect>
@@ -247,6 +256,7 @@ function MatchersTable({
                   autoComplete="off"
                   aria-label={`Matcher ${index + 1} value`}
                   aria-invalid={live[index] !== undefined || fieldState.error !== undefined}
+                  aria-describedby={describedBy(index)}
                   className="font-mono"
                 />
               )}
@@ -407,7 +417,9 @@ function ClassRow({
   onDelete,
 }: {
   c: DHCPClass;
-  pools: number;
+  /** undefined while the scopes are not loaded: no count is shown then, so
+   * a failed load never reads as "0 pools". */
+  pools: number | undefined;
   managed: boolean;
   onEdit: () => void;
   onDelete: () => void;
@@ -429,8 +441,8 @@ function ClassRow({
       <span className={cn("truncate font-mono text-xs", summary === "" && "text-muted-foreground")}>
         {summary === "" ? "inherits scope" : summary}
       </span>
-      <span className={cn("font-mono text-xs", pools === 0 && "text-muted-foreground")}>
-        {poolsLabel(pools)}
+      <span className={cn("font-mono text-xs", !pools && "text-muted-foreground")}>
+        {pools === undefined ? "—" : poolsLabel(pools)}
       </span>
       <span className="flex items-center justify-end gap-0.5">
         <Button type="button" size="sm" variant="ghost" disabled={managed} onClick={onEdit}>
@@ -448,7 +460,8 @@ function ClassRow({
  * delete that refuses while a pool names it. */
 export function DHCPClasses() {
   const classes = useClasses();
-  const usage = classUsage(useScopes().data);
+  const scopes = useScopes().data;
+  const usage = classUsage(scopes);
   const managed = useManagedBy() !== "";
   const deleteClass = useDeleteClass();
 
@@ -508,7 +521,7 @@ export function DHCPClasses() {
       <ClassRow
         key={c.id}
         c={c}
-        pools={usage.get(c.id)?.pools ?? 0}
+        pools={scopes === undefined ? undefined : (usage.get(c.id)?.pools ?? 0)}
         managed={managed}
         onEdit={() => setDialogFor(c)}
         onDelete={() => setDeleteTarget(c)}

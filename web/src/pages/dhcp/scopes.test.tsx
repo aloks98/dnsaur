@@ -688,7 +688,13 @@ test("a pool whose class is gone keeps its option, says so, and blocks Save", as
   await userEvent.click(await screen.findByRole("button", { name: "Edit" }));
   const dialog = await screen.findByRole("dialog");
   const select = within(dialog).getByLabelText("Pool 1 class");
-  expect(await within(dialog).findByRole("alert")).toHaveTextContent("Unknown class 9");
+  const alert = await within(dialog).findByRole("alert");
+  expect(alert).toHaveTextContent("Unknown class 9");
+  // The refusal describes every input in its row.
+  expect(alert.id).not.toBe("");
+  for (const input of ["Pool 1 start", "Pool 1 end", "Pool 1 class"]) {
+    expect(within(dialog).getByLabelText(input)).toHaveAttribute("aria-describedby", alert.id);
+  }
   expect(select).toHaveValue("9");
   expect(
     within(select)
