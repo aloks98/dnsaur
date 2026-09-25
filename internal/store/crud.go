@@ -49,21 +49,28 @@ func (s *sqlStore) configWrite(ctx context.Context, fn func(tx *sql.Tx) error) e
 // moved in the same transaction.
 func (s *sqlStore) configInsert(ctx context.Context, q string, args ...any) (int64, error) {
 	var id int64
-	err := s.configWrite(ctx, func(tx *sql.Tx) error {
-		if s.dialect == "postgres" {
-			return wrapDBErr(tx.QueryRowContext(ctx, s.q(q+" RETURNING id"), args...).Scan(&id))
-		}
-		res, err := tx.ExecContext(ctx, s.q(q), args...)
-		if err != nil {
-			return wrapDBErr(err)
-		}
-		id, err = res.LastInsertId()
+	err := s.configWrite(ctx, func(tx *sql.Tx) (err error) {
+		id, err = s.insertTx(ctx, tx, q, args...)
 		return err
 	})
 	if err != nil {
 		return 0, err
 	}
 	return id, nil
+}
+
+// insertTx runs an INSERT on tx and returns the new row's id, which the two
+// dialects hand back differently: postgres only through RETURNING.
+func (s *sqlStore) insertTx(ctx context.Context, tx *sql.Tx, q string, args ...any) (int64, error) {
+	if s.dialect == "postgres" {
+		var id int64
+		return id, wrapDBErr(tx.QueryRowContext(ctx, s.q(q+" RETURNING id"), args...).Scan(&id))
+	}
+	res, err := tx.ExecContext(ctx, s.q(q), args...)
+	if err != nil {
+		return 0, wrapDBErr(err)
+	}
+	return res.LastInsertId()
 }
 
 // configExecOne is execOne for a synced table. A statement that matched no

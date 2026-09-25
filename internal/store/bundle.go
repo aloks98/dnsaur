@@ -88,9 +88,11 @@ type Bundle struct {
 	TSIGKeys []TSIGKey    `json:"tsig_keys"`
 	// Zones are definitions only, and never of type internal.
 	Zones []Zone `json:"zones"`
-	// Scopes and Reservations are the DHCP configuration (DHCP design §4.3,
-	// §4.4). Leases are not here and never will be: they are the engine's
-	// state, and each box reads its own back.
+	// Classes, Scopes and Reservations are the DHCP configuration (DHCP
+	// design §4.3, §4.4; round two §3). A scope carries its pools inline.
+	// Leases are not here and never will be: they are the engine's state,
+	// and each box reads its own back.
+	Classes      []Class       `json:"classes"`
 	Scopes       []Scope       `json:"scopes"`
 	Reservations []Reservation `json:"reservations"`
 }
@@ -158,6 +160,9 @@ func (s *sqlStore) ExportBundle(ctx context.Context) (Bundle, error) {
 		b.Lists[i] = BundleList{List: l, Groups: assigned[l.ID]}
 	}
 
+	if b.Classes, err = s.DHCP().Classes(ctx); err != nil {
+		return Bundle{}, err
+	}
 	if b.Scopes, err = s.DHCP().Scopes(ctx); err != nil {
 		return Bundle{}, err
 	}
@@ -235,9 +240,16 @@ const (
 	// created_at is in the INSERT and not in the DO UPDATE, as everywhere
 	// else here: a row being created takes the main's creation date, and one
 	// that already exists does not have it rewritten.
-	upsertScopeSQL = `INSERT INTO dhcp_scopes (id, name, cidr, pool_start, pool_end, gateway, dns_servers, domain, lease_seconds, enabled, domain_search, ntp_servers, static_routes, next_server, server_hostname, boot_file, options, match_client_id, reservations_only, created_at, modified_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT (id) DO UPDATE SET name = excluded.name, cidr = excluded.cidr, pool_start = excluded.pool_start, pool_end = excluded.pool_end, gateway = excluded.gateway, dns_servers = excluded.dns_servers, domain = excluded.domain, lease_seconds = excluded.lease_seconds, enabled = excluded.enabled, domain_search = excluded.domain_search, ntp_servers = excluded.ntp_servers, static_routes = excluded.static_routes, next_server = excluded.next_server, server_hostname = excluded.server_hostname, boot_file = excluded.boot_file, options = excluded.options, match_client_id = excluded.match_client_id, reservations_only = excluded.reservations_only, modified_at = excluded.modified_at`
+	upsertScopeSQL = `INSERT INTO dhcp_scopes (id, name, cidr, gateway, dns_servers, domain, lease_seconds, enabled, domain_search, ntp_servers, static_routes, next_server, server_hostname, boot_file, options, match_client_id, reservations_only, created_at, modified_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT (id) DO UPDATE SET name = excluded.name, cidr = excluded.cidr, gateway = excluded.gateway, dns_servers = excluded.dns_servers, domain = excluded.domain, lease_seconds = excluded.lease_seconds, enabled = excluded.enabled, domain_search = excluded.domain_search, ntp_servers = excluded.ntp_servers, static_routes = excluded.static_routes, next_server = excluded.next_server, server_hostname = excluded.server_hostname, boot_file = excluded.boot_file, options = excluded.options, match_client_id = excluded.match_client_id, reservations_only = excluded.reservations_only, modified_at = excluded.modified_at`
+	upsertClassSQL = `INSERT INTO dhcp_classes (id, name, matchers, dns_servers, domain, domain_search, ntp_servers, static_routes, next_server, server_hostname, boot_file, options, created_at, modified_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT (id) DO UPDATE SET name = excluded.name, matchers = excluded.matchers, dns_servers = excluded.dns_servers, domain = excluded.domain, domain_search = excluded.domain_search, ntp_servers = excluded.ntp_servers, static_routes = excluded.static_routes, next_server = excluded.next_server, server_hostname = excluded.server_hostname, boot_file = excluded.boot_file, options = excluded.options, modified_at = excluded.modified_at`
+	// A plain insert: every pool was deleted by the prune, since a scope's
+	// pools are rewritten whole on the main too and there is no row here
+	// worth keeping.
+	insertPoolSQL        = `INSERT INTO dhcp_pools (id, scope_id, position, start, "end", class_id) VALUES (?, ?, ?, ?, ?, ?)`
 	upsertReservationSQL = `INSERT INTO dhcp_reservations (id, scope_id, mac, ip, hostname, comment, created_at, modified_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT (id) DO UPDATE SET scope_id = excluded.scope_id, mac = excluded.mac, ip = excluded.ip, hostname = excluded.hostname, comment = excluded.comment, modified_at = excluded.modified_at`
@@ -246,7 +258,7 @@ const (
 
 // syncedTables are the tables whose ids come from the main, in the order the
 // sequences behind them have to be advanced on postgres.
-var syncedTables = []string{"groups", "clients", "lists", "rules", "tsig_keys", "zones", "dhcp_reservations", "dhcp_scopes"}
+var syncedTables = []string{"groups", "clients", "lists", "rules", "tsig_keys", "zones", "dhcp_reservations", "dhcp_scopes", "dhcp_classes", "dhcp_pools"}
 
 // parkedKeys are the unique natural keys a bundle rewrites, and parking them
 // is what stops two of them *swapping* from wedging a replica.
@@ -281,6 +293,7 @@ var parkedKeys = []struct{ table, column, where string }{
 	{table: "tsig_keys", column: "name"},
 	{table: "zones", column: "name", where: ` WHERE type <> '` + zoneTypeInternal + `'`},
 	{table: "dhcp_scopes", column: "name"},
+	{table: "dhcp_classes", column: "name"},
 	// Both of a reservation's unique keys, because either can be swapped on
 	// its own: two machines trading addresses, or one NIC replaced in each
 	// of two machines.
@@ -300,6 +313,19 @@ func (s *sqlStore) ImportBundle(ctx context.Context, b Bundle) error {
 	if b.Format != BundleFormat {
 		return fmt.Errorf("bundle format %d: this instance reads %d", b.Format, BundleFormat)
 	}
+	// class_id is no foreign key — 0 names no row — so the reference a
+	// pool makes is checked here, before anything is written. A pool naming
+	// a class the bundle lacks is a broken bundle, refused whole like any
+	// other, rather than a pool quietly serving everyone.
+	classIDs := bundleIDs(b.Classes, func(c Class) int64 { return c.ID })
+	for _, sc := range b.Scopes {
+		for _, p := range sc.Pools {
+			if p.ClassID != 0 && !slices.Contains(classIDs, p.ClassID) {
+				return fmt.Errorf("%w: scope %q has a pool for class %d, which the bundle does not carry", ErrReference, sc.Name, p.ClassID)
+			}
+		}
+	}
+
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -329,11 +355,15 @@ func (s *sqlStore) ImportBundle(ctx context.Context, b Bundle) error {
 		{table: "lists", keep: bundleIDs(b.Lists, func(l BundleList) int64 { return l.ID })},
 		{table: "groups", keep: bundleIDs(b.Groups, func(g Group) int64 { return g.ID })},
 		{table: "tsig_keys", keep: bundleIDs(b.TSIGKeys, func(k TSIGKey) int64 { return k.ID })},
-		// Reservations before scopes: the foreign key between them carries
-		// no ON DELETE CASCADE, so a scope the main dropped can only go once
-		// its reservations have.
+		// Reservations and pools before scopes: the foreign keys to it
+		// carry no ON DELETE CASCADE, so a scope the main dropped can only
+		// go once its children have. Every pool goes (keep is empty): the
+		// bundle's are inserted fresh below. Classes last, once no pool
+		// names one.
 		{table: "dhcp_reservations", keep: bundleIDs(b.Reservations, func(r Reservation) int64 { return r.ID })},
+		{table: "dhcp_pools"},
 		{table: "dhcp_scopes", keep: bundleIDs(b.Scopes, func(sc Scope) int64 { return sc.ID })},
+		{table: "dhcp_classes", keep: classIDs},
 	} {
 		if err := s.pruneMissing(ctx, tx, prune.table, prune.keep, prune.where); err != nil {
 			return fmt.Errorf("pruning %s: %w", prune.table, err)
@@ -396,12 +426,26 @@ func (s *sqlStore) ImportBundle(ctx context.Context, b Bundle) error {
 			return err
 		}
 	}
+	for _, c := range b.Classes {
+		if err := s.execTx(ctx, tx, upsertClassSQL, c.ID, c.Name, marshalList(c.Matchers), c.DNSServers, c.Domain,
+			c.DomainSearch, c.NTPServers, marshalList(c.StaticRoutes), c.NextServer, c.ServerHostname, c.BootFile,
+			marshalList(c.Options), c.CreatedAt, c.ModifiedAt); err != nil {
+			return err
+		}
+	}
 	for _, sc := range b.Scopes {
-		if err := s.execTx(ctx, tx, upsertScopeSQL, sc.ID, sc.Name, sc.CIDR, sc.PoolStart, sc.PoolEnd, sc.Gateway,
+		if err := s.execTx(ctx, tx, upsertScopeSQL, sc.ID, sc.Name, sc.CIDR, sc.Gateway,
 			sc.DNSServers, sc.Domain, sc.LeaseSeconds, sc.Enabled, sc.DomainSearch, sc.NTPServers, marshalList(sc.StaticRoutes),
 			sc.NextServer, sc.ServerHostname, sc.BootFile, marshalList(sc.Options), sc.MatchClientID, sc.ReservationsOnly,
 			sc.CreatedAt, sc.ModifiedAt); err != nil {
 			return err
+		}
+		// The scope's own id, not the pool's scope_id field: the pool is
+		// the scope's because the bundle nests it there.
+		for i, p := range sc.Pools {
+			if err := s.execTx(ctx, tx, insertPoolSQL, p.ID, sc.ID, i, p.Start, p.End, p.ClassID); err != nil {
+				return err
+			}
 		}
 	}
 	for _, r := range b.Reservations {

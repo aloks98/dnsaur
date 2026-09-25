@@ -1,6 +1,8 @@
 package store
 
 import (
+	"encoding/json"
+	"errors"
 	"fmt"
 	"reflect"
 	"slices"
@@ -115,6 +117,11 @@ func TestBundleRoundTripKeepsIDs(t *testing.T) {
 			t.Fatal(err)
 		}
 		wantScope.ID = scopeID
+		if got, err := main.DHCP().Scope(ctx, scopeID); err != nil {
+			t.Fatal(err)
+		} else {
+			wantScope = storedAs(wantScope, got)
+		}
 		wantRes := []Reservation{
 			{ScopeID: scopeID, MAC: "aa:bb:cc:00:00:01", IP: f.host(10), Hostname: "printer-1", CreatedAt: 1757800000000, ModifiedAt: 1757800000000},
 			{ScopeID: scopeID, MAC: "aa:bb:cc:00:00:02", IP: f.host(11), Comment: "the nas", CreatedAt: 1757800000000, ModifiedAt: 1757800000000},
@@ -935,6 +942,96 @@ func TestImportBundleDropsRecordsAZoneNoLongerHolds(t *testing.T) {
 		if z.SOASerial != 0 || z.RefreshedAt != 0 {
 			t.Fatalf("the forwarder zone kept its transfer state: soa_serial=%d refreshed_at=%d",
 				z.SOASerial, z.RefreshedAt)
+		}
+	})
+}
+
+// TestBundleCarriesClassesAndPools is round two's §3.3 on the sync path:
+// classes travel under the main's ids and land before any pool names one, a
+// scope's pools travel inline under theirs, a class the main dropped is
+// pruned, and a pool naming a class the bundle lacks refuses the bundle whole.
+func TestBundleCarriesClassesAndPools(t *testing.T) {
+	forEachDriverPair(t, func(t *testing.T, main, replica Store) {
+		ctx := t.Context()
+		f := newFixture()
+		cid, err := main.DHCP().AddClass(ctx, Class{
+			Name: f.group, Matchers: []string{"vendor:PXEClient", "mac:a4:cf:12"},
+			ClientOptions: ClientOptions{BootFile: "ipxe.efi", Options: []GenericOption{{Code: 150, Hex: "0A"}}},
+			CreatedAt:     1757800000000, ModifiedAt: 1757800000000,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		sid, err := main.DHCP().AddScope(ctx, Scope{Name: f.scope, CIDR: f.cidr(), Enabled: true, MatchClientID: true,
+			Pools: []Pool{{Start: f.host(10), End: f.host(49), ClassID: cid}, {Start: f.host(60), End: f.host(99)}}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		wantClass, err := main.DHCP().Class(ctx, cid)
+		if err != nil {
+			t.Fatal(err)
+		}
+		wantScope, err := main.DHCP().Scope(ctx, sid)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		b, err := main.ExportBundle(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Through JSON, as the wire carries it: the nesting is the contract.
+		raw, err := json.Marshal(b)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var wire Bundle
+		if err := json.Unmarshal(raw, &wire); err != nil {
+			t.Fatal(err)
+		}
+		if err := replica.ImportBundle(ctx, wire); err != nil {
+			t.Fatal(err)
+		}
+		if got, err := replica.DHCP().Class(ctx, cid); err != nil || !reflect.DeepEqual(got, wantClass) {
+			t.Errorf("class %d on the replica = %+v (err %v), want the main's %+v", cid, got, err, wantClass)
+		}
+		if got, err := replica.DHCP().Scope(ctx, sid); err != nil || !reflect.DeepEqual(got, wantScope) {
+			t.Errorf("scope %d on the replica = %+v (err %v), want the main's %+v", sid, got, err, wantScope)
+		}
+
+		// A class the replica holds and the bundle does not: the prune's.
+		// Added after the first import, so the advanced sequence gives it an
+		// id the main's class cannot share.
+		stale, err := replica.DHCP().AddClass(ctx, Class{Name: f.group + "-stale", Matchers: []string{"mac:aa"}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Re-applying the same bundle is what a replica does on every poll;
+		// the pools, rewritten under the same ids, must not collide.
+		if err := replica.ImportBundle(ctx, wire); err != nil {
+			t.Fatalf("second import of the same bundle: %v", err)
+		}
+		if _, err := replica.DHCP().Class(ctx, stale); !errors.Is(err, ErrNotFound) {
+			t.Errorf("class %d survived an import whose bundle lacked it (err %v)", stale, err)
+		}
+		if got, err := replica.DHCP().Scope(ctx, sid); err != nil || !reflect.DeepEqual(got, wantScope) {
+			t.Errorf("scope %d after the second import = %+v (err %v), want the main's %+v", sid, got, err, wantScope)
+		}
+
+		before, err := replica.Settings().ConfigVersion(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		broken := wire
+		broken.Classes = slices.DeleteFunc(slices.Clone(wire.Classes), func(c Class) bool { return c.ID == cid })
+		if err := replica.ImportBundle(ctx, broken); !errors.Is(err, ErrReference) {
+			t.Errorf("a bundle whose pool names an absent class = %v, want ErrReference", err)
+		}
+		if after, _ := replica.Settings().ConfigVersion(ctx); after != before {
+			t.Errorf("a refused bundle moved config_version %d -> %d", before, after)
+		}
+		if _, err := replica.DHCP().Class(ctx, cid); err != nil {
+			t.Errorf("a refused bundle still pruned class %d: %v", cid, err)
 		}
 	})
 }

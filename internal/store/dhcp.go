@@ -11,6 +11,8 @@ import (
 	"net/netip"
 	"slices"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 )
 
 // Sentinels for the two DHCP rules a caller has to tell apart from a
@@ -28,6 +30,10 @@ var (
 	// subnet of the scope that holds it. The API answers 400, naming the
 	// scope's CIDR.
 	ErrOutsideScope = errors.New("address is outside the scope")
+	// ErrClassInUse is DeleteClass refusing a class a pool still names.
+	// The text reads as the middle of DeleteClass's message — `class "iot"
+	// is in use by 2 pools (Office, IoT)` — which the API hands on verbatim.
+	ErrClassInUse = errors.New("is in use")
 )
 
 // leaseFloor is the shortest non-zero lease a scope may ask for (§4.3). A
@@ -44,24 +50,45 @@ type Scope struct {
 	Name string `json:"name"`
 	// CIDR is an IPv4 prefix in masked form, e.g. "192.168.1.0/24".
 	CIDR string `json:"cidr"`
-	// PoolStart and PoolEnd bound the dynamic range, inclusive. A
-	// reservation may sit inside it or outside it.
-	PoolStart string `json:"pool_start"`
-	PoolEnd   string `json:"pool_end"`
+	// Pools are the dynamic ranges, in the order the operator listed them;
+	// the slice order is what the position column stores. A reservation
+	// may sit inside any of them or outside all of them.
+	Pools []Pool `json:"pools"`
 	// Gateway is the router option; empty hands out no router.
 	Gateway string `json:"gateway"`
-	// DNSServers is a comma-separated list of addresses; empty means the
-	// automatic answer of §5.3 rather than "no DNS".
-	DNSServers string `json:"dns_servers"`
-	// Domain is the suffix handed to clients; empty falls back to the
-	// dhcp.domain setting.
-	Domain string `json:"domain"`
 	// LeaseSeconds is at least leaseFloor, or 0 for the dhcp.lease_seconds
 	// setting.
 	LeaseSeconds int `json:"lease_seconds"`
 	// Enabled false keeps the scope out of the rendered config, and out of
 	// the overlap rule with it.
 	Enabled bool `json:"enabled"`
+	// ClientOptions is embedded, so its keys sit at the top level of a
+	// scope's JSON exactly where they sat before classes shared them.
+	ClientOptions
+	// MatchClientID false makes the engine key a lease on the hardware
+	// address alone and ignore option 61, which is what cloned VMs sharing
+	// a client id need. The column defaults to true and the Go zero value
+	// is false, so a Scope built in code — rather than read from a row or
+	// decoded from a form — has to say so.
+	MatchClientID bool `json:"match_client_id"`
+	// ReservationsOnly renders the subnet with no pool: only reserved
+	// devices get an address, and Pools may be left empty.
+	ReservationsOnly bool  `json:"reservations_only"`
+	CreatedAt        int64 `json:"created_at"`
+	ModifiedAt       int64 `json:"modified_at"`
+}
+
+// ClientOptions is what a client is told beyond its address: the set a
+// scope hands to everyone on it and a class hands to its members. One type,
+// so the two are validated, normalised and stored by the same code.
+type ClientOptions struct {
+	// DNSServers is a comma-separated list of addresses. On a scope, empty
+	// means the automatic answer of §5.3 rather than "no DNS"; on a class,
+	// the scope's value.
+	DNSServers string `json:"dns_servers"`
+	// Domain is the suffix handed to clients; empty falls back to the
+	// scope's, then to the dhcp.domain setting.
+	Domain string `json:"domain"`
 	// DomainSearch is option 119: comma-separated suffixes, or empty.
 	DomainSearch string `json:"domain_search"`
 	// NTPServers is option 42: comma-separated IPv4 addresses, or empty.
@@ -78,17 +105,31 @@ type Scope struct {
 	// the renderer emits by name are refused, so one option code never has
 	// two answers.
 	Options []GenericOption `json:"options"`
-	// MatchClientID false makes the engine key a lease on the hardware
-	// address alone and ignore option 61, which is what cloned VMs sharing
-	// a client id need. The column defaults to true and the Go zero value
-	// is false, so a Scope built in code — rather than read from a row or
-	// decoded from a form — has to say so.
-	MatchClientID bool `json:"match_client_id"`
-	// ReservationsOnly renders the subnet with no pool: only reserved
-	// devices get an address, and the pool columns may be left empty.
-	ReservationsOnly bool  `json:"reservations_only"`
-	CreatedAt        int64 `json:"created_at"`
-	ModifiedAt       int64 `json:"modified_at"`
+}
+
+// Pool is one dynamic range of a scope, inclusive at both ends.
+type Pool struct {
+	ID      int64  `json:"id"`
+	ScopeID int64  `json:"scope_id"`
+	Start   string `json:"start"`
+	End     string `json:"end"`
+	// ClassID reserves the pool for one class's members; 0 serves any
+	// client, class members included once their own pool is full.
+	ClassID int64 `json:"class_id"`
+}
+
+// Class sorts clients by what they are and gives its members their own
+// options, and — through a pool naming it — their own addresses. Global to
+// the instance and synced, like a scope.
+type Class struct {
+	ID   int64  `json:"id"`
+	Name string `json:"name"`
+	// Matchers are "vendor:<prefix>" and "mac:<hex>" tests; a client is a
+	// member when any one matches. See validateMatcher.
+	Matchers []string `json:"matchers"`
+	ClientOptions
+	CreatedAt  int64 `json:"created_at"`
+	ModifiedAt int64 `json:"modified_at"`
 }
 
 // UnmarshalJSON decodes a scope, supplying match_client_id's default when
@@ -148,10 +189,12 @@ type Reservation struct {
 // synced table, each write advances config_version in its own transaction.
 //
 // It validates nothing beyond what the schema does: the rules of §4.3 and
-// §4.4 are ValidateScope and ValidateReservation, pure functions the API
-// calls before it writes, so the same answer can be given to a form before
-// anything is stored. What does reach here is the two unique indexes, which
-// surface as ErrDuplicate exactly as groups.name and lists.url do.
+// §4.4 are ValidateScope, ValidateClass and ValidateReservation, pure
+// functions the API calls before it writes, so the same answer can be given
+// to a form before anything is stored. What does reach here is the unique
+// indexes, which surface as ErrDuplicate exactly as groups.name and
+// lists.url do, and DeleteClass's in-use refusal — the one reference no
+// foreign key can hold, since a pool's class_id of 0 names no row.
 type DHCPStore interface {
 	Scopes(ctx context.Context) ([]Scope, error)
 	Scope(ctx context.Context, id int64) (Scope, error)
@@ -162,6 +205,16 @@ type DHCPStore interface {
 	// reason the 0016 migration gives: the bundle's prune orders children
 	// before parents for every table, and this pair is no exception.
 	DeleteScope(ctx context.Context, id int64) error
+	// Classes returns every class ordered by id, which is the order the
+	// renderer emits them in.
+	Classes(ctx context.Context) ([]Class, error)
+	Class(ctx context.Context, id int64) (Class, error)
+	AddClass(ctx context.Context, c Class) (int64, error)
+	UpdateClass(ctx context.Context, c Class) error
+	// DeleteClass refuses, with ErrClassInUse naming the scopes, while any
+	// pool names the class: deleting it would silently turn a class-only
+	// pool into one that serves anyone.
+	DeleteClass(ctx context.Context, id int64) error
 	// Reservations returns every reservation of every scope, ordered by id:
 	// the engine's config is rendered from all of them at once, and so is
 	// the bundle.
@@ -174,22 +227,44 @@ type DHCPStore interface {
 type dhcpStore struct{ s *sqlStore }
 
 const (
-	scopeColumns       = `id, name, cidr, pool_start, pool_end, gateway, dns_servers, domain, lease_seconds, enabled, domain_search, ntp_servers, static_routes, next_server, server_hostname, boot_file, options, match_client_id, reservations_only, created_at, modified_at`
+	scopeColumns       = `id, name, cidr, gateway, dns_servers, domain, lease_seconds, enabled, domain_search, ntp_servers, static_routes, next_server, server_hostname, boot_file, options, match_client_id, reservations_only, created_at, modified_at`
+	classColumns       = `id, name, matchers, dns_servers, domain, domain_search, ntp_servers, static_routes, next_server, server_hostname, boot_file, options, created_at, modified_at`
+	poolColumns        = `id, scope_id, start, "end", class_id`
 	reservationColumns = `id, scope_id, mac, ip, hostname, comment, created_at, modified_at`
 )
 
+// scanScope reads a scope's own row; its pools are a second query, which
+// withPools attaches.
 func scanScope(row interface{ Scan(...any) error }, s *Scope) error {
 	var routes, options string
-	if err := row.Scan(&s.ID, &s.Name, &s.CIDR, &s.PoolStart, &s.PoolEnd, &s.Gateway, &s.DNSServers, &s.Domain, &s.LeaseSeconds, &s.Enabled,
+	if err := row.Scan(&s.ID, &s.Name, &s.CIDR, &s.Gateway, &s.DNSServers, &s.Domain, &s.LeaseSeconds, &s.Enabled,
 		&s.DomainSearch, &s.NTPServers, &routes, &s.NextServer, &s.ServerHostname, &s.BootFile, &options, &s.MatchClientID, &s.ReservationsOnly,
 		&s.CreatedAt, &s.ModifiedAt); err != nil {
 		return err
 	}
-	if err := json.Unmarshal([]byte(routes), &s.StaticRoutes); err != nil {
-		return fmt.Errorf("scope %d static_routes: %w", s.ID, err)
+	return s.decodeLists(fmt.Sprintf("scope %d", s.ID), routes, options)
+}
+
+func scanClass(row interface{ Scan(...any) error }, c *Class) error {
+	var matchers, routes, options string
+	if err := row.Scan(&c.ID, &c.Name, &matchers, &c.DNSServers, &c.Domain, &c.DomainSearch, &c.NTPServers, &routes,
+		&c.NextServer, &c.ServerHostname, &c.BootFile, &options, &c.CreatedAt, &c.ModifiedAt); err != nil {
+		return err
 	}
-	if err := json.Unmarshal([]byte(options), &s.Options); err != nil {
-		return fmt.Errorf("scope %d options: %w", s.ID, err)
+	if err := json.Unmarshal([]byte(matchers), &c.Matchers); err != nil {
+		return fmt.Errorf("class %d matchers: %w", c.ID, err)
+	}
+	return c.decodeLists(fmt.Sprintf("class %d", c.ID), routes, options)
+}
+
+// decodeLists parses the two JSON columns every options set has, naming the
+// row and the column when one does not parse.
+func (o *ClientOptions) decodeLists(row, routes, options string) error {
+	if err := json.Unmarshal([]byte(routes), &o.StaticRoutes); err != nil {
+		return fmt.Errorf("%s static_routes: %w", row, err)
+	}
+	if err := json.Unmarshal([]byte(options), &o.Options); err != nil {
+		return fmt.Errorf("%s options: %w", row, err)
 	}
 	return nil
 }
@@ -224,7 +299,13 @@ func (d *dhcpStore) Scopes(ctx context.Context) ([]Scope, error) {
 		}
 		out = append(out, s)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	// Closed before the second query: sqlite runs on one connection, and
+	// the pools query would otherwise wait on this one for ever.
+	rows.Close()
+	return out, d.withPools(ctx, out, `SELECT `+poolColumns+` FROM dhcp_pools ORDER BY scope_id, position`)
 }
 
 func (d *dhcpStore) Scope(ctx context.Context, id int64) (Scope, error) {
@@ -236,44 +317,136 @@ func (d *dhcpStore) Scope(ctx context.Context, id int64) (Scope, error) {
 		}
 		return Scope{}, err
 	}
-	return s, nil
+	out := []Scope{s}
+	if err := d.withPools(ctx, out, `SELECT `+poolColumns+` FROM dhcp_pools WHERE scope_id = ? ORDER BY position`, id); err != nil {
+		return Scope{}, err
+	}
+	return out[0], nil
+}
+
+// withPools reads pools with q and hands each to its scope in scopes, in the
+// order q returns them. Every scope gets a non-nil list, so one with no pool
+// marshals `[]`.
+func (d *dhcpStore) withPools(ctx context.Context, scopes []Scope, q string, args ...any) error {
+	rows, err := d.s.db.QueryContext(ctx, d.s.q(q), args...)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	byScope := map[int64][]Pool{}
+	for rows.Next() {
+		var p Pool
+		if err := rows.Scan(&p.ID, &p.ScopeID, &p.Start, &p.End, &p.ClassID); err != nil {
+			return err
+		}
+		byScope[p.ScopeID] = append(byScope[p.ScopeID], p)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for i := range scopes {
+		scopes[i].Pools = byScope[scopes[i].ID]
+		if scopes[i].Pools == nil {
+			scopes[i].Pools = []Pool{}
+		}
+	}
+	return nil
+}
+
+func (d *dhcpStore) Classes(ctx context.Context) ([]Class, error) {
+	rows, err := d.s.db.QueryContext(ctx, `SELECT `+classColumns+` FROM dhcp_classes ORDER BY id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []Class{}
+	for rows.Next() {
+		var c Class
+		if err := scanClass(rows, &c); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+func (d *dhcpStore) Class(ctx context.Context, id int64) (Class, error) {
+	var c Class
+	row := d.s.db.QueryRowContext(ctx, d.s.q(`SELECT `+classColumns+` FROM dhcp_classes WHERE id = ?`), id)
+	if err := scanClass(row, &c); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return Class{}, ErrNotFound
+		}
+		return Class{}, err
+	}
+	return c, nil
 }
 
 // normaliseScope trims the columns that hold an address. They are written by
 // hand and pasted from spreadsheets, and a stored " 10.0.0.0/24" parses
 // nowhere: the renderer, the overlap rule and every reservation check would
-// each have to trim it, or quietly fail to. The comma-separated ones go
-// through normaliseList, which is that rule applied per entry — dns_servers
-// among them, because the renderer hands that column to Kea exactly as it is
-// stored and Kea parses " 1.1.1.1" no better than anything else does.
+// each have to trim it, or quietly fail to.
 //
-// name, domain and comment are the operator's own text, and trimming text is
-// a different decision from canonicalising an address.
+// name and comment are the operator's own text, and trimming text is a
+// different decision from canonicalising an address.
 func normaliseScope(s Scope) Scope {
 	s.CIDR = strings.TrimSpace(s.CIDR)
-	s.PoolStart = strings.TrimSpace(s.PoolStart)
-	s.PoolEnd = strings.TrimSpace(s.PoolEnd)
 	s.Gateway = strings.TrimSpace(s.Gateway)
-	s.NextServer = strings.TrimSpace(s.NextServer)
-	s.ServerHostname = strings.TrimSpace(s.ServerHostname)
-	s.BootFile = strings.TrimSpace(s.BootFile)
-	s.DNSServers = normaliseList(s.DNSServers)
-	s.DomainSearch = normaliseList(s.DomainSearch)
-	s.NTPServers = normaliseList(s.NTPServers)
-	// Cloned first: the caller's Scope is its own, and normalising in place
-	// would rewrite the slice it still holds.
-	s.StaticRoutes = slices.Clone(s.StaticRoutes)
-	for i, r := range s.StaticRoutes {
-		s.StaticRoutes[i] = StaticRoute{Destination: strings.TrimSpace(r.Destination), Router: strings.TrimSpace(r.Router)}
+	s.ClientOptions = normaliseClientOptions(s.ClientOptions)
+	// Cloned first, like the option lists below: the caller's slice is its
+	// own.
+	s.Pools = slices.Clone(s.Pools)
+	for i, p := range s.Pools {
+		s.Pools[i].Start, s.Pools[i].End = strings.TrimSpace(p.Start), strings.TrimSpace(p.End)
 	}
-	s.Options = slices.Clone(s.Options)
-	for i, o := range s.Options {
+	return s
+}
+
+// normaliseClientOptions is normaliseScope's rule for the options a scope and
+// a class share. The comma-separated ones go through normaliseList, which is
+// that rule applied per entry — dns_servers among them, because the renderer
+// hands that column to Kea exactly as it is stored and Kea parses " 1.1.1.1"
+// no better than anything else does. domain is left as typed.
+func normaliseClientOptions(o ClientOptions) ClientOptions {
+	o.NextServer = strings.TrimSpace(o.NextServer)
+	o.ServerHostname = strings.TrimSpace(o.ServerHostname)
+	o.BootFile = strings.TrimSpace(o.BootFile)
+	o.DNSServers = normaliseList(o.DNSServers)
+	o.DomainSearch = normaliseList(o.DomainSearch)
+	o.NTPServers = normaliseList(o.NTPServers)
+	// Cloned first: the caller's value is its own, and normalising in place
+	// would rewrite the slice it still holds.
+	o.StaticRoutes = slices.Clone(o.StaticRoutes)
+	for i, r := range o.StaticRoutes {
+		o.StaticRoutes[i] = StaticRoute{Destination: strings.TrimSpace(r.Destination), Router: strings.TrimSpace(r.Router)}
+	}
+	o.Options = slices.Clone(o.Options)
+	for i, opt := range o.Options {
 		// One spelling of one value: an option pasted from a vendor
 		// document arrives with colons and in whichever case that document
 		// used, and the engine reads plain hex.
-		s.Options[i].Hex = strings.ToUpper(strings.ReplaceAll(strings.TrimSpace(o.Hex), ":", ""))
+		o.Options[i].Hex = strings.ToUpper(strings.ReplaceAll(strings.TrimSpace(opt.Hex), ":", ""))
 	}
-	return s
+	return o
+}
+
+// normaliseClass is normaliseScope for a class. The name is trimmed here,
+// unlike a scope's: it is rendered into the engine's config as the class's
+// identity and a pool refers to it, so " iot" and "iot" must not be two
+// classes. A mac: matcher is lower-cased because the renderer turns it into
+// a hex literal and the case-insensitive duplicate of one is the same test.
+func normaliseClass(c Class) Class {
+	c.Name = strings.TrimSpace(c.Name)
+	c.ClientOptions = normaliseClientOptions(c.ClientOptions)
+	c.Matchers = slices.Clone(c.Matchers)
+	for i, m := range c.Matchers {
+		m = strings.TrimSpace(m)
+		if strings.HasPrefix(m, "mac:") {
+			m = strings.ToLower(m)
+		}
+		c.Matchers[i] = m
+	}
+	return c
 }
 
 // normaliseList is the one spelling of a comma-separated list this system
@@ -310,34 +483,139 @@ func normaliseReservation(r Reservation) Reservation {
 
 func (d *dhcpStore) AddScope(ctx context.Context, sc Scope) (int64, error) {
 	s := normaliseScope(sc)
-	return d.s.configInsert(ctx,
-		`INSERT INTO dhcp_scopes (name, cidr, pool_start, pool_end, gateway, dns_servers, domain, lease_seconds, enabled, domain_search, ntp_servers, static_routes, next_server, server_hostname, boot_file, options, match_client_id, reservations_only, created_at, modified_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		s.Name, s.CIDR, s.PoolStart, s.PoolEnd, s.Gateway, s.DNSServers, s.Domain, s.LeaseSeconds, s.Enabled,
-		s.DomainSearch, s.NTPServers, marshalList(s.StaticRoutes), s.NextServer, s.ServerHostname, s.BootFile,
-		marshalList(s.Options), s.MatchClientID, s.ReservationsOnly, s.CreatedAt, s.ModifiedAt)
+	var id int64
+	err := d.s.configWrite(ctx, func(tx *sql.Tx) (err error) {
+		id, err = d.s.insertTx(ctx, tx,
+			`INSERT INTO dhcp_scopes (name, cidr, gateway, dns_servers, domain, lease_seconds, enabled, domain_search, ntp_servers, static_routes, next_server, server_hostname, boot_file, options, match_client_id, reservations_only, created_at, modified_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			s.Name, s.CIDR, s.Gateway, s.DNSServers, s.Domain, s.LeaseSeconds, s.Enabled,
+			s.DomainSearch, s.NTPServers, marshalList(s.StaticRoutes), s.NextServer, s.ServerHostname, s.BootFile,
+			marshalList(s.Options), s.MatchClientID, s.ReservationsOnly, s.CreatedAt, s.ModifiedAt)
+		if err != nil {
+			return err
+		}
+		return d.writePools(ctx, tx, id, s.Pools)
+	})
+	if err != nil {
+		return 0, err
+	}
+	return id, nil
 }
 
 func (d *dhcpStore) UpdateScope(ctx context.Context, sc Scope) error {
 	s := normaliseScope(sc)
-	return d.s.configExecOne(ctx,
-		`UPDATE dhcp_scopes SET name = ?, cidr = ?, pool_start = ?, pool_end = ?, gateway = ?, dns_servers = ?, domain = ?, lease_seconds = ?, enabled = ?,
-		 domain_search = ?, ntp_servers = ?, static_routes = ?, next_server = ?, server_hostname = ?, boot_file = ?, options = ?, match_client_id = ?, reservations_only = ?, modified_at = ? WHERE id = ?`,
-		s.Name, s.CIDR, s.PoolStart, s.PoolEnd, s.Gateway, s.DNSServers, s.Domain, s.LeaseSeconds, s.Enabled,
-		s.DomainSearch, s.NTPServers, marshalList(s.StaticRoutes), s.NextServer, s.ServerHostname, s.BootFile,
-		marshalList(s.Options), s.MatchClientID, s.ReservationsOnly, s.ModifiedAt, s.ID)
+	return d.s.configWrite(ctx, func(tx *sql.Tx) error {
+		// First: an unknown id is ErrNotFound before any pool is touched,
+		// and the transaction unwinds rather than leaving orphan pools.
+		if err := execOneTx(ctx, tx, d.s.dialect,
+			`UPDATE dhcp_scopes SET name = ?, cidr = ?, gateway = ?, dns_servers = ?, domain = ?, lease_seconds = ?, enabled = ?,
+			 domain_search = ?, ntp_servers = ?, static_routes = ?, next_server = ?, server_hostname = ?, boot_file = ?, options = ?, match_client_id = ?, reservations_only = ?, modified_at = ? WHERE id = ?`,
+			s.Name, s.CIDR, s.Gateway, s.DNSServers, s.Domain, s.LeaseSeconds, s.Enabled,
+			s.DomainSearch, s.NTPServers, marshalList(s.StaticRoutes), s.NextServer, s.ServerHostname, s.BootFile,
+			marshalList(s.Options), s.MatchClientID, s.ReservationsOnly, s.ModifiedAt, s.ID); err != nil {
+			return wrapDBErr(err)
+		}
+		return d.writePools(ctx, tx, s.ID, s.Pools)
+	})
+}
+
+// writePools replaces a scope's pools with pools, positioned by slice order.
+// Rewritten whole rather than diffed: the list is edited as one table in one
+// form, and the ids a pool had before carry nothing that anything keeps.
+func (d *dhcpStore) writePools(ctx context.Context, tx *sql.Tx, scopeID int64, pools []Pool) error {
+	if err := d.s.execTx(ctx, tx, `DELETE FROM dhcp_pools WHERE scope_id = ?`, scopeID); err != nil {
+		return err
+	}
+	for i, p := range pools {
+		if err := d.s.execTx(ctx, tx, `INSERT INTO dhcp_pools (scope_id, position, start, "end", class_id) VALUES (?, ?, ?, ?, ?)`,
+			scopeID, i, p.Start, p.End, p.ClassID); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (d *dhcpStore) DeleteScope(ctx context.Context, id int64) error {
 	return d.s.configWrite(ctx, func(tx *sql.Tx) error {
-		if _, err := tx.ExecContext(ctx, d.s.q(`DELETE FROM dhcp_reservations WHERE scope_id = ?`), id); err != nil {
-			return wrapDBErr(err)
+		for _, q := range []string{`DELETE FROM dhcp_reservations WHERE scope_id = ?`, `DELETE FROM dhcp_pools WHERE scope_id = ?`} {
+			if err := d.s.execTx(ctx, tx, q, id); err != nil {
+				return err
+			}
 		}
 		// Last, and in the same transaction: an unknown id makes this
-		// ErrNotFound, which unwinds the delete above rather than leaving a
-		// scope's reservations gone without the scope.
+		// ErrNotFound, which unwinds the deletes above rather than leaving a
+		// scope's reservations and pools gone without the scope.
 		return execOneTx(ctx, tx, d.s.dialect, `DELETE FROM dhcp_scopes WHERE id = ?`, id)
 	})
+}
+
+func (d *dhcpStore) AddClass(ctx context.Context, cl Class) (int64, error) {
+	c := normaliseClass(cl)
+	return d.s.configInsert(ctx,
+		`INSERT INTO dhcp_classes (name, matchers, dns_servers, domain, domain_search, ntp_servers, static_routes, next_server, server_hostname, boot_file, options, created_at, modified_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		c.Name, marshalList(c.Matchers), c.DNSServers, c.Domain, c.DomainSearch, c.NTPServers, marshalList(c.StaticRoutes),
+		c.NextServer, c.ServerHostname, c.BootFile, marshalList(c.Options), c.CreatedAt, c.ModifiedAt)
+}
+
+func (d *dhcpStore) UpdateClass(ctx context.Context, cl Class) error {
+	c := normaliseClass(cl)
+	return d.s.configExecOne(ctx,
+		`UPDATE dhcp_classes SET name = ?, matchers = ?, dns_servers = ?, domain = ?, domain_search = ?, ntp_servers = ?, static_routes = ?,
+		 next_server = ?, server_hostname = ?, boot_file = ?, options = ?, modified_at = ? WHERE id = ?`,
+		c.Name, marshalList(c.Matchers), c.DNSServers, c.Domain, c.DomainSearch, c.NTPServers, marshalList(c.StaticRoutes),
+		c.NextServer, c.ServerHostname, c.BootFile, marshalList(c.Options), c.ModifiedAt, c.ID)
+}
+
+func (d *dhcpStore) DeleteClass(ctx context.Context, id int64) error {
+	return d.s.configWrite(ctx, func(tx *sql.Tx) error {
+		var name string
+		if err := tx.QueryRowContext(ctx, d.s.q(`SELECT name FROM dhcp_classes WHERE id = ?`), id).Scan(&name); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return ErrNotFound
+			}
+			return err
+		}
+		// In the same transaction as the delete, so a pool written between
+		// the check and the delete cannot be left naming a class that is
+		// gone. No foreign key does this: class_id 0 names no row.
+		scopes, n, err := d.poolsNaming(ctx, tx, id)
+		if err != nil {
+			return err
+		}
+		if n > 0 {
+			noun := "pools"
+			if n == 1 {
+				noun = "pool"
+			}
+			return fmt.Errorf("class %q %w by %d %s (%s)", name, ErrClassInUse, n, noun, strings.Join(scopes, ", "))
+		}
+		return execOneTx(ctx, tx, d.s.dialect, `DELETE FROM dhcp_classes WHERE id = ?`, id)
+	})
+}
+
+// poolsNaming counts the pools reserved for class id and names the scopes
+// that hold them, each once, in scope order.
+func (d *dhcpStore) poolsNaming(ctx context.Context, tx *sql.Tx, id int64) ([]string, int, error) {
+	rows, err := tx.QueryContext(ctx, d.s.q(`SELECT s.name FROM dhcp_pools p JOIN dhcp_scopes s ON s.id = p.scope_id
+		WHERE p.class_id = ? ORDER BY s.id, p.position`), id)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+	var names []string
+	n := 0
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, 0, err
+		}
+		n++
+		if !slices.Contains(names, name) {
+			names = append(names, name)
+		}
+	}
+	return names, n, rows.Err()
 }
 
 func scanReservation(row interface{ Scan(...any) error }, r *Reservation) error {
@@ -387,26 +665,21 @@ func (d *dhcpStore) DeleteReservation(ctx context.Context, id int64) error {
 // ValidateScope is §4.3's column table as one function. others is every other
 // scope this instance holds — the overlap rule is a claim about a set of rows,
 // so it cannot be a column constraint, and the caller is what knows the set.
+// classes is every class, which a pool's class_id has to name.
 //
 // Pure, and separate from the store, because the API answers a form with it
 // before anything is written, and the renderer reads the same rules when it
 // builds the engine's config.
-func ValidateScope(s Scope, others []Scope) error {
-	if strings.TrimSpace(s.Name) == "" {
-		return errors.New("name is required")
+func ValidateScope(s Scope, others []Scope, classes []Class) error {
+	if err := validateName(s.Name); err != nil {
+		return err
 	}
 	prefix, err := parseSubnet(s.CIDR)
 	if err != nil {
 		return fmt.Errorf("cidr: %w", err)
 	}
-	// A reservations_only scope is rendered with no pool, so it is the one
-	// kind that may leave both pool columns empty. A pool it does give is
-	// checked like anyone else's — half a pool included, which is a form
-	// half filled in rather than a scope that wanted none.
-	if !s.ReservationsOnly || strings.TrimSpace(s.PoolStart) != "" || strings.TrimSpace(s.PoolEnd) != "" {
-		if err := validatePool(s, prefix); err != nil {
-			return err
-		}
+	if err := validatePools(s, prefix, classes); err != nil {
+		return err
 	}
 	if s.Gateway != "" {
 		gw, err := parseV4(s.Gateway)
@@ -417,59 +690,18 @@ func ValidateScope(s Scope, others []Scope) error {
 			return fmt.Errorf("gateway %s is not inside %s", s.Gateway, s.CIDR)
 		}
 	}
-	if err := validateV4List("dns_servers", s.DNSServers); err != nil {
-		return err
-	}
-	// The scope's own suffix, judged the way the dhcp.domain setting it
-	// overrides is: a dotted name, no trailing dot. It is handed to clients
-	// as option 15 and is the suffix a lease's name is published under
-	// (§8.1), so a value that is not a domain produces names nothing
-	// resolves and an option Kea hands out regardless.
-	if s.Domain != "" && !validHostname(s.Domain) {
-		return fmt.Errorf("domain %q is not a domain suffix like home.lan, with no trailing dot", s.Domain)
-	}
 	if s.LeaseSeconds != 0 && s.LeaseSeconds < leaseFloor {
 		return fmt.Errorf("lease_seconds %d is below the %d second floor (0 uses the dhcp.lease_seconds setting)", s.LeaseSeconds, leaseFloor)
 	}
-	if err := validateSearchList(s.DomainSearch); err != nil {
-		return err
-	}
-	if err := validateV4List("ntp_servers", s.NTPServers); err != nil {
+	if err := validateClientOptions(s.ClientOptions); err != nil {
 		return err
 	}
 	for _, r := range s.StaticRoutes {
-		dest, err := parseSubnet(r.Destination)
-		if err != nil {
-			return fmt.Errorf("static route destination: %w", err)
-		}
-		router, err := parseV4(r.Router)
-		if err != nil {
-			return fmt.Errorf("static route %s router: %w", dest, err)
-		}
 		// A router a client cannot reach without the very route it is being
 		// given is not a route; on a DHCP segment "reachable" is "in this
-		// subnet".
-		if !prefix.Contains(router) {
-			return fmt.Errorf("static route %s router %s is not inside %s", dest, r.Router, s.CIDR)
-		}
-	}
-	if s.NextServer != "" {
-		if _, err := parseV4(s.NextServer); err != nil {
-			return fmt.Errorf("next_server: %w", err)
-		}
-	}
-	if s.ServerHostname != "" && !validHostname(s.ServerHostname) {
-		return fmt.Errorf("server_hostname %q is not a hostname", s.ServerHostname)
-	}
-	if len(s.ServerHostname) > serverHostnameLimit {
-		return fmt.Errorf("server_hostname is %d bytes, above the %d the sname field holds", len(s.ServerHostname), serverHostnameLimit)
-	}
-	if len(s.BootFile) > bootFileLimit {
-		return fmt.Errorf("boot_file is %d bytes, above the %d the file field holds", len(s.BootFile), bootFileLimit)
-	}
-	for _, o := range s.Options {
-		if err := validateOption(o); err != nil {
-			return err
+		// subnet". A class has no subnet, so this half is the scope's alone.
+		if router, _ := parseV4(r.Router); !prefix.Contains(router) {
+			return fmt.Errorf("static route %s router %s is not inside %s", r.Destination, r.Router, s.CIDR)
 		}
 	}
 	// A disabled scope is rendered into nothing, so it can overlap whatever
@@ -490,6 +722,139 @@ func ValidateScope(s Scope, others []Scope) error {
 		}
 		if op.Overlaps(prefix) {
 			return fmt.Errorf("%s %w: %s (%s)", s.CIDR, ErrScopeOverlap, o.Name, o.CIDR)
+		}
+	}
+	return nil
+}
+
+// ValidateClass is the class column table of the round-two spec (§3.1).
+// others is every class this instance holds, which is where the
+// case-insensitive name rule is decided: "IoT" and "iot" would render as two
+// engine classes an operator cannot tell apart in a pool's select.
+func ValidateClass(c Class, others []Class) error {
+	if err := validateName(c.Name); err != nil {
+		return err
+	}
+	name := strings.TrimSpace(c.Name)
+	for _, o := range others {
+		if o.ID != c.ID && strings.EqualFold(strings.TrimSpace(o.Name), name) {
+			return fmt.Errorf("%w: a class named %q exists", ErrDuplicate, o.Name)
+		}
+	}
+	// A class with no matcher matches nobody, and a pool reserved for it
+	// would hand out nothing: a form left half filled in, not a class.
+	if len(c.Matchers) == 0 {
+		return errors.New("matchers: a class needs at least one")
+	}
+	for i, m := range c.Matchers {
+		if err := validateMatcher(strings.TrimSpace(m)); err != nil {
+			return fmt.Errorf("matchers[%d]: %w", i, err)
+		}
+	}
+	return validateClientOptions(c.ClientOptions)
+}
+
+// nameLimit is the longest scope or class name, in characters: a DNS label's
+// length, which is also what fits a table cell and a select.
+const nameLimit = 63
+
+// validateName is the rule scope and class names share.
+func validateName(name string) error {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return errors.New("name is required")
+	}
+	if n := utf8.RuneCountInString(name); n > nameLimit {
+		return fmt.Errorf("name is %d characters, above the %d allowed", n, nameLimit)
+	}
+	return nil
+}
+
+// macMatcherLimit is the longest hardware-address prefix a mac: matcher
+// takes: the whole of an Ethernet address, which is the most a prefix of one
+// can be.
+const macMatcherLimit = 6
+
+// validateMatcher checks one class matcher. The renderer turns each into a
+// Kea expression, so what is refused here is what the engine could not be
+// handed: a vendor prefix is rendered inside single quotes, which Kea's
+// expression language gives no way to escape, and a mac prefix becomes a hex
+// literal of whole bytes.
+func validateMatcher(m string) error {
+	kind, value, _ := strings.Cut(m, ":")
+	switch kind {
+	case "vendor":
+		switch {
+		case value == "" || len(value) > 255:
+			return fmt.Errorf("vendor prefix is %d bytes, not 1 to 255", len(value))
+		case !utf8.ValidString(value) || strings.ContainsFunc(value, unicode.IsControl):
+			return fmt.Errorf("vendor prefix %q has a control character or is not text", value)
+		case strings.Contains(value, "'"):
+			return fmt.Errorf("vendor prefix %q has a single quote, which the engine cannot match on", value)
+		}
+		return nil
+	case "mac":
+		octets := strings.Split(value, ":")
+		if value == "" || len(octets) > macMatcherLimit {
+			return fmt.Errorf("mac prefix %q is not 1 to %d bytes like aa:bb:cc", value, macMatcherLimit)
+		}
+		for _, o := range octets {
+			if _, err := hex.DecodeString(o); err != nil || len(o) != 2 {
+				return fmt.Errorf("mac prefix %q is not hex bytes separated by colons, like aa:bb:cc", value)
+			}
+		}
+		return nil
+	}
+	return fmt.Errorf("%q is neither vendor:<prefix> nor mac:<hex>", m)
+}
+
+// validateClientOptions is the half of the column table a scope and a class
+// share: every option either can hand a client, judged the same way for
+// both.
+func validateClientOptions(o ClientOptions) error {
+	if err := validateV4List("dns_servers", o.DNSServers); err != nil {
+		return err
+	}
+	// The suffix, judged the way the dhcp.domain setting it overrides is: a
+	// dotted name, no trailing dot. It is handed to clients as option 15 and
+	// is the suffix a lease's name is published under (§8.1), so a value
+	// that is not a domain produces names nothing resolves and an option Kea
+	// hands out regardless.
+	if o.Domain != "" && !validHostname(o.Domain) {
+		return fmt.Errorf("domain %q is not a domain suffix like home.lan, with no trailing dot", o.Domain)
+	}
+	if err := validateSearchList(o.DomainSearch); err != nil {
+		return err
+	}
+	if err := validateV4List("ntp_servers", o.NTPServers); err != nil {
+		return err
+	}
+	for _, r := range o.StaticRoutes {
+		dest, err := parseSubnet(r.Destination)
+		if err != nil {
+			return fmt.Errorf("static route destination: %w", err)
+		}
+		if _, err := parseV4(r.Router); err != nil {
+			return fmt.Errorf("static route %s router: %w", dest, err)
+		}
+	}
+	if o.NextServer != "" {
+		if _, err := parseV4(o.NextServer); err != nil {
+			return fmt.Errorf("next_server: %w", err)
+		}
+	}
+	if o.ServerHostname != "" && !validHostname(o.ServerHostname) {
+		return fmt.Errorf("server_hostname %q is not a hostname", o.ServerHostname)
+	}
+	if len(o.ServerHostname) > serverHostnameLimit {
+		return fmt.Errorf("server_hostname is %d bytes, above the %d the sname field holds", len(o.ServerHostname), serverHostnameLimit)
+	}
+	if len(o.BootFile) > bootFileLimit {
+		return fmt.Errorf("boot_file is %d bytes, above the %d the file field holds", len(o.BootFile), bootFileLimit)
+	}
+	for _, opt := range o.Options {
+		if err := validateOption(opt); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -610,30 +975,63 @@ func lastAddr(p netip.Prefix) netip.Addr {
 	return netip.AddrFrom4(a)
 }
 
-// validatePool is §4.3's four pool rules, split out because a
-// reservations_only scope skips all four together.
-func validatePool(s Scope, prefix netip.Prefix) error {
-	start, err := parseV4(s.PoolStart)
-	if err != nil {
-		return fmt.Errorf("pool_start: %w", err)
+// validatePools is §3.2's pool rules. A reservations_only scope is rendered
+// with no pool, so it is the one kind that may have none; a pool it does
+// give is checked like anyone else's.
+func validatePools(s Scope, prefix netip.Prefix, classes []Class) error {
+	if len(s.Pools) == 0 {
+		if s.ReservationsOnly {
+			return nil
+		}
+		return errors.New("pools: a scope needs at least one pool, unless it is reservations_only")
 	}
-	end, err := parseV4(s.PoolEnd)
-	if err != nil {
-		return fmt.Errorf("pool_end: %w", err)
+	known := make(map[int64]bool, len(classes))
+	for _, c := range classes {
+		known[c.ID] = true
 	}
-	if !prefix.Contains(start) || !prefix.Contains(end) {
-		return fmt.Errorf("pool %s-%s is not inside %s", s.PoolStart, s.PoolEnd, s.CIDR)
+	type span struct {
+		i          int
+		start, end netip.Addr
 	}
-	if start.Compare(end) > 0 {
-		return fmt.Errorf("pool_start %s is above pool_end %s", s.PoolStart, s.PoolEnd)
-	}
-	// Neither end of the pool may be the subnet's own two addresses. They
-	// are not host addresses, and a client handed one would answer to every
-	// broadcast on the segment. (On a /31 or /32 that leaves no pool at all,
-	// which is the honest answer: there is no room for one.)
+	spans := make([]span, len(s.Pools))
 	network, broadcast := prefix.Addr(), lastAddr(prefix)
-	if start == network || end == network || start == broadcast || end == broadcast {
-		return fmt.Errorf("pool %s-%s includes the network or broadcast address of %s", s.PoolStart, s.PoolEnd, s.CIDR)
+	for i, p := range s.Pools {
+		start, err := parseV4(p.Start)
+		if err != nil {
+			return fmt.Errorf("pools[%d]: start: %w", i, err)
+		}
+		end, err := parseV4(p.End)
+		if err != nil {
+			return fmt.Errorf("pools[%d]: end: %w", i, err)
+		}
+		if !prefix.Contains(start) || !prefix.Contains(end) {
+			return fmt.Errorf("pools[%d]: %s-%s is not inside %s", i, p.Start, p.End, s.CIDR)
+		}
+		if start.Compare(end) > 0 {
+			return fmt.Errorf("pools[%d]: start %s is above end %s", i, p.Start, p.End)
+		}
+		// Neither end of a pool may be the subnet's own two addresses. They
+		// are not host addresses, and a client handed one would answer to
+		// every broadcast on the segment. (On a /31 or /32 that leaves no
+		// pool at all, which is the honest answer: there is no room for one.)
+		if start == network || end == network || start == broadcast || end == broadcast {
+			return fmt.Errorf("pools[%d]: %s-%s includes the network or broadcast address of %s", i, p.Start, p.End, s.CIDR)
+		}
+		if p.ClassID != 0 && !known[p.ClassID] {
+			return fmt.Errorf("pools[%d]: no class with id %d", i, p.ClassID)
+		}
+		spans[i] = span{i: i, start: start, end: end}
+	}
+	// Two pools sharing an address would have the engine refuse the config
+	// — or, across two classes, hand one address to whichever class asked
+	// first. Sorted by start, any overlap shows between neighbours: a pool
+	// that overlaps an earlier one overlaps every pool starting in between.
+	slices.SortFunc(spans, func(a, b span) int { return a.start.Compare(b.start) })
+	for k := 1; k < len(spans); k++ {
+		if prev, next := spans[k-1], spans[k]; next.start.Compare(prev.end) <= 0 {
+			i, j := min(prev.i, next.i), max(prev.i, next.i)
+			return fmt.Errorf("pools[%d] %s-%s overlaps pools[%d] %s-%s", i, s.Pools[i].Start, s.Pools[i].End, j, s.Pools[j].Start, s.Pools[j].End)
+		}
 	}
 	return nil
 }
@@ -663,7 +1061,7 @@ func validateOption(o GenericOption) error {
 		return fmt.Errorf("option code %d is outside 1-254", o.Code)
 	}
 	if named, ok := namedOptionCodes[o.Code]; ok {
-		return fmt.Errorf("option code %d is %s, which the scope sets by name", o.Code, named)
+		return fmt.Errorf("option code %d is %s, which is set by name", o.Code, named)
 	}
 	// Colons are how a vendor document prints bytes; the value is the bytes.
 	// DecodeString is both rules at once — even length, and hex digits.
