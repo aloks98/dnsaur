@@ -3,10 +3,16 @@ import { expect, test } from "vitest";
 import { screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { server } from "../../test/msw-server";
-import { dhcpHandlers, dhcpScope, dhcpStatus, dhcpReservation } from "../../test/msw-handlers";
+import {
+  dhcpClass,
+  dhcpHandlers,
+  dhcpScope,
+  dhcpStatus,
+  dhcpReservation,
+} from "../../test/msw-handlers";
 import { renderWithProviders } from "../../test/render";
 import type { DHCPStatus } from "../../api/types";
-import { DHCPScopes, engineLine } from "./scopes";
+import { DHCPScopes, engineLine, poolRowErrors } from "./scopes";
 
 function scopeRows(): HTMLElement[] {
   return Array.from(document.querySelectorAll<HTMLElement>('[data-testid="scope-row"]'));
@@ -16,6 +22,14 @@ async function renderScopes() {
   const result = renderWithProviders(<DHCPScopes />, { route: "/dhcp" });
   await screen.findByText("Scopes");
   return result;
+}
+
+/** Name, subnet and one pool: the least a scope can be saved with. */
+async function fillBasics(dialog: HTMLElement) {
+  await userEvent.type(within(dialog).getByLabelText("Name"), "Lab");
+  await userEvent.type(within(dialog).getByLabelText("Subnet"), "192.168.153.0/24");
+  await userEvent.type(within(dialog).getByLabelText("Pool 1 start"), "192.168.153.50");
+  await userEvent.type(within(dialog).getByLabelText("Pool 1 end"), "192.168.153.99");
 }
 
 // --- the status line -------------------------------------------------------
@@ -156,8 +170,8 @@ test("the create dialog posts every field the form owns", async () => {
   const dialog = await screen.findByRole("dialog");
   await userEvent.type(within(dialog).getByLabelText("Name"), "Lab");
   await userEvent.type(within(dialog).getByLabelText("Subnet"), "192.168.153.0/24");
-  await userEvent.type(within(dialog).getByLabelText("Pool start"), "192.168.153.50");
-  await userEvent.type(within(dialog).getByLabelText("Pool end"), "192.168.153.99");
+  await userEvent.type(within(dialog).getByLabelText("Pool 1 start"), "192.168.153.50");
+  await userEvent.type(within(dialog).getByLabelText("Pool 1 end"), "192.168.153.99");
   await userEvent.type(within(dialog).getByLabelText("Gateway"), "192.168.153.1");
   await userEvent.type(within(dialog).getByLabelText("DNS suffix"), "lab.e412.in");
   await userEvent.click(within(dialog).getByRole("button", { name: "Save" }));
@@ -166,8 +180,7 @@ test("the create dialog posts every field the form owns", async () => {
   expect(body).toEqual({
     name: "Lab",
     cidr: "192.168.153.0/24",
-    pool_start: "192.168.153.50",
-    pool_end: "192.168.153.99",
+    pools: [{ start: "192.168.153.50", end: "192.168.153.99", class_id: 0 }],
     gateway: "192.168.153.1",
     domain: "lab.e412.in",
     // Blank is "use the dhcp.lease_seconds setting", which is 0 on the wire.
@@ -208,6 +221,8 @@ test("the scope a create just produced is marked in the table", async () => {
   const dialog = await screen.findByRole("dialog");
   await userEvent.type(within(dialog).getByLabelText("Name"), "Lab");
   await userEvent.type(within(dialog).getByLabelText("Subnet"), "192.168.153.0/24");
+  await userEvent.type(within(dialog).getByLabelText("Pool 1 start"), "192.168.153.50");
+  await userEvent.type(within(dialog).getByLabelText("Pool 1 end"), "192.168.153.99");
   await userEvent.click(within(dialog).getByRole("button", { name: "Save" }));
 
   await waitFor(() => expect(scopeRows()).toHaveLength(2));
@@ -229,8 +244,7 @@ test("Client options is a tab of its own, and its fields post with the rest", as
 
   await userEvent.click(screen.getByRole("button", { name: /new scope/i }));
   const dialog = await screen.findByRole("dialog");
-  await userEvent.type(within(dialog).getByLabelText("Name"), "Lab");
-  await userEvent.type(within(dialog).getByLabelText("Subnet"), "192.168.153.0/24");
+  await fillBasics(dialog);
   // Network is where a new scope starts: the half without which there is no
   // scope at all.
   expect(within(dialog).getByRole("tab", { name: "Network" })).toHaveAttribute(
@@ -280,8 +294,7 @@ test("an untouched option row is dropped, and a half-filled one says so", async 
 
   await userEvent.click(screen.getByRole("button", { name: /new scope/i }));
   const dialog = await screen.findByRole("dialog");
-  await userEvent.type(within(dialog).getByLabelText("Name"), "Lab");
-  await userEvent.type(within(dialog).getByLabelText("Subnet"), "192.168.153.0/24");
+  await fillBasics(dialog);
 
   await userEvent.click(within(dialog).getByRole("tab", { name: "Client options" }));
   await userEvent.click(await within(dialog).findByRole("button", { name: /add option/i }));
@@ -296,8 +309,7 @@ test("an untouched option row is dropped, and a half-filled one says so", async 
   body = undefined;
   await userEvent.click(screen.getByRole("button", { name: /new scope/i }));
   const again = await screen.findByRole("dialog");
-  await userEvent.type(within(again).getByLabelText("Name"), "Lab");
-  await userEvent.type(within(again).getByLabelText("Subnet"), "192.168.153.0/24");
+  await fillBasics(again);
   await userEvent.click(within(again).getByRole("tab", { name: "Client options" }));
   await userEvent.click(await within(again).findByRole("button", { name: /add option/i }));
   await userEvent.type(within(again).getByLabelText("Code 1"), "252");
@@ -325,8 +337,7 @@ test("a half-filled route blocks Save and pulls the tab it is on into view", asy
 
   await userEvent.click(screen.getByRole("button", { name: /new scope/i }));
   const dialog = await screen.findByRole("dialog");
-  await userEvent.type(within(dialog).getByLabelText("Name"), "Lab");
-  await userEvent.type(within(dialog).getByLabelText("Subnet"), "192.168.153.0/24");
+  await fillBasics(dialog);
   await userEvent.click(within(dialog).getByRole("tab", { name: "Client options" }));
   await userEvent.click(await within(dialog).findByRole("button", { name: /add route/i }));
   await userEvent.type(within(dialog).getByLabelText("Destination 1"), "10.8.0.0/24");
@@ -423,4 +434,197 @@ test("a replica cannot re-send a refused configuration either", async () => {
   await renderScopes();
 
   expect(await screen.findByRole("button", { name: "Apply again" })).toBeDisabled();
+});
+
+// --- pools -----------------------------------------------------------------
+
+test("a pool row's four states are the board's exact words", () => {
+  const classes = new Set([1]);
+  const names = new Map([
+    [1, "iot"],
+    [7, "printers"],
+  ]);
+  const row = (start: string, end: string, class_id = "0") => ({ start, end, class_id });
+  expect(
+    poolRowErrors(
+      [
+        row("192.168.151.100", "192.168.151.199"),
+        row("192.168.152.10", "192.168.152.20"),
+        row("192.168.151.240", "192.168.151.230"),
+        row("192.168.151.180", "192.168.151.220", "1"),
+        row("192.168.151.221", "192.168.151.230", "7"),
+        row("192.168.151.231", "192.168.151.235", "9"),
+        // Half-typed and blank rows are not wrong yet.
+        row("192.168.151.2", ""),
+        row("", ""),
+      ],
+      "192.168.151.0/24",
+      classes,
+      names,
+    ),
+  ).toEqual([
+    undefined,
+    "Not in subnet 192.168.151.0/24",
+    "Start is after end",
+    "Overlaps 192.168.151.100 – 192.168.151.199",
+    "Unknown class printers",
+    "Unknown class 9",
+    undefined,
+    undefined,
+  ]);
+  // No class is unknown while the list is still loading.
+  expect(
+    poolRowErrors([row("10.0.0.1", "10.0.0.9", "7")], "10.0.0.0/24", undefined, names),
+  ).toEqual([undefined]);
+});
+
+test("the dialog edits the scope's pools and patches them whole", async () => {
+  let body: Record<string, unknown> | undefined;
+  server.use(
+    ...dhcpHandlers({
+      scopes: [
+        dhcpScope({
+          pools: [
+            { id: 4, scope_id: 1, start: "192.168.150.100", end: "192.168.150.199", class_id: 0 },
+            { id: 5, scope_id: 1, start: "192.168.150.200", end: "192.168.150.239", class_id: 2 },
+          ],
+        }),
+      ],
+      classes: [dhcpClass(), dhcpClass({ id: 2, name: "printers" })],
+    }),
+    http.patch("/api/v1/dhcp/scopes/1", async ({ request }) => {
+      body = (await request.json()) as Record<string, unknown>;
+      return new HttpResponse(null, { status: 204 });
+    }),
+  );
+  await renderScopes();
+
+  await userEvent.click(await screen.findByRole("button", { name: "Edit" }));
+  const dialog = await screen.findByRole("dialog");
+  expect(within(dialog).getByLabelText("Pool 1 start")).toHaveValue("192.168.150.100");
+  expect(within(dialog).getByLabelText("Pool 2 end")).toHaveValue("192.168.150.239");
+  const select = await within(dialog).findByLabelText("Pool 2 class");
+  await waitFor(() => expect(select).toHaveValue("2"));
+  expect(
+    within(select)
+      .getAllByRole("option")
+      .map((o) => o.textContent),
+  ).toEqual(["any", "iot", "printers"]);
+
+  await userEvent.click(within(dialog).getByRole("button", { name: /add pool/i }));
+  await userEvent.type(within(dialog).getByLabelText("Pool 3 start"), "192.168.150.240");
+  await userEvent.type(within(dialog).getByLabelText("Pool 3 end"), "192.168.150.249");
+  await userEvent.selectOptions(within(dialog).getByLabelText("Pool 3 class"), "iot");
+  await userEvent.click(within(dialog).getByRole("button", { name: "Save" }));
+
+  await waitFor(() => expect(body).toBeDefined());
+  expect(body?.pools).toEqual([
+    { start: "192.168.150.100", end: "192.168.150.199", class_id: 0 },
+    { start: "192.168.150.200", end: "192.168.150.239", class_id: 2 },
+    { start: "192.168.150.240", end: "192.168.150.249", class_id: 1 },
+  ]);
+  expect(body).not.toHaveProperty("pool_start");
+  expect(body).not.toHaveProperty("pool_end");
+});
+
+test("an overlapping row says which range it overlaps, and Save waits for it", async () => {
+  server.use(...dhcpHandlers({ scopes: [] }));
+  await renderScopes();
+
+  await userEvent.click(screen.getByRole("button", { name: /new scope/i }));
+  const dialog = await screen.findByRole("dialog");
+  await fillBasics(dialog);
+  await userEvent.click(within(dialog).getByRole("button", { name: /add pool/i }));
+  await userEvent.type(within(dialog).getByLabelText("Pool 2 start"), "192.168.153.90");
+  await userEvent.type(within(dialog).getByLabelText("Pool 2 end"), "192.168.153.120");
+
+  expect(await within(dialog).findByRole("alert")).toHaveTextContent(
+    "Overlaps 192.168.153.50 – 192.168.153.99",
+  );
+  expect(within(dialog).getByLabelText("Pool 2 start")).toHaveAttribute("aria-invalid", "true");
+  expect(within(dialog).getByRole("button", { name: "Save" })).toBeDisabled();
+
+  await userEvent.clear(within(dialog).getByLabelText("Pool 2 start"));
+  await userEvent.type(within(dialog).getByLabelText("Pool 2 start"), "192.168.153.100");
+  expect(within(dialog).queryByRole("alert")).not.toBeInTheDocument();
+  expect(within(dialog).getByRole("button", { name: "Save" })).toBeEnabled();
+});
+
+test("a scope needs a pool unless it is reservations only", async () => {
+  let body: Record<string, unknown> | undefined;
+  server.use(
+    ...dhcpHandlers({ scopes: [] }),
+    http.post("/api/v1/dhcp/scopes", async ({ request }) => {
+      body = (await request.json()) as Record<string, unknown>;
+      return HttpResponse.json(dhcpScope(), { status: 201 });
+    }),
+  );
+  await renderScopes();
+
+  await userEvent.click(screen.getByRole("button", { name: /new scope/i }));
+  const dialog = await screen.findByRole("dialog");
+  await userEvent.type(within(dialog).getByLabelText("Name"), "Lab");
+  await userEvent.type(within(dialog).getByLabelText("Subnet"), "192.168.153.0/24");
+  await userEvent.click(within(dialog).getByRole("button", { name: "Save" }));
+  expect(await within(dialog).findByText("Add a pool")).toBeInTheDocument();
+  expect(body).toBeUndefined();
+
+  await userEvent.click(within(dialog).getByRole("tab", { name: "Client options" }));
+  await userEvent.click(await within(dialog).findByRole("switch", { name: "Reservations only" }));
+  await userEvent.click(within(dialog).getByRole("button", { name: "Save" }));
+  await waitFor(() => expect(body).toBeDefined());
+  expect(body?.pools).toEqual([]);
+});
+
+test("a refusal naming pools[i] lands on that row", async () => {
+  server.use(
+    ...dhcpHandlers({ scopes: [] }),
+    http.post("/api/v1/dhcp/scopes", () =>
+      HttpResponse.json({ error: "pools[1]: no class with id 9" }, { status: 422 }),
+    ),
+  );
+  await renderScopes();
+
+  await userEvent.click(screen.getByRole("button", { name: /new scope/i }));
+  const dialog = await screen.findByRole("dialog");
+  await fillBasics(dialog);
+  // A blank row between is dropped on the way out, so the server's
+  // pools[1] is the form's third row.
+  const add = within(dialog).getByRole("button", { name: /add pool/i });
+  await userEvent.click(add);
+  await userEvent.click(add);
+  await userEvent.type(within(dialog).getByLabelText("Pool 3 start"), "192.168.153.150");
+  await userEvent.type(within(dialog).getByLabelText("Pool 3 end"), "192.168.153.159");
+  await userEvent.click(within(dialog).getByRole("button", { name: "Save" }));
+
+  expect(await within(dialog).findByRole("alert")).toHaveTextContent(
+    "pools[1]: no class with id 9",
+  );
+  expect(within(dialog).getByLabelText("Pool 3 start")).toHaveAttribute("aria-invalid", "true");
+  expect(within(dialog).getByLabelText("Pool 1 start")).toHaveAttribute("aria-invalid", "false");
+});
+
+test("the Pool column reads the first range and how many more, Leased the sum", async () => {
+  server.use(
+    ...dhcpHandlers({
+      scopes: [
+        dhcpScope({
+          pools: [
+            { id: 1, scope_id: 1, start: "192.168.150.100", end: "192.168.150.199", class_id: 0 },
+            { id: 2, scope_id: 1, start: "192.168.150.200", end: "192.168.150.239", class_id: 1 },
+          ],
+        }),
+      ],
+      status: dhcpStatus({ scopes: [{ id: 1, pool_size: 140, leased: 65 }] }),
+    }),
+  );
+  await renderScopes();
+
+  await waitFor(() => expect(scopeRows()).toHaveLength(1));
+  const row = scopeRows()[0];
+  expect(within(row).getByText("+1 more")).toBeInTheDocument();
+  expect(row).toHaveTextContent("192.168.150.100 – 192.168.150.199");
+  expect(row).not.toHaveTextContent("192.168.150.239");
+  expect(within(row).getByText("65")).toBeInTheDocument();
+  expect(within(row).getByText("/ 140")).toBeInTheDocument();
 });

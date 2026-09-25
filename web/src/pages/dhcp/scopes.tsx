@@ -1,8 +1,14 @@
-import { Fragment, useId, useState, type ReactNode } from "react";
+import { Fragment, useId, useMemo, useState, type ReactNode } from "react";
 import { Link } from "react-router";
 import { Plus, TriangleAlert } from "lucide-react";
 import { toast } from "sonner";
-import { useFieldArray, useForm, type FieldErrors, type UseFormReturn } from "react-hook-form";
+import {
+  useFieldArray,
+  useForm,
+  useWatch,
+  type FieldErrors,
+  type UseFormReturn,
+} from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { z } from "zod";
 import {
@@ -25,6 +31,8 @@ import {
   FormLabel,
   FormMessage,
   Input,
+  NativeSelect,
+  NativeSelectOption,
   Skeleton,
   Switch,
   Tabs,
@@ -33,9 +41,10 @@ import {
   TabsTrigger,
 } from "@e412/rnui-react";
 import { ApiError } from "../../api/client";
-import type { DHCPScope, DHCPStatus } from "../../api/types";
+import type { DHCPClass, DHCPScope, DHCPStatus } from "../../api/types";
 import {
   useApplyDHCP,
+  useClasses,
   useCreateScope,
   useDeleteScope,
   useDHCPStatus,
@@ -50,6 +59,7 @@ import { StaleDataAlert } from "../../components/stale-data-alert";
 import { ConfirmDeleteDialog } from "../dialogs";
 import { requiredText } from "../../lib/schemas";
 import { DHCP_RESERVATIONS_PATH } from "../../lib/nav";
+import { parseIPv4 } from "../../lib/acl";
 
 /** The board's nine columns, shared by the head and every row so the two
  * cannot drift. */
@@ -158,8 +168,7 @@ function EngineStatusLine({ line, canApply }: { line: EngineLine; canApply: bool
 interface ScopeFormValues {
   name: string;
   cidr: string;
-  pool_start: string;
-  pool_end: string;
+  pools: PoolRow[];
   gateway: string;
   domain: string;
   lease_seconds: string;
@@ -176,6 +185,79 @@ interface ScopeFormValues {
    * opposite — see the control's comment. */
   match_client_id: boolean;
   reservations_only: boolean;
+}
+
+/** One row of the Pools table. `class_id` is the select's value: "0" is
+ * any client. */
+export interface PoolRow {
+  start: string;
+  end: string;
+  class_id: string;
+}
+
+function v4(s: string): number | null {
+  const b = parseIPv4(s.trim());
+  return b && ((b[0] << 24) | (b[1] << 16) | (b[2] << 8) | b[3]) >>> 0;
+}
+
+/** `a.b.c.d/n` as its first and last address, or null. */
+function v4Range(cidr: string): [number, number] | null {
+  const [addr, len, extra] = cidr.trim().split("/");
+  const base = v4(addr);
+  if (base === null || extra !== undefined || !/^\d{1,2}$/.test(len ?? "") || Number(len) > 32) {
+    return null;
+  }
+  const size = 2 ** (32 - Number(len));
+  const first = base - (base % size);
+  return [first, first + size - 1];
+}
+
+/**
+ * What is wrong with each pool row, in the board's words, or undefined.
+ *
+ * Only the four states the board names, and only once a row's addresses
+ * parse: a half-typed address is not yet wrong. Everything else — the
+ * network and broadcast addresses, an address that never parses — is the
+ * server's to say, and its 422 lands on the row it names.
+ *
+ * `classes` is the current list (undefined while loading, when no class is
+ * called unknown); `names` also remembers classes this dialog has seen and
+ * the list has since lost.
+ */
+export function poolRowErrors(
+  rows: readonly PoolRow[],
+  cidr: string,
+  classes: ReadonlySet<number> | undefined,
+  names: ReadonlyMap<number, string>,
+): (string | undefined)[] {
+  const subnet = v4Range(cidr);
+  const ranges: ([number, number] | null)[] = [];
+  return rows.map((row, i) => {
+    if (isBlankRow(row.start, row.end)) return undefined;
+    const start = v4(row.start);
+    const end = v4(row.end);
+    const both = start !== null && end !== null;
+    ranges[i] = both && start <= end ? [start, end] : null;
+    if (subnet) {
+      const outside = (a: number | null) => a !== null && (a < subnet[0] || a > subnet[1]);
+      if (outside(start) || outside(end)) return `Not in subnet ${cidr.trim()}`;
+    }
+    if (both && start > end) return "Start is after end";
+    const mine = ranges[i];
+    if (mine) {
+      for (let j = 0; j < i; j++) {
+        const other = ranges[j];
+        if (other && mine[0] <= other[1] && other[0] <= mine[1]) {
+          return `Overlaps ${rows[j].start.trim()} – ${rows[j].end.trim()}`;
+        }
+      }
+    }
+    const id = Number(row.class_id);
+    if (id !== 0 && classes !== undefined && !classes.has(id)) {
+      return `Unknown class ${names.get(id) ?? id}`;
+    }
+    return undefined;
+  });
 }
 
 /**
@@ -195,65 +277,95 @@ function halfFilled(ctx: z.RefinementCtx, index: number, field: string, what: st
 }
 
 /**
- * Client-side validation, and deliberately only the two rules a blank form
- * would otherwise post: a name and a subnet. Everything else — the pool
- * inside the cidr, the gateway inside it, the option codes the renderer
- * already emits by name, the overlap with another enabled scope — is a
- * claim about other rows or about netip arithmetic, and the server is the
- * one that can make it. Its message lands as a toast rather than being
- * approximated here (see lib/schemas.ts's framing).
+ * Client-side validation: a name, a subnet, and the pool rows — the board
+ * draws their four states live, so they are checked here too (see
+ * poolRowErrors). Everything else — the gateway inside the cidr, the option
+ * codes the renderer already emits by name, the overlap with another enabled
+ * scope — is a claim about other rows or about netip arithmetic, and the
+ * server is the one that can make it. Its message lands as a toast rather
+ * than being approximated here (see lib/schemas.ts's framing).
  */
-const scopeFormSchema = z.object({
-  name: requiredText("Name is required"),
-  cidr: requiredText("Subnet is required"),
-  pool_start: z.string(),
-  pool_end: z.string(),
-  gateway: z.string(),
-  domain: z.string(),
-  lease_seconds: z
-    .string()
-    .refine((v) => v.trim() === "" || /^\d+$/.test(v.trim()), "Lease time must be a whole number"),
-  dns_servers: z.string(),
-  enabled: z.boolean(),
-  domain_search: z.string(),
-  ntp_servers: z.string(),
-  static_routes: z
-    .array(z.object({ destination: z.string(), router: z.string() }))
-    .superRefine((rows, ctx) => {
-      rows.forEach((row, index) => {
-        if (isBlankRow(row.destination, row.router)) return;
-        if (row.destination.trim() === "") halfFilled(ctx, index, "destination", "the destination");
-        if (row.router.trim() === "") halfFilled(ctx, index, "router", "the router");
-      });
-    }),
-  options: z.array(z.object({ code: z.string(), hex: z.string() })).superRefine((rows, ctx) => {
-    rows.forEach((row, index) => {
-      const code = row.code.trim();
-      if (isBlankRow(code, row.hex)) return;
-      if (code === "") halfFilled(ctx, index, "code", "the option code");
-      else if (!/^\d+$/.test(code)) {
-        ctx.addIssue({
-          code: "custom",
-          path: [index, "code"],
-          message: "Option code must be a number",
+function scopeFormSchema(
+  classes: ReadonlySet<number> | undefined,
+  names: ReadonlyMap<number, string>,
+) {
+  return z
+    .object({
+      name: requiredText("Name is required"),
+      cidr: requiredText("Subnet is required"),
+      pools: z
+        .array(z.object({ start: z.string(), end: z.string(), class_id: z.string() }))
+        .superRefine((rows, ctx) => {
+          rows.forEach((row, index) => {
+            if (isBlankRow(row.start, row.end)) return;
+            if (row.start.trim() === "") halfFilled(ctx, index, "start", "the start");
+            if (row.end.trim() === "") halfFilled(ctx, index, "end", "the end");
+          });
+        }),
+      gateway: z.string(),
+      domain: z.string(),
+      lease_seconds: z
+        .string()
+        .refine(
+          (v) => v.trim() === "" || /^\d+$/.test(v.trim()),
+          "Lease time must be a whole number",
+        ),
+      dns_servers: z.string(),
+      enabled: z.boolean(),
+      domain_search: z.string(),
+      ntp_servers: z.string(),
+      static_routes: z
+        .array(z.object({ destination: z.string(), router: z.string() }))
+        .superRefine((rows, ctx) => {
+          rows.forEach((row, index) => {
+            if (isBlankRow(row.destination, row.router)) return;
+            if (row.destination.trim() === "")
+              halfFilled(ctx, index, "destination", "the destination");
+            if (row.router.trim() === "") halfFilled(ctx, index, "router", "the router");
+          });
+        }),
+      options: z.array(z.object({ code: z.string(), hex: z.string() })).superRefine((rows, ctx) => {
+        rows.forEach((row, index) => {
+          const code = row.code.trim();
+          if (isBlankRow(code, row.hex)) return;
+          if (code === "") halfFilled(ctx, index, "code", "the option code");
+          else if (!/^\d+$/.test(code)) {
+            ctx.addIssue({
+              code: "custom",
+              path: [index, "code"],
+              message: "Option code must be a number",
+            });
+          }
+          if (row.hex.trim() === "") halfFilled(ctx, index, "hex", "the value's bytes");
         });
+      }),
+      next_server: z.string(),
+      server_hostname: z.string(),
+      boot_file: z.string(),
+      match_client_id: z.boolean(),
+      reservations_only: z.boolean(),
+    })
+    .superRefine((v, ctx) => {
+      if (!v.reservations_only && v.pools.every((p) => isBlankRow(p.start, p.end))) {
+        ctx.addIssue({ code: "custom", path: ["pools"], message: "Add a pool" });
       }
-      if (row.hex.trim() === "") halfFilled(ctx, index, "hex", "the value's bytes");
+      poolRowErrors(v.pools, v.cidr, classes, names).forEach((message, index) => {
+        if (message !== undefined) {
+          ctx.addIssue({ code: "custom", path: ["pools", index, "start"], message });
+        }
+      });
     });
-  }),
-  next_server: z.string(),
-  server_hostname: z.string(),
-  boot_file: z.string(),
-  match_client_id: z.boolean(),
-  reservations_only: z.boolean(),
-});
+}
 
 function toFormValues(scope: DHCPScope | null): ScopeFormValues {
   return {
     name: scope?.name ?? "",
     cidr: scope?.cidr ?? "",
-    pool_start: scope?.pool_start ?? "",
-    pool_end: scope?.pool_end ?? "",
+    // A new scope starts with one empty row, so the placeholders show
+    // where the range goes.
+    pools: scope
+      ? scope.pools.map((p) => ({ start: p.start, end: p.end, class_id: String(p.class_id) }))
+      : [{ start: "", end: "", class_id: "0" }],
     gateway: scope?.gateway ?? "",
     domain: scope?.domain ?? "",
     // 0 is "use the dhcp.lease_seconds setting", which is what an empty
@@ -280,8 +392,11 @@ function toInput(values: ScopeFormValues): ScopeInput {
   return {
     name: values.name.trim(),
     cidr: values.cidr.trim(),
-    pool_start: values.pool_start.trim(),
-    pool_end: values.pool_end.trim(),
+    // Blank rows are dropped like the other tables'; poolIndexes maps the
+    // server's `pools[i]` back to the row it came from.
+    pools: values.pools
+      .filter((p) => !isBlankRow(p.start, p.end))
+      .map((p) => ({ start: p.start.trim(), end: p.end.trim(), class_id: Number(p.class_id) })),
     gateway: values.gateway.trim(),
     domain: values.domain.trim(),
     lease_seconds: Number(values.lease_seconds.trim() || 0),
@@ -303,6 +418,12 @@ function toInput(values: ScopeFormValues): ScopeInput {
     match_client_id: values.match_client_id,
     reservations_only: values.reservations_only,
   };
+}
+
+/** The form row each sent pool came from: `pools[i]` in a refusal is the
+ * i-th non-blank row. */
+function poolIndexes(values: ScopeFormValues): number[] {
+  return values.pools.flatMap((p, i) => (isBlankRow(p.start, p.end) ? [] : [i]));
 }
 
 function Field({ label, hint, children }: { label: string; hint?: string; children: ReactNode }) {
@@ -607,8 +728,8 @@ function ScopeOptions({ form }: { form: UseFormReturn<ScopeFormValues> }) {
   );
 }
 
-/** The two repeating lists on the Client options tab, which are the same
- * table with different columns. */
+/** The repeating lists — Pools on Network, routes and options on Client
+ * options — which are the same table with different columns. */
 function MiniTable({
   columns,
   template,
@@ -619,7 +740,7 @@ function MiniTable({
   onAdd,
   addLabel,
 }: {
-  columns: [string, string];
+  columns: string[];
   template: string;
   /** Names the row in its Remove button, so a panel with four of them does
    * not offer four controls all called "Remove". */
@@ -641,8 +762,9 @@ function MiniTable({
           "font-mono text-[9.5px] leading-none font-semibold tracking-[0.12em] text-muted-foreground uppercase",
         )}
       >
-        <span>{columns[0]}</span>
-        <span>{columns[1]}</span>
+        {columns.map((column) => (
+          <span key={column}>{column}</span>
+        ))}
         <span />
       </div>
       {rows.map((row, index) => {
@@ -653,7 +775,10 @@ function MiniTable({
             // field ids); the index is what addresses the same row in the
             // field array, and reordering is not offered.
             key={index}
-            className="border-b border-border-muted"
+            className={cn(
+              "border-b border-border-muted",
+              error !== undefined && "bg-card shadow-[inset_3px_0_0_var(--destructive)]",
+            )}
           >
             <div className={cn(template, "grid items-center gap-2.5 px-2.5 py-1.5")}>
               {row}
@@ -670,7 +795,12 @@ function MiniTable({
               </span>
             </div>
             {error !== undefined && (
-              <p className="px-2.5 pb-1.5 text-xs text-destructive">{error}</p>
+              <p
+                role="alert"
+                className="px-2.5 pb-1.5 font-mono text-[11px] text-destructive-foreground"
+              >
+                {error}
+              </p>
             )}
           </div>
         );
@@ -683,6 +813,128 @@ function MiniTable({
       </span>
     </div>
   );
+}
+
+/**
+ * The Pools table on the Network tab. `errors` is poolRowErrors' answer for
+ * the rows as typed; a refusal the schema or the server pinned on a row
+ * shows when there is no live one.
+ */
+function PoolsTable({
+  form,
+  errors: live,
+  classes,
+  names,
+}: {
+  form: UseFormReturn<ScopeFormValues>;
+  errors: (string | undefined)[];
+  classes: DHCPClass[] | undefined;
+  names: ReadonlyMap<number, string>;
+}) {
+  const pools = useFieldArray({ control: form.control, name: "pools" });
+  const errors = form.formState.errors.pools;
+  const tableError = errors?.message ?? errors?.root?.message;
+
+  return (
+    <div className="flex min-w-0 flex-col gap-1.5 sm:col-span-2">
+      <span className="text-[12.5px] leading-none font-medium">Pools</span>
+      <MiniTable
+        columns={["Start", "End", "Class"]}
+        template="grid-cols-[1fr_1fr_150px_64px]"
+        noun="pool"
+        rowError={(index) =>
+          live[index] ?? errors?.[index]?.start?.message ?? errors?.[index]?.end?.message
+        }
+        rows={pools.fields.map((row, index) => (
+          <Fragment key={row.id}>
+            <FormField
+              control={form.control}
+              name={`pools.${index}.start`}
+              render={({ field, fieldState }) => (
+                <Input
+                  {...field}
+                  placeholder="10.0.0.100"
+                  autoComplete="off"
+                  aria-label={`Pool ${index + 1} start`}
+                  aria-invalid={live[index] !== undefined || fieldState.error !== undefined}
+                  className="font-mono"
+                />
+              )}
+            />
+            <FormField
+              control={form.control}
+              name={`pools.${index}.end`}
+              render={({ field, fieldState }) => (
+                <Input
+                  {...field}
+                  placeholder="10.0.0.199"
+                  autoComplete="off"
+                  aria-label={`Pool ${index + 1} end`}
+                  aria-invalid={live[index] !== undefined || fieldState.error !== undefined}
+                  className="font-mono"
+                />
+              )}
+            />
+            <FormField
+              control={form.control}
+              name={`pools.${index}.class_id`}
+              render={({ field }) => {
+                const id = Number(field.value);
+                const listed = id === 0 || (classes ?? []).some((c) => c.id === id);
+                return (
+                  <NativeSelect {...field} size="sm" aria-label={`Pool ${index + 1} class`}>
+                    <NativeSelectOption value="0">any</NativeSelectOption>
+                    {(classes ?? []).map((c) => (
+                      <NativeSelectOption key={c.id} value={String(c.id)}>
+                        {c.name}
+                      </NativeSelectOption>
+                    ))}
+                    {/* A class this row names that the list no longer has
+                        (or has not loaded yet) still needs an option, or the
+                        select would show "any" for it. */}
+                    {!listed && (
+                      <NativeSelectOption value={field.value}>
+                        {names.get(id) ?? field.value}
+                      </NativeSelectOption>
+                    )}
+                  </NativeSelect>
+                );
+              }}
+            />
+          </Fragment>
+        ))}
+        onRemove={(index) => pools.remove(index)}
+        onAdd={() => pools.append({ start: "", end: "", class_id: "0" })}
+        addLabel="Add pool"
+      />
+      {tableError !== undefined && (
+        <p role="alert" className="font-mono text-[11px] text-destructive-foreground">
+          {tableError}
+        </p>
+      )}
+      <p className="text-[11px] text-muted-foreground">
+        Ranges inside the subnet, no overlaps. A pool with a class serves only that class.
+      </p>
+    </div>
+  );
+}
+
+/**
+ * Every class name this dialog has seen, so a class deleted elsewhere while
+ * it is open can still be named in its row's error.
+ */
+function useClassNames(classes: DHCPClass[] | undefined): ReadonlyMap<number, string> {
+  const merge = (prev: ReadonlyMap<number, string>) =>
+    new Map([...prev, ...(classes ?? []).map((c) => [c.id, c.name] as const)]);
+  const [names, setNames] = useState(() => merge(new Map()));
+  const [mergedFor, setMergedFor] = useState(classes);
+  // Adjusting state while rendering, React's documented pattern for state
+  // derived from a changing prop.
+  if (classes !== mergedFor) {
+    setMergedFor(classes);
+    setNames(merge);
+  }
+  return names;
 }
 
 /**
@@ -701,11 +953,18 @@ function ScopeDialog({
 }) {
   const create = useCreateScope();
   const update = useUpdateScope();
+  const classes = useClasses().data;
+  const names = useClassNames(classes);
+  const classIds = useMemo(() => classes && new Set(classes.map((c) => c.id)), [classes]);
+  const schema = useMemo(() => scopeFormSchema(classIds, names), [classIds, names]);
   const form = useForm<ScopeFormValues>({
-    resolver: zodResolver(scopeFormSchema),
+    resolver: zodResolver(schema),
     defaultValues: toFormValues(scope),
   });
   const isPending = create.isPending || update.isPending;
+  const [pools, cidr] = useWatch({ control: form.control, name: ["pools", "cidr"] });
+  const poolErrors = poolRowErrors(pools, cidr, classIds, names);
+  const poolsInvalid = poolErrors.some((e) => e !== undefined);
   // Controlled, because a refusal has to be able to change it: see
   // tabForErrors. Network is where a new scope starts — it is the half
   // without which there is no scope at all.
@@ -713,8 +972,19 @@ function ScopeDialog({
 
   function onSubmit(values: ScopeFormValues) {
     const body = toInput(values);
-    const onError = (err: unknown) =>
+    const sent = poolIndexes(values);
+    const onError = (err: unknown) => {
+      // A refusal naming `pools[i]` belongs on that row, in the server's
+      // words; everything else is a toast.
+      const match = err instanceof ApiError ? /^pools\[(\d+)\]/.exec(err.message) : null;
+      const row = match ? sent[Number(match[1])] : undefined;
+      if (err instanceof ApiError && row !== undefined) {
+        form.setError(`pools.${row}.start`, { type: "server", message: err.message });
+        setTab(TAB_NETWORK);
+        return;
+      }
       toast.error(err instanceof ApiError ? err.message : "Couldn't save the scope");
+    };
     if (scope) {
       update.mutate({ id: scope.id, ...body }, { onSuccess: onClose, onError });
       return;
@@ -785,34 +1055,7 @@ function ScopeDialog({
                       </Field>
                     )}
                   />
-                  <FormField
-                    control={form.control}
-                    name="pool_start"
-                    render={({ field }) => (
-                      <Field label="Pool start">
-                        <Input
-                          {...field}
-                          placeholder="192.168.151.100"
-                          autoComplete="off"
-                          className="font-mono"
-                        />
-                      </Field>
-                    )}
-                  />
-                  <FormField
-                    control={form.control}
-                    name="pool_end"
-                    render={({ field }) => (
-                      <Field label="Pool end">
-                        <Input
-                          {...field}
-                          placeholder="192.168.151.199"
-                          autoComplete="off"
-                          className="font-mono"
-                        />
-                      </Field>
-                    )}
-                  />
+                  <PoolsTable form={form} errors={poolErrors} classes={classes} names={names} />
                   <FormField
                     control={form.control}
                     name="gateway"
@@ -889,7 +1132,7 @@ function ScopeDialog({
               <DialogClose render={<Button type="button" size="sm" variant="ghost" />}>
                 Cancel
               </DialogClose>
-              <Button type="submit" size="sm" disabled={isPending}>
+              <Button type="submit" size="sm" disabled={isPending || poolsInvalid}>
                 {isPending ? "Saving…" : "Save"}
               </Button>
             </DialogFooter>
@@ -924,6 +1167,7 @@ function ScopeRow({
 }) {
   const update = useUpdateScope();
   const toScope = `${DHCP_RESERVATIONS_PATH}?scope=${scope.id}`;
+  const first = scope.pools.at(0);
 
   return (
     <div
@@ -951,9 +1195,16 @@ function ScopeRow({
       </span>
       <span className="truncate font-mono text-[12.5px]">{scope.cidr}</span>
       <span className="truncate font-mono text-[12.5px]">
-        {scope.pool_start}
-        <span className="text-muted-foreground"> – </span>
-        {scope.pool_end}
+        {first && (
+          <>
+            {first.start}
+            <span className="text-muted-foreground"> – </span>
+            {first.end}
+          </>
+        )}
+        {scope.pools.length > 1 && (
+          <span className="text-muted-foreground">{`  +${scope.pools.length - 1} more`}</span>
+        )}
       </span>
       <span className="truncate text-right font-mono text-[12.5px]">
         {usage?.leased ?? 0}

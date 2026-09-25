@@ -1,7 +1,9 @@
 import { useMutation, useQuery, useQueryClient, type QueryClient } from "@tanstack/react-query";
 import { api } from "../api/client";
 import type {
+  DHCPClass,
   DHCPLease,
+  DHCPPool,
   DHCPReservation,
   DHCPScope,
   DHCPStatus,
@@ -18,6 +20,7 @@ import { settingsKeys, useResolverStatus, useSettings } from "./use-settings";
 export const dhcpKeys = {
   status: ["dhcp", "status"] as const,
   scopes: ["dhcp", "scopes"] as const,
+  classes: ["dhcp", "classes"] as const,
   reservations: ["dhcp", "reservations"] as const,
   leases: ["dhcp", "leases"] as const,
 };
@@ -79,6 +82,13 @@ export function useScopes() {
   return useQuery({
     queryKey: dhcpKeys.scopes,
     queryFn: () => api.get<DHCPScope[]>("/dhcp/scopes"),
+  });
+}
+
+export function useClasses() {
+  return useQuery({
+    queryKey: dhcpKeys.classes,
+    queryFn: () => api.get<DHCPClass[]>("/dhcp/classes"),
   });
 }
 
@@ -157,7 +167,14 @@ function invalidateDHCP(qc: QueryClient, ...keys: readonly (readonly string[])[]
 
 /** The scope fields a form owns. `id` and the timestamps are the server's,
  * and a PATCH is a merge — every key omitted keeps the value it has. */
-export type ScopeInput = Partial<Omit<DHCPScope, "id" | "created_at" | "modified_at">>;
+export type ScopeInput = Partial<
+  Omit<DHCPScope, "id" | "created_at" | "modified_at" | "pools"> & {
+    /** Ids are the server's: a write replaces the list whole. */
+    pools: PoolInput[];
+  }
+>;
+
+export type PoolInput = Pick<DHCPPool, "start" | "end" | "class_id">;
 
 export function useCreateScope() {
   const qc = useQueryClient();
@@ -185,6 +202,35 @@ export function useDeleteScope() {
   return useMutation({
     mutationFn: (id: number) => api.del<void>(`/dhcp/scopes/${id}`),
     onSuccess: () => invalidateDHCP(qc, dhcpKeys.scopes, dhcpKeys.reservations, dhcpKeys.leases),
+  });
+}
+
+/** The class fields a form owns; a PATCH replaces lists whole. */
+export type ClassInput = Partial<Omit<DHCPClass, "id" | "created_at" | "modified_at">>;
+
+export function useCreateClass() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (v: ClassInput) => api.post<DHCPClass>("/dhcp/classes", v),
+    onSuccess: () => invalidateDHCP(qc, dhcpKeys.classes),
+  });
+}
+
+export function useUpdateClass() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, ...body }: ClassInput & { id: number }) =>
+      api.patch<void>(`/dhcp/classes/${id}`, body),
+    onSuccess: () => invalidateDHCP(qc, dhcpKeys.classes),
+  });
+}
+
+/** `409` while any pool names the class, in the store's words. */
+export function useDeleteClass() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (id: number) => api.del<void>(`/dhcp/classes/${id}`),
+    onSuccess: () => invalidateDHCP(qc, dhcpKeys.classes),
   });
 }
 

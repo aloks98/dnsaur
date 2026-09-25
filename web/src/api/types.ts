@@ -531,8 +531,9 @@ export interface DHCPScope {
    * quietly masked — "10.0.0.5/24" and "10.0.0.0/24" look alike in a form
    * and hand out different subnets. */
   cidr: string;
-  pool_start: string;
-  pool_end: string;
+  /** In order, and replaced whole on every write. At least one unless
+   * `reservations_only`. */
+  pools: DHCPPool[];
   gateway: string;
   dns_servers: string;
   domain: string;
@@ -547,6 +548,42 @@ export interface DHCPScope {
   options: DHCPGenericOption[];
   match_client_id: boolean;
   reservations_only: boolean;
+  created_at: number;
+  modified_at: number;
+}
+
+/**
+ * One address range of a scope, inclusive at both ends. `class_id` 0 serves
+ * any client; any other reserves the range for that class's members. Pool
+ * ids are the server's and change on every write of the scope.
+ */
+export interface DHCPPool {
+  id: number;
+  scope_id: number;
+  start: string;
+  end: string;
+  class_id: number;
+}
+
+/**
+ * A DHCP client class: a client is a member when any matcher matches
+ * (`vendor:<prefix>` against option 60, `mac:<hex>` against the hardware
+ * address), and gets the class's options on the class's own pools. Every
+ * option field empty means "the scope's".
+ */
+export interface DHCPClass {
+  id: number;
+  name: string;
+  matchers: string[];
+  dns_servers: string;
+  domain: string;
+  domain_search: string;
+  ntp_servers: string;
+  static_routes: DHCPStaticRoute[];
+  next_server: string;
+  server_hostname: string;
+  boot_file: string;
+  options: DHCPGenericOption[];
   created_at: number;
   modified_at: number;
 }
@@ -605,8 +642,8 @@ export interface DHCPHAStatus {
   unacked_clients: number;
 }
 
-/** How full one scope's pool is. `leased` may exceed `pool_size` after a
- * pool is shrunk: the engine keeps what it has already handed out. */
+/** How full one scope's pools are, summed across them. `leased` may exceed
+ * `pool_size` after a pool is shrunk: the engine keeps what it has already handed out. */
 export interface DHCPScopeUsage {
   id: number;
   pool_size: number;

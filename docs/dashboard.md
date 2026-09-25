@@ -844,9 +844,11 @@ page, and the only place **Apply again** lives. All three clear on their own.
 
 ### Scopes
 
-A scope is one subnet, rendered as one Kea `subnet4`. The table says how
-full each pool is — `61 / 100` — and that number comes from the engine, not
-from the two ends of the pool: how many addresses are actually leased is a
+A scope is one subnet, rendered as one Kea `subnet4`, handing out addresses
+from one or more pools. The table shows the first pool's range and `+N more`
+for the rest, and how full they are together — `61 / 100`, summed across
+the pools. That number comes from the engine, not from the ends of the
+ranges: how many addresses are actually leased is a
 fact about the lease database. It can exceed the total after you shrink a
 pool, because the engine keeps what it has already handed out until those
 leases expire.
@@ -856,8 +858,11 @@ Rules worth knowing before the form refuses you:
 - The subnet is written **masked**. `10.0.0.5/24` is refused rather than
   quietly saved as `10.0.0.0/24`, because the two look alike in a form and
   hand out different subnets.
-- The pool must be inside it, in order, and neither end may be the network
-  or the broadcast address.
+- Each pool must be inside it, start before end, and neither end may be the
+  network or the broadcast address. Pools in one scope may not overlap. A
+  scope needs at least one, unless **Reservations only** is on.
+- A pool's **class** reserves it for that class's members; `any` serves
+  every other client. A class is defined under DHCP › Classes.
 - **No two *enabled* scopes may overlap.** A disabled one is rendered into
   nothing and is exempt in both directions, which is what makes "disable it,
   then renumber it, then enable it" a usable sequence.
@@ -868,7 +873,12 @@ Rules worth knowing before the form refuses you:
 - A blank lease time and a blank DNS suffix fall back to the `dhcp.lease_seconds`
   and `dhcp.domain` settings. They mean "use the instance default", not "none".
 
-The form has two tabs. **Network** is the subnet itself — everything above.
+The form has two tabs. **Network** is the subnet itself — everything above,
+with the pools as a small table of start, end and class. A row that breaks a
+rule says which as you type — `Not in subnet 192.168.151.0/24`, `Start is
+after end`, `Overlaps 192.168.151.100 – 192.168.151.199`, or `Unknown class
+<name>` when its class was deleted elsewhere — and Save stays disabled until
+it is fixed. A refusal the server makes about one pool lands on that row.
 **Client options** is everything handed to the clients in it, in five
 groups: names and time (domain search list, NTP servers), routing (classless
 static routes, option 121), PXE boot, generic options by code, and

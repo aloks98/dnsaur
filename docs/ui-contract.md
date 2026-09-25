@@ -1197,9 +1197,14 @@ DHCP on is a bootstrap change and a restart.
 | Endpoint | Success | Notes |
 |---|---|---|
 | `GET /dhcp/scopes` | 200 `DHCPScope[]` | ordered by id |
-| `POST /dhcp/scopes` | 201 the scope, `Location` | **400** the validator's own message, **409** `managed by <peer_url>` on a replica |
+| `POST /dhcp/scopes` | 201 the scope, `Location` | **400** the validator's own message, **409** `managed by <peer_url>` on a replica. A pool naming no class is **422** `pools[<i>]: no class with id <n>`; `pool_start`/`pool_end` are **422** `pools replaces pool_start and pool_end` here and on a `PATCH` |
 | `PATCH /dhcp/scopes/{id}` | 204 | a **merge** — every key the body omits keeps its value. `match_client_id` absent means *unchanged* here and *true* on a create |
 | `DELETE /dhcp/scopes/{id}` | 204 | its reservations go with it |
+| `GET /dhcp/classes` | 200 `DHCPClass[]` | ordered by id |
+| `POST /dhcp/classes` | 201 the class, `Location` | **409** a name already taken, ignoring case |
+| `GET /dhcp/classes/{id}` | 200 `DHCPClass` | |
+| `PATCH /dhcp/classes/{id}` | 204 | a merge; a list in the body replaces the stored one whole |
+| `DELETE /dhcp/classes/{id}` | 204 | **409** while any pool names it, in the store's words: `class "iot" is in use by 2 pools (Office, IoT)` |
 | `GET /dhcp/reservations` | 200 `DHCPReservation[]` | every scope's, ordered by id — the config is rendered from all of them at once |
 | `POST /dhcp/reservations` | 201 the reservation, `Location` | **404** `scope_id` names no scope, **409** a collision inside that scope |
 | `PATCH /dhcp/reservations/{id}` | 204 | a merge; **`scope_id` may not move** |
@@ -1210,7 +1215,7 @@ DHCP on is a bootstrap change and a restart.
 | `GET /dhcp/status` | 200 `DHCPStatus` | the one route that answers on a box with no engine |
 | `POST /dhcp/apply` | 200 `DHCPStatus` | re-render and `config-set` now |
 
-**Scopes and reservations are synced configuration** — the ids travel in the
+**Scopes, classes and reservations are synced configuration** — the ids travel in the
 bundle, so a scope means the same row on the main and on its replica — so
 every write to them is **409** `managed by <peer_url>` on a replica.
 `DELETE /dhcp/leases/{ip}` is the one exception and stays live there: a lease
@@ -1674,7 +1679,7 @@ was chosen at creation, and that one never slides. Token material is
 
 ### 3.11 DHCP
 
-Three entities and a status object. Scopes and reservations are rows dnsaur
+Four entities and a status object. Scopes, classes and reservations are rows dnsaur
 stores and syncs; a **lease is not a row** — it is read from the engine every
 `dhcp.lease_poll_seconds` and the table is replaced whole, so nothing about a
 lease survives a restart of either process.
@@ -1686,7 +1691,7 @@ lease survives a restart of either process.
 | `id` | int64 | travels in the sync bundle, so it names the same row on both boxes |
 | `name` | string | non-empty, unique |
 | `cidr` | string | an IPv4 prefix **in masked form**. Host bits set are refused rather than quietly masked. No two *enabled* scopes may overlap |
-| `pool_start`, `pool_end` | string | both inside `cidr`, `start <= end`, neither the network nor the broadcast address. Both may be empty **only** when `reservations_only` |
+| `pools` | `{id, scope_id, start, end, class_id}[]` | in order, **replaced whole** on every write; pool ids are the server's and change with it, so a write sends `{start, end, class_id}` only. Each is inclusive, inside `cidr`, `start <= end`, neither end the network or broadcast address, and no two overlap. At least one **unless** `reservations_only`. `class_id` **`0` = any client** not in a class that owns a pool in this scope; any other reserves the pool for that class's members |
 | `gateway` | string | option 3; `""` hands out no router. Must be inside `cidr` |
 | `dns_servers` | string | comma-separated, option 6, stored one entry per comma with a single space after it — what was typed is trimmed. **`""` is not "no DNS"** — it is the automatic answer, this box's address then its HA partner's, the same two in the same order on both boxes |
 | `domain` | string | option 15; a domain suffix like `home.lan` with **no trailing dot**, the same grammar the `dhcp.domain` setting it overrides is held to. `""` falls back to that setting |
@@ -1698,7 +1703,17 @@ lease survives a restart of either process.
 | `next_server`, `server_hostname`, `boot_file` | string | PXE's siaddr, sname (option 66, ≤63 bytes) and file (option 67, ≤127 bytes) |
 | `options` | `{code, hex}[]` | every code with no field of its own. A code the renderer already emits by name (1, 3, 6, 15, 42, 51, 54, 58, 59, 66, 67, 119, 121) is refused, so one code never has two answers |
 | `match_client_id` | bool | `false` keys a lease on the hardware address alone and ignores option 61 — what cloned VMs sharing a client id need. **Absent means `true` on a create and *unchanged* on a `PATCH`**, the one field where those differ |
-| `reservations_only` | bool | renders the subnet with no pool |
+| `reservations_only` | bool | renders the subnet with no pool; `pools` may then be empty |
+| `created_at`, `modified_at` | int64 | unix ms |
+
+**Class** — sorts clients by what they are; its options reach its members on the class's own pools.
+
+| Field | Type | Notes |
+|---|---|---|
+| `id` | int64 | travels in the sync bundle, like a scope's |
+| `name` | string | 1–63 characters, unique ignoring case, no `'`, not `dnsaur-…` or one of Kea's own classes |
+| `matchers` | string[] | at least one; a client is a member when **any** matches. `vendor:<prefix>` against the start of option 60; `mac:<hex>` against the start of the hardware address, 1–6 bytes, stored lower-case |
+| `dns_servers`, `domain`, `domain_search`, `ntp_servers`, `static_routes`, `next_server`, `server_hostname`, `boot_file`, `options` | as on a scope | `""` / `[]` = **the scope's value** |
 | `created_at`, `modified_at` | int64 | unix ms |
 
 **Reservation** — a fixed address for one MAC inside one scope.
@@ -1733,7 +1748,7 @@ as `dhcp`.
 | `message` | string | the engine's own words — its refusal of the last `config-set`, or why it could not be reached. Cleared by the next render it accepts |
 | `table_age_seconds` | int64 | how stale the lease table is. An engine that stops answering keeps the table it last gave, which is still the truth about the segment |
 | `ha` | object or absent | `{mode, local_state, peer, remote_state, communication_interrupted, unacked_clients}`. **Absent on a single box**, and on an engine too old to know `status-get`'s HA block — a different fact from a pair that is not talking. `peer` is what the partner calls itself, as the engine talking to it reports the name, and is **absent** on an engine whose `status-get` does not carry one — so the status line has to read as "hot-standby" with no partner named, the same way it does for a box with no pair at all |
-| `scopes[]` | array | `{id, pool_size, leased}` per scope the last render saw. `leased` **may exceed** `pool_size` after a pool is shrunk: the engine keeps what it has already handed out until those leases expire |
+| `scopes[]` | array | `{id, pool_size, leased}` per scope the last render saw, **summed across its pools**. `leased` **may exceed** `pool_size` after a pool is shrunk: the engine keeps what it has already handed out until those leases expire |
 
 ### 3.12 Never serialized
 
@@ -2241,6 +2256,28 @@ nothing and said nothing. A static-route or generic-option row left entirely
 blank is **dropped** before validation — it is the row the `+` button
 appended — while a half-filled one is refused with the message on the field
 it is about and `aria-invalid` on it.
+
+**Network's Pools table** spans both form columns between Subnet and
+Gateway: `START` · `END` · `CLASS` · Remove per row, placeholders
+`10.0.0.100` / `10.0.0.199`, CLASS a select of `any` then the class names
+(sending `class_id`, `0` for any), `+ Add pool` under it and one muted line,
+`Ranges inside the subnet, no overlaps. A pool with a class serves only that
+class.` A new scope starts with one empty row. A row is checked as it is
+typed, once its addresses parse, and an invalid one gets the 3px
+`--destructive` inset rule, `aria-invalid` on both inputs and one of these on
+a full-width `role="alert"` line below it — **Save is disabled while any row
+shows one**:
+
+> `Not in subnet <cidr>` · `Start is after end` · `Overlaps <start> – <end>`
+> (the earlier row it overlaps) · `Unknown class <name>` (deleted elsewhere
+> while the dialog was open)
+
+A blank row is dropped like a blank route; with none left the table says
+`Add a pool` unless **Reservations only** is on. A server refusal that names
+`pools[i]` lands on the row it came from, in the server's words, and pulls
+Network into view. The Scopes table's POOL cell is the first range plus a
+muted `+N more`; LEASED is `leased / pool_size` from the status, both summed
+across the scope's pools.
 
 **DHCP's three status facts** (§6.3's rows 6, 9 and 10) are derived from the
 same `dhcp` object and watched by the same trouble poll, so a row and the

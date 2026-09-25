@@ -204,7 +204,7 @@ function parseCIDR(s: string): (AddressResult & { prefixLen: number }) | null {
 /** A dotted-quad, each octet 0-255 with no leading zero — netip.ParseAddr
  * rejects "010" as ambiguous with octal, and this mirrors that refusal
  * rather than guessing which base was meant. */
-function parseIPv4(s: string): [number, number, number, number] | null {
+export function parseIPv4(s: string): [number, number, number, number] | null {
   const parts = s.split(".");
   if (parts.length !== 4) return null;
   const bytes: number[] = [];

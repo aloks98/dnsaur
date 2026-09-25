@@ -1,6 +1,7 @@
 import { http, HttpResponse } from "msw";
 import type {
   Client,
+  DHCPClass,
   DHCPLease,
   DHCPReservation,
   DHCPScope,
@@ -221,8 +222,7 @@ export function dhcpScope(overrides: Partial<DHCPScope> = {}): DHCPScope {
     id: 1,
     name: "Main LAN",
     cidr: "192.168.150.0/24",
-    pool_start: "192.168.150.100",
-    pool_end: "192.168.150.199",
+    pools: [{ id: 1, scope_id: 1, start: "192.168.150.100", end: "192.168.150.199", class_id: 0 }],
     gateway: "192.168.150.1",
     dns_servers: "",
     domain: "lan.e412.in",
@@ -239,6 +239,27 @@ export function dhcpScope(overrides: Partial<DHCPScope> = {}): DHCPScope {
     reservations_only: false,
     created_at: Date.now() - 30 * 24 * 60 * 60 * 1000,
     modified_at: Date.now() - 15 * 60 * 1000,
+    ...overrides,
+  };
+}
+
+/** A class with one matcher and every option at "the scope's". */
+export function dhcpClass(overrides: Partial<DHCPClass> = {}): DHCPClass {
+  return {
+    id: 1,
+    name: "iot",
+    matchers: ["mac:a4:cf:12"],
+    dns_servers: "",
+    domain: "",
+    domain_search: "",
+    ntp_servers: "",
+    static_routes: [],
+    next_server: "",
+    server_hostname: "",
+    boot_file: "",
+    options: [],
+    created_at: Date.now() - 24 * 60 * 60 * 1000,
+    modified_at: Date.now() - 24 * 60 * 60 * 1000,
     ...overrides,
   };
 }
@@ -302,12 +323,14 @@ export function dhcpStatus(overrides: Partial<DHCPStatus> = {}): DHCPStatus {
 export function dhcpHandlers({
   status = dhcpStatus(),
   scopes = [dhcpScope()],
+  classes = [dhcpClass()],
   reservations = [dhcpReservation()],
   leases = [dhcpLease()],
   sync = { role: "main" } as SyncStatus,
 }: {
   status?: DHCPStatus;
   scopes?: DHCPScope[];
+  classes?: DHCPClass[];
   reservations?: DHCPReservation[];
   leases?: DHCPLease[];
   sync?: SyncStatus;
@@ -326,6 +349,7 @@ export function dhcpHandlers({
     http.get("/api/v1/resolver/status", () => HttpResponse.json(resolver)),
     http.get("/api/v1/dhcp/status", () => HttpResponse.json(status)),
     http.get("/api/v1/dhcp/scopes", () => HttpResponse.json(scopes)),
+    http.get("/api/v1/dhcp/classes", () => HttpResponse.json(classes)),
     http.get("/api/v1/dhcp/reservations", () => HttpResponse.json(reservations)),
     http.get("/api/v1/dhcp/leases", () => HttpResponse.json(leases)),
   ];
