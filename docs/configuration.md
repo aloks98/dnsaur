@@ -671,8 +671,9 @@ Classes and pools are synced configuration like scopes, and both engines of
 a pair render the same ones. Which replica is the standby is in
 [A pair](#a-pair).
 
-A lease from a class's pool is named under the class's DNS suffix when the
-class sets one.
+An address inside a class's pool is named under the class's DNS suffix when
+the class sets one. This includes a reservation there, because Kea hands
+that address the pool's options.
 
 Class names follow the scope-name rules. Names starting with `dnsaur-` are
 reserved, because the renderer uses them for its own classes. `ALL`,

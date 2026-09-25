@@ -116,16 +116,15 @@ func tableFrom(leases []Lease, scopes []store.Scope, classes []store.Class, rese
 		classDomain[c.ID] = c.Domain
 	}
 	// suffix is where a name sits: under the class of the pool the address
-	// came from when that class sets a domain, else the scope's own. A
-	// reservation passes no address and keeps the scope's: it was never
-	// drawn from a pool.
+	// is inside when that class sets a domain, else the scope's own. It goes
+	// by the address alone, reservations included, because Kea picks a
+	// pool's option-data by the assigned address: a device pinned inside the
+	// iot pool is handed the iot domain, so that is the name it answers to.
 	suffix := func(scopeID int64, ip netip.Addr) string {
 		s := byScope[scopeID]
-		if ip.IsValid() {
-			for _, p := range s.Pools {
-				if d := classDomain[p.ClassID]; d != "" && inPool(p, ip) {
-					return d
-				}
+		for _, p := range s.Pools {
+			if d := classDomain[p.ClassID]; d != "" && inPool(p, ip) {
+				return d
 			}
 		}
 		return cmp.Or(s.Domain, domain)
@@ -167,8 +166,6 @@ func tableFrom(leases []Lease, scopes []store.Scope, classes []store.Class, rese
 		}
 		if ok {
 			e.Reserved = true
-			// The operator's pin, not the pool, placed this address.
-			e.Suffix = suffix(l.SubnetID, netip.Addr{})
 			leased[res] = true
 			// A client that sent no hostname still answers to the name the
 			// operator gave its reservation.
@@ -193,7 +190,7 @@ func tableFrom(leases []Lease, scopes []store.Scope, classes []store.Class, rese
 		}
 		entries = append(entries, LeaseEntry{
 			ScopeID: r.ScopeID, IP: ip, MAC: r.MAC, Hostname: r.Hostname, Reserved: true,
-			Suffix: suffix(r.ScopeID, netip.Addr{}),
+			Suffix: suffix(r.ScopeID, ip),
 		})
 	}
 	return newTable(entries)

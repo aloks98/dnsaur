@@ -5,9 +5,10 @@
 
 CREATE TABLE dhcp_classes (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  -- Unique case-insensitively as well; that half is store.ValidateClass's,
-  -- as the overlap rule is ValidateScope's.
-  name TEXT NOT NULL UNIQUE,
+  -- Unique case-insensitively: "IoT" and "iot" would render as two engine
+  -- classes nobody can tell apart. ValidateClass says so first; the
+  -- constraint is what holds under a race.
+  name TEXT NOT NULL UNIQUE COLLATE NOCASE,
   -- JSON list of matchers: "vendor:<prefix>" (option 60 starts with) or
   -- "mac:<hex>" (hardware address starts with 1-6 bytes). Any matches.
   matchers TEXT NOT NULL DEFAULT '[]',

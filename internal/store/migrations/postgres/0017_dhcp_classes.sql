@@ -5,9 +5,10 @@
 
 CREATE TABLE dhcp_classes (
   id BIGSERIAL PRIMARY KEY,
-  -- Unique case-insensitively as well; that half is store.ValidateClass's,
-  -- as the overlap rule is ValidateScope's.
-  name TEXT NOT NULL UNIQUE,
+  -- Unique case-insensitively: "IoT" and "iot" would render as two engine
+  -- classes nobody can tell apart. ValidateClass says so first; the
+  -- dhcp_classes_name index below is what holds under a race.
+  name TEXT NOT NULL,
   -- JSON list of matchers: "vendor:<prefix>" (option 60 starts with) or
   -- "mac:<hex>" (hardware address starts with 1-6 bytes). Any matches.
   matchers TEXT NOT NULL DEFAULT '[]',
@@ -25,6 +26,8 @@ CREATE TABLE dhcp_classes (
   created_at BIGINT NOT NULL,
   modified_at BIGINT NOT NULL
 );
+
+CREATE UNIQUE INDEX dhcp_classes_name ON dhcp_classes (lower(name));
 
 CREATE TABLE dhcp_pools (
   id BIGSERIAL PRIMARY KEY,

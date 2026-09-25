@@ -1155,8 +1155,10 @@ and 3.0.3:
 
 A lease's DNS name follows its pool. If the address is inside a pool whose
 class sets a domain, the name uses that domain; otherwise it uses the
-scope's domain, then `dhcp.domain`. A reservation, leased or not, keeps the
-scope's domain: the operator placed it, not the pool.
+scope's domain, then `dhcp.domain`. A reservation is named the same way,
+leased or not: Kea chooses a pool's options by the assigned address, so a
+device reserved inside a class pool is handed that class's domain, and its
+name follows.
 
 ### The lease table
 

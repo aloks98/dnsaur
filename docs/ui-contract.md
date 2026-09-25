@@ -1199,7 +1199,7 @@ DHCP on is a bootstrap change and a restart.
 | `GET /dhcp/scopes` | 200 `DHCPScope[]` | ordered by id |
 | `POST /dhcp/scopes` | 201 the scope, `Location` | **400** the validator's own message, **409** `managed by <peer_url>` on a replica. A pool naming no class is **422** `pools[<i>]: no class with id <n>`; `pool_start`/`pool_end` are **422** `pools replaces pool_start and pool_end` here and on a `PATCH` |
 | `PATCH /dhcp/scopes/{id}` | 204 | a **merge** — every key the body omits keeps its value. `match_client_id` absent means *unchanged* here and *true* on a create |
-| `DELETE /dhcp/scopes/{id}` | 204 | its reservations go with it |
+| `DELETE /dhcp/scopes/{id}` | 204 | its reservations and pools go with it |
 | `GET /dhcp/classes` | 200 `DHCPClass[]` | ordered by id |
 | `POST /dhcp/classes` | 201 the class, `Location` | **400** the validator's own message, **409** a name already taken, ignoring case |
 | `GET /dhcp/classes/{id}` | 200 `DHCPClass` | |
@@ -1689,7 +1689,7 @@ lease survives a restart of either process.
 | Field | Type | Notes |
 |---|---|---|
 | `id` | int64 | travels in the sync bundle, so it names the same row on both boxes |
-| `name` | string | non-empty, unique |
+| `name` | string | non-empty, at most 63 characters, no control characters, unique |
 | `cidr` | string | an IPv4 prefix **in masked form**. Host bits set are refused rather than quietly masked. No two *enabled* scopes may overlap |
 | `pools` | `{id, scope_id, start, end, class_id}[]` | in order, **replaced whole** on every write; pool ids are the server's and change with it, so a write sends `{start, end, class_id}` only. Each is inclusive, inside `cidr`, `start <= end`, neither end the network or broadcast address, and no two overlap. At least one **unless** `reservations_only`. `class_id` **`0` = any client** not in a class that owns a pool in this scope; any other reserves the pool for that class's members |
 | `gateway` | string | option 3; `""` hands out no router. Must be inside `cidr` |
@@ -1711,7 +1711,7 @@ lease survives a restart of either process.
 | Field | Type | Notes |
 |---|---|---|
 | `id` | int64 | travels in the sync bundle, like a scope's |
-| `name` | string | 1–63 characters, unique ignoring case, no `'`, not `dnsaur-…` or one of Kea's own classes |
+| `name` | string | 1–63 characters after trimming, unique ignoring case, no `'` or control characters, not `dnsaur-…` or one of Kea's own classes |
 | `matchers` | string[] | at least one; a client is a member when **any** matches. `vendor:<prefix>` against the start of option 60; `mac:<hex>` against the start of the hardware address, 1–6 bytes, stored lower-case |
 | `dns_servers`, `domain`, `domain_search`, `ntp_servers`, `static_routes`, `next_server`, `server_hostname`, `boot_file`, `options` | as on a scope | `""` / `[]` = **the scope's value** |
 | `created_at`, `modified_at` | int64 | unix ms |

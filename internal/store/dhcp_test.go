@@ -351,6 +351,7 @@ func TestValidateScope(t *testing.T) {
 	}{
 		{name: "valid", scope: valid},
 		{name: "empty name", scope: with(func(s *Scope) { s.Name = "" }), want: errAny},
+		{name: "newline in name", scope: with(func(s *Scope) { s.Name = "home\nlan" }), want: errAny},
 		{name: "bad cidr", scope: with(func(s *Scope) { s.CIDR = "10.0.0.0/33" }), want: errAny},
 		{name: "host bits in cidr", scope: with(func(s *Scope) { s.CIDR = "10.0.0.5/24" }), want: errAny},
 		{name: "ipv6 cidr", scope: with(func(s *Scope) { s.CIDR = "fd00::/64" }), want: errAny},
@@ -883,6 +884,7 @@ func TestValidateClassMatchers(t *testing.T) {
 		"all":           "all is a class Kea defines itself",
 		"booting":       "booting is a class Kea defines itself",
 		"it's":          "name cannot contain '",
+		"iot\nlan":      "name cannot contain control characters",
 	} {
 		err := ValidateClass(Class{Name: name, Matchers: []string{"mac:aa"}}, nil)
 		if err == nil || err.Error() != want {
@@ -962,8 +964,12 @@ func TestClassRoundTrip(t *testing.T) {
 		if err := dhcp.DeleteClass(ctx, 987654321); !errors.Is(err, ErrNotFound) {
 			t.Errorf("DeleteClass(unknown) = %v, want ErrNotFound", err)
 		}
-		if _, err := dhcp.AddClass(ctx, Class{Name: f.group, Matchers: []string{"mac:aa"}}); !errors.Is(err, ErrDuplicate) {
-			t.Errorf("a second class named %q = %v, want ErrDuplicate", f.group, err)
+		// Past the validator too: the schema holds the case-insensitive
+		// rule when two writes race it (migration 0017).
+		for _, dup := range []string{f.group, strings.ToUpper(f.group)} {
+			if _, err := dhcp.AddClass(ctx, Class{Name: dup, Matchers: []string{"mac:aa"}}); !errors.Is(err, ErrDuplicate) {
+				t.Errorf("a second class named %q = %v, want ErrDuplicate", dup, err)
+			}
 		}
 		if err := dhcp.DeleteClass(ctx, id); err != nil {
 			t.Fatal(err)

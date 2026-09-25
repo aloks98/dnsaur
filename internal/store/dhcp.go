@@ -114,7 +114,7 @@ type Pool struct {
 	Start   string `json:"start"`
 	End     string `json:"end"`
 	// ClassID reserves the pool for one class's members; 0 serves any
-	// client, class members included once their own pool is full.
+	// client not in a class that owns a pool in this scope.
 	ClassID int64 `json:"class_id"`
 }
 
@@ -838,6 +838,11 @@ func validateName(name string) error {
 	name = strings.TrimSpace(name)
 	if name == "" {
 		return errors.New("name is required")
+	}
+	// A name is a table cell, a select option and, for a class, an engine
+	// identifier: a newline or a tab in one is a paste gone wrong.
+	if strings.ContainsFunc(name, unicode.IsControl) {
+		return errors.New("name cannot contain control characters")
 	}
 	if n := utf8.RuneCountInString(name); n > nameLimit {
 		return fmt.Errorf("name is %d characters, above the %d allowed", n, nameLimit)

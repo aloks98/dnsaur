@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/aloks98/dnsaur/internal/dhcp"
@@ -795,6 +796,72 @@ func TestDHCPClassRoutes(t *testing.T) {
 	}
 	if w := doReq(t, h, "GET", resourceURL("dhcp/classes", cls.ID), "", cookie); w.Code != http.StatusNotFound {
 		t.Fatalf("GET a deleted class = %d, want 404", w.Code)
+	}
+}
+
+// TestDHCPClassCreateAnswersTheStoredRow: the 201 is what a GET would return,
+// the name trimmed and a mac: matcher lower-cased, not the body echoed.
+func TestDHCPClassCreateAnswersTheStoredRow(t *testing.T) {
+	srv, s, _ := dhcpServer(t)
+	h := srv.Handler()
+	cookie := login(t, srv, s)
+
+	w := doReq(t, h, "POST", "/api/v1/dhcp/classes", `{"name":" IoT-Printers ","matchers":["mac:A4:CF:12"]}`, cookie)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("POST class = %d %s, want 201", w.Code, strings.TrimSpace(w.Body.String()))
+	}
+	c := mustJSON[store.Class](t, w.Body)
+	if c.Name != "IoT-Printers" || len(c.Matchers) != 1 || c.Matchers[0] != "mac:a4:cf:12" {
+		t.Fatalf("201 body = %+v, want name IoT-Printers and matcher mac:a4:cf:12", c)
+	}
+}
+
+// racingClasses is the real DHCP store with a write slipped in after the
+// first Classes() read: another request's class landing between the
+// handler's validation and its insert. Timing, not a fake.
+type racingClasses struct {
+	store.DHCPStore
+	race  func()
+	fired atomic.Bool
+}
+
+func (r *racingClasses) Classes(ctx context.Context) ([]store.Class, error) {
+	all, err := r.DHCPStore.Classes(ctx)
+	if r.fired.CompareAndSwap(false, true) {
+		r.race()
+	}
+	return all, err
+}
+
+type racingStore struct {
+	store.Store
+	dhcp store.DHCPStore
+}
+
+func (r *racingStore) DHCP() store.DHCPStore { return r.dhcp }
+
+// TestDHCPClassNameRaceIs409: a case-insensitive twin the validator could
+// not see is refused by the schema (migration 0017), and the API answers
+// 409 through storeErrDup rather than 503.
+func TestDHCPClassNameRaceIs409(t *testing.T) {
+	fake := newKeaFake(t)
+	srv, st, _ := testServer(t, func(d *Deps) {
+		inner := d.Store
+		d.DHCP = dhcp.NewManager(dhcp.NewClient(fake.srv.Socket()),
+			storeInputs{st: inner, socket: fake.srv.Socket()}, inner.Settings(),
+			slog.New(slog.NewTextHandler(io.Discard, nil)))
+		d.Store = &racingStore{Store: inner, dhcp: &racingClasses{DHCPStore: inner.DHCP(), race: func() {
+			if _, err := inner.DHCP().AddClass(context.Background(), store.Class{Name: "iot", Matchers: []string{"mac:aa"}}); err != nil {
+				t.Errorf("the racing write: %v", err)
+			}
+		}}}
+	})
+	h := srv.Handler()
+	cookie := login(t, srv, st)
+
+	w := doReq(t, h, "POST", "/api/v1/dhcp/classes", `{"name":"IoT","matchers":["mac:bb"]}`, cookie)
+	if w.Code != http.StatusConflict || errorOf(t, w) != "a class with that name already exists" {
+		t.Fatalf("POST IoT after iot landed = %d %s, want 409 from storeErrDup", w.Code, strings.TrimSpace(w.Body.String()))
 	}
 }
 

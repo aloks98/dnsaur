@@ -242,7 +242,13 @@ func realClasses(t *testing.T, c *dhcp.Client, base dhcp.RenderInput) {
 	ctx := t.Context()
 	iface := cmp.Or(os.Getenv("DNSAUR_TEST_KEA_IFACE"), "eth0")
 	in := base
-	in.Reservations = nil
+	// Pinned inside the iot pool, one to a member and one to a client no
+	// class claims: Kea picks a pool's options by the address it assigns,
+	// which is why dnsaur names a reservation by its address (leases.go).
+	in.Reservations = []store.Reservation{
+		{ID: 2, ScopeID: 2, MAC: "a4:cf:12:00:00:04", IP: "172.17.100.180", Hostname: "cam"},
+		{ID: 3, ScopeID: 2, MAC: "02:00:00:00:00:05", IP: "172.17.100.181", Hostname: "printer"},
+	}
 	in.Interfaces = nil
 	if iface != "none" {
 		in.Interfaces = []string{iface}
@@ -294,6 +300,8 @@ func realClasses(t *testing.T, c *dhcp.Client, base dhcp.RenderInput) {
 		// class's, and the class's boot file where the subnet has none.
 		{"pxe member", "02:00:00:00:00:02", "PXEClient:Arch:00007", anyPool, "172.17.0.2", "home.lan", "bootx64.efi"},
 		{"no class", "02:00:00:00:00:03", "", anyPool, "172.17.0.2", "home.lan", ""},
+		{"member reserved in the class pool", "a4:cf:12:00:00:04", "", [2]string{"172.17.100.180", "172.17.100.180"}, "172.17.0.9", "iot.lan", ""},
+		{"no class, reserved in the class pool", "02:00:00:00:00:05", "", [2]string{"172.17.100.181", "172.17.100.181"}, "172.17.0.9", "iot.lan", ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ack := exchange(t, iface, tc.mac, tc.vendor)

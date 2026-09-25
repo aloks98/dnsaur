@@ -448,7 +448,12 @@ func (s *Server) handleDHCPClassCreate(w http.ResponseWriter, r *http.Request) {
 		storeErrDup(w, err, "a class with that name already exists")
 		return
 	}
-	c.ID = id
+	// Read back rather than echo the body: the store trims the name and
+	// lower-cases mac: matchers, and the 201 is the row a GET would return.
+	if c, err = s.deps.Store.DHCP().Class(r.Context(), id); err != nil {
+		storeErr(w, err)
+		return
+	}
 	s.applyDHCP(r)
 	created(w, resourceURL("dhcp/classes", id), c)
 }

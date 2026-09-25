@@ -77,9 +77,10 @@ func TestUnnamedReservationsAreStillReservations(t *testing.T) {
 	}
 }
 
-// A lease from a pool whose class sets a domain is named under the class's
-// suffix; one from the scope's other pool, and a reservation wherever its
-// address sits, under the scope's. The suffix belongs to the entry, so a
+// An address inside a pool whose class sets a domain is named under the
+// class's suffix, a reservation's too, leased or not: Kea hands the pool's
+// domain to whatever address it gives out there. One from the scope's other
+// pool is named under the scope's. The suffix belongs to the entry, so a
 // release — which rebuilds the table from its entries — keeps every other
 // name where it was.
 func TestLeaseNamesFollowThePoolsClass(t *testing.T) {
@@ -103,7 +104,8 @@ func TestLeaseNamesFollowThePoolsClass(t *testing.T) {
 		dhcp.Lease{IP: "10.42.0.160", MAC: "a4:cf:12:00:00:01", Hostname: "plug", SubnetID: 1, CLTT: 1000, ValidLft: 3600},
 		dhcp.Lease{IP: "10.42.0.161", MAC: "a4:cf:12:00:00:02", Hostname: "bulb", SubnetID: 1, CLTT: 1000, ValidLft: 3600},
 		dhcp.Lease{IP: "10.42.0.110", MAC: "aa:bb:cc:dd:ee:10", Hostname: "laptop", SubnetID: 1, CLTT: 1000, ValidLft: 3600},
-		// Reserved, leased, and inside the class's pool: the pin placed it.
+		// Reserved, leased, and inside the class's pool: named like any
+		// other address there.
 		dhcp.Lease{IP: "10.42.0.180", MAC: "aa:bb:cc:dd:ee:02", Hostname: "cam", SubnetID: 1, CLTT: 1000, ValidLft: 3600},
 	)
 	m := dhcp.NewManager(dhcp.NewClient(e.Socket()), &fakeInputs{in: in}, openSettings(t), nil)
@@ -119,8 +121,8 @@ func TestLeaseNamesFollowThePoolsClass(t *testing.T) {
 		}{
 			{"plug", "things.lan", true}, {"plug", "home.lan", false},
 			{"laptop", "home.lan", true}, {"laptop", "things.lan", false},
-			{"printer", "home.lan", true}, {"printer", "things.lan", false},
-			{"cam", "home.lan", true}, {"cam", "things.lan", false},
+			{"printer", "things.lan", true}, {"printer", "home.lan", false},
+			{"cam", "things.lan", true}, {"cam", "home.lan", false},
 		} {
 			if _, ok := table.ByName(c.label, c.suffix); ok != c.want {
 				t.Errorf("%s: %s.%s resolves = %v, want %v", when, c.label, c.suffix, ok, c.want)

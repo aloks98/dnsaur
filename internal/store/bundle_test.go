@@ -1031,7 +1031,16 @@ func TestBundleCarriesClassesAndPools(t *testing.T) {
 		if got, err := replica.DHCP().Class(ctx, cid); err != nil || !reflect.DeepEqual(got, wantClass) {
 			t.Errorf("class %d on the replica = %+v (err %v), want the main's %+v", cid, got, err, wantClass)
 		}
-		if got, err := replica.DHCP().Scope(ctx, sid); err != nil || !reflect.DeepEqual(got, wantScope) {
+		// created_at is the replica row's own: the upsert keeps it on a row
+		// that already stands, and the shared postgres database may hold a
+		// scope under this id from an earlier test. Everything else is the
+		// main's.
+		asReplicaHolds := func(got Scope) Scope {
+			w := wantScope
+			w.CreatedAt = got.CreatedAt
+			return w
+		}
+		if got, err := replica.DHCP().Scope(ctx, sid); err != nil || !reflect.DeepEqual(got, asReplicaHolds(got)) {
 			t.Errorf("scope %d on the replica = %+v (err %v), want the main's %+v", sid, got, err, wantScope)
 		}
 
@@ -1050,7 +1059,7 @@ func TestBundleCarriesClassesAndPools(t *testing.T) {
 		if _, err := replica.DHCP().Class(ctx, stale); !errors.Is(err, ErrNotFound) {
 			t.Errorf("class %d survived an import whose bundle lacked it (err %v)", stale, err)
 		}
-		if got, err := replica.DHCP().Scope(ctx, sid); err != nil || !reflect.DeepEqual(got, wantScope) {
+		if got, err := replica.DHCP().Scope(ctx, sid); err != nil || !reflect.DeepEqual(got, asReplicaHolds(got)) {
 			t.Errorf("scope %d after the second import = %+v (err %v), want the main's %+v", sid, got, err, wantScope)
 		}
 
