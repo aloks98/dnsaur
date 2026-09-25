@@ -4,6 +4,7 @@ import { afterEach, expect, test, vi } from "vitest";
 import { screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { useForm } from "react-hook-form";
+import { dhcpHandlers } from "../test/msw-handlers";
 import { server } from "../test/msw-server";
 import { renderWithProviders } from "../test/render";
 import type { SyncStatus } from "../api/types";
@@ -79,6 +80,62 @@ test("a main lists each registered replica and marks a stale one by its last see
   // badge, no extra word, no row tint.
   const stale = screen.getByRole("row", { name: /attic-pi/ });
   expect(within(stale).getByText("2h ago")).toHaveClass("text-muted-foreground");
+});
+
+function twoReplicas(): SyncStatus {
+  const base = {
+    dns_addr: "192.168.150.2:53",
+    version_applied: 412,
+    last_seen: Date.now(),
+    stale: false,
+  };
+  return {
+    role: "main",
+    replicas: [
+      { ...base, instance_id: "backup-box", dhcp: true },
+      { ...base, instance_id: "attic-pi", dhcp: false },
+    ],
+  };
+}
+
+const noEngineLine = "A replica without an engine is never the standby.";
+
+test("the DHCP column says engine or no engine, the second muted", async () => {
+  mockSyncStatus(twoReplicas());
+  renderWithProviders(<Harness />);
+
+  const withEngine = await screen.findByRole("row", { name: /backup-box/ });
+  expect(within(withEngine).getByText("engine")).not.toHaveClass("text-muted-foreground");
+  const without = screen.getByRole("row", { name: /attic-pi/ });
+  expect(within(without).getByText("no engine")).toHaveClass("text-muted-foreground");
+  expect(screen.getByRole("columnheader", { name: "DHCP" })).toBeInTheDocument();
+});
+
+test("a replica with no engine gets the standby line when this box runs DHCP", async () => {
+  server.use(...dhcpHandlers());
+  mockSyncStatus(twoReplicas());
+  renderWithProviders(<Harness />);
+
+  expect(await screen.findByText(noEngineLine)).toBeInTheDocument();
+});
+
+test("no standby line when this box runs no DHCP", async () => {
+  mockSyncStatus(twoReplicas());
+  renderWithProviders(<Harness />);
+
+  await screen.findByRole("row", { name: /attic-pi/ });
+  expect(screen.queryByText(noEngineLine)).not.toBeInTheDocument();
+});
+
+test("no standby line when every replica has an engine", async () => {
+  server.use(...dhcpHandlers());
+  const status = twoReplicas();
+  status.replicas = status.replicas!.map((r) => ({ ...r, dhcp: true }));
+  mockSyncStatus(status);
+  renderWithProviders(<Harness />);
+
+  await screen.findByRole("row", { name: /attic-pi/ });
+  expect(screen.queryByText(noEngineLine)).not.toBeInTheDocument();
 });
 
 test("a main offers no key select and no token box", async () => {

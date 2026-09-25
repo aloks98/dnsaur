@@ -37,9 +37,9 @@ One scope treats every client alike: the same options, an address from anywhere 
 | `scope_id` | fk `dhcp_scopes` on delete cascade | |
 | `position` | integer | order in the dialog, stable |
 | `start`, `end` | text | IPv4, `start <= end`, both inside the scope's subnet, neither the network nor broadcast address |
-| `class_id` | fk `dhcp_classes` nullable, on delete **restrict** | a class in use cannot be deleted |
+| `class_id` | `0` = any client, not nullable and not a foreign key (0 names no row); the store refuses a delete while a pool names the class | a class in use cannot be deleted |
 
-The migration copies every scope's `pool_start`/`pool_end` into one pool at position 0, then drops the two columns. A scope must have at least one pool (a scope with none is refused on write, so the migration's invariant holds). Pools within a scope may not overlap; a reservation's address may sit inside or outside any pool, as before.
+The migration copies every scope's `pool_start`/`pool_end` into one pool at position 0, then drops the two columns. A scope must have at least one pool unless it is `reservations_only` (a scope with none is otherwise refused on write, so the migration's invariant holds; a `reservations_only` scope that held no range keeps none). Pools within a scope may not overlap; a reservation's address may sit inside or outside any pool, as before.
 
 ### 3.3 Wire shapes
 

@@ -601,7 +601,8 @@ Four things have to be true for it:
   `max-response-delay` on every client before serving it. Because that
   answer arrives with the probe rather than with the pairing, the pair
   appears one `sync.interval_seconds` after a replica pairs, not at the
-  moment it does. The two settings are written only once this box's own Kea
+  moment it does. The main's Sync band shows each replica's answer in its
+  `DHCP` column, `engine` or `no engine`. The two settings are written only once this box's own Kea
   has accepted a configuration carrying the pair — a main that cannot render
   one never tells a replica it is paired.
 - **Same Kea version on both boxes.** One main on 2.6 and a standby on 3.0 is
@@ -650,7 +651,8 @@ one matcher, and a client is a member when any one of them matches:
 A class's options are the same set a scope has. A blank field means the
 scope's value.
 
-A scope has one or more pools, listed in order, that do not overlap. Each
+A scope has one or more pools, listed in order, that do not overlap — none
+only when it hands out reservations alone (`reservations_only`). Each
 pool is open to any client or reserved for one class. Two rules follow from
 how Kea works:
 
@@ -664,6 +666,10 @@ how Kea works:
   members. When the class's pools are full, its members get no address in
   that scope; they do not fall back to an open pool. Size a class's pool
   for every device that matches it.
+
+Classes and pools are synced configuration like scopes, and both engines of
+a pair render the same ones. Which replica is the standby is in
+[A pair](#a-pair).
 
 A lease from a class's pool is named under the class's DNS suffix when the
 class sets one.

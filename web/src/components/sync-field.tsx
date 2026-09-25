@@ -19,6 +19,7 @@ import {
   useStopFollowing,
   useSyncStatus,
 } from "../hooks/use-sync";
+import { useDHCPEnabled } from "../hooks/use-dhcp";
 import { relativeTime } from "../lib/format";
 import { rhfName } from "../lib/rhf-name";
 
@@ -116,6 +117,7 @@ function errorId(id: string): string {
 function ReplicaTable() {
   const status = useSyncStatus();
   const forget = useForgetReplica();
+  const dhcpEnabled = useDHCPEnabled();
   const replicas = status.data?.replicas ?? [];
 
   if (replicas.length === 0) {
@@ -123,58 +125,76 @@ function ReplicaTable() {
   }
 
   return (
-    <table className="w-full border-collapse border border-border font-mono text-[12.5px]">
-      <thead>
-        <tr className="border-b border-border bg-muted text-[9.5px] tracking-[0.12em] text-muted-foreground uppercase">
-          <th className="px-2.5 py-1.5 text-left font-semibold">Instance</th>
-          <th className="w-[176px] px-2.5 py-1.5 text-left font-semibold">DNS address</th>
-          <th className="w-24 px-2.5 py-1.5 text-left font-semibold">Applied</th>
-          <th className="w-32 px-2.5 py-1.5 text-left font-semibold">Last seen</th>
-          <th className="w-[72px] px-2.5 py-1.5">
-            {/* The board leaves this header blank; the name is still owed to
+    <>
+      <table className="w-full border-collapse border border-border font-mono text-[12.5px]">
+        <thead>
+          <tr className="border-b border-border bg-muted text-[9.5px] tracking-[0.12em] text-muted-foreground uppercase">
+            <th className="px-2.5 py-1.5 text-left font-semibold">Instance</th>
+            <th className="w-[176px] px-2.5 py-1.5 text-left font-semibold">DNS address</th>
+            <th className="w-[92px] px-2.5 py-1.5 text-left font-semibold">DHCP</th>
+            <th className="w-24 px-2.5 py-1.5 text-left font-semibold">Applied</th>
+            <th className="w-32 px-2.5 py-1.5 text-left font-semibold">Last seen</th>
+            <th className="w-[72px] px-2.5 py-1.5">
+              {/* The board leaves this header blank; the name is still owed to
                 anyone reading the table a cell at a time. */}
-            <span className="sr-only">Actions</span>
-          </th>
-        </tr>
-      </thead>
-      <tbody>
-        {replicas.map((replica) => (
-          <tr key={replica.instance_id} className="border-b border-border-muted">
-            <td className="px-2.5 py-1.5 font-medium">{replica.instance_id}</td>
-            <td className="px-2.5 py-1.5">{replica.dns_addr}</td>
-            <td className="px-2.5 py-1.5 tabular-nums">v{replica.version_applied}</td>
-            {/* A stale replica is marked here and nowhere else: the row is
+              <span className="sr-only">Actions</span>
+            </th>
+          </tr>
+        </thead>
+        <tbody>
+          {replicas.map((replica) => (
+            <tr key={replica.instance_id} className="border-b border-border-muted">
+              <td className="px-2.5 py-1.5 font-medium">{replica.instance_id}</td>
+              <td className="px-2.5 py-1.5">{replica.dns_addr}</td>
+              <td
+                className={cn(
+                  "px-2.5 py-1.5 whitespace-nowrap",
+                  !replica.dhcp && "text-muted-foreground",
+                )}
+              >
+                {replica.dhcp ? "engine" : "no engine"}
+              </td>
+              <td className="px-2.5 py-1.5 tabular-nums">v{replica.version_applied}</td>
+              {/* A stale replica is marked here and nowhere else: the row is
                 not tinted and the id gains no badge, because the fact being
                 reported is exactly "this is how long it has been quiet". */}
-            <td className={cn("px-2.5 py-1.5", replica.stale && "text-muted-foreground")}>
-              {relativeTime(replica.last_seen)}
-            </td>
-            <td className="px-2.5 py-1.5 text-right">
-              {/* type="button": this band sits inside the settings form, and
+              <td className={cn("px-2.5 py-1.5", replica.stale && "text-muted-foreground")}>
+                {relativeTime(replica.last_seen)}
+              </td>
+              <td className="px-2.5 py-1.5 text-right">
+                {/* type="button": this band sits inside the settings form, and
                   a bare button in a form submits it. */}
-              <Button
-                type="button"
-                size="sm"
-                variant="ghost"
-                aria-label={`Forget ${replica.instance_id}`}
-                disabled={forget.isPending}
-                onClick={() =>
-                  forget.mutate(replica.instance_id, {
-                    // The row going away is the whole of the success
-                    // signal, so a refusal that said nothing would look
-                    // exactly like the moment before one that worked.
-                    onError: () =>
-                      toast.error(`Couldn't forget ${replica.instance_id} — try again`),
-                  })
-                }
-              >
-                Forget
-              </Button>
-            </td>
-          </tr>
-        ))}
-      </tbody>
-    </table>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="ghost"
+                  aria-label={`Forget ${replica.instance_id}`}
+                  disabled={forget.isPending}
+                  onClick={() =>
+                    forget.mutate(replica.instance_id, {
+                      // The row going away is the whole of the success
+                      // signal, so a refusal that said nothing would look
+                      // exactly like the moment before one that worked.
+                      onError: () =>
+                        toast.error(`Couldn't forget ${replica.instance_id} — try again`),
+                    })
+                  }
+                >
+                  Forget
+                </Button>
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      {/* Only where it changes something: a box with no DHCP of its own has
+        no standby to pick, so the line would describe nothing. */}
+      {dhcpEnabled && replicas.some((r) => !r.dhcp) && (
+        <p className="text-[11px] text-muted-foreground">
+          A replica without an engine is never the standby.
+        </p>
+      )}
+    </>
   );
 }
 

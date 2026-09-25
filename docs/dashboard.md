@@ -1146,8 +1146,12 @@ and adds it as a NOTIFY target, so no ACL is edited either — **Zones**'
 #### What the band shows afterwards
 
 **On a main**, one row per paired replica: its instance id, where it answers
-DNS, the configuration version it has applied, and when it was last heard
-from. A replica that has missed three intervals is marked by that last
+DNS, whether it runs a DHCP engine (`engine` or `no engine`), the
+configuration version it has applied, and when it was last heard from. On a
+box that runs DHCP, a replica with no engine adds one line under the table —
+*A replica without an engine is never the standby.* — because the main skips
+it when it picks the standby (see
+[`configuration.md`](configuration.md#a-pair)). A replica that has missed three intervals is marked by that last
 column alone, greyed — it has not been forgotten and its transfer permission
 is intact, it simply is not answering. **Forget** removes a row, revokes that
 box's secret and takes its address back out of the transfer allow. Nothing

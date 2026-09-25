@@ -2092,12 +2092,17 @@ to. The left column's line names the role, verbatim:
   answers one back, so the panel's whole lifetime is the mutation's — the ×
   clears it, a second `Add replica` replaces it, and leaving the page ends
   it.
-- One row per replica in a bordered 5-column table — `INSTANCE`,
-  `DNS ADDRESS`, `APPLIED` (as `v<version_applied>`), `LAST SEEN`, and a ghost **`Forget`**
+- One row per replica in a bordered 6-column table — `INSTANCE`,
+  `DNS ADDRESS`, `DHCP`, `APPLIED` (as `v<version_applied>`), `LAST SEEN`, and a ghost **`Forget`**
   per row
   sending `DELETE /sync/replicas/{instance_id}`. A `stale: true` entry is
   marked by its last-seen cell alone, in `--muted-foreground`: no badge, no
-  row tint. With none registered the band says `No replicas registered.`
+  row tint. `DHCP` reads `engine` when the replica's `dhcp` is true and
+  `no engine`, in `--muted-foreground`, when it is false. Under the table,
+  muted, `A replica without an engine is never the standby.` — only when
+  some replica has `dhcp: false` **and** this box runs DHCP (§6.4); a box
+  with no engine picks no standby, so the line would describe nothing. With
+  none registered the band says `No replicas registered.`
 
 A main is also any box that has not paired yet, so the band adds, below the
 registry: **`Peer URL`** (key `sync.peer_url`, placeholder
