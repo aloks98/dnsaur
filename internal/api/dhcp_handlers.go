@@ -154,15 +154,15 @@ func (s *Server) handleDHCPReservations(w http.ResponseWriter, r *http.Request) 
 // own, because it names the column and the value — and the two sentinels
 // §4.3 and §4.4 keep apart are refusals of the same kind, not failures:
 // ErrDuplicate is the one that is about another row rather than this one.
-// ErrReference is a pool naming a class that does not exist (§5): 422, the
-// message naming pools[i], whether the validator saw it or the write's own
-// re-check did.
+// A pool naming a class that does not exist is 422 (§5), the message naming
+// pools[i], whether the validator saw it or the write's own re-check did.
 func dhcpInvalid(w http.ResponseWriter, err error) {
+	var unknown *store.UnknownClassError
 	switch {
 	case errors.Is(err, store.ErrDuplicate):
 		errJSON(w, http.StatusConflict, err.Error())
-	case errors.Is(err, store.ErrReference):
-		errJSON(w, http.StatusUnprocessableEntity, err.Error())
+	case errors.As(err, &unknown):
+		errJSON(w, http.StatusUnprocessableEntity, unknown.Error())
 	default:
 		errJSON(w, http.StatusBadRequest, err.Error())
 	}
@@ -170,22 +170,42 @@ func dhcpInvalid(w http.ResponseWriter, err error) {
 
 // scopeWriteErr answers a failed AddScope or UpdateScope: a class deleted
 // between the validation and the write is the validator's refusal, late.
+// Only the store's own error is handed on; any other reference failure is a
+// driver's text, and goes through storeErrDup like every other.
 func scopeWriteErr(w http.ResponseWriter, err error) {
-	if errors.Is(err, store.ErrReference) {
-		dhcpInvalid(w, err)
+	var unknown *store.UnknownClassError
+	if errors.As(err, &unknown) {
+		errJSON(w, http.StatusUnprocessableEntity, unknown.Error())
 		return
 	}
 	storeErrDup(w, err, "a scope with that name already exists")
 }
 
+// bodyKeys is the top-level keys of a body, or nil for one that is not an
+// object — which the strict decode after it then refuses.
+func bodyKeys(raw []byte) map[string]json.RawMessage {
+	var keys map[string]json.RawMessage
+	_ = json.Unmarshal(raw, &keys)
+	return keys
+}
+
+// dropLists nils every list the body names, so the merge replaces it whole.
+// encoding/json decodes an array into the existing slice's elements in
+// place: a body's one pool without class_id, laid over a stored pool that
+// had one, would otherwise keep the class — the open range silently
+// becoming the class's.
+func dropLists(keys map[string]json.RawMessage, lists map[string]func()) {
+	for k, clear := range lists {
+		if _, ok := keys[k]; ok {
+			clear()
+		}
+	}
+}
+
 // oldPoolKeys refuses round one's pool_start and pool_end by name. The strict
 // decode would refuse them anyway, as "invalid json", which does not tell a
 // script written against the old API what to send instead.
-func oldPoolKeys(w http.ResponseWriter, raw []byte) bool {
-	var keys map[string]json.RawMessage
-	if json.Unmarshal(raw, &keys) != nil {
-		return false
-	}
+func oldPoolKeys(w http.ResponseWriter, keys map[string]json.RawMessage) bool {
 	_, start := keys["pool_start"]
 	_, end := keys["pool_end"]
 	if start || end {
@@ -213,7 +233,7 @@ type scopeWire store.Scope
 // copy of it here.
 func decodeScope(w http.ResponseWriter, r *http.Request) (store.Scope, bool) {
 	raw, ok := readBody(w, r)
-	if !ok || oldPoolKeys(w, raw) {
+	if !ok || oldPoolKeys(w, bodyKeys(raw)) {
 		return store.Scope{}, false
 	}
 	var strict scopeWire
@@ -285,10 +305,19 @@ func (s *Server) handleDHCPScopeCreate(w http.ResponseWriter, r *http.Request) {
 // DisallowUnknownFields see the keys at all.
 func patchScope(w http.ResponseWriter, r *http.Request, cur store.Scope) (store.Scope, bool) {
 	raw, ok := readBody(w, r)
-	if !ok || oldPoolKeys(w, raw) {
+	if !ok {
+		return cur, false
+	}
+	keys := bodyKeys(raw)
+	if oldPoolKeys(w, keys) {
 		return cur, false
 	}
 	merged := scopeWire(cur)
+	dropLists(keys, map[string]func(){
+		"pools":         func() { merged.Pools = nil },
+		"options":       func() { merged.Options = nil },
+		"static_routes": func() { merged.StaticRoutes = nil },
+	})
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&merged); err != nil {
@@ -424,6 +453,28 @@ func (s *Server) handleDHCPClassCreate(w http.ResponseWriter, r *http.Request) {
 	created(w, resourceURL("dhcp/classes", id), c)
 }
 
+// patchClass merges the body onto the stored class, strictly, with every
+// list the body names replaced whole rather than element by element.
+func patchClass(w http.ResponseWriter, r *http.Request, cur store.Class) (store.Class, bool) {
+	raw, ok := readBody(w, r)
+	if !ok {
+		return cur, false
+	}
+	c := cur
+	dropLists(bodyKeys(raw), map[string]func(){
+		"matchers":      func() { c.Matchers = nil },
+		"options":       func() { c.Options = nil },
+		"static_routes": func() { c.StaticRoutes = nil },
+	})
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&c); err != nil {
+		errJSON(w, http.StatusBadRequest, "invalid json")
+		return cur, false
+	}
+	return c, true
+}
+
 // handleDHCPClassPatch merges the body onto the stored class, as a scope's
 // patch does; matchers, like every list, are replaced whole.
 func (s *Server) handleDHCPClassPatch(w http.ResponseWriter, r *http.Request) {
@@ -437,8 +488,8 @@ func (s *Server) handleDHCPClassPatch(w http.ResponseWriter, r *http.Request) {
 		storeErr(w, err)
 		return
 	}
-	c := cur
-	if !decodeInto(w, r, &c) {
+	c, ok := patchClass(w, r, cur)
+	if !ok {
 		return
 	}
 	c.ID, c.CreatedAt = cur.ID, cur.CreatedAt

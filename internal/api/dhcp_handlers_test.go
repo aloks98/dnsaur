@@ -797,3 +797,51 @@ func TestDHCPClassRoutes(t *testing.T) {
 		t.Fatalf("GET a deleted class = %d, want 404", w.Code)
 	}
 }
+
+// TestDHCPPatchReplacesListsWhole: encoding/json decodes an array into the
+// existing slice's elements in place, so a merge that decoded straight onto
+// the stored row would keep whatever the body's elements leave out — a pool
+// sent without class_id would stay the class's.
+func TestDHCPPatchReplacesListsWhole(t *testing.T) {
+	srv, s, _ := dhcpServer(t)
+	h := srv.Handler()
+	cookie := login(t, srv, s)
+
+	cid := mustCreate(t, h, cookie, "/api/v1/dhcp/classes", `{"name":"iot","matchers":["mac:a4:cf:12","vendor:ESP"]}`)
+	sid := mustCreate(t, h, cookie, "/api/v1/dhcp/scopes", `{"name":"lan","cidr":"192.168.1.0/24","enabled":true,`+
+		`"options":[{"code":252,"hex":"abcd"}],"pools":[{"start":"192.168.1.30","end":"192.168.1.40","class_id":`+
+		strconv.FormatInt(cid, 10)+`},{"start":"192.168.1.10","end":"192.168.1.20"}]}`)
+
+	patch := func(url, body string) {
+		t.Helper()
+		if w := doReq(t, h, "PATCH", url, body, cookie); w.Code != http.StatusNoContent {
+			t.Fatalf("PATCH %s = %d %s, want 204", body, w.Code, strings.TrimSpace(w.Body.String()))
+		}
+	}
+	// An option sent without its value is judged as sent: the validator
+	// refuses an empty one, where the stored "abcd" carried over would pass.
+	w := doReq(t, h, "PATCH", resourceURL("dhcp/scopes", sid), `{"options":[{"code":252}]}`, cookie)
+	if w.Code != http.StatusBadRequest || errorOf(t, w) != "option 252 has no value" {
+		t.Fatalf("PATCH options without hex = %d %s, want 400 option 252 has no value", w.Code, strings.TrimSpace(w.Body.String()))
+	}
+	patch(resourceURL("dhcp/scopes", sid), `{"pools":[{"start":"192.168.1.50","end":"192.168.1.60"}]}`)
+	sc, err := s.DHCP().Scope(t.Context(), sid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sc.Pools) != 1 || sc.Pools[0].ClassID != 0 || sc.Pools[0].Start != "192.168.1.50" {
+		t.Fatalf("pools after the patch = %+v, want the one open pool the body sent", sc.Pools)
+	}
+	if len(sc.Options) != 1 || !strings.EqualFold(sc.Options[0].Hex, "abcd") {
+		t.Fatalf("options = %+v, want them untouched by a patch that did not name them", sc.Options)
+	}
+
+	patch(resourceURL("dhcp/classes", cid), `{"matchers":["mac:bb"]}`)
+	c, err := s.DHCP().Class(t.Context(), cid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(c.Matchers) != 1 || c.Matchers[0] != "mac:bb" {
+		t.Fatalf("matchers after the patch = %q, want the body's list alone", c.Matchers)
+	}
+}

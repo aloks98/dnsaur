@@ -572,7 +572,7 @@ func (d *dhcpStore) checkPoolClasses(ctx context.Context, tx *sql.Tx, pools []Po
 	}
 	for i, p := range pools {
 		if p.ClassID != 0 && !found[p.ClassID] {
-			return &unknownClass{i, p.ClassID}
+			return &UnknownClassError{Pool: i, ID: p.ClassID}
 		}
 	}
 	return nil
@@ -779,15 +779,15 @@ func ValidateClass(c Class, others []Class) error {
 		return err
 	}
 	name := strings.TrimSpace(c.Name)
-	// The class is rendered under this name into Kea's one namespace, which
-	// already holds the renderer's own guard classes (dnsaur-open-<scope>)
-	// and Kea's built-ins — DROP among them, which drops its members'
-	// packets unanswered.
 	// The renderer names the class inside member('…'), which Kea gives no
 	// way to escape.
 	if strings.Contains(name, "'") {
 		return errors.New("name cannot contain '")
 	}
+	// The class is rendered under this name into Kea's one namespace, which
+	// already holds the renderer's own guard classes (dnsaur-open-<scope>)
+	// and Kea's built-ins — DROP among them, which drops its members'
+	// packets unanswered.
 	if strings.HasPrefix(strings.ToLower(name), "dnsaur-") {
 		return errors.New("names starting with dnsaur- are reserved")
 	}
@@ -814,20 +814,20 @@ func ValidateClass(c Class, others []Class) error {
 	return validateClientOptions(c.ClientOptions)
 }
 
-// unknownClass is a pool naming a class that does not exist, from the
-// validator or from the write's own re-check. It matches ErrReference, so the
-// API can tell it from the other pool refusals, while its text stays the
-// field and the id alone.
-type unknownClass struct {
-	pool int
-	id   int64
+// UnknownClassError is a pool naming a class that does not exist, from the
+// validator or from the write's own re-check. It matches ErrReference, and
+// its text is the field and the id alone, so the API can hand it on — which
+// it must not do for a driver's own foreign-key text.
+type UnknownClassError struct {
+	Pool int
+	ID   int64
 }
 
-func (e *unknownClass) Error() string {
-	return fmt.Sprintf("pools[%d]: no class with id %d", e.pool, e.id)
+func (e *UnknownClassError) Error() string {
+	return fmt.Sprintf("pools[%d]: no class with id %d", e.Pool, e.ID)
 }
 
-func (e *unknownClass) Unwrap() error { return ErrReference }
+func (e *UnknownClassError) Unwrap() error { return ErrReference }
 
 // nameLimit is the longest scope or class name, in characters: a DNS label's
 // length, which is also what fits a table cell and a select.
@@ -1093,7 +1093,7 @@ func validatePools(s Scope, prefix netip.Prefix, classes []Class) error {
 			return fmt.Errorf("pools[%d]: %s-%s includes the network or broadcast address of %s", i, p.Start, p.End, s.CIDR)
 		}
 		if p.ClassID != 0 && !known[p.ClassID] {
-			return &unknownClass{i, p.ClassID}
+			return &UnknownClassError{Pool: i, ID: p.ClassID}
 		}
 		spans[i] = span{i: i, start: start, end: end}
 	}
