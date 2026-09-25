@@ -9,6 +9,7 @@ import {
   Router,
   ScrollText,
   Settings,
+  Shapes,
   ShieldBan,
   Tag,
   Users,
@@ -33,12 +34,13 @@ export const QUERY_LOG_PATH = "/queries";
 export const FILTERING_BASE = "/filtering";
 
 /** The DHCP section's base, which is also its first screen (Scopes). The
- * chrome hangs each of the three screens' own right-hand readout off these
+ * chrome hangs each of the four screens' own right-hand readout off these
  * — how full the pools are, how fresh the lease table is, how many
- * reservations exist. */
+ * reservations and classes exist. */
 export const DHCP_BASE = "/dhcp";
 export const DHCP_LEASES_PATH = "/dhcp/leases";
 export const DHCP_RESERVATIONS_PATH = "/dhcp/reservations";
+export const DHCP_CLASSES_PATH = "/dhcp/classes";
 
 interface NavItem {
   to: string;
@@ -119,6 +121,7 @@ const ALL_NAV_GROUPS: NavGroup[] = [
       { to: DHCP_BASE, label: "Scopes", icon: Network, end: true },
       { to: DHCP_LEASES_PATH, label: "Leases", icon: Router },
       { to: DHCP_RESERVATIONS_PATH, label: "Reservations", icon: Tag },
+      { to: DHCP_CLASSES_PATH, label: "Classes", icon: Shapes },
     ],
   },
   {

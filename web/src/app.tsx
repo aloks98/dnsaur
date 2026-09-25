@@ -9,6 +9,7 @@ import { useTheme } from "./lib/theme";
 import { TOOLTIP_DELAY_MS } from "./lib/tooltip";
 import { Account } from "./pages/account";
 import { Dashboard } from "./pages/dashboard";
+import { DHCPClasses } from "./pages/dhcp/classes";
 import { DHCPLeases } from "./pages/dhcp/leases";
 import { DHCPReservations } from "./pages/dhcp/reservations";
 import { DHCPScopes } from "./pages/dhcp/scopes";
@@ -111,7 +112,7 @@ export function App() {
                 <Route index element={<ZonesList />} />
                 <Route path=":id" element={<ZoneDetail />} />
               </Route>
-              {/* DHCP's three screens. `/dhcp` is Scopes itself rather
+              {/* DHCP's four screens. `/dhcp` is Scopes itself rather
                   than a redirecting index — the section has a first screen,
                   and the nav hides the whole group on a box with no engine
                   (lib/nav.ts). The routes stay mounted either way: an
@@ -121,6 +122,7 @@ export function App() {
                 <Route index element={<DHCPScopes />} />
                 <Route path="leases" element={<DHCPLeases />} />
                 <Route path="reservations" element={<DHCPReservations />} />
+                <Route path="classes" element={<DHCPClasses />} />
               </Route>
               <Route path="settings" element={<SettingsPage />} />
               {/* System's second tab (see lib/nav.ts): the keys that

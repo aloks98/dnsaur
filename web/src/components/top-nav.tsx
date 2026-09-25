@@ -29,6 +29,7 @@ import { useHealth } from "../hooks/use-stats";
 import {
   DASHBOARD_PATH,
   DHCP_BASE,
+  DHCP_CLASSES_PATH,
   DHCP_LEASES_PATH,
   DHCP_RESERVATIONS_PATH,
   FILTERING_BASE,
@@ -40,6 +41,7 @@ import {
 } from "../lib/nav";
 import { useLists } from "../hooks/use-filters";
 import {
+  useClasses,
   useDHCPEnabled,
   useDHCPStatus,
   useLeasePollMs,
@@ -77,7 +79,7 @@ const CELL =
   "outline-none focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-ring";
 
 /**
- * The DHCP section's three row-2 readouts. Not uppercased like the rest of
+ * The DHCP section's four row-2 readouts. Not uppercased like the rest of
  * the bar, for the reason the role chip isn't (see RoleChip): these carry
  * counts and an interval rather than a label, and `every 10 s` shouted as
  * `EVERY 10 S` reads as a unit nobody uses.
@@ -235,13 +237,14 @@ export function TopNav({ onOpenCommandPalette }: TopNavProps) {
 
           {onFilterLists && <FilterListsCell />}
 
-          {/* DHCP's three screens each get their own readout, on the same
+          {/* DHCP's four screens each get their own readout, on the same
               terms as Filtering › Lists above: the page below already has
               the query, so this is a subscription rather than a second
               fetch, and no other screen pays for it. */}
           {pathname === DHCP_BASE && <ScopesCell />}
           {pathname === DHCP_LEASES_PATH && <LeasesPollCell />}
           {pathname === DHCP_RESERVATIONS_PATH && <ReservationsCell />}
+          {pathname === DHCP_CLASSES_PATH && <ClassesCell />}
         </div>
       )}
     </header>
@@ -428,6 +431,19 @@ function ReservationsCell() {
     <output aria-label="Reservations" className={cn(CELL, DHCP_CELL)}>
       {total} {total === 1 ? "reservation" : "reservations"} · {scopes}{" "}
       {scopes === 1 ? "scope" : "scopes"}
+    </output>
+  );
+}
+
+/** DHCP › Classes' row-2 readout: how many classes exist. */
+function ClassesCell() {
+  const classes = useClasses();
+  if (!classes.data) return null;
+
+  const total = classes.data.length;
+  return (
+    <output aria-label="Classes" className={cn(CELL, DHCP_CELL)}>
+      {total} {total === 1 ? "class" : "classes"}
     </output>
   );
 }

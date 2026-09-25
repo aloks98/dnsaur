@@ -413,7 +413,7 @@ when none has ever loaded. That is a different fact from "not expiring
 soon", and conflating them would put an expiry warning on a fresh install.
 
 `sync` is **always present** and is the same object `GET /sync/status`
-answers on its own (§2.11 and §3.13). It rides here so the status panel can
+answers on its own (§2.11 and §3.14). It rides here so the status panel can
 show a failed pull or a stale replica without a second round trip (§6.3). An instance with no sync configured
 reads as `{"role": "main"}` and nothing else — the `omitempty` on every other
 field means a main with no replicas is exactly that one key.
@@ -1750,7 +1750,53 @@ as `dhcp`.
 | `ha` | object or absent | `{mode, local_state, peer, remote_state, communication_interrupted, unacked_clients}`. **Absent on a single box**, and on an engine too old to know `status-get`'s HA block — a different fact from a pair that is not talking. `peer` is what the partner calls itself, as the engine talking to it reports the name, and is **absent** on an engine whose `status-get` does not carry one — so the status line has to read as "hot-standby" with no partner named, the same way it does for a box with no pair at all |
 | `scopes[]` | array | `{id, pool_size, leased}` per scope the last render saw, **summed across its pools**. `leased` **may exceed** `pool_size` after a pool is shrunk: the engine keeps what it has already handed out until those leases expire |
 
-### 3.12 Never serialized
+### 3.12 Classes
+
+DHCP → Classes (`/dhcp/classes`) is the list of §3.11's class rows, with
+the pool counts computed client-side from `GET /dhcp/scopes` (every pool
+whose `class_id` is the class's id).
+
+| Column | Shows |
+|---|---|
+| `NAME` | the name, mono |
+| `MATCHERS` | the first two `kind:value` strings, comma-separated, then a muted `+N`; the cell's `title` is the full list |
+| `OPTIONS` | the set fields in this fixed order, joined by ` · `: `DNS <first>[ +N]` · `suffix <s>` · `search` · `NTP` · `routes N` · `PXE` · `opt N`. Nothing set is a muted `inherits scope` |
+| `POOLS` | `1 pool` / `N pools`; `0 pools` muted |
+| `ACTIONS` | Edit · Delete |
+
+Empty: `No classes yet`, one muted line, and `+ New class`. Row 2 of the
+chrome reads `N classes` (`0 classes` on empty).
+
+**The dialog** is the scope dialog's shell with two tabs, `Matchers` (the
+default) and `Client options`. Matchers holds the name and a mini-table of
+`KIND` (a select of `vendor`, `mac`) · `VALUE` (mono; placeholder
+`PXEClient:Arch:00007` for vendor, `a4:cf:12` for mac) · Remove, with
+`+ Add matcher` and the muted line `A client matches when any row matches.`
+A new class starts with one empty row. Rows are sent as `kind:value` and
+loaded by splitting on the first `:`; a mac value is lower-cased on the way
+out. A mac value that is not 1–6 whole hex octets marks its row live —
+3px `--destructive` inset, `aria-invalid`, and `Not a MAC prefix: <value>`
+on a `role="alert"` line — and **Save is disabled while one does**. A blank
+row is dropped; none left is `Add a matcher`. A server refusal naming
+`matchers[i]` lands on that row in the server's words and pulls Matchers
+into view; any other refusal is a toast.
+
+Client options is five sections, every field's placeholder `inherit`:
+NAMES & DNS (DNS servers, DNS suffix), NAMES & TIME (search list, NTP),
+ROUTING, PXE BOOT, GENERIC OPTIONS — the scope dialog's sections without
+Behaviour, and no Enabled switch.
+
+**Delete** is the standard confirm (`Delete this class?`) unless pools name
+the class. Then the title is `Delete class · <name>`, the body
+`In use by N pools in <scope names joined with " and ">. Remove it from
+those pools first.`, and the destructive action is disabled. The server's
+`409` is the backstop for a stale scope list: its text replaces the body and
+the action is disabled the same way.
+
+On a replica, New class, Edit and Delete are disabled beside `Managed by the
+main` (§6.4).
+
+### 3.13 Never serialized
 
 | Struct | Field |
 |---|---|
@@ -1762,7 +1808,7 @@ rule/list pattern, the parser's skipped-line count, and the query-log dropped
 count. Also note **there is no join returning a client or group *name* alongside
 a query row** — the UI must resolve `client_id` itself against `GET /clients`.
 
-### 3.13 Sync status
+### 3.14 Sync status
 
 One shape for both roles; read `role` first, since every other field is
 `omitempty` and a main with no replicas is `{"role": "main"}` and nothing
@@ -1971,7 +2017,7 @@ discarded on save, and lost its row error on the resync.
 
 ### 6.1 Replica mode: which controls are live
 
-Every screen reads `GET /resolver/status`'s `sync` block (§3.13) — already
+Every screen reads `GET /resolver/status`'s `sync` block (§3.14) — already
 held by the shell for the status panel, so this costs no request — and treats
 `role === "replica"` as "the write controls here are not this box's". The
 server refuses the write regardless (**409** `managed by <peer_url>`, §1);
@@ -2220,12 +2266,12 @@ An unanswered status reads as "off", which is the answer that changes nothing.
 The *routes* stay mounted either way, so an old link to `/dhcp` lands on the
 screen that says the engine is gone rather than on the not-found page.
 
-Three screens, and each gets its own row-2 readout in the chrome, from the
+Four screens, and each gets its own row-2 readout in the chrome, from the
 query the page below already holds:
 
-> `<n> scopes · <leased> leased of <pool>` — `LIVE · every <n> s` — `<n> reservations · <n> scopes`
+> `<n> scopes · <leased> leased of <pool>` — `LIVE · every <n> s` — `<n> reservations · <n> scopes` — `<n> classes`
 
-Those three cells are **not uppercased** like the rest of the bar (the role
+Those four cells are **not uppercased** like the rest of the bar (the role
 chip is the other exception): they carry counts and an interval, and
 `every 10 s` shouted as `EVERY 10 S` reads as a unit nobody uses.
 
@@ -2299,7 +2345,7 @@ being suppressed for it. Nothing stacks above the page any more, so there is
 no second copy to hide: the panel lists all three on the Scopes page exactly
 as it does everywhere else.
 
-**Replica mode.** Scopes and reservations are synced configuration, so the
+**Replica mode.** Scopes, classes and reservations are synced configuration, so the
 §6.1 rule applies unchanged: `Managed by the main` beside the disabled action,
 every read live.
 
@@ -2308,6 +2354,7 @@ every read live.
 | DHCP → Scopes | New scope, Edit, Delete, the per-row enabled switch, Add reservation, **Apply again** | the engine line, the pool numbers, the reservations links |
 | DHCP → Leases | **Reserve** | **Release**, and the whole table |
 | DHCP → Reservations | New reservation, Edit, Delete | the scope filter, and the whole table |
+| DHCP → Classes | New class, Edit, Delete | the whole table |
 
 `Release` is the one DHCP write that stays live on a replica, and the server
 agrees: a lease belongs to the engine rather than to the configuration, and
@@ -2456,6 +2503,7 @@ an inline script because the served CSP is `script-src 'self'` with no
 | DHCP → Scopes | `/dhcp` (the section's own first screen, not a redirect) |
 | DHCP → Leases | `/dhcp/leases` |
 | DHCP → Reservations | `/dhcp/reservations` (reads `?scope=<id>`) |
+| DHCP → Classes | `/dhcp/classes` (§3.12) |
 | Settings | `/settings` |
 | TSIG keys | `/tsig-keys` |
 | Account & security | `/account` |
@@ -2483,7 +2531,7 @@ an inline script because the served CSP is `script-src 'self'` with no
 
 The nav contains exactly the implemented leaf routes, in five groups
 (Monitor: Dashboard, Query Log · Filtering: Lists, Rules, Groups & Clients ·
-Zones: Zones · DHCP: Scopes, Leases, Reservations · System: Settings, TSIG
+Zones: Zones · DHCP: Scopes, Leases, Reservations, Classes · System: Settings, TSIG
 keys, Account) — there are no dead nav entries pointing at unbuilt screens.
 DHCP is the one group that is conditional rather than constant: it is dropped
 whole on an instance with no engine (§6.4), which is most of them. The group holding Zones is internally still

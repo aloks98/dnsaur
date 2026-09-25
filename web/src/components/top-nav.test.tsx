@@ -7,6 +7,7 @@ import { useLocation, useNavigationType } from "react-router";
 import { server } from "../test/msw-server";
 import {
   blockingHandler,
+  dhcpClass,
   dhcpHandlers,
   dhcpReservation,
   dhcpScope,
@@ -671,7 +672,7 @@ test("the DHCP section is absent on a box with no engine", async () => {
   expect(screen.queryByRole("button", { name: "DHCP" })).not.toBeInTheDocument();
 });
 
-test("the DHCP section appears once the box has one, with its three screens", async () => {
+test("the DHCP section appears once the box has one, with its four screens", async () => {
   server.use(...dhcpHandlers());
   renderTopNav({ route: "/dhcp" });
 
@@ -685,6 +686,10 @@ test("the DHCP section appears once the box has one, with its three screens", as
   expect(within(dhcpTabs).getByRole("link", { name: "Reservations" })).toHaveAttribute(
     "href",
     "/dhcp/reservations",
+  );
+  expect(within(dhcpTabs).getByRole("link", { name: "Classes" })).toHaveAttribute(
+    "href",
+    "/dhcp/classes",
   );
 });
 
@@ -727,10 +732,21 @@ test("each DHCP screen gets its own readout, and no other screen pays for them",
   expect(await screen.findByText("3 reservations · 2 scopes")).toBeInTheDocument();
   reservations.unmount();
 
+  server.use(...dhcpHandlers({ classes: [dhcpClass(), dhcpClass({ id: 2, name: "pxe" })] }));
+  const classes = renderTopNav({ route: "/dhcp/classes" });
+  expect(await screen.findByText("2 classes")).toBeInTheDocument();
+  classes.unmount();
+
+  server.use(...dhcpHandlers({ classes: [] }));
+  const none = renderTopNav({ route: "/dhcp/classes" });
+  expect(await screen.findByText("0 classes")).toBeInTheDocument();
+  none.unmount();
+
   server.use(...dhcpHandlers());
   renderTopNav({ route: "/settings" });
   await waitFor(() => expect(screen.getByRole("button", { name: "DHCP" })).toBeEnabled());
   expect(screen.queryByRole("status", { name: "Scopes" })).not.toBeInTheDocument();
   expect(screen.queryByRole("status", { name: "Lease table" })).not.toBeInTheDocument();
   expect(screen.queryByRole("status", { name: "Reservations" })).not.toBeInTheDocument();
+  expect(screen.queryByRole("status", { name: "Classes" })).not.toBeInTheDocument();
 });

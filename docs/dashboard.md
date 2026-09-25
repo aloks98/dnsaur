@@ -805,7 +805,7 @@ the affected records after upgrading:
 
 ## DHCP
 
-Three screens, and they only exist on a box that has an engine: dnsaur does
+Four screens, and they only exist on a box that has an engine: dnsaur does
 not implement DHCP — ISC Kea does — and the `kea_socket` bootstrap key is the
 switch. Empty (the default) means the section is not in the nav at all, not
 greyed out, because there is nothing behind it to reach. Turning it on is a
@@ -951,6 +951,52 @@ survives a reload and can be bookmarked. While it is set the header counts
 what is on screen (`2 in this scope`) and the bar above keeps the total; a
 filter that hides everything says so, with a way back to all of them.
 
+### Classes
+
+A class sorts clients by what they are, and hands them their own options. It
+matches on a list of prefixes, and a client is a member when **any** of them
+matches:
+
+- `vendor` — the start of option 60, the vendor class the client sends:
+  `PXEClient:Arch:00007` is a UEFI x64 network boot.
+- `mac` — the start of the hardware address, one to six whole bytes:
+  `a4:cf:12` is every device from one manufacturer's range. Type it in either
+  case; it is stored lower-case. Anything that is not whole hex bytes says
+  `Not a MAC prefix: <value>` on its row and Save waits for it.
+
+The table shows the first two matchers (hover for all of them), what the class
+sets — `DNS 192.168.151.2 · suffix iot.lan`, or `inherits scope` when it sets
+nothing — and how many pools name it.
+
+**Client options** are the scope's fields, and a blank one means "the
+scope's". A class's DNS servers, suffix, search list, NTP, routes and generic
+options reach its members **on the class's own pools** — anywhere else the
+scope's own values win. The PXE fields (next server, server hostname, boot
+file) are the exception and apply wherever a member asks.
+
+**A class with a pool draws only from its pools.** Once a pool in a scope
+names a class, that class's members in that scope get addresses from its
+pools and nowhere else; the `any` pools are closed to them. A full class
+pool means no address for that class there, so size it for the devices it
+holds.
+
+Two homelab examples:
+
+- **IoT devices on their own DNS.** Make a class `iot` matching `mac:a4:cf:12`
+  (and any other prefixes your plugs and bulbs share), set DNS servers to the
+  resolver you want them on, then in the scope add a pool
+  `192.168.151.200`–`192.168.151.239` with class `iot`. The devices land in
+  that range with that DNS; everyone else keeps the scope's.
+- **PXE by architecture.** Make `pxe-uefi` matching `vendor:PXEClient:Arch:00007`
+  with boot file `ipxe.efi`, and `pxe-bios` matching `vendor:PXEClient:Arch:00000`
+  with `undionly.kpxe`, both with the same next server. No pool is needed:
+  each machine gets the loader for its firmware from the scope's pools.
+
+A class that any pool still names cannot be deleted: the confirm says which
+scopes use it (`In use by 2 pools in Office and IoT. Remove it from those pools
+first.`) and its Delete stays off. Deleting it would quietly turn those pools
+into ones that serve anyone.
+
 ### What DHCP changes elsewhere
 
 - **Names.** A lease gives its device a name under the scope's suffix, answered
@@ -966,8 +1012,8 @@ filter that hides everything says so, with a way back to all of them.
 
 ### On a replica
 
-Scopes and reservations are synced configuration, so on a replica every write
-here is the main's: **Managed by the main** sits beside the disabled action,
+Scopes, classes and reservations are synced configuration, so on a replica
+every write here is the main's: **Managed by the main** sits beside the disabled action,
 and the engine line, the pools and the whole lease table stay readable.
 
 **Release is the exception and stays live.** A lease belongs to the engine

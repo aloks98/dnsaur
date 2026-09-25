@@ -103,4 +103,5 @@ test("the palette hides DHCP on a box with no engine, and lists it on one with a
   expect(await screen.findByRole("option", { name: "Scopes" })).toBeInTheDocument();
   expect(screen.getByRole("option", { name: "Leases" })).toBeInTheDocument();
   expect(screen.getByRole("option", { name: "Reservations" })).toBeInTheDocument();
+  expect(screen.getByRole("option", { name: "Classes" })).toBeInTheDocument();
 });

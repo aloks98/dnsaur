@@ -162,6 +162,7 @@ export function ConfirmDeleteDialog({
   confirmLabel = "Delete",
   pendingLabel = "Deleting…",
   isPending,
+  disabled = false,
   onConfirm,
 }: {
   open: boolean;
@@ -171,6 +172,8 @@ export function ConfirmDeleteDialog({
   confirmLabel?: string;
   pendingLabel?: string;
   isPending: boolean;
+  /** Refused before it is asked: the description says why. */
+  disabled?: boolean;
   onConfirm: () => void;
 }) {
   return (
@@ -184,7 +187,7 @@ export function ConfirmDeleteDialog({
           <AlertDialogCancel>Cancel</AlertDialogCancel>
           <AlertDialogAction
             className="bg-destructive text-destructive-solid-foreground hover:bg-destructive/90"
-            disabled={isPending}
+            disabled={isPending || disabled}
             onClick={onConfirm}
           >
             {isPending ? pendingLabel : confirmLabel}

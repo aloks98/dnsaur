@@ -5,6 +5,7 @@ import { toast } from "sonner";
 import {
   useFieldArray,
   useForm,
+  useFormContext,
   useWatch,
   type FieldErrors,
   type UseFormReturn,
@@ -165,7 +166,7 @@ function EngineStatusLine({ line, canApply }: { line: EngineLine; canApply: bool
 /** Every field is a string: these are `<input>` values, and a number field
  * that is briefly empty while being retyped has to survive the round trip
  * through the form state. Conversion happens once, in `toInput` below. */
-interface ScopeFormValues {
+interface ScopeFormValues extends ClientOptionFields {
   name: string;
   cidr: string;
   pools: PoolRow[];
@@ -174,6 +175,16 @@ interface ScopeFormValues {
   lease_seconds: string;
   dns_servers: string;
   enabled: boolean;
+  /** The switch is "Ignore client identifier", which is this field's
+   * opposite — see the control's comment. */
+  match_client_id: boolean;
+  reservations_only: boolean;
+}
+
+/** The Client options fields a scope and a class share, as form strings.
+ * Both dialogs render them with ClientOptionSections and convert them with
+ * the two functions below it. */
+export interface ClientOptionFields {
   domain_search: string;
   ntp_servers: string;
   static_routes: { destination: string; router: string }[];
@@ -181,10 +192,6 @@ interface ScopeFormValues {
   next_server: string;
   server_hostname: string;
   boot_file: string;
-  /** The switch is "Ignore client identifier", which is this field's
-   * opposite — see the control's comment. */
-  match_client_id: boolean;
-  reservations_only: boolean;
 }
 
 /** One row of the Pools table. `class_id` is the select's value: "0" is
@@ -268,13 +275,46 @@ export function poolRowErrors(
  * an option with a code and no bytes is a configuration the engine will take
  * and nobody meant.
  */
-function isBlankRow(a: string, b: string): boolean {
+export function isBlankRow(a: string, b: string): boolean {
   return a.trim() === "" && b.trim() === "";
 }
 
-function halfFilled(ctx: z.RefinementCtx, index: number, field: string, what: string): void {
+export function halfFilled(ctx: z.RefinementCtx, index: number, field: string, what: string): void {
   ctx.addIssue({ code: "custom", path: [index, field], message: `Enter ${what}` });
 }
+
+/** The shared Client options fields' schema, spread into both forms'. */
+export const clientOptionsShape = {
+  domain_search: z.string(),
+  ntp_servers: z.string(),
+  static_routes: z
+    .array(z.object({ destination: z.string(), router: z.string() }))
+    .superRefine((rows, ctx) => {
+      rows.forEach((row, index) => {
+        if (isBlankRow(row.destination, row.router)) return;
+        if (row.destination.trim() === "") halfFilled(ctx, index, "destination", "the destination");
+        if (row.router.trim() === "") halfFilled(ctx, index, "router", "the router");
+      });
+    }),
+  options: z.array(z.object({ code: z.string(), hex: z.string() })).superRefine((rows, ctx) => {
+    rows.forEach((row, index) => {
+      const code = row.code.trim();
+      if (isBlankRow(code, row.hex)) return;
+      if (code === "") halfFilled(ctx, index, "code", "the option code");
+      else if (!/^\d+$/.test(code)) {
+        ctx.addIssue({
+          code: "custom",
+          path: [index, "code"],
+          message: "Option code must be a number",
+        });
+      }
+      if (row.hex.trim() === "") halfFilled(ctx, index, "hex", "the value's bytes");
+    });
+  }),
+  next_server: z.string(),
+  server_hostname: z.string(),
+  boot_file: z.string(),
+};
 
 /**
  * Client-side validation: a name, a subnet, and the pool rows — the board
@@ -312,36 +352,7 @@ function scopeFormSchema(
         ),
       dns_servers: z.string(),
       enabled: z.boolean(),
-      domain_search: z.string(),
-      ntp_servers: z.string(),
-      static_routes: z
-        .array(z.object({ destination: z.string(), router: z.string() }))
-        .superRefine((rows, ctx) => {
-          rows.forEach((row, index) => {
-            if (isBlankRow(row.destination, row.router)) return;
-            if (row.destination.trim() === "")
-              halfFilled(ctx, index, "destination", "the destination");
-            if (row.router.trim() === "") halfFilled(ctx, index, "router", "the router");
-          });
-        }),
-      options: z.array(z.object({ code: z.string(), hex: z.string() })).superRefine((rows, ctx) => {
-        rows.forEach((row, index) => {
-          const code = row.code.trim();
-          if (isBlankRow(code, row.hex)) return;
-          if (code === "") halfFilled(ctx, index, "code", "the option code");
-          else if (!/^\d+$/.test(code)) {
-            ctx.addIssue({
-              code: "custom",
-              path: [index, "code"],
-              message: "Option code must be a number",
-            });
-          }
-          if (row.hex.trim() === "") halfFilled(ctx, index, "hex", "the value's bytes");
-        });
-      }),
-      next_server: z.string(),
-      server_hostname: z.string(),
-      boot_file: z.string(),
+      ...clientOptionsShape,
       match_client_id: z.boolean(),
       reservations_only: z.boolean(),
     })
@@ -373,15 +384,50 @@ function toFormValues(scope: DHCPScope | null): ScopeFormValues {
     lease_seconds: scope?.lease_seconds ? String(scope.lease_seconds) : "",
     dns_servers: scope?.dns_servers ?? "",
     enabled: scope?.enabled ?? true,
-    domain_search: scope?.domain_search ?? "",
-    ntp_servers: scope?.ntp_servers ?? "",
-    static_routes: scope?.static_routes ?? [],
-    options: (scope?.options ?? []).map((o) => ({ code: String(o.code), hex: o.hex })),
-    next_server: scope?.next_server ?? "",
-    server_hostname: scope?.server_hostname ?? "",
-    boot_file: scope?.boot_file ?? "",
+    ...clientOptionsToForm(scope),
     match_client_id: scope?.match_client_id ?? true,
     reservations_only: scope?.reservations_only ?? false,
+  };
+}
+
+type ClientOptionsWire = Pick<
+  DHCPScope,
+  | "domain_search"
+  | "ntp_servers"
+  | "static_routes"
+  | "options"
+  | "next_server"
+  | "server_hostname"
+  | "boot_file"
+>;
+
+export function clientOptionsToForm(src: ClientOptionsWire | null): ClientOptionFields {
+  return {
+    domain_search: src?.domain_search ?? "",
+    ntp_servers: src?.ntp_servers ?? "",
+    static_routes: src?.static_routes ?? [],
+    options: (src?.options ?? []).map((o) => ({ code: String(o.code), hex: o.hex })),
+    next_server: src?.next_server ?? "",
+    server_hostname: src?.server_hostname ?? "",
+    boot_file: src?.boot_file ?? "",
+  };
+}
+
+export function clientOptionsToInput(values: ClientOptionFields): ClientOptionsWire {
+  return {
+    domain_search: values.domain_search.trim(),
+    ntp_servers: values.ntp_servers.trim(),
+    // Blank rows only — the schema has already refused every half-filled
+    // one, so nothing that reaches here is being silently discarded.
+    static_routes: values.static_routes
+      .filter((r) => !isBlankRow(r.destination, r.router))
+      .map((r) => ({ destination: r.destination.trim(), router: r.router.trim() })),
+    options: values.options
+      .filter((o) => !isBlankRow(o.code, o.hex))
+      .map((o) => ({ code: Number(o.code.trim()), hex: o.hex.trim() })),
+    next_server: values.next_server.trim(),
+    server_hostname: values.server_hostname.trim(),
+    boot_file: values.boot_file.trim(),
   };
 }
 
@@ -402,19 +448,7 @@ function toInput(values: ScopeFormValues): ScopeInput {
     lease_seconds: Number(values.lease_seconds.trim() || 0),
     enabled: values.enabled,
     dns_servers: values.dns_servers.trim(),
-    domain_search: values.domain_search.trim(),
-    ntp_servers: values.ntp_servers.trim(),
-    // Blank rows only — the schema has already refused every half-filled
-    // one, so nothing that reaches here is being silently discarded.
-    static_routes: values.static_routes
-      .filter((r) => !isBlankRow(r.destination, r.router))
-      .map((r) => ({ destination: r.destination.trim(), router: r.router.trim() })),
-    options: values.options
-      .filter((o) => !isBlankRow(o.code, o.hex))
-      .map((o) => ({ code: Number(o.code.trim()), hex: o.hex.trim() })),
-    next_server: values.next_server.trim(),
-    server_hostname: values.server_hostname.trim(),
-    boot_file: values.boot_file.trim(),
+    ...clientOptionsToInput(values),
     match_client_id: values.match_client_id,
     reservations_only: values.reservations_only,
   };
@@ -426,7 +460,15 @@ function poolIndexes(values: ScopeFormValues): number[] {
   return values.pools.flatMap((p, i) => (isBlankRow(p.start, p.end) ? [] : [i]));
 }
 
-function Field({ label, hint, children }: { label: string; hint?: string; children: ReactNode }) {
+export function Field({
+  label,
+  hint,
+  children,
+}: {
+  label: string;
+  hint?: string;
+  children: ReactNode;
+}) {
   return (
     <FormItem className="min-w-0 gap-1.5">
       <span className="flex items-baseline gap-2">
@@ -503,7 +545,7 @@ function tabForErrors(fields: readonly string[]): string | null {
  * and the fields under it. The board's one-line leads under each head are
  * sample text — the field labels are the copy (docs/dashboard.md carries the
  * explanation). */
-function OptionsSection({ head, children }: { head: string; children: ReactNode }) {
+export function OptionsSection({ head, children }: { head: string; children: ReactNode }) {
   return (
     <section className="flex flex-col gap-2.5">
       <h3 className="border-b border-border-muted pb-1.5 font-mono text-[9.5px] leading-none font-semibold tracking-[0.14em] text-muted-foreground uppercase">
@@ -515,16 +557,20 @@ function OptionsSection({ head, children }: { head: string; children: ReactNode 
 }
 
 /**
- * The Client options tab: everything that is not the subnet itself, grouped
- * under the board's five section heads.
+ * The four Client options sections a scope and a class share: names and
+ * time, routing, PXE boot and generic options. Read from the surrounding
+ * <Form>, so either dialog's form can hold them. `inherit` is the class
+ * dialog's: a blank field there means "the scope's", and every field says so.
  */
-function ScopeOptions({ form }: { form: UseFormReturn<ScopeFormValues> }) {
+export function ClientOptionSections({ inherit = false }: { inherit?: boolean }) {
+  const form = useFormContext<ClientOptionFields>();
+  const hint = (example: string) => (inherit ? "inherit" : example);
   const routes = useFieldArray({ control: form.control, name: "static_routes" });
   const options = useFieldArray({ control: form.control, name: "options" });
   const errors = form.formState.errors;
 
   return (
-    <div className="flex flex-col gap-5">
+    <>
       <OptionsSection head="Names &amp; time">
         <div className="grid gap-3.5 gap-x-6 sm:grid-cols-2">
           <FormField
@@ -534,7 +580,7 @@ function ScopeOptions({ form }: { form: UseFormReturn<ScopeFormValues> }) {
               <Field label="Domain search list" hint="comma-separated">
                 <Input
                   {...field}
-                  placeholder="office.e412.in, e412.in"
+                  placeholder={hint("office.e412.in, e412.in")}
                   autoComplete="off"
                   className="font-mono"
                 />
@@ -548,7 +594,7 @@ function ScopeOptions({ form }: { form: UseFormReturn<ScopeFormValues> }) {
               <Field label="NTP servers" hint="addresses">
                 <Input
                   {...field}
-                  placeholder="192.168.151.1"
+                  placeholder={hint("192.168.151.1")}
                   autoComplete="off"
                   className="font-mono"
                 />
@@ -612,7 +658,7 @@ function ScopeOptions({ form }: { form: UseFormReturn<ScopeFormValues> }) {
               <Field label="Next server">
                 <Input
                   {...field}
-                  placeholder="192.168.151.5"
+                  placeholder={hint("192.168.151.5")}
                   autoComplete="off"
                   className="font-mono"
                 />
@@ -626,7 +672,7 @@ function ScopeOptions({ form }: { form: UseFormReturn<ScopeFormValues> }) {
               <Field label="Server hostname">
                 <Input
                   {...field}
-                  placeholder="pxe.office.e412.in"
+                  placeholder={hint("pxe.office.e412.in")}
                   autoComplete="off"
                   className="font-mono"
                 />
@@ -640,7 +686,7 @@ function ScopeOptions({ form }: { form: UseFormReturn<ScopeFormValues> }) {
               <Field label="Boot file">
                 <Input
                   {...field}
-                  placeholder="pxelinux.0"
+                  placeholder={hint("pxelinux.0")}
                   autoComplete="off"
                   className="font-mono"
                 />
@@ -693,6 +739,18 @@ function ScopeOptions({ form }: { form: UseFormReturn<ScopeFormValues> }) {
           addLabel="Add option"
         />
       </OptionsSection>
+    </>
+  );
+}
+
+/**
+ * The scope dialog's Client options tab: the shared sections, then the two
+ * behaviour switches only a scope has.
+ */
+function ScopeOptions({ form }: { form: UseFormReturn<ScopeFormValues> }) {
+  return (
+    <div className="flex flex-col gap-5">
+      <ClientOptionSections />
 
       <OptionsSection head="Behaviour">
         <div className="flex flex-wrap items-center gap-6">
@@ -730,7 +788,7 @@ function ScopeOptions({ form }: { form: UseFormReturn<ScopeFormValues> }) {
 
 /** The repeating lists — Pools on Network, routes and options on Client
  * options — which are the same table with different columns. */
-function MiniTable({
+export function MiniTable({
   columns,
   template,
   noun,
